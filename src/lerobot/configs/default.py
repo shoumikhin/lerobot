@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.transforms import ImageTransformsConfig
-from lerobot.utils.import_utils import get_safe_default_codec
+from lerobot.utils.import_utils import get_safe_default_video_backend
 
 
 @dataclass
@@ -34,7 +34,7 @@ class DatasetConfig:
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
-    video_backend: str = field(default_factory=get_safe_default_codec)
+    video_backend: str = field(default_factory=get_safe_default_video_backend)
     streaming: bool = False
 
     def __post_init__(self) -> None:

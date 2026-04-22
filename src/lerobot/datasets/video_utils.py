@@ -37,7 +37,7 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
-from lerobot.utils.import_utils import get_safe_default_codec
+from lerobot.utils.import_utils import get_safe_default_video_backend
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ def decode_video_frames(
     Currently supports torchcodec on cpu and pyav.
     """
     if backend is None:
-        backend = get_safe_default_codec()
+        backend = get_safe_default_video_backend()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
     elif backend in ["pyav", "video_reader"]:
