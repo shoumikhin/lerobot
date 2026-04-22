@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from lerobot.common.control_utils import is_headless
+from lerobot.datasets.video_utils import VideoEncoderConfig
 from lerobot.processor import (
     IdentityProcessorStep,
     RobotAction,
@@ -52,10 +53,12 @@ class HILDatasetConfig:
     num_image_writer_processes: int = 0
     num_image_writer_threads_per_camera: int = 4
     video_encoding_batch_size: int = 1
-    vcodec: str = "auto"
+    camera_encoder_config: VideoEncoderConfig = field(
+        default_factory=lambda: VideoEncoderConfig(vcodec="auto", preset=None)
+    )
+    encoder_threads: int | None = None
     streaming_encoding: bool = True
     encoder_queue_maxsize: int = 30
-    encoder_threads: int | None = None
     rename_map: dict[str, str] = field(default_factory=dict)
 
 

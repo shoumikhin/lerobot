@@ -39,6 +39,7 @@ from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import (
+    VideoEncoderConfig,
     decode_video_frames,
     encode_video_frames,
 )
@@ -251,10 +252,13 @@ def benchmark_encoding_decoding(
             imgs_dir=imgs_dir,
             video_path=video_path,
             fps=fps,
-            vcodec=encoding_cfg["vcodec"],
-            pix_fmt=encoding_cfg["pix_fmt"],
-            g=encoding_cfg.get("g"),
-            crf=encoding_cfg.get("crf"),
+            camera_encoder_config=VideoEncoderConfig(
+                vcodec=encoding_cfg["vcodec"],
+                pix_fmt=encoding_cfg["pix_fmt"],
+                g=encoding_cfg.get("g"),
+                crf=encoding_cfg.get("crf"),
+                preset=encoding_cfg.get("preset"),
+            ),
             # fast_decode=encoding_cfg.get("fastdecode"),
             overwrite=True,
         )

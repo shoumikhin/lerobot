@@ -990,10 +990,10 @@ def hil_collect(cfg: HILConfig) -> LeRobotDataset:
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                vcodec=cfg.dataset.vcodec,
+                camera_encoder_config=cfg.dataset.camera_encoder_config,
+                encoder_threads=cfg.dataset.encoder_threads,
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
             )
             if hasattr(robot_raw, "cameras") and robot_raw.cameras:
                 dataset.start_image_writer(
@@ -1012,10 +1012,10 @@ def hil_collect(cfg: HILConfig) -> LeRobotDataset:
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
                 * len(robot_raw.cameras if hasattr(robot_raw, "cameras") else []),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                vcodec=cfg.dataset.vcodec,
+                camera_encoder_config=cfg.dataset.camera_encoder_config,
+                encoder_threads=cfg.dataset.encoder_threads,
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
             )
 
         # Load policy — RTC needs manual loading for predict_action_chunk support
