@@ -1,0 +1,29 @@
+# Export venv requirements: torch 2.12 + torch-tensorrt 2.12 + executorch
+#
+# These packages are NOT part of the default lerobot install.
+# Set them up in a separate Python venv for running the torch-trt / torch-trt-et backends.
+#
+# Setup:
+#   python -m venv ~/lerobot-export-env
+#   source ~/lerobot-export-env/bin/activate
+#   pip install -r src/lerobot/export/requirements-export-trt.txt
+#   pip install "lerobot[smolvla,export]"
+#
+# Then run:
+#   lerobot-export --policy.path=lerobot/smolvla_base --backend=torch-trt --output_dir=bundles/smolvla_trt
+#   lerobot-export --policy.path=lerobot/smolvla_base --backend=torch-trt-et --output_dir=bundles/smolvla_pte
+
+# torch 2.12 with CUDA 12.6 (driver >=560, broadest compatibility).
+# Swap cu130 for cu126 if your driver is >=580 and you want CUDA 13.
+--index-url https://download.pytorch.org/whl/cu126
+torch==2.12.0+cu126
+torchvision==0.27.0+cu126
+
+# torch-tensorrt 2.12 -- ships as a universal PyPI wheel (no CUDA tag).
+# Bundles TRT 10.16.1 and links against the torch 2.12 ABI above.
+--extra-index-url https://pypi.org/simple
+torch-tensorrt==2.12.1
+
+# executorch -- latest stable release.
+# 1.4.0a0 is a dev build (not on PyPI); use 1.3.1 until 1.4 ships.
+executorch==1.3.1

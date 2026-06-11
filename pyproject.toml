@@ -59,8 +59,8 @@ keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artifici
 
 dependencies = [
     # Core ML
-    "torch>=2.7,<2.12.0",
-    "torchvision>=0.22.0,<0.27.0",
+    "torch>=2.7,<2.13.0",
+    "torchvision>=0.22.0,<0.28.0",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
     "Pillow>=10.0.0,<13.0.0",
@@ -107,10 +107,10 @@ dataset = [
     #   - macOS x86_64 (Intel) and linux armv7l: no wheels in any released version -> fall through to the PyAV decoder.
     # Each platform gets its own line so the resolver picks the minimum version that has a wheel for it.
 
-    # Other torch/torchcodec pairings (informational): 0.8.1 = ffmpeg>=8 support, 0.10 = system-wide ffmpeg support, 0.12 needs torch==2.12.
-    "torchcodec>=0.3.0,<0.12.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    "torchcodec>=0.7.0,<0.12.0; sys_platform == 'win32'",
-    "torchcodec>=0.11.0,<0.12.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64')",
+    # Other torch/torchcodec pairings (informational): 0.8.1 = ffmpeg>=8 support, 0.10 = system-wide ffmpeg support, 0.12 needs torch==2.12, 0.13 needs torch==2.13.
+    "torchcodec>=0.3.0,<0.13.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "torchcodec>=0.7.0,<0.13.0; sys_platform == 'win32'",
+    "torchcodec>=0.11.0,<0.13.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64')",
     "jsonlines>=4.0.0,<5.0.0",
 ]
 training = [
@@ -222,6 +222,14 @@ vla_jepa = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[qwen
 # Features
 async = ["lerobot[grpcio-dep]", "lerobot[matplotlib-dep]"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
+# lerobot-export CLI for AOTI (.pt2) export. No heavy deps: AOTI runs on the default
+# torch 2.11+cu128 install. torch-tensorrt / ExecuTorch are installed SEPARATELY in a
+# dedicated export venv (see src/lerobot/export/requirements-export-trt.txt) because
+# torch-tensorrt 2.12 needs torch 2.12+, which the cu128 index cannot resolve.
+# Note on torch ceiling: torch<2.13 is declared here so pip knows torch 2.12 is
+# allowed (for the export venv). uv+cu128 users stay on 2.11 because the cu128
+# index has no 2.12 wheel; the [tool.uv.sources] pin below is the firewall.
+export = []
 
 # Development
 dev = ["pre-commit>=3.7.0,<5.0.0", "debugpy>=1.8.1,<1.9.0", "lerobot[grpcio-dep]", "grpcio-tools==1.73.1", "mypy>=1.19.1", "ruff>=0.14.1", "lerobot[notebook]"]
@@ -318,6 +326,7 @@ lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-export="lerobot.export.cli:main"
 
 # ---------------- Tool Configurations ----------------
 
