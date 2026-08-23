@@ -97,6 +97,48 @@ class _UndeclaredPolicy(nn.Module):
     _fsdp_wrap_modules = None
 
 
+class _TiedPolicy(nn.Module):
+    """A language head tied to the input embedding, 1024 parameters each."""
+
+    _fsdp_wrap_modules = None
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(64, 16)
+        self.head = nn.Linear(16, 64, bias=False)
+        self.head.weight = self.embed.weight
+
+
+class _TiedLeafDeclaredPolicy(_TiedPolicy):
+    _fsdp_wrap_modules = ["Embedding"]
+
+
+class _Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(16, 16)
+
+
+class _Shadow:
+    class _Block(nn.Module):
+        """Shares its name with the module-level `_Block`, and holds a head tied to the root's embedding."""
+
+        def __init__(self, embed: nn.Embedding):
+            super().__init__()
+            self.head = nn.Linear(16, 64, bias=False)
+            self.head.weight = embed.weight
+
+
+class _SameNamePolicy(nn.Module):
+    _fsdp_wrap_modules = None
+
+    def __init__(self):
+        super().__init__()
+        self.first = _Block()
+        self.embed = nn.Embedding(64, 16)
+        self.second = _Shadow._Block(self.embed)
+
+
 def _accelerator_with(plugin) -> SimpleNamespace:
     return SimpleNamespace(state=SimpleNamespace(fsdp_plugin=plugin))
 
@@ -132,6 +174,39 @@ class TestSetFsdpWrapModules:
         plugin = FSDPConfig(min_num_params=1024).build_plugin()
         set_fsdp_wrap_modules(_accelerator_with(plugin), _UndeclaredPolicy())
         assert plugin.transformer_cls_names_to_wrap is None
+
+    def test_size_based_policy_rejects_splitting_tied_weights(self):
+        plugin = FSDPConfig(min_num_params=512).build_plugin()
+        replace = r"Replace --accelerator\.fsdp\.min_num_params with --accelerator\.fsdp\.wrap_modules"
+        older = "older versions silently untie them"
+        with pytest.raises(ValueError, match=rf"'embed\.weight' and 'head\.weight'.*{older}\. {replace}"):
+            set_fsdp_wrap_modules(_accelerator_with(plugin), _TiedPolicy())
+
+    def test_size_based_policy_accepts_tied_weights_in_one_unit(self):
+        plugin = FSDPConfig(min_num_params=4096).build_plugin()
+        set_fsdp_wrap_modules(_accelerator_with(plugin), _TiedPolicy())
+
+    def test_user_override_rejects_splitting_tied_weights(self):
+        plugin = FSDPConfig(wrap_modules=["Linear"]).build_plugin()
+        with pytest.raises(ValueError, match=r"'embed\.weight' and 'head\.weight'.*wrap_modules"):
+            set_fsdp_wrap_modules(_accelerator_with(plugin), _TiedPolicy())
+
+    def test_policy_declaration_rejects_splitting_tied_weights(self):
+        plugin = FSDPConfig().build_plugin()
+        with pytest.raises(ValueError, match=r"'embed\.weight' and 'head\.weight'.*wrap_modules"):
+            set_fsdp_wrap_modules(_accelerator_with(plugin), _TiedLeafDeclaredPolicy())
+
+    def test_class_based_wrap_accepts_tied_weights_in_one_unit(self):
+        plugin = FSDPConfig(wrap_modules=["_TiedPolicy"]).build_plugin()
+        set_fsdp_wrap_modules(_accelerator_with(plugin), nn.Sequential(_TiedPolicy()))
+
+    def test_wrap_name_resolves_to_the_first_class_like_accelerate(self):
+        plugin = FSDPConfig(wrap_modules=["_Block"]).build_plugin()
+        set_fsdp_wrap_modules(_accelerator_with(plugin), _SameNamePolicy())
+
+    def test_tied_weights_in_ignored_modules_belong_to_no_unit(self):
+        plugin = FSDPConfig(min_num_params=512, ignored_modules="embed").build_plugin()
+        set_fsdp_wrap_modules(_accelerator_with(plugin), _TiedPolicy())
 
     def test_non_sharded_run_is_noop(self):
         set_fsdp_wrap_modules(_accelerator_with(None), _UndeclaredPolicy())
