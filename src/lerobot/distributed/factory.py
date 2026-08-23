@@ -22,6 +22,7 @@ env vars in that mode); the yaml flow is superseded.
 """
 
 import os
+import re
 from typing import TYPE_CHECKING
 
 from lerobot.configs.parallelism import world_size_from_env
@@ -30,7 +31,10 @@ from lerobot.configs.train import CheckpointFormat, TrainPipelineConfig
 from .utils import unwrap_peft_model
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from accelerate import Accelerator
+    from torch import nn
 
     from lerobot.policies.pretrained import PreTrainedPolicy
 
@@ -114,8 +118,9 @@ def set_fsdp_wrap_modules(accelerator: "Accelerator", policy: "PreTrainedPolicy"
     silent default when no wrap source exists — is never accepted: it quietly forfeits all
     sharding memory savings.
 
-    No-op for the size-based policy (`--accelerator.fsdp.min_num_params`), which needs no class
-    names, and for non-sharded runs (no fsdp plugin).
+    The size-based policy (`--accelerator.fsdp.min_num_params`) needs no class names. Either way, the
+    wrap units are checked for tied weights they would split. No-op for non-sharded runs (no fsdp
+    plugin).
 
     Args:
         accelerator (Accelerator): The accelerator whose FSDP plugin receives the wrap-unit
@@ -125,22 +130,88 @@ def set_fsdp_wrap_modules(accelerator: "Accelerator", policy: "PreTrainedPolicy"
 
     Raises:
         ValueError: If sharded class-based wrapping is configured but neither a user override
-            nor a policy declaration supplies wrap-unit class names.
+            nor a policy declaration supplies wrap-unit class names, or if the wrap units would
+            put two copies of a tied parameter in different units.
     """
     plugin = getattr(accelerator.state, "fsdp_plugin", None)
-    if plugin is None or plugin.min_num_params:
+    if plugin is None:
         return
-    if plugin.transformer_cls_names_to_wrap:  # user override, set at build time
-        return
-    policy = unwrap_peft_model(policy)
-    # getattr, not attribute access: non-policy trainables (no `_fsdp_wrap_modules` attribute)
-    # must reach the actionable error below, not an AttributeError.
-    declared = getattr(type(policy), "_fsdp_wrap_modules", None)
-    if not declared:
-        raise ValueError(
-            f"Policy '{type(policy).__name__}' declares no FSDP wrap units. Sharded training "
-            "requires wrap-unit class names: set --accelerator.fsdp.wrap_modules='[\"MyBlock\"]' "
-            "(or --accelerator.fsdp.min_num_params for a size-based policy), or declare "
-            "`_fsdp_wrap_modules` on the policy class."
+    if plugin.min_num_params:
+        min_num_params = plugin.min_num_params
+        _check_wrap_keeps_tied_weights(
+            policy,
+            lambda m: sum(p.numel() for p in m.parameters()) > min_num_params,
+            plugin.ignored_modules,
+            f"--accelerator.fsdp.min_num_params={min_num_params}",
+            "Replace --accelerator.fsdp.min_num_params with --accelerator.fsdp.wrap_modules",
         )
-    plugin.transformer_cls_names_to_wrap = list(declared)
+        return
+    if not plugin.transformer_cls_names_to_wrap:  # a user override is set at build time
+        trainable = unwrap_peft_model(policy)
+        # getattr, not attribute access: non-policy trainables (no `_fsdp_wrap_modules` attribute)
+        # must reach the actionable error below, not an AttributeError.
+        declared = getattr(type(trainable), "_fsdp_wrap_modules", None)
+        if not declared:
+            raise ValueError(
+                f"Policy '{type(trainable).__name__}' declares no FSDP wrap units. Sharded training "
+                "requires wrap-unit class names: set --accelerator.fsdp.wrap_modules='[\"MyBlock\"]' "
+                "(or --accelerator.fsdp.min_num_params for a size-based policy), or declare "
+                "`_fsdp_wrap_modules` on the policy class."
+            )
+        plugin.transformer_cls_names_to_wrap = list(declared)
+    from accelerate.utils.dataclasses import get_module_class_from_name
+
+    names = plugin.transformer_cls_names_to_wrap
+    # accelerate's own lookup: when two classes share a name, only the first one found is wrapped.
+    wrap_classes = tuple({get_module_class_from_name(policy, name) for name in names} - {None})
+    _check_wrap_keeps_tied_weights(
+        policy,
+        lambda m: isinstance(m, wrap_classes),
+        plugin.ignored_modules,
+        f"Wrapping {names}",
+        "Pass --accelerator.fsdp.wrap_modules",
+    )
+
+
+def _check_wrap_keeps_tied_weights(
+    model: "nn.Module",
+    is_unit: "Callable[[nn.Module], bool]",
+    ignored_modules: str | None,
+    source: str,
+    remedy: str,
+) -> None:
+    """Fail before `accelerator.prepare()` if the FSDP wrap units would split a tied parameter.
+
+    FSDP2 on torch 2.12 and newer rejects a parameter managed by two wrap units, but only at the first
+    forward, after every rank has loaded and sharded the model; older versions silently untie it.
+    This mirrors how accelerate applies a wrap policy (every non-root module it selects becomes a
+    unit, the root keeps the rest, and the parameters of modules matching `ignored_modules` belong
+    to no unit) to report the same problem at startup.
+    """
+    ignored: set[int] = set()
+    if ignored_modules:
+        pattern = re.compile(ignored_modules)
+        ignored = {
+            id(p) for name, m in model.named_modules() if pattern.fullmatch(name) for p in m.parameters()
+        }
+    wrapped = {id(m) for m in list(model.modules())[1:] if is_unit(m)}
+    unit_of: dict[int, tuple[int, str]] = {}
+
+    def visit(module: "nn.Module", prefix: str, unit: int) -> None:
+        if id(module) in wrapped:
+            unit = id(module)
+        for name, param in module.named_parameters(recurse=False):
+            if id(param) in ignored:
+                continue
+            first_unit, first_name = unit_of.setdefault(id(param), (unit, prefix + name))
+            if first_unit != unit:
+                raise ValueError(
+                    f"{source} would put the tied parameters '{first_name}' and '{prefix + name}' in "
+                    "different FSDP units. PyTorch 2.12 and newer stop at the first training step, and older "
+                    f"versions silently untie them. {remedy}, listing modules that keep them together (see "
+                    "the FSDP section of the multi-GPU training guide)."
+                )
+        for name, child in module.named_children():
+            visit(child, f"{prefix}{name}.", unit)
+
+    visit(model, "", id(model))
