@@ -30,9 +30,14 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
 
-import torch
-
 from lerobot.utils.constants import QUERY_KIND, QUERY_TEXT
+from lerobot.utils.import_utils import LAZY_IMPORTS, lazy_getattr
+
+# Torch is imported the first time it is used.
+if LAZY_IMPORTS:
+    import torch
+
+__getattr__ = lazy_getattr(__name__)
 
 logger = logging.getLogger(__name__)
 
