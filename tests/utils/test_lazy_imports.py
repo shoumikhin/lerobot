@@ -35,6 +35,8 @@ LAZY_MODULES = [
     "lerobot.lerobot_types",
     "lerobot.policies",
     "lerobot.policies.rtc",
+    "lerobot.processor",
+    "lerobot.processor.converters",
     "lerobot.utils",
     pytest.param("lerobot.rollout", marks=NEEDS_DATASETS),
     "lerobot.inference",
@@ -126,7 +128,7 @@ def _resolve_type_checking_block(tree: ast.Module, package: str) -> tuple[dict, 
 
 
 def _names_read_at_runtime(tree: ast.Module) -> set[str]:
-    """Names the module reads when it runs, leaving out `if TYPE_CHECKING:` blocks and annotations."""
+    """Names read at run time, outside `if TYPE_CHECKING:` blocks, annotations and a function's own imports."""
     skipped = [
         stmt
         for node in ast.walk(tree)
@@ -139,6 +141,28 @@ def _names_read_at_runtime(tree: ast.Module) -> set[str]:
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             skipped.append(node.returns)
     ignored = {id(n) for root in skipped if root is not None for n in ast.walk(root)}
+    for function in ast.walk(tree):
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            nested = {
+                id(n)
+                for inner in ast.walk(function)
+                if inner is not function
+                and isinstance(inner, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+                for n in ast.walk(inner)
+            }
+            # An import binds the name in its own function from that point on, and nested functions see it.
+            imports = [
+                ((alias.asname or alias.name).split(".")[0], (node.lineno, node.col_offset))
+                for node in ast.walk(function)
+                if isinstance(node, ast.Import | ast.ImportFrom) and id(node) not in nested
+                for alias in node.names
+            ]
+            ignored |= {
+                id(n)
+                for n in ast.walk(function)
+                if isinstance(n, ast.Name)
+                and any(name == n.id and at < (n.lineno, n.col_offset) for name, at in imports)
+            }
     return {
         n.id
         for n in ast.walk(tree)

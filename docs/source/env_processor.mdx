@@ -332,6 +332,8 @@ class MyEnvProcessorStep(ObservationProcessorStep):
         return processed
 ```
 
+Also add the step name to `BUILTIN_STEP_MODULES` in `src/lerobot/processor/pipeline.py`, so a saved pipeline can find the step without importing every processor module. `tests/processor/test_pipeline.py` checks that table.
+
 ### 2. Update Your `EnvConfig` Subclass
 
 ```python
