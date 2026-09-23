@@ -92,10 +92,15 @@ if attempts:
         "lerobot.scripts.lerobot_find_port",
         "lerobot.scripts.lerobot_setup_can",
         "lerobot.scripts.lerobot_setup_motors",
+        "lerobot.scripts.lerobot_teleoperate",
         "lerobot.configs",
         "lerobot.policies",
         "lerobot.policies.rtc",
         "lerobot.inference",
+        "lerobot.processor",
+        "lerobot.processor.converters",
+        "lerobot.processor.factory",
+        "lerobot.processor.pipeline",
         pytest.param(
             "lerobot.scripts.lerobot_rollout",
             marks=[

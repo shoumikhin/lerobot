@@ -253,6 +253,8 @@ class MyBenchmarkProcessorStep(ObservationProcessorStep):
 
 See `LiberoProcessorStep` for a full example (image rotation, quaternion-to-axis-angle conversion).
 
+Also add the step name to `BUILTIN_STEP_MODULES` in `src/lerobot/processor/pipeline.py`, so a saved pipeline can find the step without importing every processor module. `tests/processor/test_pipeline.py` checks that table.
+
 ### 4. Dependencies (`pyproject.toml`)
 
 Add a new optional-dependency group:
