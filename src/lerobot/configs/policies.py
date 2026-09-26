@@ -11,31 +11,58 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import abc
 import builtins
+import importlib.util
 import json
 import os
+import pkgutil
 import tempfile
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import draccus
-import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
-from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
+from lerobot.utils.import_utils import import_on_demand
 
 from .types import FeatureType, PolicyFeature
 
+if TYPE_CHECKING:
+    import torch
+
+    from lerobot.optim import LRSchedulerConfig, OptimizerConfig
+
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
+
+
+def _set_up_torch_dtype() -> None:
+    """Import torch into this module and register the draccus codecs for `torch.dtype`, once.
+
+    This module imports torch only for type checking, so the commands that read it without parsing a
+    policy config never load torch. Defining a policy config class calls this, because everything done
+    with that class afterwards, parsing it, decoding it or building it, needs torch: draccus resolves the
+    `torch.dtype` annotation through this module's globals, and decodes it with these codecs.
+    """
+    global torch
+    if "torch" in globals():
+        return
+    import torch as torch_module
+
+    from .parser import register_torch_dtype_codecs
+
+    register_torch_dtype_codecs()
+    # Bound last: another thread defining a policy config returns as soon as it sees this name.
+    torch = torch_module
 
 
 @dataclass
@@ -85,7 +112,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # Optional Hub revision (commit hash, branch, or tag) to pin the pretrained model version.
     pretrained_revision: str | None = None
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        _set_up_torch_dtype()
+
     def __post_init__(self) -> None:
+        from lerobot.utils.device_utils import (
+            auto_select_torch_device,
+            is_amp_available,
+            is_torch_device_available,
+        )
+
         if self.dtype is not None and not isinstance(self.dtype, torch.dtype):
             raise ValueError(f"config.dtype must be a torch.dtype or None, got {self.dtype!r}.")
 
@@ -100,6 +137,56 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                 f"Automatic Mixed Precision (amp) is not available on device '{self.device}'. Deactivating AMP."
             )
             self.use_amp = False
+
+    @classmethod
+    def register_subclass(cls, name: str, choice_type: builtins.type | None = None) -> Any:
+        # Built-in names stay reserved: the built-in registers first, so a plugin that reuses its name fails.
+        # The decorator form calls this first with only the name, then again with the class.
+        if choice_type is not None and name not in cls._choice_registry:
+            cls._import_builtin_policy(name)
+        return super().register_subclass(name, choice_type)
+
+    @classmethod
+    def get_choice_class(cls, name: str) -> builtins.type[PreTrainedConfig]:
+        """Return the config registered as `name`, importing the policies it could come from.
+
+        Raises:
+            KeyError: If `name` is not a string, or no policy registers it once every built-in is imported.
+        """
+        if not isinstance(name, str):
+            raise KeyError(name)
+        if name not in cls._choice_registry:
+            cls._import_builtin_policy(name)
+        if name not in cls._choice_registry:
+            cls.load_all_choices()
+        return super().get_choice_class(name)
+
+    @staticmethod
+    def _import_builtin_policy(name: str) -> None:
+        """Import the built-in policy package named `name`, if there is one, which registers that policy."""
+        if not (isinstance(name, str) and name.isidentifier()):
+            return
+        # Concatenated, not formatted: a `(str, Enum)` member formats as its member name.
+        package = "lerobot.policies." + name
+        if (spec := importlib.util.find_spec(package)) and spec.submodule_search_locations:
+            import_on_demand(package)
+
+    @classmethod
+    def load_all_choices(cls) -> None:
+        """Import every built-in policy package, so each registers its config and whatever else it adds.
+
+        `lerobot.configs.parser` calls this when a command needs it. Code that calls `draccus.parse` itself on
+        a config with a policy field must call it first, since importing `lerobot` registers no policy. A
+        package that fails to import is skipped with a warning, so it does not hide the policies that load.
+        """
+        import lerobot.policies
+
+        for module in pkgutil.iter_modules(lerobot.policies.__path__, "lerobot.policies."):
+            if module.ispkg:
+                try:
+                    import_on_demand(module.name)
+                except ImportError as e:
+                    logger.warning(f"Skipping {module.name}, which failed to import: {e}")
 
     @property
     def type(self) -> str:
@@ -227,7 +314,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             raise ValueError(f"Missing 'type' field in {CONFIG_NAME} of {model_id}")
         try:
             config_cls = cls.get_choice_class(policy_type)
-        except Exception as e:
+        except KeyError as e:
+            if not isinstance(policy_type, str):
+                cls.load_all_choices()  # a non-string type fails before any policy is imported
             raise ValueError(
                 f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
                 f"Available policy types: {cls.get_known_choices()}"
@@ -237,7 +326,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             json.dump(config, f)
             config_file = f.name
 
-        cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        cli_overrides = list(policy_kwargs.pop("cli_overrides", []))  # read twice
+        from .parser import load_selected_choices
+
+        load_selected_choices(config_cls, cli_overrides)
         with draccus.config_type("json"):
             config = draccus.parse(config_cls, config_file, args=cli_overrides)
 
