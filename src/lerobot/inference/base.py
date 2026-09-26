@@ -27,8 +27,6 @@ from functools import partial
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any, Protocol
 
-import torch
-
 from lerobot.lerobot_types import EnvTransition
 from lerobot.utils import QUERY_KIND, QUERY_TEXT
 
@@ -36,6 +34,7 @@ from .contracts import DEFAULT_MAX_TEXT_INPUT_CHARS, QueryKind
 
 if TYPE_CHECKING:
     import numpy as np
+    import torch
 
 logger = logging.getLogger(__name__)
 

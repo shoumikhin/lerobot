@@ -29,7 +29,6 @@ from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, Sync
 from lerobot.inference.bundle import MANIFEST, Bundle, is_bundle
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
-from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
 from .planner import PlannerConfig
 
@@ -350,6 +349,8 @@ class RolloutConfig:
 
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
+        from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
+
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
 
