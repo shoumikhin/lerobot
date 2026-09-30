@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from lerobot.utils.import_utils import lazy_exports
 
-# These import torch, and each config imports its policy package with the model, so each is imported
+# Most of these import torch, and each config imports its policy package with the model, so each is imported
 # the first time it is used.
 if TYPE_CHECKING:
     from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
