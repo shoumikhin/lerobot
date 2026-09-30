@@ -8,6 +8,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -51,8 +52,9 @@ class GateEngine(InferenceEngine):
     supports_text_queries = True
     failed = False
 
-    def __init__(self):
+    def __init__(self, numpy_actions=False):
         super().__init__("original task")
+        self.numpy_actions = numpy_actions
         self.allowed = True
         self.pulls = 0
         self.holds = 0
@@ -77,7 +79,8 @@ class GateEngine(InferenceEngine):
         self.pulls += 1
         if self.stop_during_pull:
             self.allowed = False
-        return torch.tensor([10.0 * self.pulls])
+        action = [10.0 * self.pulls]
+        return np.array(action, dtype=np.float32) if self.numpy_actions else torch.tensor(action)
 
 
 def make_dispatch_context(engine):
@@ -99,8 +102,9 @@ def make_dispatch_context(engine):
     return ctx, robot
 
 
-def test_hold_clears_interpolation_on_a_tick_without_a_queue_pull():
-    engine = GateEngine()
+@pytest.mark.parametrize("numpy_actions", [False, True])
+def test_hold_clears_interpolation_on_a_tick_without_a_queue_pull(numpy_actions):
+    engine = GateEngine(numpy_actions)
     ctx, robot = make_dispatch_context(engine)
     interpolator = ActionInterpolator(multiplier=3)
     obs = {"joint.pos": 7.0}

@@ -22,6 +22,7 @@ intentionally NOT re-exported to avoid pulling in optional dependencies.
 
 from typing import TYPE_CHECKING
 
+from .action_interpolator import ActionInterpolator
 from .constants import (
     ACTION,
     DEFAULT_FEATURES,
@@ -43,13 +44,11 @@ from .utils import init_logging
 
 # These import torch, so each is imported the first time it is used.
 if TYPE_CHECKING:
-    from .action_interpolator import ActionInterpolator
     from .device_utils import auto_select_torch_device, get_safe_torch_device, is_torch_device_available
 else:
     __getattr__, __dir__ = lazy_exports(
         __name__,
         {
-            "ActionInterpolator": ".action_interpolator.ActionInterpolator",
             "auto_select_torch_device": ".device_utils.auto_select_torch_device",
             "get_safe_torch_device": ".device_utils.get_safe_torch_device",
             "is_torch_device_available": ".device_utils.is_torch_device_available",
