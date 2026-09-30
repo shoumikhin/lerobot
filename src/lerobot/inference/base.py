@@ -33,6 +33,10 @@ from lerobot.utils import QUERY_KIND, QUERY_TEXT
 
 from .contracts import DEFAULT_MAX_TEXT_INPUT_CHARS, QueryKind
 
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
+
 logger = logging.getLogger(__name__)
 
 EXTERNAL_HISTORY_DEFAULT = 4
@@ -826,8 +830,8 @@ class InferenceEngine(abc.ABC):
         """Clear episode state; async backends invalidate motion before queuing worker resets."""
 
     @abc.abstractmethod
-    def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
-        """Return a canonical action on the control thread, or ``None`` when unavailable.
+    def get_action(self, obs_frame: dict | None) -> torch.Tensor | np.ndarray | None:
+        """Return a canonical action, a tensor or a NumPy array, or ``None`` when unavailable.
 
         Sync may block on inference; async only consumes buffered work. Check
         ``dispatch_allowed`` again before sending, including interpolation ticks.
