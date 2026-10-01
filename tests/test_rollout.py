@@ -775,6 +775,40 @@ def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch
     engine._context.set_tensor_address.assert_not_called()
 
 
+def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch):
+    """TensorRT asks for the whole engine in one read; the reader answers with at most one piece per call."""
+    import sys
+    import types
+
+    from lerobot.rollout.inference.export import tensorrt as export_tensorrt
+
+    pieces = []
+
+    class Runtime:
+        def __init__(self, logger):
+            pass
+
+        def deserialize_cuda_engine(self, reader):
+            data, size = b"", 10
+            while len(data) < size:
+                pieces.append(reader.read(size - len(data), 0))
+                data += pieces[-1]
+            return data
+
+    fake_trt = types.SimpleNamespace(
+        IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
+        SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
+        Runtime=Runtime,
+        Logger=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
+    monkeypatch.setattr(export_tensorrt, "READ_CHUNK_BYTES", 4)
+    (tmp_path / "model.engine").write_bytes(b"0123456789")
+
+    assert export_tensorrt.load_engine(tmp_path / "model.engine") == b"0123456789"
+    assert [len(piece) for piece in pieces] == [4, 4, 2]
+
+
 def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
     """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
     import json

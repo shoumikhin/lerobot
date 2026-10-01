@@ -18,14 +18,36 @@ from pathlib import Path
 
 import torch
 
+# TensorRT asks for the whole engine in one read; answering in pieces keeps the host copy to one piece.
+READ_CHUNK_BYTES = 64 << 20
+
+
+def load_engine(path: Path):
+    """Deserialize a `.engine` file a piece at a time, without holding the whole file in memory."""
+    import tensorrt as trt
+
+    class FileReader(trt.IStreamReaderV2):
+        def __init__(self, file):
+            trt.IStreamReaderV2.__init__(self)
+            self._file = file
+
+        def read(self, num_bytes: int, stream: int) -> bytes:
+            return self._file.read(min(num_bytes, READ_CHUNK_BYTES))
+
+        def seek(self, offset: int, where: trt.SeekPosition) -> bool:
+            whence = {trt.SeekPosition.SET: 0, trt.SeekPosition.CUR: 1, trt.SeekPosition.END: 2}[where]
+            self._file.seek(offset, whence)
+            return True
+
+    with path.open("rb") as file:
+        return trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(FileReader(file))
+
 
 class TensorRTEngine:
     """Runs a `.engine` file on GPU tensors, on the current CUDA stream."""
 
     def __init__(self, path: Path, input_names: list[str], output_name: str):
-        import tensorrt as trt
-
-        engine = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(path.read_bytes())
+        engine = load_engine(path)
         self._context = engine.create_execution_context()
         self._input_names = input_names
         self._input_shapes = [tuple(engine.get_tensor_shape(name)) for name in input_names]
