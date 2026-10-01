@@ -721,6 +721,64 @@ def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu
         cpu_export_engine(tmp_path)
 
 
+def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
+    """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
+    import json
+
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from lerobot.processor import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
+    from lerobot.processor.converters import TransitionKey
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    @ProcessorStepRegistry.register(name="test_task_length_tokens")
+    class TaskLengthTokens(ProcessorStep):
+        """Stands in for the tokenizer: one token, the length of the task text."""
+
+        def __call__(self, transition):
+            observation = dict(transition[TransitionKey.OBSERVATION])
+            task = transition[TransitionKey.COMPLEMENTARY_DATA]["task"]
+            observation["observation.language.tokens"] = torch.tensor([[float(len(task))]])
+            return {**transition, TransitionKey.OBSERVATION: observation}
+
+        def transform_features(self, features):
+            return features
+
+    def program(state, tokens, noise):
+        return state[:, None, :] + tokens[:, None, :] + noise[:, :, :3]
+
+    PolicyProcessorPipeline(steps=[TaskLengthTokens()]).save_pretrained(tmp_path, config_filename="text.json")
+    noise = np.ones((1, 2, 4), dtype=np.float32)
+    state = np.arange(3, dtype=np.float32)
+    expected = state + len("pick") + 1
+    save_file(
+        {"observation.state": state, "noise": noise, "expected_actions": np.stack([expected, expected])},
+        tmp_path / "case.safetensors",
+    )
+    info = {
+        "backend": "fake",
+        "file": "model.bin",
+        "inputs": ["observation.state", "observation.language.tokens", "noise"],
+        "text_steps": "text.json",
+        "task": "pick",
+        "noise_shape": [1, 2, 4],
+        "output": "action",
+        "test_case": "case.safetensors",
+        "tolerance": 1e-6,
+    }
+    (tmp_path / "export.json").write_text(json.dumps(info))
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: program)
+    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
+
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="pick up", robot_type="")
+    first, second = (engine._run_chunk({"observation.state": state}, "pick up") for _ in range(2))
+
+    assert first.shape == (2, 3)
+    assert not np.allclose(first, second)
+    np.testing.assert_allclose(first.mean(), state.mean() + len("pick up"), atol=3.0)
+
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------

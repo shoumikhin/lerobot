@@ -17,6 +17,9 @@
 An export script writes a folder with the compiled program, the policy's `config.json`, and an
 `export.json` naming the backend, the program's inputs, and a test case. The program takes the
 tensors `prepare_observation_for_inference` makes and returns the actions to play, in robot units.
+
+A policy that reads the task also gets the token ids its saved text steps make from it, and a
+flow-matching policy gets the starting noise as its last input, drawn here for every chunk.
 """
 
 from __future__ import annotations
@@ -32,7 +35,9 @@ import numpy as np
 import torch
 from safetensors.numpy import load_file
 
+from lerobot.policies.common.flow_matching import sample_noise
 from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.processor import PolicyProcessorPipeline
 
 from ..base import InferenceEngine
 
@@ -41,6 +46,7 @@ logger = logging.getLogger(__name__)
 EXPORT_INFO = "export.json"
 # Both backends compile TensorRT engines, which run on CUDA only.
 DEVICE = torch.device("cuda")
+NOISE = "noise"
 
 Program = Callable[..., torch.Tensor]
 
@@ -79,21 +85,39 @@ class ExportInferenceEngine(InferenceEngine):
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._input_names: list[str] = info["inputs"]
         self._robot_type = robot_type
+        self._noise_shape: tuple[int, ...] | None = (
+            tuple(info["noise_shape"]) if "noise_shape" in info else None
+        )
+        self._text_steps = (
+            PolicyProcessorPipeline.from_pretrained(folder, config_filename=info["text_steps"])
+            if "text_steps" in info
+            else None
+        )
         self._program = load_program(folder, info)
         self._actions: deque[np.ndarray] = deque()
-        self._check(folder / info["test_case"], info["tolerance"])
+        self._check(folder / info["test_case"], info.get("task", task), info["tolerance"])
         logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
 
-    def _run_chunk(self, frame: dict[str, np.ndarray], task: str) -> np.ndarray:
+    def _run_chunk(
+        self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None
+    ) -> np.ndarray:
         observation = prepare_observation_for_inference(dict(frame), DEVICE, task, self._robot_type)
+        if self._text_steps is not None:
+            observation = self._text_steps(observation)
+        if self._noise_shape is not None:
+            observation[NOISE] = (
+                torch.from_numpy(noise).to(DEVICE)
+                if noise is not None
+                else sample_noise(self._noise_shape, DEVICE)
+            )
         with torch.inference_mode():
             actions = self._program(*(observation[name] for name in self._input_names))
         return actions[0].cpu().numpy()
 
-    def _check(self, path: Path, tolerance: float) -> None:
+    def _check(self, path: Path, task: str, tolerance: float) -> None:
         case = load_file(path)
         expected = case.pop("expected_actions")
-        actual = self._run_chunk(case, self.task)
+        actual = self._run_chunk(case, task, case.pop(NOISE, None))
         error = float(np.abs(actual - expected).max()) if actual.shape == expected.shape else np.inf
         logger.info("Exported policy test case: largest difference %.2e (tolerance %g)", error, tolerance)
         if not error <= tolerance:
