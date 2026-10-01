@@ -27,6 +27,10 @@ as the program's last input. One thing differs:
 The checkpoint names the robot's cameras, so they come from its config, as for ACT, except the empty
 cameras pi0.5 fills in itself. The folder's config names only the cameras the program takes. The
 checkpoint does not record the task, so the export takes it on the command line.
+
+The export stores in bfloat16 the large weights LeRobot keeps in float32 for training: the linear and
+convolution weights of the vision tower and its projector, and the action expert's adaRMS layers. The test case holds
+the actions of the policy as LeRobot runs it, before that change, so the startup check measures it.
 """
 
 import argparse
@@ -43,6 +47,7 @@ from smolvla_recipe import NOISE, TEXT_STEPS
 from torch import Tensor, nn
 
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline, TokenizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
@@ -69,6 +74,23 @@ class PI05Chunk(nn.Module):
         batch = self.preprocessor(dict(zip(self.input_names[:-1], observation, strict=True)))
         actions = self.policy.predict_action_chunk(batch, noise=noise)
         return self.postprocessor(actions[:, : self.policy.config.n_action_steps])
+
+
+def store_in_bfloat16(policy: PI05Policy) -> None:
+    """Store in bfloat16 the weights LeRobot keeps in float32 for training.
+
+    The vision tower and its projector already multiply in bfloat16 at inference, under autocast, so
+    their results do not change. The action expert's adaRMS layers now multiply in bfloat16 too, so
+    their input, the flow-matching time embedding, and their output are rounded to bfloat16.
+    """
+    paligemma = policy.model.paligemma_with_expert.paligemma.model
+    for module in [*paligemma.vision_tower.modules(), *paligemma.multi_modal_projector.modules()]:
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            module.to(torch.bfloat16)
+    for module in policy.model.paligemma_with_expert.gemma_expert.modules():
+        if isinstance(module, PiGemmaRMSNorm) and module.dense is not None:
+            module.dense.to(torch.bfloat16)
+            module.dense.register_forward_pre_hook(lambda dense, args: (args[0].to(dense.weight.dtype),))
 
 
 class PI05Export:
@@ -102,13 +124,14 @@ class PI05Export:
         cameras = [name for name in self.frame if name in config.image_features]
         names = [*cameras, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, NOISE]
         self.noise = torch.randn(1, config.chunk_size, config.max_action_dim, device="cuda")
+        self.expected_actions = self.rollout_actions()
+        store_in_bfloat16(self.policy)
         self.inputs = (*(observation[name] for name in names[:-1]), self.noise)
         self.module = PI05Chunk(self.policy, tensor_steps, postprocessor, names)
         self.input_names = names
 
     def release_policy(self) -> None:
-        """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
-        self.expected_actions = self.rollout_actions()
+        """Free the policy for the TensorRT step."""
         del self.policy, self.module
         gc.collect()
         torch.cuda.empty_cache()
@@ -144,7 +167,6 @@ class PI05Export:
 
     def rollout_actions(self) -> np.ndarray:
         """The chunk the PyTorch policy computes for the test frame, task and noise, as lerobot-rollout runs it."""
-        # Fresh processors: compiling the module leaves its own holding tensors that cannot leave the GPU.
         preprocessor, postprocessor = self.processors()
         self.policy.reset()
         observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
