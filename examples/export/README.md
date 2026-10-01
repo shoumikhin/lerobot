@@ -126,13 +126,13 @@ Setup: JetPack 7.2.1, nightly PyTorch 2.15, TensorRT 11.3, and Torch-TensorRT an
 | ACT     | Thor      | 4.5 ms (4.8)          | 4.2 ms (4.5)     | 19.2 ms (20.5)   | 14.8 ms (15.2)               |
 | ACT     | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | 65.1 ms (66.7)   | 63.6 ms (64.5)               |
 | SmolVLA | Thor      | 30.1 ms (34.8)        | 31.6 ms (35.9)   | 164.5 ms (168.2) | 58.1 ms, 1 run               |
-| SmolVLA | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | 773.5 ms (777.5) | WIP                          |
+| SmolVLA | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | 773.5 ms (777.5) | 186.9 ms, 1 run              |
 | pi0.5   | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 235.9 ms (238.8) | 135.6 ms (136.3), 1 run      |
 | pi0.5   | Orin Nano | does not fit          | does not fit     | does not fit     | does not fit                 |
 | GR00T   | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 216.2 ms (224.7) | 212.0 ms (219.2), 1 run      |
 | GR00T   | Orin Nano | WIP                   | WIP              | WIP              | WIP                          |
 
-`torch.compile` runs as `lerobot-rollout --use_torch_compile` does: ACT and SmolVLA with `--torch_compile_mode=max-autotune`, GR00T in the default mode. SmolVLA and pi0.5 also compile through their own `compile_model` option, in `max-autotune` mode by default, and pi0.5 uses only that one. pi0.5 was faster with `--policy.compile_mode=default`: 130.0 ms. The first chunk waits for the compile: about 4.3 minutes for ACT, 6.1 for SmolVLA, 7.7 for pi0.5 and 2.1 for GR00T, on the Thor.
+`torch.compile` runs as `lerobot-rollout --use_torch_compile` does: ACT and SmolVLA with `--torch_compile_mode=max-autotune`, GR00T in the default mode. SmolVLA and pi0.5 also compile through their own `compile_model` option, in `max-autotune` mode by default, and pi0.5 uses only that one. pi0.5 was faster with `--policy.compile_mode=default`: 130.0 ms. The first chunk waits for the compile: about 4.3 minutes for ACT, 6.1 for SmolVLA, 7.7 for pi0.5 and 2.1 for GR00T on the Thor, and 8.6 for ACT and 12.2 for SmolVLA on the Orin Nano.
 
 ### Memory added: process, GPU
 
