@@ -22,7 +22,7 @@ Run LeRobot policies as TensorRT engines on Jetson devices, with no PyTorch load
 
 ## Install
 
-On each Jetson:
+On each Jetson, with [uv](https://docs.astral.sh/uv/) installed:
 
 ```bash
 git clone --branch export https://github.com/shoumikhin/lerobot.git
@@ -31,7 +31,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 uv pip install \
     -e ".[smolvla,pi,groot,feetech]" \
-    "torch-tensorrt[executorch]" \
+    "torch-tensorrt[executorch]" onnx onnxscript \
     --index-url https://download.pytorch.org/whl/nightly/cu132 \
     --extra-index-url https://pypi.org/simple \
     --extra-index-url https://pypi.nvidia.com \
@@ -39,16 +39,16 @@ uv pip install \
     --prerelease allow
 ```
 
-This brings nightly PyTorch, Torch-TensorRT, ExecuTorch and TensorRT for CUDA 13.2.
+This brings nightly PyTorch, Torch-TensorRT, ExecuTorch, TensorRT and ONNX for CUDA 13.2.
 
 ## Export
 
 Export a policy you trained with `lerobot-train` on each device it's intended to run, because a TensorRT engine only runs on the GPU model that built it:
 
 ```bash
-python examples/export/smolvla_executorch_tensorrt.py \
-    --policy.path=outputs/train/smolvla_so101/checkpoints/last/pretrained_model \
-    --output_dir=smolvla_executorch_tensorrt
+python examples/export/act_executorch_tensorrt.py \
+    --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
+    --output_dir=outputs/export/act_executorch_tensorrt
 ```
 
 Every policy has one script per backend:
@@ -62,13 +62,18 @@ Every policy has one script per backend:
 
 ## Run
 
-Then run it like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:
+Then run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:
 
 ```bash
 lerobot-rollout \
-    --policy.path=smolvla_executorch_tensorrt \
+    --policy.path=outputs/export/act_executorch_tensorrt \
     --robot.type=so101_follower \
-    --robot.port=/dev/ttyACM0
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower \
+    --robot.cameras="{ wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, scene: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30} }" \
+    --duration=30
 ```
+
+Before the robot moves, the rollout replays a test case saved at export time, and stops if the actions differ from what the PyTorch policy produced.
 
 To compare the two backends, export with the other script and run its folder.
