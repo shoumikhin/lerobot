@@ -833,6 +833,28 @@ def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypat
     np.testing.assert_allclose(first.mean(), state.mean() + len("pick up"), atol=3.0)
 
 
+def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, cpu_export_engine):
+    import json
+
+    import numpy as np
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    info = json.loads((tmp_path / "export.json").read_text())
+    (tmp_path / "export.json").write_text(json.dumps({**info, "task": "pick", "task_fixed": True}))
+
+    with pytest.raises(ValueError, match="only runs the task it was exported for"):
+        cpu_export_engine(tmp_path)
+
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="pick", robot_type="")
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+    np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
+    engine.set_task("place")
+    with pytest.raises(ValueError, match="only runs the task it was exported for"):
+        engine.get_action(frame)
+
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------

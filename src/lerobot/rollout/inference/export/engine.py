@@ -19,7 +19,9 @@ An export script writes a folder with the compiled program, the policy's `config
 tensors `prepare_observation_for_inference` makes and returns the actions to play, in robot units.
 
 A policy that reads the task also gets the token ids its saved text steps make from it, and a
-flow-matching policy gets the starting noise as its last input, drawn here for every chunk.
+flow-matching policy gets the starting noise as its last input, drawn here for every chunk. A
+program compiled for one task holds that task in its weights, and `export.json` says so with
+`task_fixed`: the engine then refuses any other task.
 """
 
 from __future__ import annotations
@@ -98,6 +100,8 @@ class ExportInferenceEngine(InferenceEngine):
         )
         self._program = load_program(folder, info)
         self._actions: deque[np.ndarray] = deque()
+        self._fixed_task: str | None = info["task"] if info.get("task_fixed") else None
+        self._check_task(task)
         self._check(folder / info["test_case"], info.get("task", task), info["tolerance"])
         logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
 
@@ -116,6 +120,13 @@ class ExportInferenceEngine(InferenceEngine):
         with torch.inference_mode():
             actions = self._program(*(observation[name] for name in self._input_names))
         return actions[0].cpu().numpy()
+
+    def _check_task(self, task: str) -> None:
+        if self._fixed_task is not None and task != self._fixed_task:
+            raise ValueError(
+                f"This exported policy only runs the task it was exported for, {self._fixed_task!r}, "
+                f"not {task!r}. Export it again with the new task."
+            )
 
     def _check(self, path: Path, task: str, tolerance: float) -> None:
         case = load_file(path)
@@ -148,6 +159,7 @@ class ExportInferenceEngine(InferenceEngine):
             return None
         task, task_changed = self._take_task()
         if task_changed:
+            self._check_task(task)
             self._actions.clear()
         if not self._actions:
             start = time.perf_counter()
