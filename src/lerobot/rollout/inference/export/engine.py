@@ -46,7 +46,7 @@ from ..base import InferenceEngine
 logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
-# Both backends compile TensorRT engines, which run on CUDA only.
+# All three backends run TensorRT engines, which run on CUDA only.
 DEVICE = torch.device("cuda")
 NOISE = "noise"
 
@@ -71,6 +71,10 @@ def load_program(folder: Path, info: dict) -> Program:
         from .tensorrt import TensorRTEngine
 
         return TensorRTEngine(path, info["inputs"], info["output"])
+    if info["backend"] == "aoti_tensorrt":
+        from .aoti import AOTInductorPackage
+
+        return AOTInductorPackage(path)
     raise ValueError(f"Unknown export backend {info['backend']!r} in {folder / EXPORT_INFO}")
 
 

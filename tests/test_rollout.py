@@ -809,6 +809,27 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
     assert [len(piece) for piece in pieces] == [4, 4, 2]
 
 
+def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    loaded = []
+
+    def aoti_load_package(path):
+        loaded.append(path)
+        return _fake_program
+
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", types.ModuleType("torch_tensorrt"))
+    monkeypatch.setattr(torch._inductor, "aoti_load_package", aoti_load_package)
+
+    program = export_engine.load_program(tmp_path, {"backend": "aoti_tensorrt", "file": "model.pt2"})
+
+    assert loaded == [str(tmp_path / "model.pt2")]
+    torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))
+
+
 def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
     """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
     import json
