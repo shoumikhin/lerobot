@@ -31,6 +31,10 @@ checkpoint does not record the task, so the export takes it on the command line.
 The export stores in bfloat16 the large weights LeRobot keeps in float32 for training: the linear and
 convolution weights of the vision tower and its projector, and the action expert's adaRMS layers. The test case holds
 the actions of the policy as LeRobot runs it, before that change, so the startup check measures it.
+
+The program also keeps only the rows of the 257,152-row vocabulary that the task's prompt can hold:
+the task's own words, the fixed words around it, and the state's bins written as numbers. That saves
+about 1 GiB, and ties the folder to the task, so `export.json` marks it `task_fixed`.
 """
 
 import argparse
@@ -47,10 +51,17 @@ from smolvla_recipe import NOISE, TEXT_STEPS
 from torch import Tensor, nn
 
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
 from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline, TokenizerProcessorStep
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_IMAGES,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 
 
 class PI05Chunk(nn.Module):
@@ -93,6 +104,23 @@ def store_in_bfloat16(policy: PI05Policy) -> None:
             module.dense.register_forward_pre_hook(lambda dense, args: (args[0].to(dense.weight.dtype),))
 
 
+class CompactEmbedding(nn.Module):
+    """An embedding that keeps only the rows of `token_ids`, and finds them with a constant table."""
+
+    def __init__(self, embedding: nn.Embedding, token_ids: Tensor):
+        super().__init__()
+        token_ids = token_ids.to(embedding.weight.device)
+        rows = torch.zeros(embedding.num_embeddings, dtype=torch.long, device=token_ids.device)
+        rows[token_ids] = torch.arange(len(token_ids), device=token_ids.device)
+        self.register_buffer("rows", rows)
+        embedding.weight = nn.Parameter(embedding.weight.detach()[token_ids], requires_grad=False)
+        embedding.num_embeddings = len(token_ids)
+        self.embedding = embedding
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        return self.embedding(self.rows[token_ids])
+
+
 class PI05Export:
     """Loads a trained pi0.5 checkpoint, and writes the exported folder around a compiled program."""
 
@@ -126,6 +154,8 @@ class PI05Export:
         self.noise = torch.randn(1, config.chunk_size, config.max_action_dim, device="cuda")
         self.expected_actions = self.rollout_actions()
         store_in_bfloat16(self.policy)
+        language_model = self.policy.model.paligemma_with_expert.paligemma.model.language_model
+        language_model.embed_tokens = CompactEmbedding(language_model.embed_tokens, self.prompt_token_ids())
         self.inputs = (*(observation[name] for name in names[:-1]), self.noise)
         self.module = PI05Chunk(self.policy, tensor_steps, postprocessor, names)
         self.input_names = names
@@ -150,6 +180,8 @@ class PI05Export:
             "inputs": self.input_names,
             "text_steps": TEXT_STEPS,
             "task": self.task,
+            # The program keeps only the vocabulary rows this task's prompt can hold.
+            "task_fixed": True,
             "noise_shape": list(self.noise.shape),
             "output": ACTION,
             "test_case": TEST_CASE,
@@ -164,6 +196,23 @@ class PI05Export:
         # The prompt carries the state, so its length can change every step; the program takes one shape.
         next(s for s in preprocessor.steps if isinstance(s, TokenizerProcessorStep)).padding = "max_length"
         return preprocessor, postprocessor
+
+    def prompt_token_ids(self) -> Tensor:
+        """Every token id the task's prompt can hold, whatever the state.
+
+        The prompt writes each normalized state value as its bin, -1 below the range and 0 to 255 inside
+        it, so the prompt's own steps run once per bin, with the whole state in the middle of that bin.
+        """
+        steps = self.text_steps.steps
+        start = next(i for i, s in enumerate(steps) if isinstance(s, Pi05PrepareStateTokenizerProcessorStep))
+        prompt_steps = PolicyProcessorPipeline(steps=steps[start:])
+        state_size = self.frame[OBS_STATE].shape[-1]
+        token_ids = set()
+        for value in range(-1, 256):
+            state = torch.full((1, state_size), -1 + (value + 0.5) / 128, device="cuda")
+            observation = prompt_steps({OBS_STATE: state, "task": [self.task]})
+            token_ids.update(observation[OBS_LANGUAGE_TOKENS].flatten().tolist())
+        return torch.tensor(sorted(token_ids))
 
     def rollout_actions(self) -> np.ndarray:
         """The chunk the PyTorch policy computes for the test frame, task and noise, as lerobot-rollout runs it."""
