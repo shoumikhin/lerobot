@@ -34,8 +34,27 @@ from act_recipe import ACTExport, parse_args
 
 from lerobot.utils.constants import ACTION
 
+GIB = 1 << 30
 
-def build_engine(onnx_path: Path) -> bytes:
+
+class FileWriter(trt.IStreamWriter):
+    """Writes the engine to a file as TensorRT serializes it, without another copy in memory."""
+
+    def __init__(self, file):
+        trt.IStreamWriter.__init__(self)
+        self._file = file
+
+    def write(self, data: bytes) -> int:
+        return self._file.write(data)
+
+
+def build_engine(
+    onnx_path: Path,
+    engine_path: Path,
+    workspace_gib: float | None = None,
+    tactic_gib: float | None = None,
+    optimization_level: int | None = None,
+) -> None:
     """Build a TensorRT engine that keeps the ONNX file's own dtypes, as the ExecuTorch route does."""
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -43,10 +62,16 @@ def build_engine(onnx_path: Path) -> bytes:
     parser = trt.OnnxParser(network, logger)
     if not parser.parse_from_file(str(onnx_path)):
         raise SystemExit("\n".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
-    engine = builder.build_serialized_network(network, builder.create_builder_config())
-    if engine is None:
-        raise SystemExit("TensorRT could not build the engine.")
-    return bytes(engine)
+    config = builder.create_builder_config()
+    if workspace_gib is not None:
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gib * GIB))
+    if tactic_gib is not None:
+        config.set_memory_pool_limit(trt.MemoryPoolType.TACTIC_DRAM, int(tactic_gib * GIB))
+    if optimization_level is not None:
+        config.builder_optimization_level = optimization_level
+    with engine_path.open("wb") as file:
+        if not builder.build_serialized_network_to_stream(network, config, FileWriter(file)):
+            raise SystemExit("TensorRT could not build the engine.")
 
 
 def main() -> None:
@@ -68,9 +93,10 @@ def main() -> None:
     print(f"Exported {onnx_path} in {time.perf_counter() - start:.0f} s")
     export.release_policy()
 
-    start = time.perf_counter()
-    engine_path.write_bytes(build_engine(onnx_path))
-    print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
+    if not args.export_only:
+        start = time.perf_counter()
+        build_engine(onnx_path, engine_path)
+        print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
 
     export.write("onnx_tensorrt", engine_path.name, args.tolerance)
 

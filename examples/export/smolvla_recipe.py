@@ -205,4 +205,9 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=5.0, help="Largest allowed action error, robot units."
     )
+    parser.add_argument(
+        "--export_only",
+        action="store_true",
+        help="Write the folder without the engine, to build it with build_engine.py on each device.",
+    )
     return parser.parse_args()

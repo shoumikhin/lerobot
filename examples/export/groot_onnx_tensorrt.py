@@ -49,9 +49,10 @@ def main() -> None:
     print(f"Exported {onnx_path} in {time.perf_counter() - start:.0f} s")
     export.release_policy()
 
-    start = time.perf_counter()
-    engine_path.write_bytes(build_engine(onnx_path))
-    print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
+    if not args.export_only:
+        start = time.perf_counter()
+        build_engine(onnx_path, engine_path)
+        print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
 
     export.write("onnx_tensorrt", engine_path.name, args.tolerance)
 

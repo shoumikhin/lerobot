@@ -37,6 +37,8 @@ from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
 from executorch.exir.schema import DeviceType, Tensor
 
+EXPORTED_PROGRAM = "model.pt2"
+
 # No copies at the program's edges: it reads the caller's GPU inputs directly and returns GPU outputs.
 # Outputs stay planned in the program's own GPU memory, because a Python caller cannot provide one.
 GPU_RESIDENT = ExecutorchBackendConfig(
@@ -77,6 +79,11 @@ def main() -> None:
     start = time.perf_counter()
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
+    if args.export_only:
+        torch.export.save(program, export.output_dir / EXPORTED_PROGRAM)
+        export.release_policy()
+        export.write("executorch_tensorrt", pte_path.name, args.tolerance)
+        return
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()

@@ -91,6 +91,21 @@ python examples/export/pi05_executorch_tensorrt.py \
 
 pi0.5 and GR00T do not run on the Orin Nano. Both export scripts load the PyTorch policy, which does not fit in its 7.3 GiB. TensorRT also runs out of GPU memory when it builds an engine on the Orin Nano from an ONNX file exported on the Thor, about 5 GiB, and an engine built on the Thor does not run there. Export and run them on the Thor.
 
+### Export once, build on each device
+
+To export once and build on several devices, export with `--export_only`: the script writes the folder without the engine. The ONNX route keeps `model.onnx` and its weights, and the ExecuTorch route saves the exported program as `model.pt2`. Copy the folder to each device, then build the engine there:
+
+```bash
+python examples/export/act_onnx_tensorrt.py \
+    --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
+    --output_dir=outputs/export/act_onnx_tensorrt \
+    --export_only
+python examples/export/build_engine.py outputs/export/act_onnx_tensorrt \
+    --workspace_gib=2 --optimization_level=3
+```
+
+`build_engine.py` builds the engine for the local GPU, writes the file the rollout loads, and checks it against the test case the export saved. Lower `--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` make the build need less memory, and the engine may run slower. Every export script takes `--export_only`, with the same options as without it.
+
 ## Run
 
 Then run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:

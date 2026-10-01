@@ -30,7 +30,7 @@ import time
 
 import torch
 import torch_tensorrt
-from act_executorch_tensorrt import GPU_RESIDENT, check_program
+from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT, check_program
 from groot_recipe import GrootExport, parse_args
 
 
@@ -42,6 +42,11 @@ def main() -> None:
     start = time.perf_counter()
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
+    if args.export_only:
+        torch.export.save(program, export.output_dir / EXPORTED_PROGRAM)
+        export.release_policy()
+        export.write("executorch_tensorrt", pte_path.name, args.tolerance)
+        return
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
