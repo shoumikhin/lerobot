@@ -59,6 +59,7 @@ from .inference import (
     RTCInferenceConfig,
     create_inference_engine,
 )
+from .inference.export import ExportInferenceEngine, export_dir
 from .inference.rtc import supports_rtc_inference
 from .robot_wrapper import ThreadSafeRobot
 
@@ -231,11 +232,14 @@ class HardwareContext:
 
 @dataclass
 class PolicyContext:
-    """Loaded policy and its inference engine."""
+    """Loaded policy and its inference engine.
 
-    policy: PreTrainedPolicy
-    preprocessor: PolicyProcessorPipeline
-    postprocessor: PolicyProcessorPipeline
+    An exported policy has no PyTorch policy or processors: its program and the engine replace them.
+    """
+
+    policy: PreTrainedPolicy | None
+    preprocessor: PolicyProcessorPipeline | None
+    postprocessor: PolicyProcessorPipeline | None
     inference: InferenceEngine
 
 
@@ -308,6 +312,37 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     )
 
 
+def _load_policy_for_rollout(
+    cfg: RolloutConfig, policy_config: PreTrainedConfig, is_rtc: bool
+) -> tuple[PreTrainedPolicy, bool]:
+    """Load the PyTorch policy on the rollout device; return it and whether torch compile is active."""
+    policy = _load_pretrained_policy(policy_config)
+
+    if is_rtc:
+        if not supports_rtc_inference(policy):
+            raise ValueError(
+                f"RTC inference is not supported by policy type '{policy_config.type}': "
+                "the policy must implement RTC semantics and predict_action_chunk must accept "
+                "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
+            )
+        policy.config.rtc_config = cfg.inference.rtc
+        if hasattr(policy, "init_rtc_processor"):
+            policy.init_rtc_processor()
+
+    policy = policy.to(cfg.device)
+    policy.eval()
+    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+
+    torch_compile_active = cfg.use_torch_compile
+    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
+            policy,
+            backend=cfg.torch_compile_backend,
+            mode=cfg.torch_compile_mode,
+        )
+    return policy, torch_compile_active
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -343,36 +378,21 @@ def build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
-    policy = _load_pretrained_policy(policy_config)
-
-    if is_rtc:
-        if not supports_rtc_inference(policy):
-            raise ValueError(
-                f"RTC inference is not supported by policy type '{policy_config.type}': "
-                "the policy must implement RTC semantics and predict_action_chunk must accept "
-                "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
-            )
-        policy.config.rtc_config = cfg.inference.rtc
-        if hasattr(policy, "init_rtc_processor"):
-            policy.init_rtc_processor()
-
-    policy = policy.to(cfg.device)
-    policy.eval()
-    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
-
-    torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
-            policy,
-            backend=cfg.torch_compile_backend,
-            mode=cfg.torch_compile_mode,
+    policy_export_dir = export_dir(policy_config.pretrained_path)
+    if policy_export_dir is not None and (is_rtc or cfg.use_torch_compile):
+        raise ValueError(
+            "An exported policy runs with the default inference: drop --inference.type and torch compile."
         )
 
-    if cfg.use_torch_compile and not torch_compile_active:
-        # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
-        # dataclasses.replace when carrying the effective state downstream.
-        cfg = copy(cfg)
-        cfg.use_torch_compile = False
+    policy: PreTrainedPolicy | None = None
+    torch_compile_active = False
+    if policy_export_dir is None:
+        policy, torch_compile_active = _load_policy_for_rollout(cfg, policy_config, is_rtc)
+        if cfg.use_torch_compile and not torch_compile_active:
+            # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
+            # dataclasses.replace when carrying the effective state downstream.
+            cfg = copy(cfg)
+            cfg.use_torch_compile = False
 
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (
@@ -547,51 +567,61 @@ def build_rollout_context(
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
 
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
-    dataset_stats = None
-    if dataset is not None:
-        dataset_stats = rename_stats(
-            dataset.meta.stats,
-            cfg.rename_map,
+    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+    preprocessor: PolicyProcessorPipeline | None = None
+    postprocessor: PolicyProcessorPipeline | None = None
+    if policy_export_dir is not None:
+        # The exported program already contains the policy's processors.
+        logger.info("Creating inference engine (type=export)...")
+        inference_strategy: InferenceEngine = ExportInferenceEngine(
+            policy_export_dir, task=task_str, robot_type=robot_wrapper.robot_type
+        )
+    else:
+        assert policy is not None
+        dataset_stats = None
+        if dataset is not None:
+            dataset_stats = rename_stats(
+                dataset.meta.stats,
+                cfg.rename_map,
+            )
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=policy_config.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
         )
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy_config,
-        pretrained_path=policy_config.pretrained_path,
-        pretrained_revision=policy_config.pretrained_revision,
-        dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
-    )
+        # A relative-action chunk is anchored to the state it was predicted from, and the engines
+        # below rerun the preprocessor once per tick. Hand the step the policy's queue depth so it
+        # holds that anchor until the chunk drains, instead of following the moving arm. Harmless
+        # for the chunk-at-once engines (RTC), whose policy queue is always empty.
+        bind_relative_anchor(policy, preprocessor)
 
-    # A relative-action chunk is anchored to the state it was predicted from, and the engines
-    # below rerun the preprocessor once per tick. Hand the step the policy's queue depth so it
-    # holds that anchor until the chunk drains, instead of following the moving arm. Harmless
-    # for the chunk-at-once engines (RTC), whose policy queue is always empty.
-    bind_relative_anchor(policy, preprocessor)
-
-    # --- 7. Inference strategy (needs policy + pre/post + hardware) --
-    logger.info(
-        "Creating inference engine (type=%s)...",
-        cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
-    )
-    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-    inference_strategy = create_inference_engine(
-        cfg.inference,
-        policy=policy,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        robot_wrapper=robot_wrapper,
-        dataset_features=dataset_features,
-        ordered_action_keys=ordered_action_keys,
-        task=task_str,
-        fps=cfg.fps,
-        device=cfg.device,
-        use_torch_compile=torch_compile_active,
-        compile_warmup_inferences=cfg.compile_warmup_inferences,
-        shutdown_event=shutdown_event,
-    )
+        # --- 7. Inference strategy (needs policy + pre/post + hardware) --
+        logger.info(
+            "Creating inference engine (type=%s)...",
+            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+        )
+        inference_strategy = create_inference_engine(
+            cfg.inference,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            dataset_features=dataset_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task_str,
+            fps=cfg.fps,
+            device=cfg.device,
+            use_torch_compile=torch_compile_active,
+            compile_warmup_inferences=cfg.compile_warmup_inferences,
+            shutdown_event=shutdown_event,
+        )
 
     # --- 8. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")

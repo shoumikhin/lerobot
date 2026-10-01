@@ -1,0 +1,130 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The inference engine for an exported policy.
+
+An export script writes a folder with the compiled program, the policy's `config.json`, and an
+`export.json` naming the backend, the program's inputs, and a test case. The program takes the
+tensors `prepare_observation_for_inference` makes and returns the actions to play, in robot units.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections import deque
+from collections.abc import Callable
+from pathlib import Path
+
+import numpy as np
+import torch
+from safetensors.numpy import load_file
+
+from lerobot.policies.utils import prepare_observation_for_inference
+
+from ..base import InferenceEngine
+
+logger = logging.getLogger(__name__)
+
+EXPORT_INFO = "export.json"
+# Both backends compile TensorRT engines, which run on CUDA only.
+DEVICE = torch.device("cuda")
+
+Program = Callable[..., torch.Tensor]
+
+
+def export_dir(path: str | Path | None) -> Path | None:
+    """The folder an export script wrote, or None when `path` holds a regular policy checkpoint."""
+    if path is not None and (Path(path) / EXPORT_INFO).is_file():
+        return Path(path)
+    return None
+
+
+def load_program(folder: Path, info: dict) -> Program:
+    """Load the folder's program with the backend `export.json` names."""
+    path = folder / info["file"]
+    if info["backend"] == "executorch_tensorrt":
+        from .executorch import ExecuTorchProgram
+
+        return ExecuTorchProgram(path)
+    if info["backend"] == "onnx_tensorrt":
+        from .tensorrt import TensorRTEngine
+
+        return TensorRTEngine(path, info["inputs"], info["output"])
+    raise ValueError(f"Unknown export backend {info['backend']!r} in {folder / EXPORT_INFO}")
+
+
+class ExportInferenceEngine(InferenceEngine):
+    """Inline inference with an exported program: one program call per action chunk.
+
+    Plays the chunk one action per call, as `SyncInferenceEngine` does with the PyTorch policy's
+    action queue. Before running, it replays the folder's test case and refuses to start if the
+    program's actions differ from what `lerobot-rollout` played with PyTorch at export time.
+    """
+
+    def __init__(self, folder: Path, task: str, robot_type: str) -> None:
+        super().__init__(task=task)
+        info = json.loads((folder / EXPORT_INFO).read_text())
+        self._input_names: list[str] = info["inputs"]
+        self._robot_type = robot_type
+        self._program = load_program(folder, info)
+        self._actions: deque[np.ndarray] = deque()
+        self._check(folder / info["test_case"], info["tolerance"])
+        logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
+
+    def _run_chunk(self, frame: dict[str, np.ndarray], task: str) -> np.ndarray:
+        observation = prepare_observation_for_inference(dict(frame), DEVICE, task, self._robot_type)
+        with torch.inference_mode():
+            actions = self._program(*(observation[name] for name in self._input_names))
+        return actions[0].cpu().numpy()
+
+    def _check(self, path: Path, tolerance: float) -> None:
+        case = load_file(path)
+        expected = case.pop("expected_actions")
+        actual = self._run_chunk(case, self.task)
+        error = float(np.abs(actual - expected).max()) if actual.shape == expected.shape else np.inf
+        logger.info("Exported policy test case: largest difference %.2e (tolerance %g)", error, tolerance)
+        if not error <= tolerance:
+            raise RuntimeError(
+                f"The exported policy does not reproduce its test case ({error:.2e} > {tolerance}). "
+                "Export it again on this device."
+            )
+
+    @property
+    def control_thread_owns_policy(self) -> bool:
+        return True
+
+    def start(self) -> None:
+        """No background resources to start."""
+
+    def stop(self) -> None:
+        """No background resources to stop."""
+
+    def reset(self) -> None:
+        self._actions.clear()
+        self._discard_task_change()
+
+    def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
+        if obs_frame is None:
+            return None
+        task, task_changed = self._take_task()
+        if task_changed:
+            self._actions.clear()
+        if not self._actions:
+            start = time.perf_counter()
+            self._actions.extend(self._run_chunk(obs_frame, task))
+            self.inference_seconds.append(time.perf_counter() - start)
+        self._set_dispatched_task(task)
+        return self._actions.popleft()

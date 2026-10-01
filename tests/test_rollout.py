@@ -648,6 +648,80 @@ def test_create_inference_engine_sync():
 
 
 # ---------------------------------------------------------------------------
+# Exported policies
+# ---------------------------------------------------------------------------
+
+
+def _write_export_folder(folder: Path, expected_actions) -> None:
+    import json
+
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    frame = {"observation.state": np.arange(3, dtype=np.float32)}
+    save_file(
+        {**frame, "expected_actions": np.asarray(expected_actions, np.float32)}, folder / "case.safetensors"
+    )
+    info = {
+        "backend": "fake",
+        "file": "model.bin",
+        "inputs": ["observation.state"],
+        "output": "action",
+        "test_case": "case.safetensors",
+        "tolerance": 0.5,
+    }
+    (folder / "export.json").write_text(json.dumps(info))
+
+
+def _fake_program(*inputs):
+    """A program whose chunk is the state twice, then doubled: two actions of three joints."""
+    state = inputs[0]
+    return torch.stack([state, 2 * state], dim=1)
+
+
+@pytest.fixture
+def cpu_export_engine(monkeypatch):
+    """Builds an export engine around `_fake_program`, on the CPU."""
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
+    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
+    return lambda folder: export_engine.ExportInferenceEngine(folder, task="", robot_type="")
+
+
+def test_export_dir_tells_an_exported_folder_from_a_checkpoint(tmp_path):
+    from lerobot.rollout.inference.export import export_dir
+
+    assert export_dir(tmp_path) is None
+    assert export_dir(None) is None
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    assert export_dir(tmp_path) == tmp_path
+
+
+def test_export_engine_plays_one_chunk_one_action_per_call(tmp_path, cpu_export_engine):
+    import numpy as np
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    engine = cpu_export_engine(tmp_path)
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+
+    with patch.object(engine, "_run_chunk", wraps=engine._run_chunk) as run_chunk:
+        actions = [engine.get_action(frame) for _ in range(3)]
+
+    np.testing.assert_array_equal(actions[0], [1, 2, 3])
+    np.testing.assert_array_equal(actions[1], [2, 4, 6])
+    np.testing.assert_array_equal(actions[2], [1, 2, 3])
+    assert run_chunk.call_count == 2
+    assert len(engine.inference_seconds) == 2
+
+
+def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu_export_engine):
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        cpu_export_engine(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
 
