@@ -89,7 +89,7 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
-pi0.5 does not fit in the Orin Nano's 8 GB: its export and its TensorRT engine build both run out of memory there. Export and run it on the Thor.
+pi0.5 and GR00T do not run on the Orin Nano. Both export scripts load the PyTorch policy, which does not fit in its 7.3 GiB. TensorRT also runs out of GPU memory when it builds an engine on the Orin Nano from an ONNX file exported on the Thor, about 5 GiB, and an engine built on the Thor does not run there. Export and run them on the Thor.
 
 ## Run
 
@@ -115,7 +115,7 @@ To compare the two backends, export with the other script and run its folder.
 
 ## Benchmarks
 
-Time for one action chunk, and the memory a process adds to run it. Each cell is the median of 3 runs unless marked 1 run, each in a fresh process, through the rollout's own inference engines. Each run times at least 100 chunks after 20 warmup chunks. The policies were trained on an SO-101 arm with two cameras. "WIP" means not measured yet.
+Time for one action chunk, and the memory a process adds to run it. Each cell is the median of 3 runs unless marked 1 run, each in a fresh process, through the rollout's own inference engines. Each run times at least 100 chunks after 20 warmup chunks. The policies were trained on an SO-101 arm with two cameras.
 
 Setup: JetPack 7.2.1, nightly PyTorch 2.15, TensorRT 11.3, and Torch-TensorRT and ExecuTorch built from source with two fixes: [pytorch/executorch#23301](https://github.com/pytorch/executorch/pull/23301) and [pytorch/TensorRT#4767](https://github.com/pytorch/TensorRT/pull/4767).
 
@@ -130,9 +130,11 @@ Setup: JetPack 7.2.1, nightly PyTorch 2.15, TensorRT 11.3, and Torch-TensorRT an
 | pi0.5   | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 235.9 ms (238.8) | 135.6 ms (136.3), 1 run      |
 | pi0.5   | Orin Nano | does not fit          | does not fit     | does not fit     | does not fit                 |
 | GR00T   | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 216.2 ms (224.7) | 212.0 ms (219.2), 1 run      |
-| GR00T   | Orin Nano | WIP                   | WIP              | WIP              | WIP                          |
+| GR00T   | Orin Nano | does not fit          | does not fit     | does not fit     | does not fit                 |
 
 `torch.compile` runs as `lerobot-rollout --use_torch_compile` does: ACT and SmolVLA with `--torch_compile_mode=max-autotune`, GR00T in the default mode. SmolVLA and pi0.5 also compile through their own `compile_model` option, in `max-autotune` mode by default, and pi0.5 uses only that one. pi0.5 was faster with `--policy.compile_mode=default`: 130.0 ms. The first chunk waits for the compile: about 4.3 minutes for ACT, 6.1 for SmolVLA, 7.7 for pi0.5 and 2.1 for GR00T on the Thor, and 8.6 for ACT and 12.2 for SmolVLA on the Orin Nano.
+
+On the Orin Nano, GR00T's PyTorch policy runs out of memory while it moves its float32 weights, 11.7 GiB, to the GPU, which shares the board's 7.3 GiB. `torch.compile` starts from the same policy.
 
 ### Memory added: process, GPU
 
@@ -144,6 +146,6 @@ Setup: JetPack 7.2.1, nightly PyTorch 2.15, TensorRT 11.3, and Torch-TensorRT an
 | SmolVLA | Orin Nano | 1.5 GB, 0.6 GB        | 1.5 GB, 0.5 GB  | 2.5 GB, 1.4 GB  |
 | pi0.5   | Thor      | 1.3 GB, 6.9 GB        | 1.3 GB, 7.8 GB  | 1.7 GB, 10.4 GB |
 | GR00T   | Thor      | 1.2 GB, 5.9 GB        | 1.2 GB, 6.7 GB  | 2.0 GB, 14.3 GB |
-| GR00T   | Orin Nano | WIP                   | WIP             | WIP             |
+| GR00T   | Orin Nano | does not fit          | does not fit    | does not fit    |
 
 The Thor and the Orin Nano share one memory between the CPU and the GPU, so the sum of the two numbers is an upper bound. Both count only what loading and running the policy adds. Each process also needs about 0.6 GB for PyTorch and the CUDA context, measured on the Thor, which is not counted here.
