@@ -47,6 +47,7 @@ from torch import Tensor, nn
 from transformers.feature_extraction_utils import BatchFeature
 
 from lerobot.datasets import LeRobotDatasetMetadata
+from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
@@ -195,9 +196,15 @@ class GrootChunk(nn.Module):
         backbone._ensure_mm_token_type_ids(model_input)
         backbone._ensure_legacy_qwen3_position_ids(model_input)
         ids, attention_mask = model_input["input_ids"], model_input["attention_mask"]
+        embodiment_id = batch["embodiment_id"]
         with torch.no_grad():
             text_embeds = backbone.language_model.get_input_embeddings()(ids)
             image_token_mask, _ = qwen.get_placeholder_mask(ids, inputs_embeds=text_embeds)
+            # The action head keeps weights for every embodiment it can be trained on; the program runs one.
+            for layer in self.action_head.modules():
+                if isinstance(layer, CategorySpecificLinear):
+                    layer.W = nn.Parameter(layer.W[embodiment_id], requires_grad=False)
+                    layer.b = nn.Parameter(layer.b[embodiment_id], requires_grad=False)
         constants = {
             "text_embeds": text_embeds,
             "image_token_mask": image_token_mask,
@@ -207,12 +214,20 @@ class GrootChunk(nn.Module):
             "visual_pos_masks": image_token_mask[..., 0],
             "image_mask": ids == backbone.model.config.image_token_id,
             "backbone_attention_mask": attention_mask == 1,
-            "embodiment_id": batch["embodiment_id"],
+            "embodiment_id": torch.zeros_like(embodiment_id),
         }
         for name, value in constants.items():
             self.register_buffer(name, value, persistent=False)
         self.vision = Qwen3VisionForExport(qwen.visual, model_input["image_grid_thw"])
         self.llm = LLMForExport(backbone.language_model)
+        if self.use_bf16:
+            # Autocast casts these weights to bfloat16 on every call, so holding them in bfloat16 gives the
+            # same results without a float32 copy in the program. Biases added outside a matmul stay float32.
+            for layer in (*self.vision.modules(), *self.llm.modules(), *self.action_head.modules()):
+                if isinstance(layer, (nn.Linear, nn.Conv3d)):
+                    layer.to(torch.bfloat16)
+                elif isinstance(layer, CategorySpecificLinear):
+                    layer.W.data = layer.W.data.to(torch.bfloat16)
 
     def forward(self, pixel_values: Tensor, state: Tensor, noise: Tensor) -> Tensor:
         # The same autocast GrootPolicy.predict_action_chunk runs the model under.
