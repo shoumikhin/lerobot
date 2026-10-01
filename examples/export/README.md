@@ -60,6 +60,17 @@ Every policy has one script per backend:
 | pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       |
 | GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     |
 
+SmolVLA also needs the dataset it was trained on, because its checkpoint does not record the robot's cameras. The export reads their names, their sizes and the task from it:
+
+```bash
+python examples/export/smolvla_executorch_tensorrt.py \
+    --policy.path=outputs/train/smolvla_so101/checkpoints/last/pretrained_model \
+    --dataset.repo_id=<user>/so101_dataset \
+    --output_dir=outputs/export/smolvla_executorch_tensorrt
+```
+
+Add `--dataset.root=<folder>` if the dataset is only on your disk.
+
 ## Run
 
 Then run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:
@@ -75,5 +86,7 @@ lerobot-rollout \
 ```
 
 Before the robot moves, the rollout replays a test case saved at export time, and stops if the actions differ from what the PyTorch policy produced.
+
+For SmolVLA, give the task as you would with the PyTorch policy, for example `--task="Pick up the brick and put it in the bin"`.
 
 To compare the two backends, export with the other script and run its folder.
