@@ -32,7 +32,7 @@ import torch
 import torch_tensorrt
 from act_recipe import ACTExport, parse_args
 from executorch.exir import ExecutorchBackendConfig
-from executorch.exir._serialize._program import deserialize_pte_binary
+from executorch.exir._serialize._program import _ExtendedHeader, _flatbuffer_to_program, _get_extended_header
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
 from executorch.exir.schema import DeviceType, Tensor
@@ -50,7 +50,11 @@ GPU_RESIDENT = ExecutorchBackendConfig(
 
 def check_program(path: Path) -> None:
     """Fail unless the program is one TensorRT engine and nothing else, reading and writing GPU memory."""
-    plan = deserialize_pte_binary(path.read_bytes()).program.execution_plan[0]
+    # Read only the program's description, not the engine after it, which can be several GB.
+    with path.open("rb") as file:
+        header = _get_extended_header(file.read(_ExtendedHeader.NUM_HEAD_BYTES))
+        file.seek(0)
+        plan = _flatbuffer_to_program(file.read(header.program_size)).execution_plan[0]
     delegates = [delegate.id for delegate in plan.delegates]
     operators = [operator.name for operator in plan.operators]
     on_host = [
