@@ -47,6 +47,7 @@ def main() -> None:
             export.module, export.inputs, onnx_path, dynamo=True, input_names=INPUTS, output_names=[ACTION]
         )
     print(f"Exported {onnx_path} in {time.perf_counter() - start:.0f} s")
+    export.release_policy()
 
     start = time.perf_counter()
     engine_path.write_bytes(build_engine(onnx_path))

@@ -74,6 +74,8 @@ def main() -> None:
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
+    del program
+    export.release_policy()
     torch_tensorrt.save(
         engine, str(pte_path), output_format="executorch", retrace=False, backend_config=GPU_RESIDENT
     )

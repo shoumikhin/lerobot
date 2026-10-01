@@ -31,6 +31,7 @@ camera check matches the robot without a --rename_map.
 """
 
 import argparse
+import gc
 import json
 from copy import copy
 from pathlib import Path
@@ -89,6 +90,7 @@ class SmolVLAExport:
         self.output_dir = make_output_dir(output_dir, job_name)
         self.policy_path = policy_path
         self.policy = SmolVLAPolicy.from_pretrained(policy_path).to("cuda").eval()
+        self.config = self.policy.config
         preprocessor, postprocessor = self.processors()
         text_steps = [
             s for s in preprocessor.steps if isinstance(s, NewLineTaskProcessorStep | TokenizerProcessorStep)
@@ -113,19 +115,27 @@ class SmolVLAExport:
         self.noise = torch.randn(1, config.chunk_size, config.max_action_dim, device="cuda")
         self.inputs = (*(observation[name] for name in names[:-1]), self.noise)
         self.module = SmolVLAChunk(self.policy, tensor_steps, postprocessor, names)
+        self.input_names = names
+
+    def release_policy(self) -> None:
+        """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
+        self.expected_actions = self.rollout_actions()
+        del self.policy, self.module
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def write(self, backend: str, program_file: str, tolerance: float) -> None:
         """Save the test case, the policy config, the text steps and `export.json` beside the program."""
-        case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.rollout_actions()}
+        case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
-        config = copy(self.policy.config)
+        config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
         self.text_steps.save_pretrained(self.output_dir, config_filename=TEXT_STEPS)
         info = {
             "backend": backend,
             "file": program_file,
-            "inputs": self.module.input_names,
+            "inputs": self.input_names,
             "text_steps": TEXT_STEPS,
             "task": self.task,
             "noise_shape": list(self.noise.shape),

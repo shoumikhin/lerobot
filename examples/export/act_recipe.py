@@ -25,6 +25,7 @@ plays with PyTorch for one random frame, which the exported engine replays befor
 
 import argparse
 import datetime as dt
+import gc
 import json
 from pathlib import Path
 
@@ -74,19 +75,28 @@ class ACTExport:
             )
         self.output_dir = make_output_dir(output_dir, job_name)
         self.policy_path = policy_path
-        self.module = ACTChunk(self.policy, *gpu_processors(self.policy.config, policy_path))
+        self.config = self.policy.config
+        self.module = ACTChunk(self.policy, *gpu_processors(self.config, policy_path))
+        self.input_names = self.module.input_names
         self.frame = random_robot_frame(self.policy)
         observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"))
-        self.inputs = tuple(observation[name] for name in self.module.input_names)
+        self.inputs = tuple(observation[name] for name in self.input_names)
+
+    def release_policy(self) -> None:
+        """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
+        self.expected_actions = self.rollout_actions()
+        del self.policy, self.module
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def write(self, backend: str, program_file: str, tolerance: float) -> None:
         """Save the test case, the policy config, and `export.json` beside the compiled program."""
-        save_file({**self.frame, "expected_actions": self.rollout_actions()}, self.output_dir / TEST_CASE)
-        self.policy.config.save_pretrained(self.output_dir)
+        save_file({**self.frame, "expected_actions": self.expected_actions}, self.output_dir / TEST_CASE)
+        self.config.save_pretrained(self.output_dir)
         info = {
             "backend": backend,
             "file": program_file,
-            "inputs": self.module.input_names,
+            "inputs": self.input_names,
             "output": ACTION,
             "test_case": TEST_CASE,
             "tolerance": tolerance,

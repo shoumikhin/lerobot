@@ -32,6 +32,7 @@ records the task it was exported for.
 """
 
 import argparse
+import gc
 import json
 from copy import copy
 from pathlib import Path
@@ -249,6 +250,7 @@ class GrootExport:
         self.output_dir = make_output_dir(output_dir, job_name)
         self.policy_path = policy_path
         self.policy = GrootPolicy.from_pretrained(policy_path).to("cuda").eval()
+        self.config = self.policy.config
         # The rollout runs the checkpoint's whole preprocessor before the program: the program takes its outputs.
         preprocessor, postprocessor = gpu_processors(self.policy.config, policy_path)
         self.steps = preprocessor
@@ -270,6 +272,13 @@ class GrootExport:
         self.expected_actions = self.rollout_actions(preprocessor, postprocessor)
         self.module = GrootChunk(self.policy, batch, postprocessor).eval()
         self.inputs = (batch["pixel_values"], batch["state"], self.noise)
+        self.input_names = INPUTS
+
+    def release_policy(self) -> None:
+        """Free the policy for the TensorRT step: the test case's actions are already computed."""
+        del self.policy, self.module
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def observation(self) -> dict[str, Tensor]:
         return prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
@@ -288,7 +297,7 @@ class GrootExport:
         """Save the test case, the policy config, the preprocessor steps and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
-        config = copy(self.policy.config)
+        config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
         self.steps.save_pretrained(self.output_dir, config_filename=STEPS)
