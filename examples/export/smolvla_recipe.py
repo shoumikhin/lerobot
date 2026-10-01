@@ -26,25 +26,27 @@ postprocessor. Two things differ from ACT:
   it, and the test case gives the program the noise the PyTorch policy got.
 
 The robot's cameras and the task come from the dataset the policy was trained on, because SmolVLA's
-checkpoint only names placeholder cameras.
+checkpoint only names placeholder cameras. The folder's config names the robot's cameras, so the rollout's
+camera check matches the robot without a --rename_map.
 """
 
 import argparse
 import json
+from copy import copy
 from pathlib import Path
 
 import numpy as np
 import torch
-from act_recipe import TEST_CASE, make_output_dir
+from act_recipe import TEST_CASE, gpu_processors, make_output_dir
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
 from lerobot.datasets import LeRobotDatasetMetadata
-from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import NewLineTaskProcessorStep, PolicyProcessorPipeline, TokenizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STR
+from lerobot.utils.feature_utils import dataset_to_policy_features
 
 NOISE = "noise"
 TEXT_STEPS = "text_steps.json"
@@ -84,16 +86,10 @@ class SmolVLAExport:
         output_dir: Path | None,
         job_name: str,
     ):
-        self.policy_path = policy_path
         self.output_dir = make_output_dir(output_dir, job_name)
+        self.policy_path = policy_path
         self.policy = SmolVLAPolicy.from_pretrained(policy_path).to("cuda").eval()
-        # Keep every step on the GPU: the saved postprocessor would otherwise copy the actions to the CPU.
-        preprocessor, postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_path,
-            preprocessor_overrides={"device_processor": {"device": "cuda"}},
-            postprocessor_overrides={"device_processor": {"device": "cuda"}},
-        )
+        preprocessor, postprocessor = self.processors()
         text_steps = [
             s for s in preprocessor.steps if isinstance(s, NewLineTaskProcessorStep | TokenizerProcessorStep)
         ]
@@ -103,6 +99,12 @@ class SmolVLAExport:
         metadata = LeRobotDatasetMetadata(dataset, root=dataset_root)
         self.task = str(metadata.tasks.index[0])
         self.frame = random_robot_frame(metadata.features)
+        # The folder takes the robot's cameras, so its config names them, not the checkpoint's placeholders.
+        self.input_features = {
+            name: feature
+            for name, feature in dataset_to_policy_features(metadata.features).items()
+            if name in self.frame
+        }
         observation = self.text_steps(
             prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
         )
@@ -116,7 +118,9 @@ class SmolVLAExport:
         """Save the test case, the policy config, the text steps and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.rollout_actions()}
         save_file(case, self.output_dir / TEST_CASE)
-        self.policy.config.save_pretrained(self.output_dir)
+        config = copy(self.policy.config)
+        config.input_features = self.input_features
+        config.save_pretrained(self.output_dir)
         self.text_steps.save_pretrained(self.output_dir, config_filename=TEXT_STEPS)
         info = {
             "backend": backend,
@@ -132,11 +136,17 @@ class SmolVLAExport:
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
         print(f"Wrote {self.output_dir}")
 
+    def processors(self) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+        """The checkpoint's processors on the GPU, with the tokenizer padding every task to one width."""
+        preprocessor, postprocessor = gpu_processors(self.policy.config, self.policy_path)
+        # One width for every task, so the program's token inputs keep the shape they were exported with.
+        next(s for s in preprocessor.steps if isinstance(s, TokenizerProcessorStep)).padding = "max_length"
+        return preprocessor, postprocessor
+
     def rollout_actions(self) -> np.ndarray:
         """The chunk the PyTorch policy computes for the test frame, task and noise, as lerobot-rollout runs it."""
-        preprocessor, postprocessor = make_pre_post_processors(
-            self.policy.config, pretrained_path=self.policy_path
-        )
+        # Fresh processors: compiling the module leaves its own holding tensors that cannot leave the GPU.
+        preprocessor, postprocessor = self.processors()
         self.policy.reset()
         observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
         with torch.inference_mode():

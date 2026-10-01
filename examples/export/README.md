@@ -1,6 +1,6 @@
 # Compiled LeRobot policies on an NVIDIA Jetson
 
-Run LeRobot policies as TensorRT engines on Jetson devices, with no PyTorch loaded on the robot.
+Run LeRobot policies as TensorRT engines on Jetson devices, without the policy's PyTorch code on the robot.
 
 ## Hardware
 
@@ -17,8 +17,6 @@ Run LeRobot policies as TensorRT engines on Jetson devices, with no PyTorch load
 
 - [ACT](../../docs/source/act.mdx)
 - [SmolVLA](../../docs/source/smolvla.mdx)
-- [pi0.5](../../docs/source/pi05.mdx)
-- [GR00T](../../docs/source/groot.mdx)
 
 ## Install
 
@@ -57,8 +55,6 @@ Every policy has one script per backend:
 | ------- | ---------------------------------------------------------------- | ---------------------------------------------------- |
 | ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         |
 | SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) |
-| pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       |
-| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     |
 
 SmolVLA also needs the dataset it was trained on, because its checkpoint does not record the robot's cameras. The export reads their names, their sizes and the task from it:
 

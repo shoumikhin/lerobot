@@ -33,6 +33,7 @@ import torch
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
@@ -65,17 +66,15 @@ class ACTExport:
     """Loads a trained ACT checkpoint, and writes the exported folder around a compiled program."""
 
     def __init__(self, policy_path: str, output_dir: Path | None, job_name: str):
-        self.policy_path = policy_path
-        self.output_dir = make_output_dir(output_dir, job_name)
         self.policy = ACTPolicy.from_pretrained(policy_path).to("cuda").eval()
-        # Keep every step on the GPU: the saved postprocessor would otherwise copy the actions to the CPU.
-        preprocessor, postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_path,
-            preprocessor_overrides={"device_processor": {"device": "cuda"}},
-            postprocessor_overrides={"device_processor": {"device": "cuda"}},
-        )
-        self.module = ACTChunk(self.policy, preprocessor, postprocessor)
+        if self.policy.config.temporal_ensemble_coeff is not None:
+            # The ensembler averages chunks across ticks, which one program call per chunk cannot do.
+            raise ValueError(
+                "ACT with temporal_ensemble_coeff set cannot be exported: its ensemble spans ticks."
+            )
+        self.output_dir = make_output_dir(output_dir, job_name)
+        self.policy_path = policy_path
+        self.module = ACTChunk(self.policy, *gpu_processors(self.policy.config, policy_path))
         self.frame = random_robot_frame(self.policy)
         observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"))
         self.inputs = tuple(observation[name] for name in self.module.input_names)
@@ -97,15 +96,31 @@ class ACTExport:
 
     def rollout_actions(self) -> np.ndarray:
         """The chunk `lerobot-rollout` plays with PyTorch for the test frame, one action per tick."""
-        preprocessor, postprocessor = make_pre_post_processors(
-            self.policy.config, pretrained_path=self.policy_path
-        )
+        # Fresh processors: compiling the module leaves its own holding tensors that cannot leave the GPU.
         engine = SyncInferenceEngine(
-            self.policy, preprocessor, postprocessor, {}, [], task="", device="cuda", robot_type=""
+            self.policy,
+            *gpu_processors(self.policy.config, self.policy_path),
+            {},
+            [],
+            task="",
+            device="cuda",
+            robot_type="",
         )
         engine.reset()
         steps = self.policy.config.n_action_steps
         return np.stack([engine.get_action(dict(self.frame)).numpy() for _ in range(steps)])
+
+
+def gpu_processors(
+    config: PreTrainedConfig, policy_path: str
+) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """The checkpoint's saved processors with every step on the GPU, whatever device they were saved with."""
+    return make_pre_post_processors(
+        config,
+        pretrained_path=policy_path,
+        preprocessor_overrides={"device_processor": {"device": "cuda"}},
+        postprocessor_overrides={"device_processor": {"device": "cuda"}},
+    )
 
 
 def random_robot_frame(policy: ACTPolicy) -> dict[str, np.ndarray]:
