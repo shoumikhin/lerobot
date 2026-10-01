@@ -18,6 +18,7 @@ Run LeRobot policies as TensorRT engines on Jetson devices, without the policy's
 - [ACT](../../docs/source/act.mdx)
 - [SmolVLA](../../docs/source/smolvla.mdx)
 - [pi0.5](../../docs/source/pi05.mdx)
+- [GR00T N1.7](../../docs/source/groot.mdx)
 
 ## Install
 
@@ -57,6 +58,7 @@ Every policy has one script per backend:
 | ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         |
 | SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) |
 | pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       |
+| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     |
 
 SmolVLA also needs the dataset it was trained on, because its checkpoint does not record the robot's cameras. The export reads their names, their sizes and the task from it:
 
@@ -68,6 +70,15 @@ python examples/export/smolvla_executorch_tensorrt.py \
 ```
 
 Add `--dataset.root=<folder>` if the dataset is only on your disk.
+
+GR00T takes the same options as SmolVLA. Its export also fixes the task and the camera size, because the program holds the task's tokens and the image layout as constants:
+
+```bash
+python examples/export/groot_executorch_tensorrt.py \
+    --policy.path=outputs/train/groot_so101/checkpoints/last/pretrained_model \
+    --dataset.repo_id=<user>/so101_dataset \
+    --output_dir=outputs/export/groot_executorch_tensorrt
+```
 
 pi0.5's checkpoint names the robot's cameras but not the task, so give the task it was trained on:
 
@@ -97,5 +108,7 @@ lerobot-rollout \
 Before the robot moves, the rollout replays a test case saved at export time, and stops if the actions differ from what the PyTorch policy produced.
 
 For SmolVLA and pi0.5, give the task as you would with the PyTorch policy, for example `--task="Pick up the brick and put it in the bin"`.
+
+For GR00T, give the task it was exported for. The rollout refuses any other task, so export again to change it.
 
 To compare the two backends, export with the other script and run its folder.
