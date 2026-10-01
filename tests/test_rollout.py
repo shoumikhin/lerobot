@@ -721,6 +721,60 @@ def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu
         cpu_export_engine(tmp_path)
 
 
+def test_export_engine_applies_the_rename_map_to_the_robot_frame(tmp_path, monkeypatch):
+    import numpy as np
+
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
+    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
+    engine = export_engine.ExportInferenceEngine(
+        tmp_path, task="", robot_type="", rename_map={"observation.joints": "observation.state"}
+    )
+
+    action = engine.get_action({"observation.joints": np.array([1, 2, 3], dtype=np.float32)})
+
+    np.testing.assert_array_equal(action, [1, 2, 3])
+
+
+def test_rollout_checks_an_export_before_connecting_the_robot(tmp_path, monkeypatch):
+    import lerobot.rollout.context as rollout_context
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
+    robot_config = MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
+    robot = MockRobot(robot_config)
+    cfg = RolloutConfig(
+        robot=robot_config, policy=ACTConfig(device="cpu", pretrained_path=tmp_path), device="cpu"
+    )
+
+    def failing_engine(*args, **kwargs):
+        raise RuntimeError("does not reproduce its test case")
+
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "ExportInferenceEngine", failing_engine)
+
+    with pytest.raises(RuntimeError, match="test case"):
+        rollout_context.build_rollout_context(cfg, threading.Event())
+    assert not robot.is_connected
+
+
+def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch):
+    from lerobot.rollout.inference.export.tensorrt import TensorRTEngine
+
+    engine = TensorRTEngine.__new__(TensorRTEngine)
+    engine._input_names = ["observation.images.wrist"]
+    engine._input_shapes = [(1, 3, 480, 640)]
+    engine._context = MagicMock()
+
+    with pytest.raises(ValueError, match=r"the engine was built for \(1, 3, 480, 640\)"):
+        engine(torch.zeros(1, 3, 240, 320))
+    engine._context.set_tensor_address.assert_not_called()
+
+
 def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
     """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
     import json

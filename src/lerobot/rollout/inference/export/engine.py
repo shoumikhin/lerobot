@@ -37,7 +37,7 @@ from safetensors.numpy import load_file
 
 from lerobot.policies.common.flow_matching import sample_noise
 from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import PolicyProcessorPipeline, RenameObservationsProcessorStep
 
 from ..base import InferenceEngine
 
@@ -80,11 +80,14 @@ class ExportInferenceEngine(InferenceEngine):
     program's actions differ from what `lerobot-rollout` played with PyTorch at export time.
     """
 
-    def __init__(self, folder: Path, task: str, robot_type: str) -> None:
+    def __init__(
+        self, folder: Path, task: str, robot_type: str, rename_map: dict[str, str] | None = None
+    ) -> None:
         super().__init__(task=task)
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._input_names: list[str] = info["inputs"]
         self._robot_type = robot_type
+        self._rename = RenameObservationsProcessorStep(rename_map=rename_map or {})
         self._noise_shape: tuple[int, ...] | None = (
             tuple(info["noise_shape"]) if "noise_shape" in info else None
         )
@@ -148,7 +151,7 @@ class ExportInferenceEngine(InferenceEngine):
             self._actions.clear()
         if not self._actions:
             start = time.perf_counter()
-            self._actions.extend(self._run_chunk(obs_frame, task))
+            self._actions.extend(self._run_chunk(self._rename.observation(obs_frame), task))
             self.inference_seconds.append(time.perf_counter() - start)
         self._set_dispatched_task(task)
         return self._actions.popleft()

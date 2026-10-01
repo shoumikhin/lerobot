@@ -411,6 +411,14 @@ def build_rollout_context(
         raise ValueError("--robot.type is required for rollout")
     logger.info("Connecting robot (%s)...", robot_config.type)
     robot = make_robot_from_config(robot_config)
+    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+    export_engine: ExportInferenceEngine | None = None
+    if policy_export_dir is not None:
+        # Before connecting, so an export that fails its test case never touches the robot.
+        logger.info("Creating inference engine (type=export)...")
+        export_engine = ExportInferenceEngine(
+            policy_export_dir, task=task_str, robot_type=robot.robot_type, rename_map=cfg.rename_map
+        )
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
@@ -567,15 +575,11 @@ def build_rollout_context(
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
 
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
-    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
     preprocessor: PolicyProcessorPipeline | None = None
     postprocessor: PolicyProcessorPipeline | None = None
-    if policy_export_dir is not None:
+    if export_engine is not None:
         # The exported program already contains the policy's processors.
-        logger.info("Creating inference engine (type=export)...")
-        inference_strategy: InferenceEngine = ExportInferenceEngine(
-            policy_export_dir, task=task_str, robot_type=robot_wrapper.robot_type
-        )
+        inference_strategy: InferenceEngine = export_engine
     else:
         assert policy is not None
         dataset_stats = None

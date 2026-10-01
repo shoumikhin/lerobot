@@ -28,11 +28,15 @@ class TensorRTEngine:
         engine = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(path.read_bytes())
         self._context = engine.create_execution_context()
         self._input_names = input_names
+        self._input_shapes = [tuple(engine.get_tensor_shape(name)) for name in input_names]
         self._output_name = output_name
         self._output = torch.empty(tuple(engine.get_tensor_shape(output_name)), device="cuda")
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
-        for name, tensor in zip(self._input_names, inputs, strict=True):
+        for name, shape, tensor in zip(self._input_names, self._input_shapes, inputs, strict=True):
+            # TensorRT reads raw memory, so a frame of another size would be read out of bounds, not refused.
+            if tuple(tensor.shape) != shape:
+                raise ValueError(f"{name} has shape {tuple(tensor.shape)}; the engine was built for {shape}.")
             self._context.set_tensor_address(name, tensor.data_ptr())
         self._context.set_tensor_address(self._output_name, self._output.data_ptr())
         if not self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
