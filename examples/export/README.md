@@ -11,9 +11,9 @@ Run LeRobot policies as compiled programs on Jetson devices, without the policy'
 ## Backends
 
 - `executorch_tensorrt`: Torch-TensorRT into an ExecuTorch `.pte` file
+- `executorch_cuda`: ExecuTorch's CUDA backend, without TensorRT, into a `.pte` file and its `.ptd` weights
 - `onnx_tensorrt`: ONNX, then TensorRT, into an `.engine` file
 - `torch_tensorrt`: Torch-TensorRT into an AOTInductor `.pt2` package, which needs PyTorch to run
-- `executorch_cuda`: ExecuTorch's CUDA backend, without TensorRT, into a `.pte` file and its `.ptd` weights
 
 ## Policies
 
@@ -51,12 +51,12 @@ python examples/export/act_executorch_tensorrt.py \
     --output_dir=outputs/export/act_executorch_tensorrt
 ```
 
-| policy  | `executorch_tensorrt`                                            | `onnx_tensorrt`                                      | `torch_tensorrt`                                       | `executorch_cuda`                                    |
-| ------- | ---------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------- |
-| ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         | [act_torch_tensorrt.py](act_torch_tensorrt.py)         | [act_executorch_cuda.py](act_executorch_cuda.py)     |
-| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) | not supported yet                                    |
-| pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       | [pi05_torch_tensorrt.py](pi05_torch_tensorrt.py)       | [pi05_executorch_cuda.py](pi05_executorch_cuda.py)   |
-| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     | [groot_executorch_cuda.py](groot_executorch_cuda.py) |
+| policy  | `executorch_tensorrt`                                            | `executorch_cuda`                                    | `onnx_tensorrt`                                      | `torch_tensorrt`                                       |
+| ------- | ---------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ |
+| ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_executorch_cuda.py](act_executorch_cuda.py)     | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         | [act_torch_tensorrt.py](act_torch_tensorrt.py)         |
+| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | not supported yet                                    | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) |
+| pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_executorch_cuda.py](pi05_executorch_cuda.py)   | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       | [pi05_torch_tensorrt.py](pi05_torch_tensorrt.py)       |
+| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_executorch_cuda.py](groot_executorch_cuda.py) | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     |
 
 SmolVLA and GR00T also need the dataset they were trained on, for the cameras and the task:
 
@@ -126,39 +126,39 @@ Measured with JetPack 7.2.1 and the packages above. Each latency and memory cell
 
 Typical difference from the PyTorch policy, in robot action units, with the 95th percentile in parentheses, over 50 dataset frames (random inputs for pi0.5). The last column is how much the PyTorch policy differs from itself with other starting noise.
 
-| policy              | `executorch_tensorrt` | `onnx_tensorrt` | `torch_tensorrt`  | `executorch_cuda` | PyTorch, other noise |
-| ------------------- | --------------------- | --------------- | ----------------- | ----------------- | -------------------- |
-| ACT                 | 0.01 (0.02)           | 0.01 (0.02)     | 0.01 (0.02)       | 0.01 (0.02)       | no noise             |
-| SmolVLA             | 0.17 (0.56)           | 0.15 (0.52)     | 0.17 (0.56)       | not supported yet | 3.2 (11.9)           |
-| pi0.5               | 0.31 (1.17)           | 0.33 (1.37)     | 0.31 (1.23)       | 0.26 (0.95)       | 11.4 (44.8)          |
-| pi0.5, INT8 weights | not supported yet     | 0.51 (2.00)     | not supported yet | not supported yet | 11.4 (44.8)          |
-| GR00T               | 0.28 (0.91)           | 0.28 (0.89)     | 0.28 (0.91)       | 0.49 (1.39)       | 7.8 (22.6)           |
+| policy              | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt` | `torch_tensorrt`  | PyTorch, other noise |
+| ------------------- | --------------------- | ----------------- | --------------- | ----------------- | -------------------- |
+| ACT                 | 0.01 (0.02)           | 0.01 (0.02)       | 0.01 (0.02)     | 0.01 (0.02)       | no noise             |
+| SmolVLA             | 0.17 (0.56)           | not supported yet | 0.15 (0.52)     | 0.17 (0.56)       | 3.2 (11.9)           |
+| pi0.5               | 0.31 (1.17)           | 0.26 (0.95)       | 0.33 (1.37)     | 0.31 (1.23)       | 11.4 (44.8)          |
+| pi0.5, INT8 weights | not supported yet     | not supported yet | 0.51 (2.00)     | not supported yet | 11.4 (44.8)          |
+| GR00T               | 0.28 (0.91)           | 0.49 (1.39)       | 0.28 (0.89)     | 0.28 (0.91)       | 7.8 (22.6)           |
 
 ### Latency per action chunk, median (99th percentile)
 
-| policy              | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `torch_tensorrt`  | `executorch_cuda` | PyTorch           | `torch.compile`   |
-| ------------------- | --------- | --------------------- | ---------------- | ----------------- | ----------------- | ----------------- | ----------------- |
-| ACT                 | Thor      | 4.5 ms (4.8)          | 4.2 ms (4.5)     | 4.4 ms (5.0)      | 38.7 ms (39.0)    | 19.2 ms (20.5)    | 14.8 ms (15.2)    |
-| ACT                 | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | 27.7 ms (28.5)    | 152.3 ms (153.8)  | 65.1 ms (66.7)    | 63.6 ms (64.5)    |
-| SmolVLA             | Thor      | 30.1 ms (34.8)        | 31.6 ms (35.9)   | 29.9 ms (34.3)    | not supported yet | 164.5 ms (168.2)  | 58.1 ms           |
-| SmolVLA             | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | 137.9 ms (140.8)  | not supported yet | 773.5 ms (777.5)  | 186.9 ms          |
-| pi0.5               | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 108.5 ms (109.7)  | 122.6 ms (123.2)  | 235.9 ms (238.8)  | 135.6 ms (136.3)  |
-| pi0.5               | Orin Nano | does not fit          | does not fit     | does not fit      | does not fit      | does not fit      | does not fit      |
-| pi0.5, INT8 weights | Thor      | not supported yet     | 170.3 ms         | not supported yet | not supported yet | not supported yet | not supported yet |
-| pi0.5, INT8 weights | Orin Nano | not supported yet     | 861.5 ms (864.8) | not supported yet | not supported yet | not supported yet | not supported yet |
-| GR00T               | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 69.5 ms (72.7)    | 78.1 ms (82.3)    | 216.2 ms (224.7)  | 212.0 ms (219.2)  |
+| policy              | device    | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt`  | `torch_tensorrt`  | PyTorch           | `torch.compile`   |
+| ------------------- | --------- | --------------------- | ----------------- | ---------------- | ----------------- | ----------------- | ----------------- |
+| ACT                 | Thor      | 4.5 ms (4.8)          | 38.7 ms (39.0)    | 4.2 ms (4.5)     | 4.4 ms (5.0)      | 19.2 ms (20.5)    | 14.8 ms (15.2)    |
+| ACT                 | Orin Nano | 27.3 ms (28.6)        | 152.3 ms (153.8)  | 27.5 ms (28.4)   | 27.7 ms (28.5)    | 65.1 ms (66.7)    | 63.6 ms (64.5)    |
+| SmolVLA             | Thor      | 30.1 ms (34.8)        | not supported yet | 31.6 ms (35.9)   | 29.9 ms (34.3)    | 164.5 ms (168.2)  | 58.1 ms           |
+| SmolVLA             | Orin Nano | 136.3 ms (137.1)      | not supported yet | 132.0 ms (133.2) | 137.9 ms (140.8)  | 773.5 ms (777.5)  | 186.9 ms          |
+| pi0.5               | Thor      | 108.4 ms (109.3)      | 122.6 ms (123.2)  | 125.2 ms (125.7) | 108.5 ms (109.7)  | 235.9 ms (238.8)  | 135.6 ms (136.3)  |
+| pi0.5               | Orin Nano | does not fit          | does not fit      | does not fit     | does not fit      | does not fit      | does not fit      |
+| pi0.5, INT8 weights | Thor      | not supported yet     | not supported yet | 170.3 ms         | not supported yet | not supported yet | not supported yet |
+| pi0.5, INT8 weights | Orin Nano | not supported yet     | not supported yet | 861.5 ms (864.8) | not supported yet | not supported yet | not supported yet |
+| GR00T               | Thor      | 70.1 ms (74.2)        | 78.1 ms (82.3)    | 78.5 ms (80.6)   | 69.5 ms (72.7)    | 216.2 ms (224.7)  | 212.0 ms (219.2)  |
 
 ### Memory added: process, GPU
 
-| policy              | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `torch_tensorrt`       | `executorch_cuda` | PyTorch           |
-| ------------------- | --------- | --------------------- | ---------------- | ---------------------- | ----------------- | ----------------- |
-| ACT                 | Thor      | 0.5 GiB, 0.4 GiB      | 0.5 GiB, 0.5 GiB | 0.9 GiB, 1.8 GiB       | 0.2 GiB, 0.4 GiB  | 1.4 GiB, 1.4 GiB  |
-| ACT                 | Orin Nano | 0.6 GiB, 0.2 GiB      | 0.7 GiB, 0.2 GiB | 1.2 GiB, 0.5 GiB       | 0.4 GiB, 0.1 GiB  | 1.2 GiB, 0.7 GiB  |
-| SmolVLA             | Thor      | 0.9 GiB, 1.3 GiB      | 0.9 GiB, 1.6 GiB | 0.9 GiB, 3.3 GiB       | not supported yet | 2.4 GiB, 3.0 GiB  |
-| SmolVLA             | Orin Nano | 1.5 GiB, 0.6 GiB      | 1.5 GiB, 0.5 GiB | 0.7 GiB, under 0.3 GiB | not supported yet | 2.5 GiB, 1.4 GiB  |
-| pi0.5               | Thor      | 1.3 GiB, 6.9 GiB      | 1.3 GiB, 7.8 GiB | 1.3 GiB, 12.5 GiB      | 0.8 GiB, 6.3 GiB  | 1.7 GiB, 10.4 GiB |
-| pi0.5               | Orin Nano | does not fit          | does not fit     | does not fit           | does not fit      | does not fit      |
-| pi0.5, INT8 weights | Orin Nano | not supported yet     | 3.8 GiB, 2.8 GiB | not supported yet      | not supported yet | not supported yet |
-| GR00T               | Thor      | 1.2 GiB, 5.9 GiB      | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | 0.8 GiB, 5.7 GiB  | 2.0 GiB, 14.3 GiB |
+| policy              | device    | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt`  | `torch_tensorrt`       | PyTorch           |
+| ------------------- | --------- | --------------------- | ----------------- | ---------------- | ---------------------- | ----------------- |
+| ACT                 | Thor      | 0.5 GiB, 0.4 GiB      | 0.2 GiB, 0.4 GiB  | 0.5 GiB, 0.5 GiB | 0.9 GiB, 1.8 GiB       | 1.4 GiB, 1.4 GiB  |
+| ACT                 | Orin Nano | 0.6 GiB, 0.2 GiB      | 0.4 GiB, 0.1 GiB  | 0.7 GiB, 0.2 GiB | 1.2 GiB, 0.5 GiB       | 1.2 GiB, 0.7 GiB  |
+| SmolVLA             | Thor      | 0.9 GiB, 1.3 GiB      | not supported yet | 0.9 GiB, 1.6 GiB | 0.9 GiB, 3.3 GiB       | 2.4 GiB, 3.0 GiB  |
+| SmolVLA             | Orin Nano | 1.5 GiB, 0.6 GiB      | not supported yet | 1.5 GiB, 0.5 GiB | 0.7 GiB, under 0.3 GiB | 2.5 GiB, 1.4 GiB  |
+| pi0.5               | Thor      | 1.3 GiB, 6.9 GiB      | 0.8 GiB, 6.3 GiB  | 1.3 GiB, 7.8 GiB | 1.3 GiB, 12.5 GiB      | 1.7 GiB, 10.4 GiB |
+| pi0.5               | Orin Nano | does not fit          | does not fit      | does not fit     | does not fit           | does not fit      |
+| pi0.5, INT8 weights | Orin Nano | not supported yet     | not supported yet | 3.8 GiB, 2.8 GiB | not supported yet      | not supported yet |
+| GR00T               | Thor      | 1.2 GiB, 5.9 GiB      | 0.8 GiB, 5.7 GiB  | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | 2.0 GiB, 14.3 GiB |
 
 The Jetson CPU and GPU share one memory, so the two numbers can overlap.
