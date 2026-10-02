@@ -809,6 +809,46 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
     assert [len(piece) for piece in pieces] == [4, 4, 2]
 
 
+def test_tensorrt_denoising_loop_runs_the_step_engine_once_per_euler_step():
+    """The prefix runs once, the step engine once per Euler step from time 1 down, then the actions engine."""
+    from lerobot.rollout.inference.export.tensorrt import TensorRTDenoisingLoop
+
+    cache = (torch.tensor([[True]]), torch.tensor([2.0]))
+    times = []
+
+    def step(*inputs):
+        *step_cache, x_t, timestep = inputs
+        assert all(given is made for given, made in zip(step_cache, cache, strict=True))
+        times.append(timestep.item())
+        return x_t * timestep
+
+    loop = TensorRTDenoisingLoop.__new__(TensorRTDenoisingLoop)
+    loop._prefix = lambda state: cache
+    loop._step = step
+    loop._actions = lambda x_0: 10 * x_0
+    loop._num_steps = 4
+
+    actions = loop(torch.zeros(1, 3), torch.ones(1, 2, 3))
+
+    assert times == [1.0, 0.75, 0.5, 0.25]
+    # x <- x + dt * v with dt = -1/4 and v = x * t, from x = 1.
+    expected = 10 * (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625)
+    torch.testing.assert_close(actions, torch.full((1, 2, 3), expected))
+
+
+def test_load_program_runs_a_chunk_split_into_engines_as_a_denoising_loop(tmp_path, monkeypatch):
+    from lerobot.rollout.inference.export import engine as export_engine, tensorrt as export_tensorrt
+
+    monkeypatch.setattr(export_tensorrt, "TensorRTDenoisingLoop", lambda *args: args)
+    programs = {
+        name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
+        for name in ("prefix", "step", "actions")
+    }
+    info = {"backend": "onnx_tensorrt", "programs": programs, "num_steps": 10}
+
+    assert export_engine.load_program(tmp_path, info) == (tmp_path, programs, 10)
+
+
 def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, monkeypatch):
     import sys
     import types

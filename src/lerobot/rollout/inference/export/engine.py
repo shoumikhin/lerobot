@@ -62,6 +62,10 @@ def export_dir(path: str | Path | None) -> Path | None:
 
 def load_program(folder: Path, info: dict) -> Program:
     """Load the folder's program with the backend `export.json` names."""
+    if info["backend"] == "onnx_tensorrt" and "programs" in info:
+        from .tensorrt import TensorRTDenoisingLoop
+
+        return TensorRTDenoisingLoop(folder, info["programs"], info["num_steps"])
     path = folder / info["file"]
     if info["backend"] == "executorch_tensorrt":
         from .executorch import ExecuTorchProgram
@@ -74,7 +78,7 @@ def load_program(folder: Path, info: dict) -> Program:
     if info["backend"] == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 
-        return TensorRTEngine(path, info["inputs"], info["output"])
+        return TensorRTEngine(path, info["inputs"], [info["output"]])
     if info["backend"] == "aoti_tensorrt":
         from .aoti import AOTInductorPackage
 
