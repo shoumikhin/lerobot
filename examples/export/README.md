@@ -93,7 +93,7 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
-pi0.5 and GR00T do not run on the Orin Nano. Both export scripts load the PyTorch policy, which does not fit in its 7.3 GiB. TensorRT also runs out of GPU memory when it builds an engine on the Orin Nano from an ONNX file exported on the Thor, about 5 GiB, and an engine built on the Thor does not run there. Export and run them on the Thor.
+pi0.5 and GR00T do not run on the Orin Nano. Both export scripts load the PyTorch policy, which does not fit in its 7.3 GiB, and an engine built on the Thor does not run there. Even split into engines small enough to build on the Orin Nano, pi0.5's bfloat16 weights take 5.1 GiB of GPU memory, and only about 4.3 GiB of them load before the Orin Nano runs out. Export and run them on the Thor.
 
 ### Export once, build on each device
 
