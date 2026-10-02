@@ -809,6 +809,50 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
     assert [len(piece) for piece in pieces] == [4, 4, 2]
 
 
+def test_tensorrt_engine_binds_its_int8_weights_once(tmp_path, monkeypatch):
+    """An engine with an INT8 weights file beside it gets each weight bound to its input once, when it loads."""
+    import sys
+    import types
+
+    from safetensors.torch import save_file
+
+    from lerobot.rollout.inference.export import tensorrt as export_tensorrt
+
+    bound = {}
+
+    class Context:
+        def set_tensor_address(self, name, address):
+            bound[name] = address
+
+    engine = MagicMock()
+    engine.create_execution_context.return_value = Context()
+    engine.get_tensor_shape.return_value = (1, 2)
+    engine.get_tensor_dtype.return_value = "float"
+    fake_trt = types.SimpleNamespace(
+        ExecutionContextAllocationStrategy=types.SimpleNamespace(STATIC=0, USER_MANAGED=1)
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
+    monkeypatch.setattr(export_tensorrt, "load_engine", lambda path: engine)
+    monkeypatch.setattr(export_tensorrt, "torch_dtype", lambda dtype: torch.float32)
+    weights = {"w.int8": torch.ones(4, dtype=torch.int8), "v.int8": torch.ones(2, dtype=torch.int8)}
+    save_file(weights, str(tmp_path / "model_int8_weights.safetensors"))
+    monkeypatch.setattr(
+        export_tensorrt,
+        "load_file",
+        lambda path, device: {name: tensor.clone() for name, tensor in weights.items()},
+    )
+
+    real_empty = torch.empty
+    monkeypatch.setattr(
+        export_tensorrt.torch, "empty", lambda *shape, **kw: real_empty(*shape, dtype=kw.get("dtype"))
+    )
+
+    loaded = export_tensorrt.TensorRTEngine(tmp_path / "model.engine", ["x"], ["y"])
+
+    assert sorted(bound) == ["v.int8", "w.int8"]
+    assert {name: tensor.data_ptr() for name, tensor in loaded._weights.items()} == bound
+
+
 def test_tensorrt_denoising_loop_runs_the_step_engine_once_per_euler_step():
     """The prefix runs once, the step engine once per Euler step from time 1 down, then the actions engine."""
     from lerobot.rollout.inference.export.tensorrt import TensorRTDenoisingLoop

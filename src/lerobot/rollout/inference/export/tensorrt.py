@@ -17,6 +17,7 @@
 from pathlib import Path
 
 import torch
+from safetensors.torch import load_file
 
 from lerobot.policies.common.flow_matching import euler_integrate
 
@@ -64,6 +65,8 @@ class TensorRTEngine:
 
     Returns the output, or a tuple of outputs when the engine has several. With `own_scratch=False`, the
     engine runs in the scratch memory given to `use_scratch`, which engines run one after another can share.
+    An engine built with `build_engine.py --int8_weights` gets its INT8 weights from the
+    `<name>_int8_weights.safetensors` file beside it, loaded to the GPU once.
     """
 
     def __init__(self, path: Path, input_names: list[str], output_names: list[str], own_scratch: bool = True):
@@ -74,6 +77,10 @@ class TensorRTEngine:
         self._context = self._engine.create_execution_context(
             strategy.STATIC if own_scratch else strategy.USER_MANAGED
         )
+        weights_file = path.with_name(f"{path.stem}_int8_weights.safetensors")
+        self._weights = load_file(weights_file, device="cuda") if weights_file.exists() else {}
+        for name, weight in self._weights.items():
+            self._context.set_tensor_address(name, weight.data_ptr())
         self._input_names = input_names
         self._input_shapes = [tuple(self._engine.get_tensor_shape(name)) for name in input_names]
         self._output_names = output_names
