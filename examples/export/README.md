@@ -4,9 +4,9 @@ Run LeRobot policies as compiled programs on Jetson devices, without the policy'
 
 ## Hardware
 
-- SO-101 arm with a scene camera and a wrist camera
-- Jetson AGX Thor, to train, export and run
-- Jetson Orin Nano, to export and run a pretrained policy
+- [SO-101](../../docs/source/so101.mdx) arm with a scene camera and a wrist camera
+- [Jetson AGX Thor](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/), to train, export and run
+- [Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/), to export and run a pretrained policy
 
 ## Backends
 
@@ -24,7 +24,7 @@ Run LeRobot policies as compiled programs on Jetson devices, without the policy'
 
 ## Install
 
-On each Jetson, with [uv](https://docs.astral.sh/uv/) installed:
+On each Jetson, with [uv](https://docs.astral.sh/uv/) installed. It is one of the environment managers in LeRobot's [installation guide](../../docs/source/installation.mdx), and it creates the environment without the `python3-venv` package, which JetPack may not include:
 
 ```bash
 git clone --branch export https://github.com/shoumikhin/lerobot.git
