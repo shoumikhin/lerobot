@@ -893,6 +893,116 @@ def test_load_program_runs_a_chunk_split_into_engines_as_a_denoising_loop(tmp_pa
     assert export_engine.load_program(tmp_path, info) == (tmp_path, programs, 10)
 
 
+def test_int8_weights_stores_large_matmul_weights_in_int8_and_leaves_small_ones(tmp_path, monkeypatch):
+    """A large MatMul weight becomes an INT8 engine input plus a DequantizeLinear; a small one stays as it was."""
+    import sys
+
+    import numpy as np
+
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("ml_dtypes")
+    from onnx import TensorProto, helper, numpy_helper
+    from safetensors.numpy import load_file
+
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "examples" / "export"))
+    monkeypatch.delitem(sys.modules, "int8_weights", raising=False)
+    import int8_weights
+
+    monkeypatch.setattr(int8_weights, "MIN_INT8_ELEMENTS", 64)
+    rng = np.random.default_rng(0)
+    large = rng.standard_normal((16, 8)).astype(np.float32)
+    small = rng.standard_normal((8, 4)).astype(np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["x", "large"], ["h"]),
+            helper.make_node("MatMul", ["h", "small"], ["y"]),
+        ],
+        "two_layers",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 16])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 4])],
+        [numpy_helper.from_array(large, "large"), numpy_helper.from_array(small, "small")],
+    )
+    onnx.save(helper.make_model(graph), tmp_path / "model.onnx")
+
+    assert int8_weights.int8_weights(tmp_path / "model.onnx") == 1
+
+    model = onnx.load(tmp_path / "model.onnx")
+    assert [init.name for init in model.graph.initializer] == ["small", "large.scale"]
+    assert [i.name for i in model.graph.input] == ["x", "large.int8"]
+    (dequantize,) = (node for node in model.graph.node if node.op_type == "DequantizeLinear")
+    assert list(dequantize.input) == ["large.int8", "large.scale"] and list(dequantize.output) == ["large"]
+    assert helper.get_attribute_value(dequantize.attribute[0]) == 1
+    values = load_file(tmp_path / "model_int8_weights.safetensors")["large.int8"]
+    scale = numpy_helper.to_array(model.graph.initializer[1])
+    assert values.dtype == np.int8 and np.abs(values).max() == 127
+    np.testing.assert_allclose(values * scale, large, atol=scale.max() / 2)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_int8_weights_scale_keeps_the_weight_dtype(tmp_path, monkeypatch, dtype):
+    """The DequantizeLinear gives back the weight's own dtype, so the graph stays valid."""
+    import sys
+
+    import numpy as np
+
+    onnx = pytest.importorskip("onnx")
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    from onnx import TensorProto, helper
+
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "examples" / "export"))
+    monkeypatch.delitem(sys.modules, "int8_weights", raising=False)
+    import int8_weights
+
+    monkeypatch.setattr(int8_weights, "MIN_INT8_ELEMENTS", 64)
+    onnx_type = {"float16": TensorProto.FLOAT16, "bfloat16": TensorProto.BFLOAT16}[dtype]
+    weight = np.random.default_rng(0).standard_normal((16, 8)).astype(getattr(ml_dtypes, dtype, np.float16))
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "w"], ["y"])],
+        "one_layer",
+        [helper.make_tensor_value_info("x", onnx_type, [2, 16])],
+        [helper.make_tensor_value_info("y", onnx_type, [2, 8])],
+        [helper.make_tensor("w", onnx_type, weight.shape, weight.tobytes(), raw=True)],
+    )
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)]), tmp_path / "model.onnx")
+
+    assert int8_weights.int8_weights(tmp_path / "model.onnx") == 1
+
+    model = onnx.load(tmp_path / "model.onnx")
+    assert model.graph.initializer[0].data_type == onnx_type
+    onnx.checker.check_model(model, full_check=True)
+
+
+def test_int8_weights_skips_a_transpose_that_feeds_nothing(tmp_path, monkeypatch):
+    """A weight whose only use is a Transpose with no consumer is left as it was."""
+    import sys
+
+    import numpy as np
+
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("ml_dtypes")
+    from onnx import TensorProto, helper, numpy_helper
+
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "examples" / "export"))
+    monkeypatch.delitem(sys.modules, "int8_weights", raising=False)
+    import int8_weights
+
+    monkeypatch.setattr(int8_weights, "MIN_INT8_ELEMENTS", 64)
+    weight = np.ones((16, 8), dtype=np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["w"], ["unused"], perm=[1, 0]),
+            helper.make_node("Identity", ["x"], ["y"]),
+        ],
+        "unused_transpose",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [numpy_helper.from_array(weight, "w")],
+    )
+    onnx.save(helper.make_model(graph), tmp_path / "model.onnx")
+
+    assert int8_weights.int8_weights(tmp_path / "model.onnx") == 0
+
+
 def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, monkeypatch):
     import sys
     import types
