@@ -51,12 +51,12 @@ python examples/export/act_executorch_tensorrt.py \
     --output_dir=outputs/export/act_executorch_tensorrt
 ```
 
-| policy  | `executorch_tensorrt`                                            | `onnx_tensorrt`                                      | `torch_tensorrt`                                       | `executorch_cuda`                                  |
-| ------- | ---------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------- |
-| ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         | [act_torch_tensorrt.py](act_torch_tensorrt.py)         | [act_executorch_cuda.py](act_executorch_cuda.py)   |
-| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) | not supported yet                                  |
-| pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       | [pi05_torch_tensorrt.py](pi05_torch_tensorrt.py)       | [pi05_executorch_cuda.py](pi05_executorch_cuda.py) |
-| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     | not supported yet                                  |
+| policy  | `executorch_tensorrt`                                            | `onnx_tensorrt`                                      | `torch_tensorrt`                                       | `executorch_cuda`                                    |
+| ------- | ---------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------- |
+| ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         | [act_torch_tensorrt.py](act_torch_tensorrt.py)         | [act_executorch_cuda.py](act_executorch_cuda.py)     |
+| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) | not supported yet                                    |
+| pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       | [pi05_torch_tensorrt.py](pi05_torch_tensorrt.py)       | [pi05_executorch_cuda.py](pi05_executorch_cuda.py)   |
+| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     | [groot_executorch_cuda.py](groot_executorch_cuda.py) |
 
 SmolVLA and GR00T also need the dataset they were trained on, for the cameras and the task:
 
@@ -78,7 +78,7 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
-The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`.
+The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`. GR00T's needs an ExecuTorch with its CUDA backend fixes for attention masks and view weights.
 
 GR00T runs only on the Thor, and pi0.5 runs on the Orin Nano only with INT8 weights (below). Their bfloat16 weights do not fit in the Orin Nano's memory.
 
@@ -146,7 +146,7 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | pi0.5               | Orin Nano | does not fit          | does not fit     | does not fit      | does not fit      | does not fit      | does not fit      |
 | pi0.5, INT8 weights | Thor      | not supported yet     | 170.3 ms         | not supported yet | not supported yet | not supported yet | not supported yet |
 | pi0.5, INT8 weights | Orin Nano | not supported yet     | 861.5 ms (864.8) | not supported yet | not supported yet | not supported yet | not supported yet |
-| GR00T               | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 69.5 ms (72.7)    | not supported yet | 216.2 ms (224.7)  | 212.0 ms (219.2)  |
+| GR00T               | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 69.5 ms (72.7)    | 78.1 ms (82.3)    | 216.2 ms (224.7)  | 212.0 ms (219.2)  |
 
 ### Memory added: process, GPU
 
@@ -159,6 +159,6 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | pi0.5               | Thor      | 1.3 GiB, 6.9 GiB      | 1.3 GiB, 7.8 GiB | 1.3 GiB, 12.5 GiB      | 0.8 GiB, 6.3 GiB  | 1.7 GiB, 10.4 GiB |
 | pi0.5               | Orin Nano | does not fit          | does not fit     | does not fit           | does not fit      | does not fit      |
 | pi0.5, INT8 weights | Orin Nano | not supported yet     | 3.8 GiB, 2.8 GiB | not supported yet      | not supported yet | not supported yet |
-| GR00T               | Thor      | 1.2 GiB, 5.9 GiB      | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | not supported yet | 2.0 GiB, 14.3 GiB |
+| GR00T               | Thor      | 1.2 GiB, 5.9 GiB      | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | 0.8 GiB, 5.7 GiB  | 2.0 GiB, 14.3 GiB |
 
 The Jetson CPU and GPU share one memory, so the two numbers can overlap.
