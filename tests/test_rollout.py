@@ -864,7 +864,7 @@ def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, 
     monkeypatch.setitem(sys.modules, "torch_tensorrt", types.ModuleType("torch_tensorrt"))
     monkeypatch.setattr(torch._inductor, "aoti_load_package", aoti_load_package)
 
-    program = export_engine.load_program(tmp_path, {"backend": "aoti_tensorrt", "file": "model.pt2"})
+    program = export_engine.load_program(tmp_path, {"backend": "torch_tensorrt", "file": "model.pt2"})
 
     assert loaded == [str(tmp_path / "model.pt2")]
     torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))

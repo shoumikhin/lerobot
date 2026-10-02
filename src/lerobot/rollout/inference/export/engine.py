@@ -79,7 +79,7 @@ def load_program(folder: Path, info: dict) -> Program:
         from .tensorrt import TensorRTEngine
 
         return TensorRTEngine(path, info["inputs"], [info["output"]])
-    if info["backend"] == "aoti_tensorrt":
+    if info["backend"] == "torch_tensorrt":
         from .aoti import AOTInductorPackage
 
         return AOTInductorPackage(path)

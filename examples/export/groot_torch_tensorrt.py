@@ -14,16 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained pi0.5 policy as an AOTInductor package that runs on TensorRT.
+"""Export a trained GR00T N1.7 policy as an AOTInductor package that runs on TensorRT.
 
 Run it on the device the policy will run on, because a TensorRT engine only runs on the GPU
 model that built it:
 
-    python examples/export/pi05_aoti_tensorrt.py \
-        --policy.path=outputs/train/pi05_so101/checkpoints/last/pretrained_model \
-        --task="Pick up the block and place it in the cup"
+    python examples/export/groot_torch_tensorrt.py \
+        --policy.path=outputs/train/groot_so101/checkpoints/last/pretrained_model \
+        --dataset.repo_id=<user>/so101_dataset
 
-Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
+Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
 Unlike the other two backends, the package runs only with PyTorch and Torch-TensorRT installed.
 """
 
@@ -31,16 +31,16 @@ import time
 
 import torch
 import torch_tensorrt
-from pi05_recipe import PI05Export, parse_args
+from groot_recipe import GrootExport, parse_args
 
 
 def main() -> None:
-    args = parse_args(__doc__, "aoti_tensorrt")
+    args = parse_args(__doc__, "torch_tensorrt")
     if args.export_only:
         raise SystemExit(
             "--export_only is not supported here: build_engine.py does not build AOTInductor packages."
         )
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = GrootExport(args.policy_path, args.dataset, args.dataset_root, args.output_dir, args.job_name)
     package_path = export.output_dir / "model.pt2"
 
     start = time.perf_counter()
@@ -52,7 +52,7 @@ def main() -> None:
     torch_tensorrt.save(engine, str(package_path), output_format="aot_inductor", arg_inputs=export.inputs)
     print(f"Exported {package_path} in {time.perf_counter() - start:.0f} s")
 
-    export.write("aoti_tensorrt", package_path.name, args.tolerance)
+    export.write("torch_tensorrt", package_path.name, args.tolerance)
 
 
 if __name__ == "__main__":
