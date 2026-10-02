@@ -132,7 +132,7 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | SmolVLA             | 0.17 (0.56)           | 0.15 (0.52)     | 0.17 (0.56)       | not supported yet | 3.2 (11.9)           |
 | pi0.5               | 0.31 (1.17)           | 0.33 (1.37)     | 0.31 (1.23)       | 0.26 (0.95)       | 11.4 (44.8)          |
 | pi0.5, INT8 weights | not supported yet     | 0.51 (2.00)     | not supported yet | not supported yet | 11.4 (44.8)          |
-| GR00T               | 0.28 (0.91)           | 0.28 (0.89)     | 0.28 (0.91)       | not supported yet | 7.8 (22.6)           |
+| GR00T               | 0.28 (0.91)           | 0.28 (0.89)     | 0.28 (0.91)       | 0.49 (1.39)       | 7.8 (22.6)           |
 
 ### Latency per action chunk, median (99th percentile)
 
