@@ -110,6 +110,8 @@ python examples/export/build_engine.py outputs/export/act_onnx_tensorrt \
 
 `build_engine.py` builds the engine for the local GPU, writes the file the rollout loads, and checks it against the test case the export saved. Lower `--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` make the build need less memory, and the engine may run slower. Every `executorch_tensorrt` and `onnx_tensorrt` export script takes `--export_only`, with the same options as without it.
 
+pi0.5's chunk runs the action expert 10 times, once per denoising step, and TensorRT builds those 10 steps as one large graph. With `--step_engine`, `pi05_onnx_tensorrt.py` writes three ONNX files instead of one: `prefix.onnx` turns the cameras and the prompt into the attention cache, `step.onnx` is one denoising step, and `actions.onnx` turns the result into robot actions. `build_engine.py` builds an engine from each, and the rollout runs the step engine once per denoising step, as the PyTorch policy does. On the Thor a chunk takes about as long as with one engine, 117.0 ms against 115.2 ms. The smaller engines also build on the Orin Nano, but they do not all fit in its memory at once.
+
 ## Run
 
 Then run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:

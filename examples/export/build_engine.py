@@ -81,18 +81,22 @@ def main() -> None:
     args = parser.parse_args()
     info = json.loads((args.folder / "export.json").read_text())
 
-    start = time.perf_counter()
     if info["backend"] == "onnx_tensorrt":
-        build_engine(
-            args.folder / "model.onnx",
-            args.folder / info["file"],
-            args.workspace_gib,
-            args.tactic_gib,
-            args.optimization_level,
-        )
+        # A chunk exported with --step_engine has one ONNX file per engine, named like its program.
+        for name, program in info.get("programs", {"model": info}).items():
+            start = time.perf_counter()
+            build_engine(
+                args.folder / f"{name}.onnx",
+                args.folder / program["file"],
+                args.workspace_gib,
+                args.tactic_gib,
+                args.optimization_level,
+            )
+            print(f"Built {args.folder / program['file']} in {time.perf_counter() - start:.0f} s")
     else:
+        start = time.perf_counter()
         build_executorch(args.folder, info["file"], args)
-    print(f"Built {args.folder / info['file']} in {time.perf_counter() - start:.0f} s")
+        print(f"Built {args.folder / info['file']} in {time.perf_counter() - start:.0f} s")
 
     # The rollout's own startup check: the engine must reproduce the PyTorch test case.
     ExportInferenceEngine(args.folder, task=info.get("task", ""), robot_type="")

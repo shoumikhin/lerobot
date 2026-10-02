@@ -49,8 +49,10 @@ from act_recipe import TEST_CASE, gpu_processors, make_output_dir, random_robot_
 from safetensors.numpy import save_file
 from smolvla_recipe import NOISE, TEXT_STEPS
 from torch import Tensor, nn
+from transformers import DynamicCache
 
-from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch
 from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
 from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.policies.utils import prepare_observation_for_inference
@@ -85,6 +87,71 @@ class PI05Chunk(nn.Module):
         batch = self.preprocessor(dict(zip(self.input_names[:-1], observation, strict=True)))
         actions = self.policy.predict_action_chunk(batch, noise=noise)
         return self.postprocessor(actions[:, : self.policy.config.n_action_steps])
+
+
+class PI05Prefix(nn.Module):
+    """What `sample_actions` runs once per chunk: the cameras and the prompt in, the KV cache out."""
+
+    def __init__(self, policy: PI05Policy, preprocessor: PolicyProcessorPipeline, input_names: list[str]):
+        super().__init__()
+        self.policy = policy
+        self.preprocessor = preprocessor
+        self.input_names = input_names
+
+    def forward(self, *observation: Tensor) -> tuple[Tensor, ...]:
+        batch = self.preprocessor(dict(zip(self.input_names, observation, strict=True)))
+        images, img_masks = self.policy._preprocess_images(batch)
+        states, state_masks = self.policy._prepare_memory_states(batch)
+        model = self.policy.model
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images,
+            img_masks,
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
+            states,
+            state_masks,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
+        _, past_key_values = model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        # A program passes only tensors, so the cache leaves as each layer's keys and values.
+        return prefix_pad_masks, *(tensor for keys, values, _ in past_key_values for tensor in (keys, values))
+
+
+class PI05Step(nn.Module):
+    """LeRobot's `denoise_step`: the prefix's mask and KV cache, the noisy actions and the time in, the velocity out."""
+
+    def __init__(self, model: PI05Pytorch):
+        super().__init__()
+        self.model = model
+
+    def forward(self, prefix_pad_masks: Tensor, *inputs: Tensor) -> Tensor:
+        *cache, x_t, timestep = inputs
+        past_key_values = DynamicCache(
+            tuple((keys, values, None) for keys, values in zip(cache[::2], cache[1::2], strict=True))
+        )
+        return self.model.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+
+
+class PI05Actions(nn.Module):
+    """The end of the chunk: the denoised actions in, the actions to play out."""
+
+    def __init__(self, policy: PI05Policy, postprocessor: PolicyProcessorPipeline):
+        super().__init__()
+        self.policy = policy
+        self.postprocessor = postprocessor
+
+    def forward(self, x_0: Tensor) -> Tensor:
+        action_dim = self.policy.config.output_features[ACTION].shape[0]
+        return self.postprocessor(x_0[:, : self.policy.config.n_action_steps, :action_dim])
 
 
 def store_in_bfloat16(policy: PI05Policy) -> None:
@@ -166,17 +233,51 @@ class PI05Export:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def write(self, backend: str, program_file: str, tolerance: float) -> None:
-        """Save the test case, the policy config, the text steps and `export.json` beside the program."""
+    def denoising_programs(self) -> dict[str, tuple[nn.Module, tuple[Tensor, ...], list[str], list[str]]]:
+        """The chunk as three programs, each with its example inputs, input names and output names.
+
+        The prefix runs once per chunk, the denoising step once per Euler step and the actions at the end.
+        No engine holds the whole 10-step loop.
+        """
+        config = self.policy.config
+        if config.use_visual_memory or config.use_proprioceptive_memory:
+            raise SystemExit("--step_engine does not support a policy with visual or proprioceptive memory.")
+        observation, observation_names = self.inputs[:-1], self.input_names[:-1]
+        prefix = PI05Prefix(self.policy, self.module.preprocessor, observation_names)
+        with torch.no_grad():
+            cache = prefix(*observation)
+        layers = range((len(cache) - 1) // 2)
+        cache_names = ["prefix_pad_masks", *(f"past_{kind}_{i}" for i in layers for kind in ("key", "value"))]
+        step_inputs = (*cache, self.noise, torch.ones(1, device="cuda"))
+        return {
+            "prefix": (prefix, observation, observation_names, cache_names),
+            "step": (PI05Step(self.policy.model), step_inputs, [*cache_names, "x_t", "timestep"], ["v_t"]),
+            "actions": (
+                PI05Actions(self.policy, self.module.postprocessor),
+                (self.noise,),
+                ["x_t"],
+                [ACTION],
+            ),
+        }
+
+    def write(self, backend: str, program: str | dict, tolerance: float) -> None:
+        """Save the test case, the policy config, the text steps and `export.json` beside the program.
+
+        `program` is the program's file or, for a chunk split into engines, each engine's file, inputs and outputs.
+        """
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
         self.text_steps.save_pretrained(self.output_dir, config_filename=TEXT_STEPS)
+        if isinstance(program, dict):
+            files = {"programs": program, "num_steps": self.config.num_inference_steps}
+        else:
+            files = {"file": program}
         info = {
             "backend": backend,
-            "file": program_file,
+            **files,
             "inputs": self.input_names,
             "text_steps": TEXT_STEPS,
             "task": self.task,
@@ -247,4 +348,10 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
         action="store_true",
         help="Write the folder without the engine, to build it with build_engine.py on each device.",
     )
+    if backend == "onnx_tensorrt":
+        parser.add_argument(
+            "--step_engine",
+            action="store_true",
+            help="Export the prefix, one denoising step and the actions as three engines.",
+        )
     return parser.parse_args()
