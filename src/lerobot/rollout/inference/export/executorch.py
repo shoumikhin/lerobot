@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run an exported policy's ExecuTorch program, with its TensorRT engine inside."""
+"""Run an exported policy's ExecuTorch program, on its TensorRT or CUDA backend."""
 
 from pathlib import Path
 
@@ -20,13 +20,18 @@ import torch
 
 
 class ExecuTorchProgram:
-    """Runs a `.pte` program whose inputs and outputs stay on the GPU."""
+    """Runs a `.pte` program whose inputs and outputs stay on the GPU.
 
-    def __init__(self, path: Path):
-        import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
+    A program on ExecuTorch's CUDA backend keeps its weights in a `.ptd` file beside it.
+    """
+
+    def __init__(self, path: Path, tensorrt: bool = True):
+        if tensorrt:
+            import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
         from executorch.runtime import Runtime
 
-        self._method = Runtime.get().load_program(path).load_method("forward")
+        data_path = next(path.parent.glob("*.ptd"), None)
+        self._method = Runtime.get().load_program(path, data_path=data_path).load_method("forward")
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
         return self._method.execute(list(inputs))[0]

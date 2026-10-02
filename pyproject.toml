@@ -532,7 +532,7 @@ default.extend-ignore-identifiers-re = [
     "nd",  # einsum output axes "...nd" in the vendored FLUX 3 Action transformer
     "EmbedND",
 ]
-default.extend-words = { nd = "nd" }
+default.extend-words = { nd = "nd", ptd = "ptd" }
 
 # Docstring coverage gate. `fail-under` is a RATCHET, not a target: it is set just below the currently
 # measured coverage so it passes today, and is raised in the same PR that documents a module. Never set it

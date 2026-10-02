@@ -50,8 +50,8 @@ GPU_RESIDENT = ExecutorchBackendConfig(
 )
 
 
-def check_program(path: Path) -> None:
-    """Fail unless the program is one TensorRT engine and nothing else, reading and writing GPU memory."""
+def check_program(path: Path, backend: str = "TensorRTBackend") -> None:
+    """Fail unless the program is one `backend` delegate and nothing else, reading and writing GPU memory."""
     # Read only the program's description, not the engine after it, which can be several GB.
     with path.open("rb") as file:
         header = _get_extended_header(file.read(_ExtendedHeader.NUM_HEAD_BYTES))
@@ -66,9 +66,9 @@ def check_program(path: Path) -> None:
         and getattr(plan.values[index].val.extra_tensor_info, "device_type", DeviceType.CPU)
         != DeviceType.CUDA
     ]
-    if delegates != ["TensorRTBackend"] or operators or on_host:
+    if delegates != [backend] or operators or on_host:
         raise SystemExit(f"{path}: delegates {delegates}, operators {operators}, CPU tensors {on_host}.")
-    print(f"{path} is one TensorRT engine, with its inputs and outputs on the GPU")
+    print(f"{path} is one {backend} delegate, with its inputs and outputs on the GPU")
 
 
 def main() -> None:

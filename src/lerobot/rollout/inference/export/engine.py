@@ -46,7 +46,7 @@ from ..base import InferenceEngine
 logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
-# All three backends run TensorRT engines, which run on CUDA only.
+# Every backend runs the program on CUDA only.
 DEVICE = torch.device("cuda")
 NOISE = "noise"
 
@@ -67,6 +67,10 @@ def load_program(folder: Path, info: dict) -> Program:
         from .executorch import ExecuTorchProgram
 
         return ExecuTorchProgram(path)
+    if info["backend"] == "executorch_cuda":
+        from .executorch import ExecuTorchProgram
+
+        return ExecuTorchProgram(path, tensorrt=False)
     if info["backend"] == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 

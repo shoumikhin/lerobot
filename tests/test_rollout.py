@@ -830,6 +830,40 @@ def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, 
     torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))
 
 
+@pytest.mark.parametrize("data_file", [None, "data.ptd"])
+def test_executorch_cuda_program_loads_the_weights_file_beside_it(tmp_path, monkeypatch, data_file):
+    """A CUDA backend program gets its `.ptd` weights file, and needs no TensorRT runtime."""
+    import sys
+    import types
+
+    from lerobot.rollout.inference.export import engine as export_engine
+
+    loads = []
+
+    class Method:
+        def execute(self, inputs):
+            return [_fake_program(*inputs)]
+
+    class Runtime:
+        @staticmethod
+        def get():
+            return Runtime()
+
+        def load_program(self, path, data_path=None):
+            loads.append((path, data_path))
+            return types.SimpleNamespace(load_method=lambda name: Method())
+
+    monkeypatch.setitem(sys.modules, "executorch.runtime", types.SimpleNamespace(Runtime=Runtime))
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", None)
+    if data_file:
+        (tmp_path / data_file).write_bytes(b"")
+
+    program = export_engine.load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
+
+    assert loads == [(tmp_path / "model.pte", tmp_path / data_file if data_file else None)]
+    torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))
+
+
 def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
     """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
     import json
