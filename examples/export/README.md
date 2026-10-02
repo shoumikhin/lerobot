@@ -1,6 +1,6 @@
 # Compiled LeRobot policies on an NVIDIA Jetson
 
-Run LeRobot policies as TensorRT engines, or with ExecuTorch's own CUDA backend, on Jetson devices, without the policy's PyTorch code on the robot.
+Run LeRobot policies as compiled programs on Jetson devices, without the policy's PyTorch code on the robot.
 
 ## Hardware
 
@@ -10,10 +10,10 @@ Run LeRobot policies as TensorRT engines, or with ExecuTorch's own CUDA backend,
 
 ## Backends
 
-- `onnx_tensorrt`: ONNX using `torch.export`, then TensorRT, into an `.engine` file
-- `executorch_tensorrt`: `torch.export`, then Torch-TensorRT, into an ExecuTorch `.pte` file
-- `torch_tensorrt`: `torch.export`, then Torch-TensorRT, into an AOTInductor `.pt2` package. Unlike the others, its file runs only with PyTorch and Torch-TensorRT installed. A `.pte` or `.engine` file can also run without them.
-- `executorch_cuda`: `torch.export`, then ExecuTorch's CUDA backend, into an ExecuTorch `.pte` file and its weights in a `.ptd` file. The backend compiles the policy with AOTInductor into CUDA and Triton kernels, without TensorRT.
+- `executorch_tensorrt`: Torch-TensorRT into an ExecuTorch `.pte` file
+- `onnx_tensorrt`: ONNX, then TensorRT, into an `.engine` file
+- `torch_tensorrt`: Torch-TensorRT into an AOTInductor `.pt2` package, which needs PyTorch to run
+- `executorch_cuda`: ExecuTorch's CUDA backend, without TensorRT, into a `.pte` file and its `.ptd` weights
 
 ## Policies
 
@@ -41,11 +41,9 @@ uv pip install \
     --prerelease allow
 ```
 
-This brings nightly PyTorch, Torch-TensorRT, ExecuTorch, TensorRT and ONNX for CUDA 13.2.
-
 ## Export
 
-Export a policy you trained with `lerobot-train` on each device it's intended to run, because a TensorRT engine only runs on the GPU model that built it:
+Export on each device the policy will run on, because the compiled program only runs on the same GPU model that built it:
 
 ```bash
 python examples/export/act_executorch_tensorrt.py \
@@ -53,18 +51,14 @@ python examples/export/act_executorch_tensorrt.py \
     --output_dir=outputs/export/act_executorch_tensorrt
 ```
 
-Each policy has one script per backend, except where the table says not yet:
-
 | policy  | `executorch_tensorrt`                                            | `onnx_tensorrt`                                      | `torch_tensorrt`                                       | `executorch_cuda`                                  |
 | ------- | ---------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------- |
 | ACT     | [act_executorch_tensorrt.py](act_executorch_tensorrt.py)         | [act_onnx_tensorrt.py](act_onnx_tensorrt.py)         | [act_torch_tensorrt.py](act_torch_tensorrt.py)         | [act_executorch_cuda.py](act_executorch_cuda.py)   |
-| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) | not yet                                            |
+| SmolVLA | [smolvla_executorch_tensorrt.py](smolvla_executorch_tensorrt.py) | [smolvla_onnx_tensorrt.py](smolvla_onnx_tensorrt.py) | [smolvla_torch_tensorrt.py](smolvla_torch_tensorrt.py) | not supported yet                                  |
 | pi0.5   | [pi05_executorch_tensorrt.py](pi05_executorch_tensorrt.py)       | [pi05_onnx_tensorrt.py](pi05_onnx_tensorrt.py)       | [pi05_torch_tensorrt.py](pi05_torch_tensorrt.py)       | [pi05_executorch_cuda.py](pi05_executorch_cuda.py) |
-| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     | not yet                                            |
+| GR00T   | [groot_executorch_tensorrt.py](groot_executorch_tensorrt.py)     | [groot_onnx_tensorrt.py](groot_onnx_tensorrt.py)     | [groot_torch_tensorrt.py](groot_torch_tensorrt.py)     | not supported yet                                  |
 
-The `executorch_cuda` scripts take the same options as the `executorch_tensorrt` ones, except `--export_only`. Their kernels are compiled for the GPU of the machine that runs the export, so export on each device. The export compiles them with `nvcc` from the CUDA toolkit, so add it to your `PATH` first, for example `export PATH=/usr/local/cuda/bin:$PATH`.
-
-SmolVLA also needs the dataset it was trained on, because its checkpoint does not record the robot's cameras. The export reads their names, their sizes and the task from it:
+SmolVLA and GR00T also need the dataset they were trained on, for the cameras and the task:
 
 ```bash
 python examples/export/smolvla_executorch_tensorrt.py \
@@ -75,16 +69,7 @@ python examples/export/smolvla_executorch_tensorrt.py \
 
 Add `--dataset.root=<folder>` if the dataset is only on your disk.
 
-GR00T takes the same options as SmolVLA. Its export also fixes the task and the camera size, because the program holds the task's tokens and the image layout as constants:
-
-```bash
-python examples/export/groot_executorch_tensorrt.py \
-    --policy.path=outputs/train/groot_so101/checkpoints/last/pretrained_model \
-    --dataset.repo_id=<user>/so101_dataset \
-    --output_dir=outputs/export/groot_executorch_tensorrt
-```
-
-pi0.5's checkpoint names the robot's cameras but not the task, so give the task it was trained on:
+pi0.5 needs the task it was trained on:
 
 ```bash
 python examples/export/pi05_executorch_tensorrt.py \
@@ -93,28 +78,29 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
-pi0.5 and GR00T do not run on the Orin Nano. Both export scripts load the PyTorch policy, which does not fit in its 7.3 GiB, and an engine built on the Thor does not run there. Even split into engines small enough to build on the Orin Nano, pi0.5's bfloat16 weights take 5.1 GiB of GPU memory, and only about 4.3 GiB of them load before the Orin Nano runs out. Export and run them on the Thor.
+The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`.
+
+pi0.5 and GR00T run only on the Thor. Their weights do not fit in the Orin Nano's memory.
 
 ### Export once, build on each device
 
-To export once and build on several devices, export with `--export_only`: the script writes the folder without the engine. The ONNX route keeps `model.onnx` and its weights, and the `executorch_tensorrt` route saves the exported program as `model.pt2`. Copy the folder to each device, then build the engine there:
+With `--export_only`, the `executorch_tensorrt` and `onnx_tensorrt` scripts write the folder without the engine. Copy it to each device and build the engine there:
 
 ```bash
 python examples/export/act_onnx_tensorrt.py \
     --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
     --output_dir=outputs/export/act_onnx_tensorrt \
     --export_only
-python examples/export/build_engine.py outputs/export/act_onnx_tensorrt \
-    --workspace_gib=2 --optimization_level=3
+python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 ```
 
-`build_engine.py` builds the engine for the local GPU, writes the file the rollout loads, and checks it against the test case the export saved. Lower `--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` make the build need less memory, and the engine may run slower. Every `executorch_tensorrt` and `onnx_tensorrt` export script takes `--export_only`, with the same options as without it.
+Lower `--workspace_gib` and `--optimization_level` make the build use less memory.
 
-pi0.5's chunk runs the action expert 10 times, once per denoising step, and TensorRT builds those 10 steps as one large graph. With `--step_engine`, `pi05_onnx_tensorrt.py` writes three ONNX files instead of one: `prefix.onnx` turns the cameras and the prompt into the attention cache, `step.onnx` is one denoising step, and `actions.onnx` turns the result into robot actions. `build_engine.py` builds an engine from each, and the rollout runs the step engine once per denoising step, as the PyTorch policy does. On the Thor a chunk takes about as long as with one engine, 117.0 ms against 115.2 ms. The smaller engines also build on the Orin Nano, but they do not all fit in its memory at once.
+With `--step_engine`, `pi05_onnx_tensorrt.py` exports pi0.5 as three smaller engines instead of one, and the rollout runs the denoising step engine once per step. On the Thor it runs about as fast as one engine.
 
 ## Run
 
-Then run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with, including `--robot.cameras`:
+Run the exported folder like any LeRobot policy, with the same `--robot.*` options you recorded with:
 
 ```bash
 lerobot-rollout \
@@ -126,64 +112,45 @@ lerobot-rollout \
     --duration=30
 ```
 
-Before the robot moves, the rollout replays a test case saved at export time, and stops if the actions differ from what the PyTorch policy produced.
+For SmolVLA, add the task, for example `--task="Pick up the brick and put it in the bin"`. pi0.5 and GR00T run only the task they were exported for, so pass that same `--task`.
 
-For SmolVLA and pi0.5, give the task as you would with the PyTorch policy, for example `--task="Pick up the brick and put it in the bin"`.
-
-For GR00T, give the task it was exported for. The rollout refuses any other task, so export again to change it.
-
-To compare backends, export with another script and run its folder.
+Before the robot moves, the rollout checks the program against a test case saved at export time, and stops if its actions differ from the PyTorch policy's.
 
 ## Benchmarks
 
-Time for one action chunk, and the memory a process adds to run it. Each cell is the median of 3 runs unless marked 1 run, each in a fresh process, through the rollout's own inference engines. Each run times at least 100 chunks after 20 warmup chunks. The policies were trained on an SO-101 arm with two cameras.
+Measured with JetPack 7.2.1 and the packages above. Each latency and memory cell is the median of 3 runs, each in a fresh process, except one run for `torch.compile` with SmolVLA, pi0.5 and GR00T.
 
-Setup: JetPack 7.2.1, with the nightly PyTorch 2.15, Torch-TensorRT, ExecuTorch and TensorRT 11.3 from the install above.
+### Accuracy
 
-### Accuracy against the PyTorch policy
+Typical difference from the PyTorch policy, in robot action units, with the 95th percentile in parentheses, over 50 dataset frames (random inputs for pi0.5). The last column is how much the PyTorch policy differs from itself with other starting noise.
 
-The exported programs were run next to the PyTorch policy on the same inputs and the same starting noise: 50 frames from the dataset the policy was trained on, every action of every chunk. The table gives the typical difference and the 95th percentile of the difference, in the robot's action units, over all six joints. pi0.5 was checked on 50 random inputs, not dataset frames.
+| policy  | `executorch_tensorrt` | `onnx_tensorrt` | `torch_tensorrt` | `executorch_cuda` | PyTorch, other noise |
+| ------- | --------------------- | --------------- | ---------------- | ----------------- | -------------------- |
+| ACT     | 0.01 (0.02)           | 0.01 (0.02)     | 0.01 (0.02)      | 0.01 (0.02)       | no noise             |
+| SmolVLA | 0.17 (0.56)           | 0.15 (0.52)     | 0.17 (0.56)      | not supported yet | 3.2 (11.9)           |
+| pi0.5   | 0.31 (1.17)           | 0.33 (1.37)     | 0.31 (1.23)      | 0.26 (0.95)       | 11.4 (44.8)          |
+| GR00T   | 0.28 (0.91)           | 0.28 (0.89)     | 0.28 (0.91)      | not supported yet | 7.8 (22.6)           |
 
-| policy  | `executorch_tensorrt` | `onnx_tensorrt` | `torch_tensorrt` | `executorch_cuda` | PyTorch with other noise |
-| ------- | --------------------- | --------------- | ---------------- | ----------------- | ------------------------ |
-| ACT     | 0.01 (0.02)           | 0.01 (0.02)     | 0.01 (0.02)      | 0.01 (0.02)       | the policy is not random |
-| SmolVLA | 0.17 (0.56)           | 0.15 (0.52)     | 0.17 (0.56)      | not yet           | 3.2 (11.9)               |
-| pi0.5   | 0.31 (1.17)           | 0.33 (1.37)     | 0.31 (1.23)      | 0.26 (0.95)       | 11.4 (44.8)              |
-| GR00T   | 0.28 (0.91)           | 0.28 (0.89)     | 0.28 (0.91)      | not yet           | 7.8 (22.6)               |
+### Latency per action chunk, median (99th percentile)
 
-SmolVLA, pi0.5 and GR00T start each chunk from random noise, so the PyTorch policy itself gives different actions every time. The last column is that difference, from the same frame with other noise. PyTorch differs from itself 20 to 50 times more than the exported programs differ from it. For ACT, each joint moves 0.3 to 0.8 on average from one dataset frame to the next, against 0.01 for the exported programs.
-
-### Chunk latency, median (99th percentile)
-
-| policy  | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `torch_tensorrt` | `executorch_cuda` | PyTorch          | PyTorch with `torch.compile` |
-| ------- | --------- | --------------------- | ---------------- | ---------------- | ----------------- | ---------------- | ---------------------------- |
-| ACT     | Thor      | 4.5 ms (4.8)          | 4.2 ms (4.5)     | 4.4 ms (5.0)     | 38.7 ms (39.0)    | 19.2 ms (20.5)   | 14.8 ms (15.2)               |
-| ACT     | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | not measured     | 152.3 ms (153.8)  | 65.1 ms (66.7)   | 63.6 ms (64.5)               |
-| SmolVLA | Thor      | 30.1 ms (34.8)        | 31.6 ms (35.9)   | 29.9 ms (34.3)   | not yet           | 164.5 ms (168.2) | 58.1 ms, 1 run               |
-| SmolVLA | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | not measured     | not yet           | 773.5 ms (777.5) | 186.9 ms, 1 run              |
-| pi0.5   | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 108.5 ms (109.7) | 122.6 ms (123.2)  | 235.9 ms (238.8) | 135.6 ms (136.3), 1 run      |
-| pi0.5   | Orin Nano | does not fit          | does not fit     | does not fit     | does not fit      | does not fit     | does not fit                 |
-| GR00T   | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 69.5 ms (72.7)   | not yet           | 216.2 ms (224.7) | 212.0 ms (219.2), 1 run      |
-| GR00T   | Orin Nano | does not fit          | does not fit     | does not fit     | does not fit      | does not fit     | does not fit                 |
-
-`torch.compile` runs as `lerobot-rollout --use_torch_compile` does: ACT and SmolVLA with `--torch_compile_mode=max-autotune`, GR00T in the default mode. SmolVLA and pi0.5 also compile through their own `compile_model` option, in `max-autotune` mode by default, and pi0.5 uses only that one. pi0.5 was faster with `--policy.compile_mode=default`: 130.0 ms. The first chunk waits for the compile: about 4.3 minutes for ACT, 6.1 for SmolVLA, 7.7 for pi0.5 and 2.1 for GR00T on the Thor, and 8.6 for ACT and 12.2 for SmolVLA on the Orin Nano.
-
-`executorch_cuda` does not use TensorRT. ExecuTorch's CUDA backend runs every matrix multiplication and convolution as a Triton kernel, tuned at export time, while TensorRT and PyTorch use NVIDIA's own libraries. For ACT, a chunk takes 38.7 ms on the Thor and 152.3 ms on the Orin Nano, at least twice as long as with PyTorch, and the program loads in under half a second. On the Orin Nano, the ACT export takes about 36 minutes, because its six CPU cores compile every kernel the backend tries. pi0.5 takes 122.6 ms, between the TensorRT routes, and loads in 8.8 s. SmolVLA and GR00T do not export with it yet. SmolVLA's vision encoder writes positions through a boolean mask, which the backend's compile cannot follow. GR00T's attention uses a float mask, and the backend replaces attention with its own kernel that accepts only a boolean mask.
-
-`torch_tensorrt` builds its TensorRT engine the same way as `executorch_tensorrt`, so a chunk takes about as long, but it loads slower and holds more GPU memory: on the Thor, loading takes 5.8 s for ACT, 13.8 s for SmolVLA, 50.3 s for pi0.5 and 52.6 s for GR00T, against 0.2 s, 4.2 s, 8.9 s and 7.0 s for `executorch_tensorrt`. It was not measured on the Orin Nano.
-
-On the Orin Nano, GR00T's PyTorch policy runs out of memory while it moves its float32 weights, 11.7 GiB, to the GPU, which shares the board's 7.3 GiB. `torch.compile` starts from the same policy.
+| policy  | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `torch_tensorrt` | `executorch_cuda` | PyTorch          | `torch.compile`  |
+| ------- | --------- | --------------------- | ---------------- | ---------------- | ----------------- | ---------------- | ---------------- |
+| ACT     | Thor      | 4.5 ms (4.8)          | 4.2 ms (4.5)     | 4.4 ms (5.0)     | 38.7 ms (39.0)    | 19.2 ms (20.5)   | 14.8 ms (15.2)   |
+| ACT     | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | 27.7 ms (28.5)   | 152.3 ms (153.8)  | 65.1 ms (66.7)   | 63.6 ms (64.5)   |
+| SmolVLA | Thor      | 30.1 ms (34.8)        | 31.6 ms (35.9)   | 29.9 ms (34.3)   | not supported yet | 164.5 ms (168.2) | 58.1 ms          |
+| SmolVLA | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | 137.9 ms (140.8) | not supported yet | 773.5 ms (777.5) | 186.9 ms         |
+| pi0.5   | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 108.5 ms (109.7) | 122.6 ms (123.2)  | 235.9 ms (238.8) | 135.6 ms (136.3) |
+| GR00T   | Thor      | 70.1 ms (74.2)        | 78.5 ms (80.6)   | 69.5 ms (72.7)   | not supported yet | 216.2 ms (224.7) | 212.0 ms (219.2) |
 
 ### Memory added: process, GPU
 
-| policy  | device    | `executorch_tensorrt` | `onnx_tensorrt` | `torch_tensorrt` | `executorch_cuda` | PyTorch         |
-| ------- | --------- | --------------------- | --------------- | ---------------- | ----------------- | --------------- |
-| ACT     | Thor      | 0.5 GB, 0.4 GB        | 0.5 GB, 0.5 GB  | 0.9 GB, 1.8 GB   | 0.2 GB, 0.4 GB    | 1.4 GB, 1.4 GB  |
-| ACT     | Orin Nano | 0.6 GB, 0.2 GB        | 0.7 GB, 0.2 GB  | not measured     | 0.4 GB, 0.1 GB    | 1.2 GB, 0.7 GB  |
-| SmolVLA | Thor      | 0.9 GB, 1.3 GB        | 0.9 GB, 1.6 GB  | 0.9 GB, 3.3 GB   | not yet           | 2.4 GB, 3.0 GB  |
-| SmolVLA | Orin Nano | 1.5 GB, 0.6 GB        | 1.5 GB, 0.5 GB  | not measured     | not yet           | 2.5 GB, 1.4 GB  |
-| pi0.5   | Thor      | 1.3 GB, 6.9 GB        | 1.3 GB, 7.8 GB  | 1.3 GB, 12.5 GB  | 0.8 GB, 6.3 GB    | 1.7 GB, 10.4 GB |
-| GR00T   | Thor      | 1.2 GB, 5.9 GB        | 1.2 GB, 6.7 GB  | 1.2 GB, 12.9 GB  | not yet           | 2.0 GB, 14.3 GB |
-| GR00T   | Orin Nano | does not fit          | does not fit    | does not fit     | does not fit      | does not fit    |
+| policy  | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `torch_tensorrt`       | `executorch_cuda` | PyTorch           |
+| ------- | --------- | --------------------- | ---------------- | ---------------------- | ----------------- | ----------------- |
+| ACT     | Thor      | 0.5 GiB, 0.4 GiB      | 0.5 GiB, 0.5 GiB | 0.9 GiB, 1.8 GiB       | 0.2 GiB, 0.4 GiB  | 1.4 GiB, 1.4 GiB  |
+| ACT     | Orin Nano | 0.6 GiB, 0.2 GiB      | 0.7 GiB, 0.2 GiB | 1.2 GiB, 0.5 GiB       | 0.4 GiB, 0.1 GiB  | 1.2 GiB, 0.7 GiB  |
+| SmolVLA | Thor      | 0.9 GiB, 1.3 GiB      | 0.9 GiB, 1.6 GiB | 0.9 GiB, 3.3 GiB       | not supported yet | 2.4 GiB, 3.0 GiB  |
+| SmolVLA | Orin Nano | 1.5 GiB, 0.6 GiB      | 1.5 GiB, 0.5 GiB | 0.7 GiB, under 0.3 GiB | not supported yet | 2.5 GiB, 1.4 GiB  |
+| pi0.5   | Thor      | 1.3 GiB, 6.9 GiB      | 1.3 GiB, 7.8 GiB | 1.3 GiB, 12.5 GiB      | 0.8 GiB, 6.3 GiB  | 1.7 GiB, 10.4 GiB |
+| GR00T   | Thor      | 1.2 GiB, 5.9 GiB      | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | not supported yet | 2.0 GiB, 14.3 GiB |
 
-The Thor and the Orin Nano share one memory between the CPU and the GPU, so the sum of the two numbers is an upper bound. Both count only what loading and running the policy adds. Each process also needs about 0.6 GB for PyTorch and the CUDA context, measured on the Thor, which is not counted here.
+The Jetson CPU and GPU share one memory, so the two numbers can overlap.
