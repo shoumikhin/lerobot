@@ -156,7 +156,7 @@ SmolVLA, pi0.5 and GR00T start each chunk from random noise, so the PyTorch poli
 | policy  | device    | `executorch_tensorrt` | `onnx_tensorrt`  | `aoti_tensorrt`  | `executorch_cuda` | PyTorch          | PyTorch with `torch.compile` |
 | ------- | --------- | --------------------- | ---------------- | ---------------- | ----------------- | ---------------- | ---------------------------- |
 | ACT     | Thor      | 4.5 ms (4.8)          | 4.2 ms (4.5)     | 4.4 ms (5.0)     | 38.7 ms (39.0)    | 19.2 ms (20.5)   | 14.8 ms (15.2)               |
-| ACT     | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | not measured     | not measured      | 65.1 ms (66.7)   | 63.6 ms (64.5)               |
+| ACT     | Orin Nano | 27.3 ms (28.6)        | 27.5 ms (28.4)   | not measured     | 152.3 ms (153.8)  | 65.1 ms (66.7)   | 63.6 ms (64.5)               |
 | SmolVLA | Thor      | 30.1 ms (34.8)        | 31.6 ms (35.9)   | 29.9 ms (34.3)   | not yet           | 164.5 ms (168.2) | 58.1 ms, 1 run               |
 | SmolVLA | Orin Nano | 136.3 ms (137.1)      | 132.0 ms (133.2) | not measured     | not yet           | 773.5 ms (777.5) | 186.9 ms, 1 run              |
 | pi0.5   | Thor      | 108.4 ms (109.3)      | 125.2 ms (125.7) | 108.5 ms (109.7) | 122.6 ms (123.2)  | 235.9 ms (238.8) | 135.6 ms (136.3), 1 run      |
@@ -166,7 +166,7 @@ SmolVLA, pi0.5 and GR00T start each chunk from random noise, so the PyTorch poli
 
 `torch.compile` runs as `lerobot-rollout --use_torch_compile` does: ACT and SmolVLA with `--torch_compile_mode=max-autotune`, GR00T in the default mode. SmolVLA and pi0.5 also compile through their own `compile_model` option, in `max-autotune` mode by default, and pi0.5 uses only that one. pi0.5 was faster with `--policy.compile_mode=default`: 130.0 ms. The first chunk waits for the compile: about 4.3 minutes for ACT, 6.1 for SmolVLA, 7.7 for pi0.5 and 2.1 for GR00T on the Thor, and 8.6 for ACT and 12.2 for SmolVLA on the Orin Nano.
 
-`executorch_cuda` does not use TensorRT. ExecuTorch's CUDA backend runs every matrix multiplication and convolution as a Triton kernel, tuned at export time, while TensorRT and PyTorch use NVIDIA's own libraries. For ACT on the Thor, a chunk takes 38.7 ms, twice as long as with PyTorch, and the program loads in 0.3 s. pi0.5 takes 122.6 ms, between the TensorRT routes, and loads in 8.8 s. SmolVLA and GR00T do not export with it yet. SmolVLA's vision encoder writes positions through a boolean mask, which the backend's compile cannot follow. GR00T's attention uses a float mask, and the backend replaces attention with its own kernel that accepts only a boolean mask.
+`executorch_cuda` does not use TensorRT. ExecuTorch's CUDA backend runs every matrix multiplication and convolution as a Triton kernel, tuned at export time, while TensorRT and PyTorch use NVIDIA's own libraries. For ACT, a chunk takes 38.7 ms on the Thor and 152.3 ms on the Orin Nano, at least twice as long as with PyTorch, and the program loads in under half a second. On the Orin Nano, the ACT export takes about 36 minutes, because its six CPU cores compile every kernel the backend tries. pi0.5 takes 122.6 ms, between the TensorRT routes, and loads in 8.8 s. SmolVLA and GR00T do not export with it yet. SmolVLA's vision encoder writes positions through a boolean mask, which the backend's compile cannot follow. GR00T's attention uses a float mask, and the backend replaces attention with its own kernel that accepts only a boolean mask.
 
 `aoti_tensorrt` builds its TensorRT engine the same way as `executorch_tensorrt`, so a chunk takes about as long, but it loads slower and holds more GPU memory: on the Thor, loading takes 5.8 s for ACT, 13.8 s for SmolVLA, 50.3 s for pi0.5 and 52.6 s for GR00T, against 0.2 s, 4.2 s, 8.9 s and 7.0 s for `executorch_tensorrt`. It was not measured on the Orin Nano.
 
@@ -177,7 +177,7 @@ On the Orin Nano, GR00T's PyTorch policy runs out of memory while it moves its f
 | policy  | device    | `executorch_tensorrt` | `onnx_tensorrt` | `aoti_tensorrt` | `executorch_cuda` | PyTorch         |
 | ------- | --------- | --------------------- | --------------- | --------------- | ----------------- | --------------- |
 | ACT     | Thor      | 0.5 GB, 0.4 GB        | 0.5 GB, 0.5 GB  | 0.9 GB, 1.8 GB  | 0.2 GB, 0.4 GB    | 1.4 GB, 1.4 GB  |
-| ACT     | Orin Nano | 0.6 GB, 0.2 GB        | 0.7 GB, 0.2 GB  | not measured    | not measured      | 1.2 GB, 0.7 GB  |
+| ACT     | Orin Nano | 0.6 GB, 0.2 GB        | 0.7 GB, 0.2 GB  | not measured    | 0.4 GB, 0.1 GB    | 1.2 GB, 0.7 GB  |
 | SmolVLA | Thor      | 0.9 GB, 1.3 GB        | 0.9 GB, 1.6 GB  | 0.9 GB, 3.3 GB  | not yet           | 2.4 GB, 3.0 GB  |
 | SmolVLA | Orin Nano | 1.5 GB, 0.6 GB        | 1.5 GB, 0.5 GB  | not measured    | not yet           | 2.5 GB, 1.4 GB  |
 | pi0.5   | Thor      | 1.3 GB, 6.9 GB        | 1.3 GB, 7.8 GB  | 1.3 GB, 12.5 GB | 0.8 GB, 6.3 GB    | 1.7 GB, 10.4 GB |

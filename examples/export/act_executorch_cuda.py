@@ -36,7 +36,7 @@ from act_recipe import ACTExport, parse_args
 from executorch.backends.cuda.cuda_backend import CudaBackend
 from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
-from torch._inductor import utils as inductor_utils
+from torch._inductor import config as inductor_config, utils as inductor_utils
 
 
 @contextmanager
@@ -46,7 +46,11 @@ def tune_on_any_gpu() -> Iterator[None]:
     is_big_gpu = inductor_utils.is_big_gpu
     inductor_utils.is_big_gpu = lambda index_or_device=0: True
     try:
-        yield
+        # A small board's CPU needs more than the default 5 minutes to compile all of a kernel's choices.
+        with inductor_config.patch(
+            precompilation_timeout_seconds=max(inductor_config.precompilation_timeout_seconds, 60 * 60)
+        ):
+            yield
     finally:
         inductor_utils.is_big_gpu = is_big_gpu
 
