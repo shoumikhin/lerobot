@@ -78,7 +78,7 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
-The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`. GR00T's needs an ExecuTorch with its CUDA backend fixes for attention masks and view weights.
+The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`.
 
 GR00T runs only on the Thor, and pi0.5 runs on the Orin Nano only with INT8 weights (below). Their bfloat16 weights do not fit in the Orin Nano's memory.
 
