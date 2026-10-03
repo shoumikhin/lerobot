@@ -95,7 +95,7 @@ def _write_tiny_base(path, tune_backbone=True):
     return base
 
 
-def _policy_config(base, device="cpu", model_params_fp32=True):
+def _policy_config(base, device="cpu", dtype=torch.float32):
     return GrootConfig(
         base_model_path=str(base),
         input_features={
@@ -104,7 +104,7 @@ def _policy_config(base, device="cpu", model_params_fp32=True):
         },
         output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(5,))},
         device=device,
-        model_params_fp32=model_params_fp32,
+        dtype=dtype,
         chunk_size=4,
         n_action_steps=4,
         # Not the defaults, so a load that drops the model config overrides gives a different model.
@@ -113,9 +113,9 @@ def _policy_config(base, device="cpu", model_params_fp32=True):
     )
 
 
-def _save_finetune(tmp_path, device="cpu", model_params_fp32=True, tune_backbone=True):
+def _save_finetune(tmp_path, device="cpu", dtype=torch.float32, tune_backbone=True):
     base = _write_tiny_base(tmp_path, tune_backbone)
-    policy = GrootPolicy(_policy_config(base, device, model_params_fp32))
+    policy = GrootPolicy(_policy_config(base, device, dtype))
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for parameter in policy.parameters():
@@ -166,9 +166,9 @@ def _record_builds(monkeypatch):
     return built
 
 
-@pytest.mark.parametrize("model_params_fp32", [True, False])
-def test_finetune_matches_regular_load_without_base_weights(tmp_path, monkeypatch, model_params_fp32):
-    base, finetune = _save_finetune(tmp_path, model_params_fp32=model_params_fp32)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_finetune_matches_regular_load_without_base_weights(tmp_path, monkeypatch, dtype):
+    base, finetune = _save_finetune(tmp_path, dtype=dtype)
     expected = _tensors(_load_regular(finetune, monkeypatch))
 
     (base / "model.safetensors").unlink()

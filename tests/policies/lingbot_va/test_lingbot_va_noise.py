@@ -35,7 +35,7 @@ IMAGE_KEY = "observation.images.image"
 def make_config() -> LingBotVAConfig:
     return LingBotVAConfig(
         device="cpu",
-        dtype="float32",
+        dtype=torch.float32,
         input_features={IMAGE_KEY: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32))},
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         obs_cam_keys=[IMAGE_KEY],

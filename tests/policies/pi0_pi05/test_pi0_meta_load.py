@@ -46,7 +46,7 @@ RENAMES = {f"action_time_mlp_in.{name}": f"time_mlp_in.{name}" for name in ("wei
 @pytest.fixture
 def config(monkeypatch):
     use_tiny_backbone(monkeypatch, modeling_pi0)
-    config = PI0Config(image_resolution=(28, 28), device="cpu", dtype="bfloat16")
+    config = PI0Config(image_resolution=(28, 28), device="cpu", dtype=torch.bfloat16)
     config.input_features = {
         "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),

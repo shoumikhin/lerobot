@@ -19,6 +19,7 @@
 import sys
 
 import pytest
+import torch
 
 pytest.importorskip("transformers")
 
@@ -44,7 +45,7 @@ RENAMES = {f"time_mlp_in.{name}": f"action_time_mlp_in.{name}" for name in ("wei
 @pytest.fixture
 def config(monkeypatch):
     use_tiny_backbone(monkeypatch, modeling_pi05)
-    config = PI05Config(image_resolution=(28, 28), device="cpu", dtype="bfloat16")
+    config = PI05Config(image_resolution=(28, 28), device="cpu", dtype=torch.bfloat16)
     config.input_features = {
         "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
