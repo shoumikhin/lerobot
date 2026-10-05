@@ -31,7 +31,6 @@ import time
 
 import torch
 from act_executorch_cuda import lower_to_cuda
-from act_executorch_tensorrt import GPU_RESIDENT
 from groot_recipe import GrootExport, parse_args
 
 
@@ -48,7 +47,7 @@ def main() -> None:
     lowered = lower_to_cuda(program)
     del program
     export.release_policy()
-    executorch_program = lowered.to_executorch(GPU_RESIDENT)
+    executorch_program = lowered.to_executorch()
     executorch_program.save(str(pte_path))
     executorch_program.write_tensor_data_to_file(str(export.output_dir))
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
