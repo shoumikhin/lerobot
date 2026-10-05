@@ -332,7 +332,7 @@ def test_build_rollout_context_uses_resolved_device(
         return processor, PolicyProcessorPipeline(steps=[])
 
     monkeypatch.setattr(rollout_context, "_load_pretrained_policy", load_policy)
-    monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
+    monkeypatch.setattr("lerobot.policies.factory.make_pre_post_processors", make_processors)
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
 
     try:
@@ -359,7 +359,7 @@ def test_load_pretrained_policy_passes_revision(monkeypatch):
     policy_class = MagicMock()
     loaded_policy = MagicMock()
     policy_class.from_pretrained.return_value = loaded_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
+    monkeypatch.setattr("lerobot.policies.factory.get_policy_class", lambda _: policy_class)
 
     policy = rollout_context._load_pretrained_policy(policy_config)
 
@@ -383,7 +383,7 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
     policy_class = MagicMock()
     base_policy = MagicMock()
     policy_class.from_pretrained.return_value = base_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
+    monkeypatch.setattr("lerobot.policies.factory.get_policy_class", lambda _: policy_class)
 
     peft_config = SimpleNamespace(
         base_model_name_or_path="user/base-policy",
@@ -394,17 +394,14 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
     peft_model_from_pretrained = MagicMock(return_value=adapted_policy)
     require_package = MagicMock()
     monkeypatch.setattr(rollout_context, "require_package", require_package)
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftConfig",
-        SimpleNamespace(from_pretrained=peft_config_from_pretrained),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftModel",
-        SimpleNamespace(from_pretrained=peft_model_from_pretrained),
-        raising=False,
+    # peft is optional, so the test stands in for the whole module the loader imports.
+    monkeypatch.setitem(
+        sys.modules,
+        "peft",
+        SimpleNamespace(
+            PeftConfig=SimpleNamespace(from_pretrained=peft_config_from_pretrained),
+            PeftModel=SimpleNamespace(from_pretrained=peft_model_from_pretrained),
+        ),
     )
 
     policy = rollout_context._load_pretrained_policy(policy_config)

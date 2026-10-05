@@ -28,22 +28,13 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING
 
-import torch
-
 from lerobot.configs import FeatureType, PreTrainedConfig
-from lerobot.datasets import (
-    LeRobotDataset,
-    aggregate_pipeline_dataset_features,
-    create_initial_features,
-)
-from lerobot.policies import get_policy_class, make_pre_post_processors
-from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.processor import (
     PolicyProcessorPipeline,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
-    bind_relative_anchor,
     make_default_processors,
     rename_stats,
 )
@@ -51,7 +42,7 @@ from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
-from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.utils.import_utils import require_package
 
 from .configs import RolloutConfig
 from .inference import (
@@ -60,14 +51,13 @@ from .inference import (
     create_inference_engine,
 )
 from .inference.export import ExportInferenceEngine, export_dir
-from .inference.rtc import supports_rtc_inference
 from .robot_wrapper import ThreadSafeRobot
 
-if TYPE_CHECKING or _peft_available:
-    from peft import PeftConfig, PeftModel
-else:
-    PeftConfig = None
-    PeftModel = None
+# An exported policy runs without PyTorch, so torch, the PyTorch policies and the dataset stack are
+# imported where a PyTorch policy or a recording needs them.
+if TYPE_CHECKING:
+    from lerobot.datasets import LeRobotDataset
+    from lerobot.policies.pretrained import PreTrainedPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +73,8 @@ def _wrap_predict_action_chunk_with_torch_compile(
     ``torch.compile`` compiles lazily on the first invocation, so success here
     does not guarantee that backend compilation will succeed during warm-up.
     """
+    import torch
+
     if not hasattr(torch, "compile"):
         logger.warning("torch.compile is not available in this PyTorch build")
         return False
@@ -286,6 +278,8 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     pretrained_path = policy_config.pretrained_path
     if pretrained_path is None:
         raise ValueError("--policy.path is required for rollout")
+    from lerobot.policies import get_policy_class
+
     pretrained_revision = policy_config.pretrained_revision
     policy_class = get_policy_class(policy_config.type)
 
@@ -297,6 +291,7 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
         )
 
     require_package("peft", extra="peft")
+    from peft import PeftConfig, PeftModel
 
     peft_config = PeftConfig.from_pretrained(pretrained_path, revision=pretrained_revision)
     policy = policy_class.from_pretrained(
@@ -316,6 +311,8 @@ def _load_policy_for_rollout(
     cfg: RolloutConfig, policy_config: PreTrainedConfig, is_rtc: bool
 ) -> tuple[PreTrainedPolicy, bool]:
     """Load the PyTorch policy on the rollout device; return it and whether torch compile is active."""
+    from .inference.rtc import supports_rtc_inference
+
     policy = _load_pretrained_policy(policy_config)
 
     if is_rtc:
@@ -525,6 +522,8 @@ def build_rollout_context(
     # --- 5. Dataset -------------
     dataset = None
     if cfg.dataset is not None:
+        from lerobot.datasets import LeRobotDataset
+
         logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
         # Strategy-owned columns join the robot/policy features above the resume/create
         # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
@@ -581,6 +580,9 @@ def build_rollout_context(
         # The exported program already contains the policy's processors.
         inference_strategy: InferenceEngine = export_engine
     else:
+        from lerobot.policies import make_pre_post_processors
+        from lerobot.processor import bind_relative_anchor
+
         assert policy is not None
         dataset_stats = None
         if dataset is not None:
