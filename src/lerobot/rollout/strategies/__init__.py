@@ -14,6 +14,10 @@
 
 """Rollout strategies — public API re-exports."""
 
+from typing import TYPE_CHECKING
+
+from lerobot.utils.import_utils import lazy_exports
+
 from .base import BaseStrategy
 from .core import (
     RolloutStrategy,
@@ -21,11 +25,26 @@ from .core import (
     safe_push_to_hub,
     send_next_action,
 )
-from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
-from .episodic import EpisodicStrategy
 from .factory import create_strategy
-from .highlight import HighlightStrategy
-from .sentry import SentryStrategy
+
+# The recording strategies import torch and the dataset stack, so each is imported the first time it is used.
+if TYPE_CHECKING:
+    from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
+    from .episodic import EpisodicStrategy
+    from .highlight import HighlightStrategy
+    from .sentry import SentryStrategy
+else:
+    __getattr__, __dir__ = lazy_exports(
+        __name__,
+        {
+            "DAggerEvents": ".dagger.DAggerEvents",
+            "DAggerPhase": ".dagger.DAggerPhase",
+            "DAggerStrategy": ".dagger.DAggerStrategy",
+            "EpisodicStrategy": ".episodic.EpisodicStrategy",
+            "HighlightStrategy": ".highlight.HighlightStrategy",
+            "SentryStrategy": ".sentry.SentryStrategy",
+        },
+    )
 
 __all__ = [
     "BaseStrategy",

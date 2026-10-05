@@ -24,8 +24,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from lerobot.configs.dataset import DatasetRecordConfig
-from lerobot.datasets import LeRobotDataset
-from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.lerobot_types import RobotObservation
 from lerobot.teleoperators import Teleoperator
 from lerobot.utils.action_interpolator import ActionInterpolator
@@ -38,6 +36,8 @@ from lerobot.utils.visualization_utils import log_visualization_data
 from ..inference import InferenceEngine
 
 if TYPE_CHECKING:
+    from lerobot.datasets import LeRobotDataset
+
     from ..configs import RolloutConfig, RolloutStrategyConfig
     from ..context import (
         DatasetContext,
@@ -321,7 +321,7 @@ def safe_push_to_hub(dataset, tags=None, private=False) -> bool:
 def estimate_max_episode_seconds(
     dataset_features: dict,
     fps: float,
-    target_size_mb: float = DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+    target_size_mb: float | None = None,
 ) -> float:
     """Conservatively estimate how many seconds of video will exceed *target_size_mb*.
 
@@ -340,6 +340,7 @@ def estimate_max_episode_seconds(
     we only need a rough lower bound on bitrate, not a precise prediction.
 
     Falls back to 300 s (5 min) when no video features are present.
+    *target_size_mb* defaults to ``DEFAULT_VIDEO_FILE_SIZE_IN_MB``.
     """
     # 0.1 bits-per-pixel is a *low* estimate for CRF-30 streaming video of
     # robot footage (real-world is typically 0.1 – 0.3 bpp).  Under-
@@ -374,6 +375,10 @@ def estimate_max_episode_seconds(
     if bytes_per_second <= 0:
         return 300.0
 
+    if target_size_mb is None:
+        from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
+
+        target_size_mb = DEFAULT_VIDEO_FILE_SIZE_IN_MB
     return (target_size_mb * 1024 * 1024) / bytes_per_second
 
 

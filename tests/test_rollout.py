@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -463,9 +464,8 @@ def test_ring_buffer_tensor_bytes():
     from lerobot.rollout.ring_buffer import RolloutRingBuffer
 
     buf = RolloutRingBuffer(max_seconds=1.0, max_memory_mb=100.0, fps=10.0)
-    t = torch.zeros(100, dtype=torch.float32)  # 400 bytes
-    buf.append({"tensor": t})
-    assert buf.estimated_bytes >= 400
+    buf.append({"tensor": torch.zeros(100, dtype=torch.float32), "array": np.zeros(50, dtype=np.float64)})
+    assert buf.estimated_bytes == 400 + 400
 
 
 # ---------------------------------------------------------------------------

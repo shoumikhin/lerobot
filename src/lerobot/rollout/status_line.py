@@ -29,8 +29,6 @@ import threading
 import time
 from typing import IO
 
-import torch
-
 from .inference import InferenceEngine
 from .robot_wrapper import ThreadSafeRobot
 
@@ -45,6 +43,19 @@ def _process_rss_bytes() -> int:
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     except (OSError, ValueError, IndexError):
         return 0
+
+
+def _cuda_used_and_total_bytes(device: str | None) -> tuple[int, int] | None:
+    """GPU memory in use and in total, or None when PyTorch has not set up CUDA in this process."""
+    # Never imports torch: a policy that runs without PyTorch must not load it for this one field.
+    torch = sys.modules.get("torch")
+    if torch is None or device is None or not torch.cuda.is_initialized():
+        return None
+    torch_device = torch.device(device)
+    if torch_device.type != "cuda":
+        return None
+    free, total = torch.cuda.mem_get_info(torch_device)
+    return total - free, total
 
 
 class StatusLine:
@@ -67,7 +78,7 @@ class StatusLine:
         self._robot = robot
         self._engine = engine
         self._tick_hz = tick_hz
-        self._device = torch.device(device) if device is not None else None
+        self._device = device
         self._stream = stream or sys.stderr
         self._enabled = self._stream.isatty()
         # Reentrant: a signal handler that logs, such as Ctrl-C's, can interrupt a write on the same thread.
@@ -128,7 +139,8 @@ class StatusLine:
         rss = _process_rss_bytes()
         if rss:
             parts.append(f"process {rss / 2**30:4.2f} GiB")
-        if self._device is not None and self._device.type == "cuda" and torch.cuda.is_initialized():
-            free, total = torch.cuda.mem_get_info(self._device)
-            parts.append(f"GPU {(total - free) / 2**30:4.2f}/{total / 2**30:4.1f} GiB")
+        gpu = _cuda_used_and_total_bytes(self._device)
+        if gpu is not None:
+            used, total = gpu
+            parts.append(f"GPU {used / 2**30:4.2f}/{total / 2**30:4.1f} GiB")
         return " · ".join(parts)

@@ -37,6 +37,7 @@ LAZY_MODULES = [
     "lerobot.utils",
     pytest.param("lerobot.rollout", marks=NEEDS_DATASETS),
     pytest.param("lerobot.rollout.inference", marks=NEEDS_DATASETS),
+    pytest.param("lerobot.rollout.strategies", marks=NEEDS_DATASETS),
 ]
 
 

@@ -82,6 +82,8 @@ if attempts:
                 "lerobot.scripts.lerobot_rollout",
                 "lerobot.datasets",
                 "lerobot.datasets.pipeline_features",
+                "lerobot.rollout.ring_buffer",
+                "lerobot.rollout.status_line",
             ]
         ),
     ],
