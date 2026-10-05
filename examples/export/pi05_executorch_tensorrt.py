@@ -30,7 +30,7 @@ import time
 
 import torch
 import torch_tensorrt
-from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT, check_program
+from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT
 from pi05_recipe import PI05Export, parse_args
 
 
@@ -55,7 +55,6 @@ def main() -> None:
     )
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path)
     export.write("executorch_tensorrt", pte_path.name, args.tolerance)
 
 

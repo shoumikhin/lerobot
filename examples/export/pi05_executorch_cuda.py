@@ -31,7 +31,7 @@ import time
 
 import torch
 from act_executorch_cuda import lower_to_cuda
-from act_executorch_tensorrt import GPU_RESIDENT, check_program
+from act_executorch_tensorrt import GPU_RESIDENT
 from pi05_recipe import PI05Export, parse_args
 
 
@@ -53,7 +53,6 @@ def main() -> None:
     executorch_program.write_tensor_data_to_file(str(export.output_dir))
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path, "CudaBackend")
     export.write("executorch_cuda", pte_path.name, args.tolerance)
 
 

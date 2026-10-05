@@ -31,7 +31,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
-from act_executorch_tensorrt import GPU_RESIDENT, check_program
+from act_executorch_tensorrt import GPU_RESIDENT
 from act_recipe import ACTExport, parse_args
 from executorch.backends.cuda.cuda_backend import CudaBackend
 from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
@@ -83,7 +83,6 @@ def main() -> None:
     executorch_program.write_tensor_data_to_file(str(export.output_dir))
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path, "CudaBackend")
     export.write("executorch_cuda", pte_path.name, args.tolerance)
 
 

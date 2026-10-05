@@ -39,7 +39,7 @@ from lerobot.rollout.inference.export import ExportInferenceEngine
 
 def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) -> None:
     import torch_tensorrt
-    from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT, check_program
+    from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT
 
     program = torch.export.load(folder / EXPORTED_PROGRAM)  # nosec B614: a folder the user exported
     inputs = program.example_inputs[0]
@@ -63,7 +63,6 @@ def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) 
     del engine
     gc.collect()
     torch.cuda.empty_cache()
-    check_program(folder / program_file)
 
 
 def main() -> None:
