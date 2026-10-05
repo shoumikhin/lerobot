@@ -23,10 +23,11 @@ import pytest
 
 from lerobot.utils.import_utils import _datasets_available
 
-NEEDS_DATASETS = pytest.mark.skipif(not _datasets_available, reason="lerobot.rollout needs the dataset extra")
+NEEDS_DATASETS = pytest.mark.skipif(not _datasets_available, reason="needs the dataset extra")
 
 LAZY_MODULES = [
     "lerobot.configs",
+    pytest.param("lerobot.datasets", marks=NEEDS_DATASETS),
     "lerobot.envs",
     "lerobot.lerobot_types",
     "lerobot.policies",

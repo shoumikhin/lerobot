@@ -74,9 +74,15 @@ if attempts:
         "lerobot.policies",
         "lerobot.processor",
         "lerobot.utils.action_interpolator",
-        pytest.param(
-            "lerobot.scripts.lerobot_rollout",
-            marks=pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
+        *(
+            pytest.param(
+                module, marks=pytest.mark.skipif(not _datasets_available, reason="datasets not installed")
+            )
+            for module in [
+                "lerobot.scripts.lerobot_rollout",
+                "lerobot.datasets",
+                "lerobot.datasets.pipeline_features",
+            ]
         ),
     ],
 )
