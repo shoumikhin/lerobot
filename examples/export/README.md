@@ -80,7 +80,7 @@ python examples/export/pi05_executorch_tensorrt.py \
 
 The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`.
 
-GR00T runs only on the Thor, and pi0.5 runs on the Orin Nano only with INT8 weights (below). Their bfloat16 weights do not fit in the Orin Nano's memory.
+GR00T and pi0.5 run only on the Thor. Their bfloat16 weights do not fit in the Orin Nano's memory.
 
 ### Export once, build on each device
 
@@ -97,8 +97,6 @@ python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 Lower `--workspace_gib` and `--optimization_level` make the build use less memory.
 
 With `--step_engine`, `pi05_onnx_tensorrt.py` exports pi0.5 as three smaller engines instead of one, and the rollout runs the denoising step engine once per step. On the Thor it runs about as fast as one engine.
-
-With `--int8_weights`, `build_engine.py` rewrites the ONNX files of an `onnx_tensorrt` folder to store their large weights in INT8, and the layers still compute in bfloat16. This halves the memory of the weights, so pi0.5 exported with `--step_engine` fits on the Orin Nano. It runs slower and drifts a little more from the PyTorch policy: on the Thor, 170.3 ms against 117.0 ms in bfloat16.
 
 ## Run
 
@@ -131,7 +129,6 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | ACT                 | 0.01 (0.02)           | 0.01 (0.02)       | 0.01 (0.02)     | 0.01 (0.02)       | no noise             |
 | SmolVLA             | 0.17 (0.56)           | not supported yet | 0.15 (0.52)     | 0.17 (0.56)       | 3.2 (11.9)           |
 | pi0.5               | 0.31 (1.17)           | 0.26 (0.95)       | 0.33 (1.37)     | 0.31 (1.23)       | 11.4 (44.8)          |
-| pi0.5, INT8 weights | not supported yet     | not supported yet | 0.51 (2.00)     | not supported yet | 11.4 (44.8)          |
 | GR00T               | 0.28 (0.91)           | 0.49 (1.39)       | 0.28 (0.89)     | 0.28 (0.91)       | 7.8 (22.6)           |
 
 ### Latency per action chunk, median (99th percentile)
@@ -144,8 +141,6 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | SmolVLA             | Orin Nano | 136.3 ms (137.1)      | not supported yet | 132.0 ms (133.2) | 137.9 ms (140.8)  | 773.5 ms (777.5)  | 186.9 ms          |
 | pi0.5               | Thor      | 108.4 ms (109.3)      | 122.6 ms (123.2)  | 125.2 ms (125.7) | 108.5 ms (109.7)  | 235.9 ms (238.8)  | 135.6 ms (136.3)  |
 | pi0.5               | Orin Nano | does not fit          | does not fit      | does not fit     | does not fit      | does not fit      | does not fit      |
-| pi0.5, INT8 weights | Thor      | not supported yet     | not supported yet | 170.3 ms         | not supported yet | not supported yet | not supported yet |
-| pi0.5, INT8 weights | Orin Nano | not supported yet     | not supported yet | 861.5 ms (864.8) | not supported yet | not supported yet | not supported yet |
 | GR00T               | Thor      | 70.1 ms (74.2)        | 78.1 ms (82.3)    | 78.5 ms (80.6)   | 69.5 ms (72.7)    | 216.2 ms (224.7)  | 212.0 ms (219.2)  |
 
 ### Memory added: process, GPU
@@ -158,7 +153,6 @@ Typical difference from the PyTorch policy, in robot action units, with the 95th
 | SmolVLA             | Orin Nano | 1.5 GiB, 0.6 GiB      | not supported yet | 1.5 GiB, 0.5 GiB | 0.7 GiB, under 0.3 GiB | 2.5 GiB, 1.4 GiB  |
 | pi0.5               | Thor      | 1.3 GiB, 6.9 GiB      | 0.8 GiB, 6.3 GiB  | 1.3 GiB, 7.8 GiB | 1.3 GiB, 12.5 GiB      | 1.7 GiB, 10.4 GiB |
 | pi0.5               | Orin Nano | does not fit          | does not fit      | does not fit     | does not fit           | does not fit      |
-| pi0.5, INT8 weights | Orin Nano | not supported yet     | not supported yet | 3.8 GiB, 2.8 GiB | not supported yet      | not supported yet |
 | GR00T               | Thor      | 1.2 GiB, 5.9 GiB      | 0.8 GiB, 5.7 GiB  | 1.2 GiB, 6.7 GiB | 1.2 GiB, 12.9 GiB      | 2.0 GiB, 14.3 GiB |
 
 The Jetson CPU and GPU share one memory, so the two numbers can overlap.
