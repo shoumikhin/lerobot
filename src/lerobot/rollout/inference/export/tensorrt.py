@@ -14,6 +14,7 @@
 
 """Run an exported policy's TensorRT engine, built from its ONNX file."""
 
+import functools
 from pathlib import Path
 
 import torch
@@ -23,6 +24,44 @@ from lerobot.policies.common.flow_matching import euler_integrate
 
 # TensorRT asks for the whole engine in one read; answering in pieces keeps the host copy to one piece.
 READ_CHUNK_BYTES = 64 << 20
+
+
+@functools.cache
+def runtime():
+    """The TensorRT runtime to load engines with, taking GPU memory from PyTorch's allocator.
+
+    TensorRT's default allocator uses a stream-ordered memory pool, which on a Jetson's shared memory
+    cannot place a large engine that a plain allocation still can.
+    """
+    import tensorrt as trt
+
+    class TorchAllocator(trt.IGpuAllocator):
+        # PyTorch's allocator does not track TensorRT's streams, so wait for the device before a block
+        # changes hands. TensorRT allocates only while an engine loads, so this is off the control loop.
+        def __init__(self):
+            trt.IGpuAllocator.__init__(self)
+
+        def allocate(self, size: int, alignment: int, flags: int) -> int:
+            torch.cuda.synchronize()
+            try:
+                return torch.cuda.caching_allocator_alloc(size)
+            except torch.OutOfMemoryError:
+                return 0
+
+        def allocate_async(self, size: int, alignment: int, flags: int, stream: int) -> int:
+            return self.allocate(size, alignment, flags)
+
+        def deallocate(self, memory: int) -> bool:
+            torch.cuda.synchronize()
+            torch.cuda.caching_allocator_delete(memory)
+            return True
+
+        def deallocate_async(self, memory: int, stream: int) -> bool:
+            return self.deallocate(memory)
+
+    result = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    result.gpu_allocator = TorchAllocator()
+    return result
 
 
 def load_engine(path: Path):
@@ -43,7 +82,7 @@ def load_engine(path: Path):
             return True
 
     with path.open("rb") as file:
-        return trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(FileReader(file))
+        return runtime().deserialize_cuda_engine(FileReader(file))
 
 
 def torch_dtype(dtype) -> torch.dtype:

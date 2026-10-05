@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import io
 import logging
 import sys
@@ -797,16 +798,19 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
 
     fake_trt = types.SimpleNamespace(
         IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
+        IGpuAllocator=type("IGpuAllocator", (), {"__init__": lambda self: None}),
         SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
         Runtime=Runtime,
         Logger=MagicMock(),
     )
     monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
+    monkeypatch.setattr(export_tensorrt, "runtime", functools.cache(export_tensorrt.runtime.__wrapped__))
     monkeypatch.setattr(export_tensorrt, "READ_CHUNK_BYTES", 4)
     (tmp_path / "model.engine").write_bytes(b"0123456789")
 
     assert export_tensorrt.load_engine(tmp_path / "model.engine") == b"0123456789"
     assert [len(piece) for piece in pieces] == [4, 4, 2]
+    assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_trt.IGpuAllocator)
 
 
 def test_tensorrt_engine_binds_its_int8_weights_once(tmp_path, monkeypatch):
