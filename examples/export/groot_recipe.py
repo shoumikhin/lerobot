@@ -26,9 +26,9 @@ one fixed image grid, and the language model with the rope positions as an input
 
 For one task and one camera size, everything those loops compute is the same on every frame: the token
 ids, the rope positions, and the rows the image features go to. So they are computed here, once, and held
-as constants. The program takes the patchified images, the packed state and the noise. The checkpoint's
-preprocessor, saved beside it, makes the first two from the robot's frame at rollout, and the folder
-records the task it was exported for.
+as constants. The program takes raw uint8 HWC cameras, float32 state and unbatched noise. Image resize,
+crop, normalization and patch packing, state normalization and action unnormalization run inside the
+program. The folder records the task it was exported for; no tokenizer runs at inference.
 """
 
 import argparse
@@ -40,23 +40,24 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from act_recipe import TEST_CASE, gpu_processors, make_output_dir
+from act_recipe import TEST_CASE, gpu_processors, make_output_dir, to_policy_input
 from safetensors.numpy import save_file
 from smolvla_recipe import random_robot_frame
 from torch import Tensor, nn
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.v2 import functional as tvF  # noqa: N812
 from transformers.feature_extraction_utils import BatchFeature
 
 from lerobot.datasets import LeRobotDatasetMetadata
 from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear
 from lerobot.policies.groot.modeling_groot import GrootPolicy
+from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep, GrootN17VLMEncodeStep
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 NOISE = "noise"
-INPUTS = ["pixel_values", "state", NOISE]
-STEPS = "policy_steps.json"
 
 
 # From NVIDIA's export_onnx_n1d7.py: rotary with real numbers, where Qwen3-VL's own uses complex ones.
@@ -70,28 +71,20 @@ def _apply_rotary_real(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return (x * cos + rotated * sin).to(orig_dtype)
 
 
-# From NVIDIA's export_onnx_n1d7.py: each image attends within its own fixed chunk of patches, where
-# Qwen3-VL's own attention splits the sequence at runtime by cu_seqlens.
-def _make_vision_attention_forward(attn_module: nn.Module, chunk_sizes: list[int]):
-    def forward(hidden_states, cu_seqlens=None, rotary_pos_emb=None, position_embeddings=None, **kwargs):
-        seq_length = hidden_states.shape[0]
-        qkv = attn_module.qkv(hidden_states).reshape(seq_length, 3, attn_module.num_heads, -1)
-        q, k, v = qkv.permute(1, 0, 2, 3).unbind(0)
-        cos, sin = position_embeddings
-        q = _apply_rotary_real(q, cos, sin)
-        k = _apply_rotary_real(k, cos, sin)
-        outputs = []
-        for q_c, k_c, v_c in zip(
-            q.split(chunk_sizes), k.split(chunk_sizes), v.split(chunk_sizes), strict=True
-        ):
-            q_c, k_c, v_c = q_c.transpose(0, 1), k_c.transpose(0, 1), v_c.transpose(0, 1)
-            w = torch.matmul(q_c, k_c.transpose(-2, -1)) * attn_module.scaling
-            w = F.softmax(w.to(torch.float32), dim=-1).to(v_c.dtype)
-            outputs.append(torch.matmul(w, v_c).transpose(0, 1))
-        attn_output = torch.cat(outputs, dim=0).reshape(seq_length, -1).contiguous()
-        return attn_module.proj(attn_output)
-
-    return forward
+# Fix the image sequence lengths at export time instead of reading cu_seqlens inside the graph.
+def vision_attention(attn: nn.Module, hidden_states: Tensor, position_embeddings, chunk_sizes: list[int]):
+    seq_length = hidden_states.shape[0]
+    qkv = attn.qkv(hidden_states).reshape(seq_length, 3, attn.num_heads, -1)
+    q, k, v = qkv.permute(1, 0, 2, 3).unbind(0)
+    cos, sin = position_embeddings
+    q = _apply_rotary_real(q, cos, sin)
+    k = _apply_rotary_real(k, cos, sin)
+    outputs = []
+    for q_c, k_c, v_c in zip(q.split(chunk_sizes), k.split(chunk_sizes), v.split(chunk_sizes), strict=True):
+        q_c, k_c, v_c = (x.transpose(0, 1)[None] for x in (q_c, k_c, v_c))
+        output = F.scaled_dot_product_attention(q_c, k_c, v_c, scale=attn.scaling)
+        outputs.append(output[0].transpose(0, 1))
+    return attn.proj(torch.cat(outputs, dim=0).reshape(seq_length, -1).contiguous())
 
 
 class Qwen3VisionForExport(nn.Module):
@@ -99,9 +92,7 @@ class Qwen3VisionForExport(nn.Module):
 
     def __init__(self, vision_model: nn.Module, grid_thw: Tensor):
         super().__init__()
-        chunk_sizes = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
-        for block in vision_model.blocks:
-            block.attn.forward = _make_vision_attention_forward(block.attn, chunk_sizes)
+        self.chunk_sizes = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
         self.patch_embed = vision_model.patch_embed
         self.blocks = vision_model.blocks
         self.merger = vision_model.merger
@@ -120,7 +111,10 @@ class Qwen3VisionForExport(nn.Module):
         position_embeddings = (self._rot_cos, self._rot_sin)
         deepstack_features = []
         for layer_num, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, cu_seqlens=None, position_embeddings=position_embeddings)
+            hidden_states = hidden_states + vision_attention(
+                block.attn, block.norm1(hidden_states), position_embeddings, self.chunk_sizes
+            )
+            hidden_states = hidden_states + block.mlp(block.norm2(hidden_states))
             if layer_num in self.deepstack_visual_indexes:
                 index = self.deepstack_visual_indexes.index(layer_num)
                 deepstack_features.append(self.deepstack_merger_list[index](hidden_states))
@@ -176,16 +170,119 @@ class LLMForExport(nn.Module):
         return hidden_states
 
 
-class GrootChunk(nn.Module):
-    """One action chunk: the patchified images, the packed state and the noise in, robot actions out."""
+class GrootObservation(nn.Module):
+    """The saved processor's tensor operations for one raw robot frame."""
 
-    def __init__(self, policy: GrootPolicy, batch: dict[str, Tensor], postprocessor: PolicyProcessorPipeline):
+    def __init__(self, preprocessor: PolicyProcessorPipeline, frame: dict[str, np.ndarray], batch: dict):
+        super().__init__()
+        pack_index = next(
+            i for i, s in enumerate(preprocessor.steps) if isinstance(s, GrootN17PackInputsStep)
+        )
+        pack = preprocessor.steps[pack_index]
+        encode = next(s for s in preprocessor.steps if isinstance(s, GrootN17VLMEncodeStep))
+        ip = encode.proc.image_processor
+        if encode.use_albumentations or pack.video_horizon not in (None, 1):
+            raise ValueError("Raw-frame export requires tensor image processing and one observation frame.")
+        self.frame_names = list(frame)
+        self.frame_processor = PolicyProcessorPipeline(steps=preprocessor.steps[:pack_index])
+        sample = self.frame_processor({n: to_policy_input(n, torch.from_numpy(x)) for n, x in frame.items()})
+        self.cameras = (
+            sorted(n for n in sample if n.startswith(OBS_IMAGES))
+            if not pack.video_modality_keys
+            else [f"{OBS_IMAGES}.{n}" for n in pack.video_modality_keys]
+        )
+        if not self.cameras or not set(self.cameras) <= sample.keys():
+            raise ValueError("The frame must provide the checkpoint's camera keys.")
+        self.target_size = encode.image_target_size
+        self.resize_edge = encode.shortest_image_edge or (self.target_size[0] if self.target_size else None)
+        self.crop_fraction = encode.crop_fraction
+        if self.crop_fraction is None and encode.image_crop_size and self.target_size:
+            self.crop_fraction = encode.image_crop_size[0] / self.target_size[0]
+        self.letterbox = encode.letter_box_transform
+        self.patch_size, self.temporal_patch_size, self.merge_size = (
+            ip.patch_size,
+            ip.temporal_patch_size,
+            ip.merge_size,
+        )
+        grids = batch["image_grid_thw"].tolist()
+        if len(grids) != len(self.cameras) or any(g != grids[0] for g in grids) or grids[0][0] != 1:
+            raise ValueError("Raw-frame export requires equal, single-frame camera grids.")
+        _, self.grid_h, self.grid_w = grids[0]
+        self.image_size = [self.grid_h * ip.patch_size, self.grid_w * ip.patch_size]
+        self.rescale, self.normalize = ip.do_rescale, ip.do_normalize
+        self.rescale_factor = ip.rescale_factor
+        scale = 1 / ip.rescale_factor if self.rescale else 1
+        self.register_buffer("image_mean", (torch.tensor(ip.image_mean) * scale)[None, :, None, None])
+        self.register_buffer("image_std", (torch.tensor(ip.image_std) * scale)[None, :, None, None])
+        dim = frame[OBS_STATE].size
+        if dim > pack.max_state_dim:
+            raise ValueError("The frame's state exceeds the checkpoint's state width.")
+        self.max_state_dim = pack.max_state_dim
+        self.normalize_state = pack.normalize_min_max and pack.stats is not None and OBS_STATE in pack.stats
+        self.clip_state = pack.clip_outliers
+        if self.normalize_state:
+            stats = pack.stats[OBS_STATE]
+            lo = torch.as_tensor(stats.get("min", torch.zeros(dim)), dtype=torch.float32).flatten()[:dim]
+            hi = torch.as_tensor(stats.get("max", torch.ones(dim)), dtype=torch.float32).flatten()[:dim]
+            lo, hi = F.pad(lo, (0, dim - lo.numel())), F.pad(hi, (0, dim - hi.numel()), value=1)
+            span = hi - lo
+            self.register_buffer("state_min", lo)
+            self.register_buffer("state_nonzero", span != 0)
+            self.register_buffer("state_span", torch.where(span != 0, span, torch.ones_like(span)))
+
+    def forward(self, *frame: Tensor) -> tuple[Tensor, Tensor]:
+        obs = self.frame_processor(
+            {n: to_policy_input(n, x) for n, x in zip(self.frame_names, frame, strict=True)}
+        )
+        images = torch.cat([obs[n] for n in self.cameras])
+        images = (images.clamp(0, 1) * 255).to(torch.uint8)
+        if self.target_size:
+            if self.letterbox:
+                h, w = images.shape[-2:]
+                side = max(h, w)
+                images = tvF.pad(
+                    images, [(side - w) // 2, (side - h) // 2, (side - w + 1) // 2, (side - h + 1) // 2]
+                )
+            images = tvF.resize(images, [self.resize_edge] * 2, InterpolationMode.BICUBIC, antialias=True)
+            if self.crop_fraction is not None and 0 < self.crop_fraction < 1:
+                crop = max(1, round(self.resize_edge * self.crop_fraction))
+                offset = (self.resize_edge - crop) // 2
+                images = images[..., offset : offset + crop, offset : offset + crop]
+            images = tvF.resize(images, list(self.target_size), InterpolationMode.BICUBIC, antialias=True)
+        images = tvF.resize(images, self.image_size, InterpolationMode.BICUBIC, antialias=True).float()
+        if self.normalize:
+            images = (images - self.image_mean) / self.image_std
+        elif self.rescale:
+            images = images * self.rescale_factor
+        p, t, m = self.patch_size, self.temporal_patch_size, self.merge_size
+        patches = images[:, None].repeat(1, t, 1, 1, 1)
+        patches = patches.reshape(len(self.cameras), 1, t, 3, self.grid_h // m, m, p, self.grid_w // m, m, p)
+        pixels = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9).reshape(-1, 3 * t * p * p)
+        state = obs[OBS_STATE]
+        if self.normalize_state:
+            state = torch.where(self.state_nonzero, 2 * (state - self.state_min) / self.state_span - 1, 0)
+            if self.clip_state:
+                state = state.clamp(-1, 1)
+        return pixels, F.pad(state[:, None], (0, self.max_state_dim - state.shape[-1]))
+
+
+class GrootChunk(nn.Module):
+    """One action chunk: the raw frame and noise in, unbatched robot actions out."""
+
+    def __init__(
+        self,
+        policy: GrootPolicy,
+        batch: dict[str, Tensor],
+        postprocessor: PolicyProcessorPipeline,
+        preprocessor: GrootObservation,
+    ):
         super().__init__()
         model = policy._groot_model
         backbone = model.backbone
         qwen = backbone.model.model
         self.action_head = model.action_head
         self.postprocessor = postprocessor
+        self.preprocessor = preprocessor
         self.use_bf16 = policy.config.use_bf16
         self.horizon = policy._action_queue_steps
         self.action_dim = policy.config.output_features[ACTION].shape[0]
@@ -193,9 +290,14 @@ class GrootChunk(nn.Module):
         # The constants Qwen3Backbone.forward would compute from these inputs on every frame.
         names = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids")
         model_input = {name: batch[name] for name in names if name in batch}
-        backbone._ensure_mm_token_type_ids(model_input)
-        backbone._ensure_legacy_qwen3_position_ids(model_input)
         ids, attention_mask = model_input["input_ids"], model_input["attention_mask"]
+        mm_types = model_input.get("mm_token_type_ids", (ids == qwen.config.image_token_id).int())
+        position_ids, _ = qwen.get_rope_index(
+            input_ids=ids,
+            mm_token_type_ids=mm_types,
+            image_grid_thw=model_input["image_grid_thw"],
+            attention_mask=attention_mask,
+        )
         embodiment_id = batch["embodiment_id"]
         with torch.no_grad():
             text_embeds = backbone.language_model.get_input_embeddings()(ids)
@@ -209,8 +311,7 @@ class GrootChunk(nn.Module):
             "text_embeds": text_embeds,
             "image_token_mask": image_token_mask,
             "attention_mask": attention_mask.long(),
-            # Qwen3Backbone adds a text row in front of the three multimodal rows; NVIDIA's wrapper takes the three.
-            "position_ids": model_input["position_ids"][1:],
+            "position_ids": position_ids,
             "visual_pos_masks": image_token_mask[..., 0],
             "image_mask": ids == backbone.model.config.image_token_id,
             "backbone_attention_mask": attention_mask == 1,
@@ -220,16 +321,10 @@ class GrootChunk(nn.Module):
             self.register_buffer(name, value, persistent=False)
         self.vision = Qwen3VisionForExport(qwen.visual, model_input["image_grid_thw"])
         self.llm = LLMForExport(backbone.language_model)
-        if self.use_bf16:
-            # Autocast casts these weights to bfloat16 on every call, so holding them in bfloat16 gives the
-            # same results without a float32 copy in the program. Biases added outside a matmul stay float32.
-            for layer in (*self.vision.modules(), *self.llm.modules(), *self.action_head.modules()):
-                if isinstance(layer, (nn.Linear, nn.Conv3d)):
-                    layer.to(torch.bfloat16)
-                elif isinstance(layer, CategorySpecificLinear):
-                    layer.W.data = layer.W.data.to(torch.bfloat16)
 
-    def forward(self, pixel_values: Tensor, state: Tensor, noise: Tensor) -> Tensor:
+    def forward(self, *inputs: Tensor) -> Tensor:
+        *frame, noise = inputs
+        pixel_values, state = self.preprocessor(*frame)
         # The same autocast GrootPolicy.predict_action_chunk runs the model under.
         with torch.autocast("cuda", torch.bfloat16, enabled=self.use_bf16):
             image_embeds, deepstack = self.vision(pixel_values)
@@ -247,8 +342,8 @@ class GrootChunk(nn.Module):
                 }
             )
             action_input = BatchFeature(data={"state": state, "embodiment_id": self.embodiment_id})
-            actions = self.action_head.get_action(backbone_output, action_input, noise=noise)
-        return self.postprocessor(actions["action_pred"][:, : self.horizon, : self.action_dim])
+            actions = self.action_head.get_action(backbone_output, action_input, noise=noise[None])
+        return self.postprocessor(actions["action_pred"][:, : self.horizon, : self.action_dim])[0]
 
 
 class GrootExport:
@@ -266,9 +361,7 @@ class GrootExport:
         self.policy_path = policy_path
         self.policy = GrootPolicy.from_pretrained(policy_path).to("cuda").eval()
         self.config = self.policy.config
-        # The rollout runs the checkpoint's whole preprocessor before the program: the program takes its outputs.
         preprocessor, postprocessor = gpu_processors(self.policy.config, policy_path)
-        self.steps = preprocessor
 
         metadata = LeRobotDatasetMetadata(dataset, root=dataset_root)
         self.task = str(metadata.tasks.index[0])
@@ -281,13 +374,13 @@ class GrootExport:
         batch = preprocessor(self.observation())
         model = self.policy._groot_model
         self.noise = torch.randn(
-            1, model.action_head.action_horizon, model.action_head.action_dim, device="cuda"
+            model.action_head.action_horizon, model.action_head.action_dim, device="cuda"
         )
-        # Before the module exists: it swaps the vision attention for NVIDIA's.
         self.expected_actions = self.rollout_actions(preprocessor, postprocessor)
-        self.module = GrootChunk(self.policy, batch, postprocessor).eval()
-        self.inputs = (batch["pixel_values"], batch["state"], self.noise)
-        self.input_names = INPUTS
+        observation = GrootObservation(preprocessor, self.frame, batch).cuda()
+        self.module = GrootChunk(self.policy, batch, postprocessor, observation).eval()
+        self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
+        self.input_names = [*self.frame, NOISE]
 
     def release_policy(self) -> None:
         """Free the policy for the TensorRT step: the test case's actions are already computed."""
@@ -304,23 +397,23 @@ class GrootExport:
         """The chunk the PyTorch policy plays for the test frame, task and noise, as lerobot-rollout runs it."""
         self.policy.reset()
         with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(preprocessor(self.observation()), noise=self.noise)
+            actions = self.policy.predict_action_chunk(
+                preprocessor(self.observation()), noise=self.noise[None]
+            )
             actions = postprocessor(actions[:, : self.policy._action_queue_steps])
         return actions[0].float().cpu().numpy()
 
     def write(self, backend: str, program_file: str, tolerance: float) -> None:
-        """Save the test case, the policy config, the preprocessor steps and `export.json` beside the program."""
+        """Save the raw test case, policy config and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
-        self.steps.save_pretrained(self.output_dir, config_filename=STEPS)
         info = {
             "backend": backend,
             "file": program_file,
-            "inputs": INPUTS,
-            "text_steps": STEPS,
+            "inputs": self.input_names,
             "task": self.task,
             # The task's token ids and rope positions are constants inside the program.
             "task_fixed": True,
@@ -369,7 +462,7 @@ if __name__ == "__main__":
     args = parse_args("Check the GR00T recipe module in eager against the PyTorch rollout chunk.", "eager")
     export = GrootExport(args.policy_path, args.dataset, args.dataset_root, args.output_dir, args.job_name)
     with torch.inference_mode():
-        actual = export.module(*export.inputs)[0].float().cpu().numpy()
+        actual = export.module(*export.inputs).float().cpu().numpy()
     print("inputs", [(tuple(t.shape), str(t.dtype)) for t in export.inputs])
     print(
         f"EAGER_VS_ROLLOUT max_abs={np.abs(actual - export.expected_actions).max():.4g} "
