@@ -26,10 +26,8 @@ model that built it:
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
 """
 
-import time
-
 import torch
-from act_onnx_tensorrt import build_engine
+from build_engine import build_engine
 from groot_recipe import GrootExport, parse_args
 
 from lerobot.utils.constants import ACTION
@@ -37,11 +35,10 @@ from lerobot.utils.constants import ACTION
 
 def main() -> None:
     args = parse_args(__doc__, "onnx_tensorrt")
-    export = GrootExport(args.policy_path, args.dataset, args.dataset_root, args.output_dir, args.job_name)
+    export = GrootExport(args)
     onnx_path = export.output_dir / "model.onnx"
     engine_path = export.output_dir / "model.engine"
 
-    start = time.perf_counter()
     with torch.no_grad():
         torch.onnx.export(
             export.module,
@@ -51,15 +48,10 @@ def main() -> None:
             input_names=export.input_names,
             output_names=[ACTION],
         )
-    print(f"Exported {onnx_path} in {time.perf_counter() - start:.0f} s")
     export.release_policy()
-
     if not args.export_only:
-        start = time.perf_counter()
         build_engine(onnx_path, engine_path)
-        print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
-
-    export.write("onnx_tensorrt", engine_path.name, args.tolerance)
+    export.write(engine_path)
 
 
 if __name__ == "__main__":

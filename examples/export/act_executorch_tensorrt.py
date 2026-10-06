@@ -25,35 +25,26 @@ model that built it:
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
-import time
-
 import torch
 import torch_tensorrt
-from act_recipe import ACTExport, parse_args
-
-EXPORTED_PROGRAM = "model.pt2"
+from act_recipe import ACTExport, parse_args, save_for_build_engine
 
 
 def main() -> None:
     args = parse_args(__doc__, "executorch_tensorrt")
-    export = ACTExport(args.policy_path, args.output_dir, args.job_name)
+    export = ACTExport(args)
     pte_path = export.output_dir / "model.pte"
 
-    start = time.perf_counter()
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
     if args.export_only:
-        torch.export.save(program, export.output_dir / EXPORTED_PROGRAM)
-        export.release_policy()
-        export.write("executorch_tensorrt", pte_path.name, args.tolerance)
+        save_for_build_engine(export, program, pte_path)
         return
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
     torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
-    print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
-
-    export.write("executorch_tensorrt", pte_path.name, args.tolerance)
+    export.write(pte_path)
 
 
 if __name__ == "__main__":

@@ -38,12 +38,20 @@ about 1 GiB, and ties the folder to the task, so `export.json` marks it `task_fi
 import argparse
 import gc
 import json
+import time
 from copy import copy
 from pathlib import Path
 
 import numpy as np
 import torch
-from act_recipe import TEST_CASE, gpu_processors, make_output_dir, random_robot_frame, to_policy_input
+from act_recipe import (
+    TEST_CASE,
+    add_backend_args,
+    gpu_processors,
+    make_output_dir,
+    random_robot_frame,
+    to_policy_input,
+)
 from safetensors.numpy import save_file
 from smolvla_recipe import NOISE
 from torch import Tensor, nn
@@ -232,18 +240,12 @@ class CompactEmbedding(nn.Module):
 class PI05Export:
     """Loads a trained pi0.5 checkpoint, and writes the exported folder around a compiled program."""
 
-    def __init__(
-        self,
-        policy_path: str,
-        task: str,
-        output_dir: Path | None,
-        job_name: str,
-        cameras: list[str] | None = None,
-    ):
-        self.output_dir = make_output_dir(output_dir, job_name)
-        self.policy_path = policy_path
-        self.task = task
-        self.policy = PI05Policy.from_pretrained(policy_path).to("cuda").eval()
+    def __init__(self, args: argparse.Namespace):
+        self.output_dir = make_output_dir(args.output_dir, args.job_name)
+        self.policy_path = args.policy_path
+        self.backend, self.tolerance = args.backend, args.tolerance
+        self.task = args.task
+        self.policy = PI05Policy.from_pretrained(self.policy_path).to("cuda").eval()
         self.config = self.policy.config
         preprocessor, postprocessor = self.processors()
         tokenizer = next(s for s in preprocessor.steps if isinstance(s, TokenizerProcessorStep))
@@ -261,7 +263,7 @@ class PI05Export:
         # pi0.5 fills in its empty cameras itself, so the robot does not send them.
         empty_cameras = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(config.empty_cameras)}
         available = set(config.image_features) - empty_cameras
-        cameras = available if cameras is None else set(cameras)
+        cameras = available if args.cameras is None else set(args.cameras)
         if not cameras or not cameras <= available:
             raise ValueError(f"Choose cameras from {sorted(available)}.")
         self.frame = {
@@ -270,7 +272,7 @@ class PI05Export:
             if name not in config.image_features or name in cameras
         }
         self.input_features = {name: config.input_features[name] for name in self.frame}
-        prompt = StatePrompt(tokenizer, task, self.frame[OBS_STATE].size).cuda()
+        prompt = StatePrompt(tokenizer, self.task, self.frame[OBS_STATE].size).cuda()
         names = [*self.frame, NOISE]
         self.noise = torch.randn(config.chunk_size, config.max_action_dim, device="cuda")
         self.expected_actions = self.rollout_actions()
@@ -281,6 +283,7 @@ class PI05Export:
         observation = PI05Observation(list(self.frame), tensor_steps, prompt)
         self.module = PI05Chunk(self.policy, observation, postprocessor, names)
         self.input_names = names
+        self.start = time.perf_counter()
 
     def release_policy(self) -> None:
         """Free the policy for the TensorRT step."""
@@ -315,10 +318,10 @@ class PI05Export:
             ),
         }
 
-    def write(self, backend: str, program: str | dict, tolerance: float) -> None:
+    def write(self, program: Path | dict) -> None:
         """Save the raw test case, the policy config and `export.json` beside the program.
 
-        `program` is the program's file or, for a chunk split into engines, each engine's file, inputs and outputs.
+        `program` is the program's path or, for a chunk split into engines, each engine's file, inputs and outputs.
         """
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
@@ -328,9 +331,9 @@ class PI05Export:
         if isinstance(program, dict):
             files = {"programs": program, "num_steps": self.config.num_inference_steps}
         else:
-            files = {"file": program}
+            files = {"file": program.name}
         info = {
-            "backend": backend,
+            "backend": self.backend,
             **files,
             "inputs": self.input_names,
             "raw_frame": True,
@@ -340,10 +343,10 @@ class PI05Export:
             "noise_shape": list(self.noise.shape),
             "output": ACTION,
             "test_case": TEST_CASE,
-            "tolerance": tolerance,
+            "tolerance": self.tolerance,
         }
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
-        print(f"Wrote {self.output_dir}")
+        print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")
 
     def processors(self) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
         """The checkpoint's processors on the GPU, with the tokenizer padding every prompt to one width."""
@@ -364,7 +367,7 @@ class PI05Export:
 
 
 def parse_args(description: str, backend: str) -> argparse.Namespace:
-    """The command line both pi0.5 export scripts share."""
+    """The command line every pi0.5 export script shares."""
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -383,11 +386,7 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=5.0, help="Largest allowed action error, robot units."
     )
-    parser.add_argument(
-        "--export_only",
-        action="store_true",
-        help="Write the folder without the engine, to build it with build_engine.py on each device.",
-    )
+    add_backend_args(parser, backend)
     if backend == "onnx_tensorrt":
         parser.add_argument(
             "--step_engine",

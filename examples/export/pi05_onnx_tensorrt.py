@@ -30,11 +30,10 @@ the prompt to the KV cache), one denoising step, and the actions. The runtime ru
 once per Euler step, so no engine holds the whole 10-step loop.
 """
 
-import time
 from pathlib import Path
 
 import torch
-from act_onnx_tensorrt import build_engine
+from build_engine import build_engine
 from pi05_recipe import PI05Export, parse_args
 
 from lerobot.utils.constants import ACTION
@@ -45,7 +44,6 @@ def export_onnx(programs: dict, folder: Path) -> dict:
     files = {}
     with torch.no_grad():
         for name, (module, inputs, input_names, output_names) in programs.items():
-            start = time.perf_counter()
             torch.onnx.export(
                 module,
                 inputs,
@@ -54,14 +52,13 @@ def export_onnx(programs: dict, folder: Path) -> dict:
                 input_names=input_names,
                 output_names=output_names,
             )
-            print(f"Exported {name}.onnx in {time.perf_counter() - start:.0f} s")
             files[name] = {"file": f"{name}.engine", "inputs": input_names, "outputs": output_names}
     return files
 
 
 def main() -> None:
     args = parse_args(__doc__, "onnx_tensorrt")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
+    export = PI05Export(args)
     if args.step_engine:
         files = export_onnx(export.denoising_programs(), export.output_dir)
     else:
@@ -72,11 +69,8 @@ def main() -> None:
 
     if not args.export_only:
         for name, program in files.items():
-            start = time.perf_counter()
             build_engine(export.output_dir / f"{name}.onnx", export.output_dir / program["file"])
-            print(f"Built {program['file']} in {time.perf_counter() - start:.0f} s")
-
-    export.write("onnx_tensorrt", files if args.step_engine else files["model"]["file"], args.tolerance)
+    export.write(files if args.step_engine else export.output_dir / files["model"]["file"])
 
 
 if __name__ == "__main__":

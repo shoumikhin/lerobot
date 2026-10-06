@@ -26,8 +26,6 @@ policy will run on, because the kernels are tuned for the GPU that compiles them
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
-import time
-
 import torch
 from act_recipe import ACTExport, parse_args
 from executorch.backends.cuda.cuda_backend import CudaBackend
@@ -35,34 +33,25 @@ from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 
 
-def lower_to_cuda(program: torch.export.ExportedProgram):
-    """Compile the whole program into one CUDA delegate, as ExecuTorch's CUDA example does."""
-    return to_edge_transform_and_lower(
+def main() -> None:
+    args = parse_args(__doc__, "executorch_cuda")
+    export = ACTExport(args)
+    pte_path = export.output_dir / "model.pte"
+
+    with torch.no_grad():
+        program = torch.export.export(export.module, export.inputs)
+    # Compile the whole program into one CUDA delegate, as ExecuTorch's CUDA example does.
+    lowered = to_edge_transform_and_lower(
         program,
         partitioner=[CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])],
         compile_config=EdgeCompileConfig(_check_ir_validity=False, _skip_dim_order=True),
     )
-
-
-def main() -> None:
-    args = parse_args(__doc__, "executorch_cuda")
-    if args.export_only:
-        raise SystemExit("--export_only is not supported here: build_engine.py builds TensorRT engines only.")
-    export = ACTExport(args.policy_path, args.output_dir, args.job_name)
-    pte_path = export.output_dir / "model.pte"
-
-    start = time.perf_counter()
-    with torch.no_grad():
-        program = torch.export.export(export.module, export.inputs)
-    lowered = lower_to_cuda(program)
     del program
     export.release_policy()
     executorch_program = lowered.to_executorch()
     executorch_program.save(str(pte_path))
     executorch_program.write_tensor_data_to_file(str(export.output_dir))
-    print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
-
-    export.write("executorch_cuda", pte_path.name, args.tolerance)
+    export.write(pte_path)
 
 
 if __name__ == "__main__":

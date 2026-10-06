@@ -25,80 +25,32 @@ model that built it:
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
-import time
-from pathlib import Path
-
-import tensorrt as trt
 import torch
 from act_recipe import ACTExport, parse_args
+from build_engine import build_engine
 
 from lerobot.utils.constants import ACTION
-
-GIB = 1 << 30
-
-
-class FileWriter(trt.IStreamWriter):
-    """Writes the engine to a file as TensorRT serializes it, without another copy in memory."""
-
-    def __init__(self, file):
-        trt.IStreamWriter.__init__(self)
-        self._file = file
-
-    def write(self, data: bytes) -> int:
-        return self._file.write(data)
-
-
-def build_engine(
-    onnx_path: Path,
-    engine_path: Path,
-    workspace_gib: float | None = None,
-    tactic_gib: float | None = None,
-    optimization_level: int | None = None,
-) -> None:
-    """Build a TensorRT engine that keeps the ONNX file's own dtypes, as the ExecuTorch route does."""
-    logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
-    parser = trt.OnnxParser(network, logger)
-    if not parser.parse_from_file(str(onnx_path)):
-        raise SystemExit("\n".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
-    config = builder.create_builder_config()
-    if workspace_gib is not None:
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gib * GIB))
-    if tactic_gib is not None:
-        config.set_memory_pool_limit(trt.MemoryPoolType.TACTIC_DRAM, int(tactic_gib * GIB))
-    if optimization_level is not None:
-        config.builder_optimization_level = optimization_level
-    with engine_path.open("wb") as file:
-        if not builder.build_serialized_network_to_stream(network, config, FileWriter(file)):
-            raise SystemExit("TensorRT could not build the engine.")
 
 
 def main() -> None:
     args = parse_args(__doc__, "onnx_tensorrt")
-    export = ACTExport(args.policy_path, args.output_dir, args.job_name)
+    export = ACTExport(args)
     onnx_path = export.output_dir / "model.onnx"
     engine_path = export.output_dir / "model.engine"
 
-    start = time.perf_counter()
     with torch.no_grad():
         torch.onnx.export(
             export.module,
             export.inputs,
             onnx_path,
             dynamo=True,
-            input_names=export.module.input_names,
+            input_names=export.input_names,
             output_names=[ACTION],
         )
-    print(f"Exported {onnx_path} in {time.perf_counter() - start:.0f} s")
     export.release_policy()
-
     if not args.export_only:
-        start = time.perf_counter()
         build_engine(onnx_path, engine_path)
-        print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
-
-    export.write("onnx_tensorrt", engine_path.name, args.tolerance)
+    export.write(engine_path)
 
 
 if __name__ == "__main__":

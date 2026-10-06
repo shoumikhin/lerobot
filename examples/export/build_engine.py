@@ -31,15 +31,56 @@ import json
 import time
 from pathlib import Path
 
+import tensorrt as trt
 import torch
-from act_onnx_tensorrt import GIB, build_engine
+from act_recipe import EXPORTED_PROGRAM
 
 from lerobot.rollout.inference.export import ExportInferenceEngine
+
+GIB = 1 << 30
+
+
+class FileWriter(trt.IStreamWriter):
+    """Writes the engine to a file as TensorRT serializes it, without another copy in memory."""
+
+    def __init__(self, file):
+        trt.IStreamWriter.__init__(self)
+        self._file = file
+
+    def write(self, data: bytes) -> int:
+        return self._file.write(data)
+
+
+def build_engine(
+    onnx_path: Path,
+    engine_path: Path,
+    workspace_gib: float | None = None,
+    tactic_gib: float | None = None,
+    optimization_level: int | None = None,
+) -> None:
+    """Build a TensorRT engine that keeps the ONNX file's own dtypes, as the ExecuTorch route does."""
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(str(onnx_path)):
+        raise SystemExit("\n".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
+    config = builder.create_builder_config()
+    if workspace_gib is not None:
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gib * GIB))
+    if tactic_gib is not None:
+        config.set_memory_pool_limit(trt.MemoryPoolType.TACTIC_DRAM, int(tactic_gib * GIB))
+    if optimization_level is not None:
+        config.builder_optimization_level = optimization_level
+    start = time.perf_counter()
+    with engine_path.open("wb") as file:
+        if not builder.build_serialized_network_to_stream(network, config, FileWriter(file)):
+            raise SystemExit("TensorRT could not build the engine.")
+    print(f"Built {engine_path} in {time.perf_counter() - start:.0f} s")
 
 
 def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) -> None:
     import torch_tensorrt
-    from act_executorch_tensorrt import EXPORTED_PROGRAM
 
     program = torch.export.load(folder / EXPORTED_PROGRAM)  # nosec B614: a folder the user exported
     inputs = program.example_inputs[0]
@@ -77,7 +118,6 @@ def main() -> None:
     if info["backend"] == "onnx_tensorrt":
         # A chunk exported with --step_engine has one ONNX file per engine, named like its program.
         for name, program in info.get("programs", {"model": info}).items():
-            start = time.perf_counter()
             build_engine(
                 args.folder / f"{name}.onnx",
                 args.folder / program["file"],
@@ -85,7 +125,6 @@ def main() -> None:
                 args.tactic_gib,
                 args.optimization_level,
             )
-            print(f"Built {args.folder / program['file']} in {time.perf_counter() - start:.0f} s")
     else:
         start = time.perf_counter()
         build_executorch(args.folder, info["file"], args)

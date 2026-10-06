@@ -27,8 +27,6 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with
 Unlike the other two backends, the package runs only with PyTorch and Torch-TensorRT installed.
 """
 
-import time
-
 import torch
 import torch_tensorrt
 from groot_recipe import GrootExport, parse_args
@@ -36,23 +34,16 @@ from groot_recipe import GrootExport, parse_args
 
 def main() -> None:
     args = parse_args(__doc__, "torch_tensorrt")
-    if args.export_only:
-        raise SystemExit(
-            "--export_only is not supported here: build_engine.py does not build AOTInductor packages."
-        )
-    export = GrootExport(args.policy_path, args.dataset, args.dataset_root, args.output_dir, args.job_name)
+    export = GrootExport(args)
     package_path = export.output_dir / "model.pt2"
 
-    start = time.perf_counter()
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
     torch_tensorrt.save(engine, str(package_path), output_format="aot_inductor", arg_inputs=export.inputs)
-    print(f"Exported {package_path} in {time.perf_counter() - start:.0f} s")
-
-    export.write("torch_tensorrt", package_path.name, args.tolerance)
+    export.write(package_path)
 
 
 if __name__ == "__main__":

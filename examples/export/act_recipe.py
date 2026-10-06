@@ -29,6 +29,7 @@ import argparse
 import datetime as dt
 import gc
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,9 @@ from lerobot.rollout.inference import SyncInferenceEngine
 from lerobot.utils.constants import ACTION
 
 TEST_CASE = "test_case.safetensors"
+# What `--export_only` saves instead of an engine, for build_engine.py to compile on each device.
+EXPORTED_PROGRAM = "model.pt2"
+BUILD_ENGINE_BACKENDS = ("executorch_tensorrt", "onnx_tensorrt")
 
 
 class ACTChunk(nn.Module):
@@ -76,20 +80,22 @@ def to_policy_input(name: str, x: Tensor) -> Tensor:
 class ACTExport:
     """Loads a trained ACT checkpoint, and writes the exported folder around a compiled program."""
 
-    def __init__(self, policy_path: str, output_dir: Path | None, job_name: str):
-        self.policy = ACTPolicy.from_pretrained(policy_path).to("cuda").eval()
+    def __init__(self, args: argparse.Namespace):
+        self.policy = ACTPolicy.from_pretrained(args.policy_path).to("cuda").eval()
         if self.policy.config.temporal_ensemble_coeff is not None:
             # The ensembler averages chunks across ticks, which one program call per chunk cannot do.
             raise ValueError(
                 "ACT with temporal_ensemble_coeff set cannot be exported: its ensemble spans ticks."
             )
-        self.output_dir = make_output_dir(output_dir, job_name)
-        self.policy_path = policy_path
+        self.output_dir = make_output_dir(args.output_dir, args.job_name)
+        self.policy_path = args.policy_path
+        self.backend, self.tolerance = args.backend, args.tolerance
         self.config = self.policy.config
-        self.module = ACTChunk(self.policy, *gpu_processors(self.config, policy_path))
+        self.module = ACTChunk(self.policy, *gpu_processors(self.config, self.policy_path))
         self.input_names = self.module.input_names
         self.frame = random_robot_frame(self.policy)
         self.inputs = tuple(torch.from_numpy(self.frame[name]).cuda() for name in self.input_names)
+        self.start = time.perf_counter()
 
     def release_policy(self) -> None:
         """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
@@ -98,21 +104,21 @@ class ACTExport:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def write(self, backend: str, program_file: str, tolerance: float) -> None:
+    def write(self, program_path: Path) -> None:
         """Save the test case, the policy config, and `export.json` beside the compiled program."""
         save_file({**self.frame, "expected_actions": self.expected_actions}, self.output_dir / TEST_CASE)
         self.config.save_pretrained(self.output_dir)
         info = {
-            "backend": backend,
-            "file": program_file,
+            "backend": self.backend,
+            "file": program_path.name,
             "inputs": self.input_names,
             "raw_frame": True,
             "output": ACTION,
             "test_case": TEST_CASE,
-            "tolerance": tolerance,
+            "tolerance": self.tolerance,
         }
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
-        print(f"Wrote {self.output_dir}")
+        print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")
 
     def rollout_actions(self) -> np.ndarray:
         """The chunk `lerobot-rollout` plays with PyTorch for the test frame, one action per tick."""
@@ -129,6 +135,24 @@ class ACTExport:
         engine.reset()
         steps = self.policy.config.n_action_steps
         return np.stack([engine.get_action(dict(self.frame)).numpy() for _ in range(steps)])
+
+
+def save_for_build_engine(export, program: torch.export.ExportedProgram, program_path: Path) -> None:
+    """With `--export_only`, save the exported program and the folder, but no engine."""
+    torch.export.save(program, export.output_dir / EXPORTED_PROGRAM)
+    export.release_policy()
+    export.write(program_path)
+
+
+def add_backend_args(parser: argparse.ArgumentParser, backend: str) -> None:
+    """Name the backend, and offer `--export_only` where build_engine.py can finish the folder on each device."""
+    parser.set_defaults(backend=backend, export_only=False)
+    if backend in BUILD_ENGINE_BACKENDS:
+        parser.add_argument(
+            "--export_only",
+            action="store_true",
+            help="Write the folder without the engine, to build it with build_engine.py on each device.",
+        )
 
 
 def gpu_processors(
@@ -167,7 +191,7 @@ def make_output_dir(output_dir: Path | None, job_name: str) -> Path:
 
 
 def parse_args(description: str, backend: str) -> argparse.Namespace:
-    """The command line both ACT export scripts share."""
+    """The command line every ACT export script shares."""
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -179,9 +203,5 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=0.5, help="Largest allowed action error, robot units."
     )
-    parser.add_argument(
-        "--export_only",
-        action="store_true",
-        help="Write the folder without the engine, to build it with build_engine.py on each device.",
-    )
+    add_backend_args(parser, backend)
     return parser.parse_args()

@@ -33,12 +33,13 @@ camera check matches the robot without a --rename_map.
 import argparse
 import gc
 import json
+import time
 from copy import copy
 from pathlib import Path
 
 import numpy as np
 import torch
-from act_recipe import TEST_CASE, gpu_processors, make_output_dir, to_policy_input
+from act_recipe import TEST_CASE, add_backend_args, gpu_processors, make_output_dir, to_policy_input
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
@@ -88,17 +89,11 @@ class SmolVLAChunk(nn.Module):
 class SmolVLAExport:
     """Loads a trained SmolVLA checkpoint, and writes the exported folder around a compiled program."""
 
-    def __init__(
-        self,
-        policy_path: str,
-        dataset: str,
-        dataset_root: Path | None,
-        output_dir: Path | None,
-        job_name: str,
-    ):
-        self.output_dir = make_output_dir(output_dir, job_name)
-        self.policy_path = policy_path
-        self.policy = SmolVLAPolicy.from_pretrained(policy_path).to("cuda").eval()
+    def __init__(self, args: argparse.Namespace):
+        self.output_dir = make_output_dir(args.output_dir, args.job_name)
+        self.policy_path = args.policy_path
+        self.backend, self.tolerance = args.backend, args.tolerance
+        self.policy = SmolVLAPolicy.from_pretrained(self.policy_path).to("cuda").eval()
         self.config = self.policy.config
         preprocessor, postprocessor = self.processors()
         text_steps = [
@@ -107,7 +102,7 @@ class SmolVLAExport:
         self.text_steps = PolicyProcessorPipeline(steps=text_steps)
         tensor_steps = PolicyProcessorPipeline(steps=[s for s in preprocessor.steps if s not in text_steps])
 
-        metadata = LeRobotDatasetMetadata(dataset, root=dataset_root)
+        metadata = LeRobotDatasetMetadata(args.dataset, root=args.dataset_root)
         self.task = str(metadata.tasks.index[0])
         self.frame = random_robot_frame(metadata.features)
         # The folder takes the robot's cameras, so its config names them, not the checkpoint's placeholders.
@@ -131,6 +126,7 @@ class SmolVLAExport:
             prompt[OBS_LANGUAGE_ATTENTION_MASK],
         )
         self.input_names = self.module.input_names
+        self.start = time.perf_counter()
 
     def release_policy(self) -> None:
         """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
@@ -139,7 +135,7 @@ class SmolVLAExport:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def write(self, backend: str, program_file: str, tolerance: float) -> None:
+    def write(self, program_path: Path) -> None:
         """Save the test case, the policy config and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
@@ -147,8 +143,8 @@ class SmolVLAExport:
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
         info = {
-            "backend": backend,
-            "file": program_file,
+            "backend": self.backend,
+            "file": program_path.name,
             "inputs": self.input_names,
             "raw_frame": True,
             "task": self.task,
@@ -157,10 +153,10 @@ class SmolVLAExport:
             "noise_shape": list(self.noise.shape),
             "output": ACTION,
             "test_case": TEST_CASE,
-            "tolerance": tolerance,
+            "tolerance": self.tolerance,
         }
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
-        print(f"Wrote {self.output_dir}")
+        print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")
 
     def processors(self) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
         """The checkpoint's processors on the GPU, with the tokenizer padding every task to one width."""
@@ -195,7 +191,7 @@ def random_robot_frame(features: dict[str, dict]) -> dict[str, np.ndarray]:
 
 
 def parse_args(description: str, backend: str) -> argparse.Namespace:
-    """The command line both SmolVLA export scripts share."""
+    """The command line every SmolVLA export script shares."""
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -221,9 +217,5 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=5.0, help="Largest allowed action error, robot units."
     )
-    parser.add_argument(
-        "--export_only",
-        action="store_true",
-        help="Write the folder without the engine, to build it with build_engine.py on each device.",
-    )
+    add_backend_args(parser, backend)
     return parser.parse_args()
