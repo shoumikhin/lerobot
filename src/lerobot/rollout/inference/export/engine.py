@@ -16,8 +16,8 @@
 
 An export script writes a folder with the compiled program, the policy's `config.json`, and an
 `export.json` naming the backend, the program's inputs, and a test case. Programs can take raw
-frame arrays or the batched, normalized images used by older exports. The declared input shape
-distinguishes these contracts. Both return actions to play in robot units.
+frame arrays or the batched, normalized images used by older exports. The raw_frame flag or the
+program's declared input shape distinguishes these contracts. Both return actions in robot units.
 
 A policy that reads the task also gets the token ids its saved text steps make from it, and a
 flow-matching policy gets the starting noise as its last input, drawn here for every chunk. A
@@ -111,7 +111,8 @@ class ExportInferenceEngine(InferenceEngine):
                 folder, config_filename=info["text_steps"]
             )
         self._program = load_program(folder, info)
-        self._raw_frame = False
+        self._raw_frame: bool | None = info.get("raw_frame")
+        self._image_resize = info.get("image_resize")
         self._actions: deque[np.ndarray] = deque()
         self._fixed_task: str | None = info["task"] if info.get("task_fixed") else None
         self._check_task(task)
@@ -122,6 +123,10 @@ class ExportInferenceEngine(InferenceEngine):
         self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None,
         initialize: bool = False,
     ) -> np.ndarray:
+        if self._image_resize is not None:
+            from .images import resize_images
+
+            frame = resize_images(frame, self._image_resize)
         observation = {}
         names = [name for name in self._input_names if name != NOISE] if self._raw_frame else frame
         for name in names:
@@ -163,11 +168,12 @@ class ExportInferenceEngine(InferenceEngine):
         case = load_file(path)
         expected = case.pop("expected_actions")
         input_shape = getattr(self._program, "input_shape", None)
-        self._raw_frame = (
-            self._text_steps is None
-            and input_shape is not None
-            and input_shape == case[self._input_names[0]].shape
-        )
+        if self._raw_frame is None:
+            self._raw_frame = (
+                self._text_steps is None
+                and input_shape is not None
+                and input_shape == case[self._input_names[0]].shape
+            )
         actual = self._run_chunk(case, task, case.pop(NOISE, None), initialize=True)
         error = float(np.abs(actual - expected).max()) if actual.shape == expected.shape else np.inf
         logger.info("Exported policy test case: largest difference %.2e (tolerance %g)", error, tolerance)

@@ -155,7 +155,10 @@ def test_executorch_invalid_step_count(tmp_path):
 
 
 @pytest.mark.parametrize("image_first", [False, True])
-def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(tmp_path, monkeypatch, image_first):
+@pytest.mark.parametrize("declared_layout", [False, True])
+def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(
+    tmp_path, monkeypatch, image_first, declared_layout
+):
     from safetensors.numpy import save_file
 
     from lerobot.rollout.inference.export import engine as module
@@ -173,6 +176,8 @@ def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(tmp_path, monk
         "output": "action", "noise_shape": [4, 3], "task": "pick", "task_fixed": True,
         "test_case": "case.safetensors", "tolerance": 0.0,
     }
+    if declared_layout:
+        info["raw_frame"] = True
     (tmp_path / "export.json").write_text(json.dumps(info))
     save_file({**frame, "noise": noise, "expected_actions": expected}, tmp_path / "case.safetensors")
     calls = []
@@ -189,6 +194,8 @@ def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(tmp_path, monk
             calls.append(arrays[-1].copy())
             return expected
 
+    if declared_layout:
+        del Program.input_shape
     monkeypatch.setattr(module, "load_program", lambda *args: Program())
     engine = ExportInferenceEngine(tmp_path, "pick", "replay", {"camera": "observation.images.camera"})
     np.testing.assert_array_equal(calls[0], noise)
