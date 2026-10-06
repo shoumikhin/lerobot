@@ -150,6 +150,7 @@ class SmolVLAExport:
             "backend": backend,
             "file": program_file,
             "inputs": self.input_names,
+            "raw_frame": True,
             "task": self.task,
             # The program holds the task's token ids.
             "task_fixed": True,

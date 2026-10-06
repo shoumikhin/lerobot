@@ -106,6 +106,7 @@ class ACTExport:
             "backend": backend,
             "file": program_file,
             "inputs": self.input_names,
+            "raw_frame": True,
             "output": ACTION,
             "test_case": TEST_CASE,
             "tolerance": tolerance,

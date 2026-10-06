@@ -333,6 +333,7 @@ class PI05Export:
             "backend": backend,
             **files,
             "inputs": self.input_names,
+            "raw_frame": True,
             "task": self.task,
             # The program keeps only the vocabulary rows this task's prompt can hold.
             "task_fixed": True,
