@@ -176,6 +176,10 @@ class TensorRTEngine:
                 raise RuntimeError(f"TensorRT could not bind output {name}")
 
     @property
+    def input_shape(self) -> tuple[int, ...]:
+        return self._input_shapes[0]
+
+    @property
     def scratch_bytes(self) -> int:
         return self._engine.device_memory_size_v2
 
@@ -245,12 +249,16 @@ class TensorRTDenoisingLoop:
             engine.use_scratch(self._scratch)
         self._num_steps = num_steps
 
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return self._prefix.input_shape
+
     def __call__(self, *inputs: np.ndarray) -> np.ndarray:
         *observation, noise = inputs
         cache = self._prefix.run_device(*observation)
         dt = -1.0 / self._num_steps
         sample = noise
         for step in range(self._num_steps):
-            timestep = np.full((noise.shape[0],), 1.0 + step * dt, dtype=np.float32)
+            timestep = np.array([1.0 + step * dt], dtype=np.float32)
             sample = sample + dt * self._step(*cache, sample, timestep)
         return self._actions(sample)

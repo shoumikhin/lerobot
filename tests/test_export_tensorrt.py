@@ -172,3 +172,42 @@ def test_bfloat16_bindings_use_extension_dtype(monkeypatch):
 def test_cuda_error_is_not_ignored():
     with pytest.raises(RuntimeError, match="CUDA runtime call failed"):
         backend.check_cuda((2, 0))
+
+
+@pytest.mark.parametrize("noise_shape", [(1, 4, 3), (4, 3)])
+def test_split_loop_passes_one_timestep_for_both_contracts(tmp_path, monkeypatch, noise_shape):
+    times = []
+    cache = object()
+
+    class Engine:
+        scratch_bytes = 64
+        input_shape = (3,)
+
+        def __init__(self, path, *args, **kwargs):
+            self.name = path.stem
+
+        def use_scratch(self, scratch):
+            pass
+
+        def run_device(self, state):
+            return (cache,)
+
+        def __call__(self, *inputs):
+            if self.name == "actions":
+                return inputs[0]
+            saved, sample, timestep = inputs
+            assert saved is cache
+            assert timestep.shape == (1,) and timestep.dtype == np.float32
+            times.append(timestep.item())
+            return sample * timestep
+
+    monkeypatch.setattr(backend, "TensorRTEngine", Engine)
+    monkeypatch.setattr(backend, "CudaStream", lambda: None)
+    monkeypatch.setattr(backend, "CudaBuffer", lambda *a: None)
+    programs = {name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
+                for name in ("prefix", "step", "actions")}
+    loop = backend.TensorRTDenoisingLoop(tmp_path, programs, 4)
+    result = loop(np.ones(3), np.ones(noise_shape, dtype=np.float32))
+    assert result.shape == noise_shape
+    assert times == [1.0, 0.75, 0.5, 0.25]
+    np.testing.assert_allclose(result, (1 - .25) * (1 - .1875) * (1 - .125) * (1 - .0625))

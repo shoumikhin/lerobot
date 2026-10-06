@@ -96,7 +96,8 @@ def test_imports_without_torch(module):
     assert result.returncode == 0, result.stderr
 
 
-def test_act_export_config_and_engine_run_without_torch(tmp_path):
+@pytest.mark.parametrize("raw_frame", [False, True])
+def test_act_export_config_and_engine_run_without_torch(tmp_path, raw_frame):
     code = r'''
 import json
 import sys
@@ -113,6 +114,7 @@ from lerobot.rollout.inference.export import ExportInferenceEngine
 from lerobot.robots.config import RobotConfig
 
 folder = Path(sys.argv[1])
+raw_frame = sys.argv[2] == "True"
 info = {
     "backend": "executorch_cuda", "file": "model.pte",
     "inputs": ["observation.state", "observation.images.camera"],
@@ -131,12 +133,21 @@ save_file({"observation.state": state, "observation.images.camera": image,
           folder / "case.safetensors")
 
 class Method:
+    metadata = SimpleNamespace(input_tensor_meta=lambda i: SimpleNamespace(
+        sizes=lambda: (1,) if raw_frame else (1, 1)))
+
     def execute(self, inputs):
         state, image = inputs
         assert isinstance(state, np.ndarray)
-        assert image.shape == (1, 3, 2, 2) and image.dtype == np.float32
-        np.testing.assert_array_equal(image, 1.0)
-        return [np.stack([state, 2 * state], axis=1)]
+        if raw_frame:
+            assert state.shape == (1,)
+            assert image.shape == (2, 2, 3) and image.dtype == np.uint8
+            np.testing.assert_array_equal(image, 255)
+        else:
+            assert state.shape == (1, 1)
+            assert image.shape == (1, 3, 2, 2) and image.dtype == np.float32
+            np.testing.assert_array_equal(image, 1.0)
+        return [np.stack([state, 2 * state], axis=0 if raw_frame else 1)]
 
 runtime = SimpleNamespace(load_program=lambda *a, **kw: SimpleNamespace(load_method=lambda n: Method()))
 sys.modules["executorch.runtime"] = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
@@ -160,6 +171,6 @@ np.testing.assert_array_equal(engine.get_action(frame), [4.0])
 assert "torch" not in sys.modules
 '''
     result = subprocess.run(
-        [sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code, str(tmp_path), str(raw_frame)], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stderr

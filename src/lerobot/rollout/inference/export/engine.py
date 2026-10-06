@@ -15,8 +15,9 @@
 """The inference engine for an exported policy.
 
 An export script writes a folder with the compiled program, the policy's `config.json`, and an
-`export.json` naming the backend, the program's inputs, and a test case. The program takes the
-tensors `prepare_observation_for_inference` makes and returns the actions to play, in robot units.
+`export.json` naming the backend, the program's inputs, and a test case. Programs can take raw
+frame arrays or the batched, normalized images used by older exports. The declared input shape
+distinguishes these contracts. Both return actions to play in robot units.
 
 A policy that reads the task also gets the token ids its saved text steps make from it, and a
 flow-matching policy gets the starting noise as its last input, drawn here for every chunk. A
@@ -110,6 +111,7 @@ class ExportInferenceEngine(InferenceEngine):
                 folder, config_filename=info["text_steps"]
             )
         self._program = load_program(folder, info)
+        self._raw_frame = False
         self._actions: deque[np.ndarray] = deque()
         self._fixed_task: str | None = info["task"] if info.get("task_fixed") else None
         self._check_task(task)
@@ -120,12 +122,16 @@ class ExportInferenceEngine(InferenceEngine):
         self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None
     ) -> np.ndarray:
         observation = {}
-        for name, value in frame.items():
-            if "image" in name:
-                if value.dtype == np.uint8:
-                    value = value.astype(np.float32) / 255
-                value = value.transpose(2, 0, 1)
-            observation[name] = np.ascontiguousarray(value)[None]
+        names = [name for name in self._input_names if name != NOISE] if self._raw_frame else frame
+        for name in names:
+            value = frame[name]
+            if not self._raw_frame:
+                if "image" in name:
+                    if value.dtype == np.uint8:
+                        value = value.astype(np.float32) / 255
+                    value = value.transpose(2, 0, 1)
+                value = value[None]
+            observation[name] = np.ascontiguousarray(value)
         if self._text_steps is not None:
             import torch
 
@@ -142,7 +148,7 @@ class ExportInferenceEngine(InferenceEngine):
                 noise if noise is not None else np.random.standard_normal(self._noise_shape).astype(np.float32)
             )
         actions = self._program(*(observation[name] for name in self._input_names))
-        return actions[0].copy()
+        return (actions if self._raw_frame else actions[0]).copy()
 
     def _check_task(self, task: str) -> None:
         if self._fixed_task is not None and task != self._fixed_task:
@@ -154,6 +160,12 @@ class ExportInferenceEngine(InferenceEngine):
     def _check(self, path: Path, task: str, tolerance: float) -> None:
         case = load_file(path)
         expected = case.pop("expected_actions")
+        input_shape = getattr(self._program, "input_shape", None)
+        self._raw_frame = (
+            self._text_steps is None
+            and input_shape is not None
+            and input_shape == case[self._input_names[0]].shape
+        )
         actual = self._run_chunk(case, task, case.pop(NOISE, None))
         error = float(np.abs(actual - expected).max()) if actual.shape == expected.shape else np.inf
         logger.info("Exported policy test case: largest difference %.2e (tolerance %g)", error, tolerance)

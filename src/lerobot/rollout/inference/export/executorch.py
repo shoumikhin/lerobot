@@ -31,6 +31,10 @@ class ExecuTorchProgram:
         self._method = Runtime.get().load_program(path, data_path=data_path).load_method("forward")
         self._torch_inputs = False
 
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return tuple(self._method.metadata.input_tensor_meta(0).sizes())
+
     def __call__(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         arrays = [np.ascontiguousarray(value) for value in inputs]
         if not self._torch_inputs:
@@ -81,6 +85,10 @@ class ExecuTorchDenoisingLoop:
         )
         self._num_steps = num_steps
 
+    @property
+    def input_shape(self) -> tuple[int, ...]:
+        return self._prefix.input_shape
+
     def __call__(self, *inputs: np.ndarray) -> np.ndarray:
         *observation, noise = inputs
         cache = self._prefix(*observation)
@@ -89,6 +97,6 @@ class ExecuTorchDenoisingLoop:
         dt = -1.0 / self._num_steps
         sample = noise
         for step in range(self._num_steps):
-            timestep = np.full((noise.shape[0],), 1.0 + step * dt, dtype=np.float32)
+            timestep = np.array([1.0 + step * dt], dtype=np.float32)
             sample = sample + dt * self._step(*cache, sample, timestep)
         return self._actions(sample)
