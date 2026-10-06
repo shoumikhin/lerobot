@@ -27,41 +27,21 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 import torch
 from act_recipe import ACTExport, parse_args
 from executorch.backends.cuda.cuda_backend import CudaBackend
 from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
-from torch._inductor import config as inductor_config, utils as inductor_utils
-
-
-@contextmanager
-def tune_on_any_gpu() -> Iterator[None]:
-    """Let AOTInductor tune its Triton kernels on a GPU with fewer than 68 SMs, such as a Jetson's."""
-    # The CUDA backend allows only Triton matrix kernels, and Inductor offers none below that size.
-    is_big_gpu = inductor_utils.is_big_gpu
-    inductor_utils.is_big_gpu = lambda index_or_device=0: True
-    try:
-        # A small board's CPU needs more than the default 5 minutes to compile all of a kernel's choices.
-        with inductor_config.patch(
-            precompilation_timeout_seconds=max(inductor_config.precompilation_timeout_seconds, 60 * 60)
-        ):
-            yield
-    finally:
-        inductor_utils.is_big_gpu = is_big_gpu
 
 
 def lower_to_cuda(program: torch.export.ExportedProgram):
     """Compile the whole program into one CUDA delegate, as ExecuTorch's CUDA example does."""
-    with tune_on_any_gpu():
-        return to_edge_transform_and_lower(
-            program,
-            partitioner=[CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])],
-            compile_config=EdgeCompileConfig(_check_ir_validity=False, _skip_dim_order=True),
-        )
+    return to_edge_transform_and_lower(
+        program,
+        partitioner=[CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False, _skip_dim_order=True),
+    )
 
 
 def main() -> None:
