@@ -42,16 +42,31 @@ class ExecuTorchProgram:
         if self._torch_inputs:
             import torch
 
-            outputs = self._method.execute([torch.from_numpy(value) for value in arrays])
+            tensors = [
+                torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
+                if value.dtype.name == "bfloat16"
+                else torch.from_numpy(value)
+                for value in arrays
+            ]
+            outputs = self._method.execute(tensors)
         result = []
         for output in outputs:
             if output.__dlpack_device__()[0] == 1:
-                result.append(np.from_dlpack(output).copy())
-            else:
-                # Older exports return device memory instead of host outputs.
-                import torch
+                try:
+                    result.append(np.from_dlpack(output).copy())
+                    continue
+                except (BufferError, RuntimeError):
+                    # NumPy cannot consume every DLPack dtype, including bfloat16.
+                    pass
+            import torch
 
-                result.append(torch.from_dlpack(output).cpu().numpy())
+            tensor = torch.from_dlpack(output).cpu()
+            if tensor.dtype == torch.bfloat16:
+                from ml_dtypes import bfloat16
+
+                result.append(tensor.view(torch.uint16).numpy().view(bfloat16).copy())
+            else:
+                result.append(tensor.numpy().copy())
         return result[0] if len(result) == 1 else tuple(result)
 
 

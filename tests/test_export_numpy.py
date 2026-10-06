@@ -77,6 +77,32 @@ def test_executorch_output_survives_next_execution(tmp_path, monkeypatch):
     np.testing.assert_array_equal(first, 1.0)
 
 
+def test_executorch_bfloat16_compatibility_preserves_values_and_ownership(tmp_path, monkeypatch):
+    import torch
+
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    buffer = torch.zeros((1, 2), dtype=torch.bfloat16)
+    input_types = []
+
+    def execute(inputs):
+        input_types.append(type(inputs[0]))
+        if not isinstance(inputs[0], torch.Tensor):
+            raise TypeError("Tensor inputs required")
+        buffer.copy_(inputs[0])
+        return [buffer]
+
+    runtime = SimpleNamespace(load_program=lambda *args, **kw: SimpleNamespace(
+        load_method=lambda name: SimpleNamespace(execute=execute)))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
+    first = program(np.array([[1.25, -2.5]], dtype=ml_dtypes.bfloat16))
+    second = program(np.zeros((1, 2), dtype=ml_dtypes.bfloat16))
+    assert first.dtype == np.dtype(ml_dtypes.bfloat16)
+    np.testing.assert_array_equal(first.astype(np.float32), [[1.25, -2.5]])
+    np.testing.assert_array_equal(second.astype(np.float32), [[0, 0]])
+    assert input_types == [np.ndarray, torch.Tensor, torch.Tensor]
+
+
 def test_executorch_invalid_step_count(tmp_path):
     from lerobot.rollout.inference.export.executorch import ExecuTorchDenoisingLoop
 
