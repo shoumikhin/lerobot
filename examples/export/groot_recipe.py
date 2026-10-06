@@ -246,9 +246,10 @@ class GrootObservation(nn.Module):
         elif self.rescale:
             images = images * self.rescale_factor
         p, t, m = self.patch_size, self.temporal_patch_size, self.merge_size
-        patches = images[:, None].repeat(1, t, 1, 1, 1)
-        patches = patches.reshape(len(self.cameras), 1, t, 3, self.grid_h // m, m, p, self.grid_w // m, m, p)
-        pixels = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9).reshape(-1, 3 * t * p * p)
+        # Combine channel and repeated time to stay within TensorRT's eight-dimension limit.
+        patches = images[:, :, None].repeat(1, 1, t, 1, 1)
+        patches = patches.reshape(len(self.cameras), 3 * t, self.grid_h // m, m, p, self.grid_w // m, m, p)
+        pixels = patches.permute(0, 2, 5, 3, 6, 1, 4, 7).reshape(-1, 3 * t * p * p)
         state = obs[OBS_STATE]
         if self.normalize_state:
             state = torch.where(self.state_nonzero, 2 * (state - self.state_min) / self.state_span - 1, 0)
