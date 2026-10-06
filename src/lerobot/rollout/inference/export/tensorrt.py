@@ -12,61 +12,106 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run an exported policy's TensorRT engine, built from its ONNX file."""
+"""Run an exported policy's TensorRT engine with CUDA buffers and NumPy inputs."""
 
 import functools
 from pathlib import Path
 
 import numpy as np
-import torch
-from safetensors.torch import load_file
 
-from lerobot.policies.common.flow_matching import euler_integrate
-
-# TensorRT asks for the whole engine in one read; answering in pieces keeps the host copy to one piece.
+# Limit the host copy while TensorRT reads a large engine.
 READ_CHUNK_BYTES = 64 << 20
 
 
 @functools.cache
-def runtime():
-    """The TensorRT runtime to load engines with, taking GPU memory from PyTorch's allocator.
+def cuda_runtime():
+    from cuda.bindings import runtime
 
-    TensorRT's default allocator uses a stream-ordered memory pool, which on a Jetson's shared memory
-    cannot place a large engine that a plain allocation still can.
-    """
+    return runtime
+
+
+def check_cuda(result):
+    status, *values = result
+    if status != 0:
+        raise RuntimeError(f"CUDA runtime call failed: {status}")
+    return values[0] if values else None
+
+
+class CudaStream:
+    def __init__(self):
+        self.handle = check_cuda(cuda_runtime().cudaStreamCreate())
+
+    def synchronize(self):
+        check_cuda(cuda_runtime().cudaStreamSynchronize(self.handle))
+
+    def __del__(self):
+        if getattr(self, "handle", None) is not None:
+            cuda_runtime().cudaStreamDestroy(self.handle)
+
+
+class CudaBuffer:
+    """Own a fixed-shape device allocation, including buffers passed between engines."""
+
+    def __init__(self, shape, dtype):
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+        if any(size < 0 for size in self.shape):
+            raise ValueError(f"Exported TensorRT engines require fixed shapes, got {self.shape}")
+        self.nbytes = int(np.prod(self.shape)) * self.dtype.itemsize
+        self.ptr = check_cuda(cuda_runtime().cudaMalloc(max(self.nbytes, 1)))
+
+    def numpy(self, stream: CudaStream) -> np.ndarray:
+        value = np.empty(self.shape, self.dtype)
+        cuda = cuda_runtime()
+        check_cuda(cuda.cudaMemcpyAsync(
+            value.ctypes.data, self.ptr, self.nbytes, cuda.cudaMemcpyKind.cudaMemcpyDeviceToHost, stream.handle
+        ))
+        stream.synchronize()
+        return value
+
+    def __del__(self):
+        if getattr(self, "ptr", 0):
+            cuda_runtime().cudaFree(self.ptr)
+
+
+@functools.cache
+def runtime():
+    """Use plain allocations so large engines fit without a stream-ordered memory pool."""
     import tensorrt as trt
 
-    class TorchAllocator(trt.IGpuAllocator):
-        # PyTorch's allocator does not track TensorRT's streams, so wait for the device before a block
-        # changes hands. TensorRT allocates only while an engine loads, so this is off the control loop.
+    class CudaAllocator(trt.IGpuAllocator):
         def __init__(self):
             trt.IGpuAllocator.__init__(self)
 
         def allocate(self, size: int, alignment: int, flags: int) -> int:
-            torch.cuda.synchronize()
-            try:
-                return torch.cuda.caching_allocator_alloc(size)
-            except torch.OutOfMemoryError:
+            status, pointer = cuda_runtime().cudaMalloc(size)
+            if status != 0:
                 return 0
+            if alignment and pointer % alignment:
+                cuda_runtime().cudaFree(pointer)
+                return 0
+            return pointer
 
         def allocate_async(self, size: int, alignment: int, flags: int, stream: int) -> int:
+            if cuda_runtime().cudaStreamSynchronize(stream)[0] != 0:
+                return 0
             return self.allocate(size, alignment, flags)
 
         def deallocate(self, memory: int) -> bool:
-            torch.cuda.synchronize()
-            torch.cuda.caching_allocator_delete(memory)
-            return True
+            return cuda_runtime().cudaFree(memory)[0] == 0
 
         def deallocate_async(self, memory: int, stream: int) -> bool:
+            if cuda_runtime().cudaStreamSynchronize(stream)[0] != 0:
+                return False
             return self.deallocate(memory)
 
     result = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-    result.gpu_allocator = TorchAllocator()
+    result.gpu_allocator = CudaAllocator()
     return result
 
 
 def load_engine(path: Path):
-    """Deserialize a `.engine` file a piece at a time, without holding the whole file in memory."""
+    """Deserialize an engine without holding another complete copy on the host."""
     import tensorrt as trt
 
     class FileReader(trt.IStreamReaderV2):
@@ -83,33 +128,19 @@ def load_engine(path: Path):
             return True
 
     with path.open("rb") as file:
-        return runtime().deserialize_cuda_engine(FileReader(file))
-
-
-def torch_dtype(dtype) -> torch.dtype:
-    """The torch dtype of a TensorRT tensor dtype."""
-    import tensorrt as trt
-
-    return {
-        trt.DataType.FLOAT: torch.float32,
-        trt.DataType.HALF: torch.float16,
-        trt.DataType.BF16: torch.bfloat16,
-        trt.DataType.INT32: torch.int32,
-        trt.DataType.INT64: torch.int64,
-        trt.DataType.BOOL: torch.bool,
-    }[dtype]
+        engine = runtime().deserialize_cuda_engine(FileReader(file))
+    if engine is None:
+        raise RuntimeError(f"TensorRT could not load {path}")
+    return engine
 
 
 class TensorRTEngine:
-    """Runs a `.engine` file on GPU tensors, on the current CUDA stream.
+    """Run a fixed-shape engine; related engines can share a stream and scratch allocation."""
 
-    Returns the output, or a tuple of outputs when the engine has several. With `own_scratch=False`, the
-    engine runs in the scratch memory given to `use_scratch`, which engines run one after another can share.
-    An engine built with `build_engine.py --int8_weights` gets its INT8 weights from the
-    `<name>_int8_weights.safetensors` file beside it, loaded to the GPU once.
-    """
-
-    def __init__(self, path: Path, input_names: list[str], output_names: list[str], own_scratch: bool = True):
+    def __init__(
+        self, path: Path, input_names: list[str], output_names: list[str],
+        own_scratch: bool = True, stream: CudaStream | None = None,
+    ):
         import tensorrt as trt
 
         self._engine = load_engine(path)
@@ -117,72 +148,98 @@ class TensorRTEngine:
         self._context = self._engine.create_execution_context(
             strategy.STATIC if own_scratch else strategy.USER_MANAGED
         )
-        weights_file = path.with_name(f"{path.stem}_int8_weights.safetensors")
-        self._weights = load_file(weights_file, device="cuda") if weights_file.exists() else {}
-        for name, weight in self._weights.items():
-            self._context.set_tensor_address(name, weight.data_ptr())
+        if self._context is None:
+            raise RuntimeError(f"TensorRT could not create an execution context for {path}")
+        self._stream = stream if stream is not None else CudaStream()
         self._input_names = input_names
         self._input_shapes = [tuple(self._engine.get_tensor_shape(name)) for name in input_names]
+        self._input_dtypes = [np.dtype(trt.nptype(self._engine.get_tensor_dtype(name))) for name in input_names]
+        self._inputs = {}
         self._output_names = output_names
         self._outputs = [
-            torch.empty(
-                tuple(self._engine.get_tensor_shape(name)),
-                dtype=torch_dtype(self._engine.get_tensor_dtype(name)),
-                device="cuda",
-            )
+            CudaBuffer(self._engine.get_tensor_shape(name), trt.nptype(self._engine.get_tensor_dtype(name)))
             for name in output_names
         ]
+        for name, output in zip(output_names, self._outputs, strict=True):
+            if not self._context.set_tensor_address(name, output.ptr):
+                raise RuntimeError(f"TensorRT could not bind output {name}")
 
     @property
     def scratch_bytes(self) -> int:
         return self._engine.device_memory_size_v2
 
-    def use_scratch(self, scratch: torch.Tensor) -> None:
-        self._context.set_device_memory(scratch.data_ptr(), self.scratch_bytes)
+    def use_scratch(self, scratch: CudaBuffer) -> None:
+        if scratch.nbytes < self.scratch_bytes:
+            raise ValueError("The scratch allocation is too small")
+        self._scratch = scratch
+        self._context.set_device_memory(scratch.ptr, self.scratch_bytes)
 
-    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        host = isinstance(inputs[0], np.ndarray)
-        if host:
-            inputs = tuple(torch.from_numpy(value).to("cuda") for value in inputs)
-        for name, shape, tensor in zip(self._input_names, self._input_shapes, inputs, strict=True):
-            # TensorRT reads raw memory, so a frame of another size would be read out of bounds, not refused.
-            if tuple(tensor.shape) != shape:
-                raise ValueError(f"{name} has shape {tuple(tensor.shape)}; the engine was built for {shape}.")
-            self._context.set_tensor_address(name, tensor.data_ptr())
-        for name, output in zip(self._output_names, self._outputs, strict=True):
-            self._context.set_tensor_address(name, output.data_ptr())
-        if not self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
-            raise RuntimeError("TensorRT could not run the engine.")
-        outputs = [value.cpu().numpy() for value in self._outputs] if host else self._outputs
+    def run_device(self, *inputs: np.ndarray | CudaBuffer) -> tuple[CudaBuffer, ...]:
+        for name, shape, value in zip(self._input_names, self._input_shapes, inputs, strict=True):
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{name} has shape {tuple(value.shape)}; the engine was built for {shape}.")
+        cuda = cuda_runtime()
+        host_inputs = []
+        try:
+            for name, dtype, value in zip(self._input_names, self._input_dtypes, inputs, strict=True):
+                if isinstance(value, CudaBuffer):
+                    if value.dtype != dtype:
+                        raise ValueError(f"{name} has dtype {value.dtype}; the engine expects {dtype}")
+                    buffer = value
+                else:
+                    value = np.ascontiguousarray(value, dtype=dtype)
+                    host_inputs.append(value)
+                    if name not in self._inputs:
+                        self._inputs[name] = CudaBuffer(value.shape, dtype)
+                    buffer = self._inputs[name]
+                    check_cuda(cuda.cudaMemcpyAsync(
+                        buffer.ptr, value.ctypes.data, buffer.nbytes,
+                        cuda.cudaMemcpyKind.cudaMemcpyHostToDevice, self._stream.handle,
+                    ))
+                if not self._context.set_tensor_address(name, buffer.ptr):
+                    raise RuntimeError(f"TensorRT could not bind input {name}")
+            if not self._context.execute_async_v3(self._stream.handle):
+                raise RuntimeError("TensorRT could not run the engine.")
+        finally:
+            # Input arrays must remain alive until their queued copies finish, including on errors.
+            self._stream.synchronize()
+        return tuple(self._outputs)
+
+    def __call__(self, *inputs: np.ndarray | CudaBuffer) -> np.ndarray | tuple[np.ndarray, ...]:
+        outputs = [value.numpy(self._stream) for value in self.run_device(*inputs)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    def __del__(self):
+        # Destroy the context before releasing its bound buffers and shared scratch.
+        self._context = None
+        self._engine = None
 
 
 class TensorRTDenoisingLoop:
-    """Runs a flow-matching chunk exported as three engines, as the policy's `sample_actions` does.
-
-    The prefix engine turns the observation into the KV cache, the step engine runs once per Euler step of
-    LeRobot's own `euler_integrate`, and the actions engine turns the result into the actions to play. The
-    engines run one after another, so they share one scratch buffer, and the KV cache stays on the GPU.
-    """
+    """Integrate a three-engine export while its attention cache stays on the device."""
 
     def __init__(self, folder: Path, programs: dict[str, dict], num_steps: int):
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        self._stream = CudaStream()
         self._prefix, self._step, self._actions = engines = [
-            TensorRTEngine(folder / program["file"], program["inputs"], program["outputs"], own_scratch=False)
+            TensorRTEngine(
+                folder / program["file"], program["inputs"], program["outputs"],
+                own_scratch=False, stream=self._stream,
+            )
             for program in (programs["prefix"], programs["step"], programs["actions"])
         ]
-        self._scratch = torch.empty(
-            max(engine.scratch_bytes for engine in engines), dtype=torch.uint8, device="cuda"
-        )
+        self._scratch = CudaBuffer((max(engine.scratch_bytes for engine in engines),), np.uint8)
         for engine in engines:
             engine.use_scratch(self._scratch)
         self._num_steps = num_steps
 
-    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
-        host = isinstance(inputs[0], np.ndarray)
-        if host:
-            inputs = tuple(torch.from_numpy(value).to("cuda") for value in inputs)
+    def __call__(self, *inputs: np.ndarray) -> np.ndarray:
         *observation, noise = inputs
-        cache = self._prefix(*observation)
-        x_0 = euler_integrate(lambda x_t, timestep: self._step(*cache, x_t, timestep), noise, self._num_steps)
-        actions = self._actions(x_0)
-        return actions.cpu().numpy() if host else actions
+        cache = self._prefix.run_device(*observation)
+        dt = -1.0 / self._num_steps
+        sample = noise
+        for step in range(self._num_steps):
+            timestep = np.full((noise.shape[0],), 1.0 + step * dt, dtype=np.float32)
+            sample = sample + dt * self._step(*cache, sample, timestep)
+        return self._actions(sample)

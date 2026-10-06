@@ -808,55 +808,11 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
     assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_trt.IGpuAllocator)
 
 
-def test_tensorrt_engine_binds_its_int8_weights_once(tmp_path, monkeypatch):
-    """An engine with an INT8 weights file beside it gets each weight bound to its input once, when it loads."""
-    import sys
-    import types
-
-    from safetensors.torch import save_file
-
-    from lerobot.rollout.inference.export import tensorrt as export_tensorrt
-
-    bound = {}
-
-    class Context:
-        def set_tensor_address(self, name, address):
-            bound[name] = address
-
-    engine = MagicMock()
-    engine.create_execution_context.return_value = Context()
-    engine.get_tensor_shape.return_value = (1, 2)
-    engine.get_tensor_dtype.return_value = "float"
-    fake_trt = types.SimpleNamespace(
-        ExecutionContextAllocationStrategy=types.SimpleNamespace(STATIC=0, USER_MANAGED=1)
-    )
-    monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
-    monkeypatch.setattr(export_tensorrt, "load_engine", lambda path: engine)
-    monkeypatch.setattr(export_tensorrt, "torch_dtype", lambda dtype: torch.float32)
-    weights = {"w.int8": torch.ones(4, dtype=torch.int8), "v.int8": torch.ones(2, dtype=torch.int8)}
-    save_file(weights, str(tmp_path / "model_int8_weights.safetensors"))
-    monkeypatch.setattr(
-        export_tensorrt,
-        "load_file",
-        lambda path, device: {name: tensor.clone() for name, tensor in weights.items()},
-    )
-
-    real_empty = torch.empty
-    monkeypatch.setattr(
-        export_tensorrt.torch, "empty", lambda *shape, **kw: real_empty(*shape, dtype=kw.get("dtype"))
-    )
-
-    loaded = export_tensorrt.TensorRTEngine(tmp_path / "model.engine", ["x"], ["y"])
-
-    assert sorted(bound) == ["v.int8", "w.int8"]
-    assert {name: tensor.data_ptr() for name, tensor in loaded._weights.items()} == bound
-
-
 def test_tensorrt_denoising_loop_runs_the_step_engine_once_per_euler_step():
     """The prefix runs once, the step engine once per Euler step from time 1 down, then the actions engine."""
     from lerobot.rollout.inference.export.tensorrt import TensorRTDenoisingLoop
 
-    cache = (torch.tensor([[True]]), torch.tensor([2.0]))
+    cache = (np.array([[True]]), np.array([2.0]))
     times = []
 
     def step(*inputs):
@@ -866,17 +822,17 @@ def test_tensorrt_denoising_loop_runs_the_step_engine_once_per_euler_step():
         return x_t * timestep
 
     loop = TensorRTDenoisingLoop.__new__(TensorRTDenoisingLoop)
-    loop._prefix = lambda state: cache
+    loop._prefix = SimpleNamespace(run_device=lambda state: cache)
     loop._step = step
     loop._actions = lambda x_0: 10 * x_0
     loop._num_steps = 4
 
-    actions = loop(torch.zeros(1, 3), torch.ones(1, 2, 3))
+    actions = loop(np.zeros((1, 3)), np.ones((1, 2, 3)))
 
     assert times == [1.0, 0.75, 0.5, 0.25]
     # x <- x + dt * v with dt = -1/4 and v = x * t, from x = 1.
     expected = 10 * (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625)
-    torch.testing.assert_close(actions, torch.full((1, 2, 3), expected))
+    np.testing.assert_allclose(actions, np.full((1, 2, 3), expected))
 
 
 def test_load_program_runs_a_chunk_split_into_engines_as_a_denoising_loop(tmp_path, monkeypatch):

@@ -74,6 +74,7 @@ if attempts:
         "lerobot.policies",
         "lerobot.processor",
         "lerobot.utils.action_interpolator",
+        "lerobot.rollout.inference.export.tensorrt",
         *(
             pytest.param(
                 module, marks=pytest.mark.skipif(not _datasets_available, reason="datasets not installed")
