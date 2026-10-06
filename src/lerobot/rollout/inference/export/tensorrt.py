@@ -17,6 +17,7 @@
 import functools
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import load_file
 
@@ -140,6 +141,9 @@ class TensorRTEngine:
         self._context.set_device_memory(scratch.data_ptr(), self.scratch_bytes)
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        host = isinstance(inputs[0], np.ndarray)
+        if host:
+            inputs = tuple(torch.from_numpy(value).to("cuda") for value in inputs)
         for name, shape, tensor in zip(self._input_names, self._input_shapes, inputs, strict=True):
             # TensorRT reads raw memory, so a frame of another size would be read out of bounds, not refused.
             if tuple(tensor.shape) != shape:
@@ -149,7 +153,8 @@ class TensorRTEngine:
             self._context.set_tensor_address(name, output.data_ptr())
         if not self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
             raise RuntimeError("TensorRT could not run the engine.")
-        return self._outputs[0] if len(self._outputs) == 1 else tuple(self._outputs)
+        outputs = [value.cpu().numpy() for value in self._outputs] if host else self._outputs
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
 class TensorRTDenoisingLoop:
@@ -173,7 +178,11 @@ class TensorRTDenoisingLoop:
         self._num_steps = num_steps
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
+        host = isinstance(inputs[0], np.ndarray)
+        if host:
+            inputs = tuple(torch.from_numpy(value).to("cuda") for value in inputs)
         *observation, noise = inputs
         cache = self._prefix(*observation)
         x_0 = euler_integrate(lambda x_t, timestep: self._step(*cache, x_t, timestep), noise, self._num_steps)
-        return self._actions(x_0)
+        actions = self._actions(x_0)
+        return actions.cpu().numpy() if host else actions

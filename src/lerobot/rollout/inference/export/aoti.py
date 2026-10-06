@@ -16,6 +16,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -27,5 +28,7 @@ class AOTInductorPackage:
 
         self._model = torch._inductor.aoti_load_package(str(path))
 
-    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
-        return self._model(*inputs)
+    def __call__(self, *inputs: np.ndarray) -> np.ndarray:
+        with torch.inference_mode():
+            tensors = [torch.from_numpy(value).to("cuda") for value in inputs]
+            return self._model(*tensors).cpu().numpy()

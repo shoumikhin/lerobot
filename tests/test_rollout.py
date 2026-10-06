@@ -674,7 +674,7 @@ def _write_export_folder(folder: Path, expected_actions) -> None:
 def _fake_program(*inputs):
     """A program whose chunk is the state twice, then doubled: two actions of three joints."""
     state = inputs[0]
-    return torch.stack([state, 2 * state], dim=1)
+    return np.stack([state, 2 * state], axis=1)
 
 
 @pytest.fixture
@@ -683,7 +683,6 @@ def cpu_export_engine(monkeypatch):
     from lerobot.rollout.inference.export import engine as export_engine
 
     monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
-    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
     return lambda folder: export_engine.ExportInferenceEngine(folder, task="", robot_type="")
 
 
@@ -726,7 +725,6 @@ def test_export_engine_applies_the_rename_map_to_the_robot_frame(tmp_path, monke
 
     _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
     monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
-    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
     engine = export_engine.ExportInferenceEngine(
         tmp_path, task="", robot_type="", rename_map={"observation.joints": "observation.state"}
     )
@@ -1014,15 +1012,16 @@ def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, 
 
     def aoti_load_package(path):
         loaded.append(path)
-        return _fake_program
+        return lambda state: torch.stack([state, 2 * state], dim=1)
 
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, device: self)
     monkeypatch.setitem(sys.modules, "torch_tensorrt", types.ModuleType("torch_tensorrt"))
     monkeypatch.setattr(torch._inductor, "aoti_load_package", aoti_load_package)
 
     program = export_engine.load_program(tmp_path, {"backend": "torch_tensorrt", "file": "model.pt2"})
 
     assert loaded == [str(tmp_path / "model.pt2")]
-    torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))
+    np.testing.assert_array_equal(program(np.array([[1.0, 2.0]])), [[[1.0, 2.0], [2.0, 4.0]]])
 
 
 @pytest.mark.parametrize("data_file", [None, "data.ptd"])
@@ -1056,7 +1055,7 @@ def test_executorch_cuda_program_loads_the_weights_file_beside_it(tmp_path, monk
     program = export_engine.load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
 
     assert loads == [(tmp_path / "model.pte", tmp_path / data_file if data_file else None)]
-    torch.testing.assert_close(program(torch.tensor([[1.0, 2.0]])), torch.tensor([[[1.0, 2.0], [2.0, 4.0]]]))
+    np.testing.assert_array_equal(program(np.array([[1.0, 2.0]])), [[[1.0, 2.0], [2.0, 4.0]]])
 
 
 def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
@@ -1107,7 +1106,6 @@ def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypat
     }
     (tmp_path / "export.json").write_text(json.dumps(info))
     monkeypatch.setattr(export_engine, "load_program", lambda folder, info: program)
-    monkeypatch.setattr(export_engine, "DEVICE", torch.device("cpu"))
 
     engine = export_engine.ExportInferenceEngine(tmp_path, task="pick up", robot_type="")
     first, second = (engine._run_chunk({"observation.state": state}, "pick up") for _ in range(2))

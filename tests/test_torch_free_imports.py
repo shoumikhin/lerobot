@@ -93,3 +93,67 @@ def test_imports_without_torch(module):
         [sys.executable, "-c", IMPORT_WITHOUT_TORCH, module], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_act_export_config_and_engine_run_without_torch(tmp_path):
+    code = r'''
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+from safetensors.numpy import save_file
+
+from lerobot.rollout.configs import RolloutConfig
+from lerobot.rollout.inference.export import ExportInferenceEngine
+from lerobot.robots.config import RobotConfig
+
+folder = Path(sys.argv[1])
+info = {
+    "backend": "executorch_cuda", "file": "model.pte",
+    "inputs": ["observation.state", "observation.images.camera"],
+    "output": "action", "test_case": "case.safetensors", "tolerance": 0.0,
+}
+(folder / "export.json").write_text(json.dumps(info))
+(folder / "config.json").write_text(json.dumps({
+    "type": "act", "input_features": {
+        "observation.images.camera": {"type": "VISUAL", "shape": [3, 2, 2]}
+    }, "action_feature_names": ["joint.pos"],
+}))
+state = np.array([2.0], dtype=np.float32)
+image = np.full((2, 2, 3), 255, dtype=np.uint8)
+save_file({"observation.state": state, "observation.images.camera": image,
+           "expected_actions": np.array([[2.0], [4.0]], dtype=np.float32)},
+          folder / "case.safetensors")
+
+class Method:
+    def execute(self, inputs):
+        state, image = inputs
+        assert isinstance(state, np.ndarray)
+        assert image.shape == (1, 3, 2, 2) and image.dtype == np.float32
+        np.testing.assert_array_equal(image, 1.0)
+        return [np.stack([state, 2 * state], axis=1)]
+
+runtime = SimpleNamespace(load_program=lambda *a, **kw: SimpleNamespace(load_method=lambda n: Method()))
+sys.modules["executorch.runtime"] = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+
+@RobotConfig.register_subclass("test_export_robot")
+@dataclass
+class ExportRobotConfig(RobotConfig):
+    pass
+
+sys.argv = ["lerobot-rollout", f"--policy.path={folder}"]
+cfg = RolloutConfig(robot=ExportRobotConfig())
+assert cfg.policy.type == "act" and cfg.policy.action_feature_names == ["joint.pos"]
+engine = ExportInferenceEngine(folder, task="", robot_type="test_export_robot")
+frame = {"observation.state": state, "observation.images.camera": image}
+np.testing.assert_array_equal(engine.get_action(frame), [2.0])
+np.testing.assert_array_equal(engine.get_action(frame), [4.0])
+assert "torch" not in sys.modules
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr

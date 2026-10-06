@@ -34,23 +34,16 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-import torch
 from safetensors.numpy import load_file
-
-from lerobot.policies.common.flow_matching import sample_noise
-from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline, RenameObservationsProcessorStep
 
 from ..base import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
-# Every backend runs the program on CUDA only.
-DEVICE = torch.device("cuda")
 NOISE = "noise"
 
-Program = Callable[..., torch.Tensor]
+Program = Callable[..., np.ndarray]
 
 
 def export_dir(path: str | Path | None) -> Path | None:
@@ -66,6 +59,10 @@ def load_program(folder: Path, info: dict) -> Program:
         from .tensorrt import TensorRTDenoisingLoop
 
         return TensorRTDenoisingLoop(folder, info["programs"], info["num_steps"])
+    if info["backend"] == "executorch_tensorrt" and "programs" in info:
+        from .executorch import ExecuTorchDenoisingLoop
+
+        return ExecuTorchDenoisingLoop(folder, info["programs"], info["num_steps"])
     path = folder / info["file"]
     if info["backend"] == "executorch_tensorrt":
         from .executorch import ExecuTorchProgram
@@ -101,15 +98,17 @@ class ExportInferenceEngine(InferenceEngine):
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._input_names: list[str] = info["inputs"]
         self._robot_type = robot_type
-        self._rename = RenameObservationsProcessorStep(rename_map=rename_map or {})
+        self._rename = rename_map or {}
         self._noise_shape: tuple[int, ...] | None = (
             tuple(info["noise_shape"]) if "noise_shape" in info else None
         )
-        self._text_steps = (
-            PolicyProcessorPipeline.from_pretrained(folder, config_filename=info["text_steps"])
-            if "text_steps" in info
-            else None
-        )
+        self._text_steps = None
+        if "text_steps" in info:
+            from lerobot.processor import PolicyProcessorPipeline
+
+            self._text_steps = PolicyProcessorPipeline.from_pretrained(
+                folder, config_filename=info["text_steps"]
+            )
         self._program = load_program(folder, info)
         self._actions: deque[np.ndarray] = deque()
         self._fixed_task: str | None = info["task"] if info.get("task_fixed") else None
@@ -120,18 +119,30 @@ class ExportInferenceEngine(InferenceEngine):
     def _run_chunk(
         self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None
     ) -> np.ndarray:
-        observation = prepare_observation_for_inference(dict(frame), DEVICE, task, self._robot_type)
+        observation = {}
+        for name, value in frame.items():
+            if "image" in name:
+                if value.dtype == np.uint8:
+                    value = value.astype(np.float32) / 255
+                value = value.transpose(2, 0, 1)
+            observation[name] = np.ascontiguousarray(value)[None]
         if self._text_steps is not None:
-            observation = self._text_steps(observation)
+            import torch
+
+            tensors = {name: torch.from_numpy(value) for name, value in observation.items()}
+            tensors.update(task=task or "", robot_type=self._robot_type or "")
+            with torch.inference_mode():
+                observation = self._text_steps(tensors)
+            observation = {
+                name: value.cpu().numpy() if isinstance(value, torch.Tensor) else value
+                for name, value in observation.items()
+            }
         if self._noise_shape is not None:
             observation[NOISE] = (
-                torch.from_numpy(noise).to(DEVICE)
-                if noise is not None
-                else sample_noise(self._noise_shape, DEVICE)
+                noise if noise is not None else np.random.standard_normal(self._noise_shape).astype(np.float32)
             )
-        with torch.inference_mode():
-            actions = self._program(*(observation[name] for name in self._input_names))
-        return actions[0].cpu().numpy()
+        actions = self._program(*(observation[name] for name in self._input_names))
+        return actions[0].copy()
 
     def _check_task(self, task: str) -> None:
         if self._fixed_task is not None and task != self._fixed_task:
@@ -175,7 +186,8 @@ class ExportInferenceEngine(InferenceEngine):
             self._actions.clear()
         if not self._actions:
             start = time.perf_counter()
-            self._actions.extend(self._run_chunk(self._rename.observation(obs_frame), task))
+            frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+            self._actions.extend(self._run_chunk(frame, task))
             self.inference_seconds.append(time.perf_counter() - start)
         self._set_dispatched_task(task)
         return self._actions.popleft()

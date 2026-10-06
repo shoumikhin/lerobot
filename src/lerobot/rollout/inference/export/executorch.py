@@ -16,22 +16,64 @@
 
 from pathlib import Path
 
-import torch
+import numpy as np
 
 
 class ExecuTorchProgram:
-    """Runs a `.pte` program whose inputs and outputs stay on the GPU.
-
-    A program on ExecuTorch's CUDA backend keeps its weights in a `.ptd` file beside it.
-    """
+    """Run a `.pte` program with host arrays and read its outputs through DLPack."""
 
     def __init__(self, path: Path, tensorrt: bool = True):
         if tensorrt:
-            import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
+            import torch_tensorrt_executorch_runtime  # noqa: F401
         from executorch.runtime import Runtime
 
         data_path = next(path.parent.glob("*.ptd"), None)
         self._method = Runtime.get().load_program(path, data_path=data_path).load_method("forward")
+        self._torch_inputs = False
 
-    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
-        return self._method.execute(list(inputs))[0]
+    def __call__(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        arrays = [np.ascontiguousarray(value) for value in inputs]
+        if not self._torch_inputs:
+            try:
+                outputs = self._method.execute(arrays)
+            except TypeError:
+                # Older bindings accept only torch tensors.
+                self._torch_inputs = True
+        if self._torch_inputs:
+            import torch
+
+            outputs = self._method.execute([torch.from_numpy(value) for value in arrays])
+        result = []
+        for output in outputs:
+            if output.__dlpack_device__()[0] == 1:
+                result.append(np.from_dlpack(output).copy())
+            else:
+                # Older exports return device memory instead of host outputs.
+                import torch
+
+                result.append(torch.from_dlpack(output).cpu().numpy())
+        return result[0] if len(result) == 1 else tuple(result)
+
+
+class ExecuTorchDenoisingLoop:
+    """Run the prefix once, integrate the velocity, and convert the final actions."""
+
+    def __init__(self, folder: Path, programs: dict[str, dict], num_steps: int):
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        self._prefix, self._step, self._actions = (
+            ExecuTorchProgram(folder / programs[name]["file"]) for name in ("prefix", "step", "actions")
+        )
+        self._num_steps = num_steps
+
+    def __call__(self, *inputs: np.ndarray) -> np.ndarray:
+        *observation, noise = inputs
+        cache = self._prefix(*observation)
+        if not isinstance(cache, tuple):
+            cache = (cache,)
+        dt = -1.0 / self._num_steps
+        sample = noise
+        for step in range(self._num_steps):
+            timestep = np.full((noise.shape[0],), 1.0 + step * dt, dtype=np.float32)
+            sample = sample + dt * self._step(*cache, sample, timestep)
+        return self._actions(sample)
