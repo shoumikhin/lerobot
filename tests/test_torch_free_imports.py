@@ -99,7 +99,7 @@ def test_imports_without_torch(module):
 @pytest.mark.parametrize("raw_frame", [False, True])
 @pytest.mark.parametrize("input_type", ["numpy", "dlpack", "torch"])
 def test_act_export_config_and_engine_input_compatibility(tmp_path, raw_frame, input_type):
-    code = r'''
+    code = r"""
 import json
 import sys
 from dataclasses import dataclass
@@ -183,9 +183,11 @@ np.testing.assert_array_equal(engine.get_action(frame), [2.0])
 np.testing.assert_array_equal(engine.get_action(frame), [4.0])
 assert calls == (["numpy", "torch", "torch"] if input_type == "torch" else ["numpy", "numpy"])
 assert ("torch" in sys.modules) == (input_type == "torch")
-'''
+"""
     result = subprocess.run(
         [sys.executable, "-c", code, str(tmp_path), str(raw_frame), input_type],
-        capture_output=True, text=True, timeout=300
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     assert result.returncode == 0, result.stderr

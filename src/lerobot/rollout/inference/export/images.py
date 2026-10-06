@@ -60,8 +60,11 @@ def resize_images(frame: dict[str, np.ndarray], geometry: dict) -> dict[str, np.
                 side = max(height, width)
                 image = np.pad(
                     image,
-                    (((side - height) // 2, (side - height + 1) // 2),
-                     ((side - width) // 2, (side - width + 1) // 2), (0, 0)),
+                    (
+                        ((side - height) // 2, (side - height + 1) // 2),
+                        ((side - width) // 2, (side - width + 1) // 2),
+                        (0, 0),
+                    ),
                 )
             edge = geometry["resize_edge"]
             image = resize_bicubic(image, (edge, edge))

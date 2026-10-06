@@ -29,13 +29,19 @@ def test_bicubic_matches_antialiased_reference(size):
 
     image = np.random.default_rng(7).integers(0, 256, (7, 11, 3), dtype=np.uint8)
     original = image.copy()
-    expected = functional.interpolate(
-        torch.from_numpy(image).permute(2, 0, 1)[None].float(),
-        size=size,
-        mode="bicubic",
-        align_corners=False,
-        antialias=True,
-    ).clamp(0, 255).round()[0].permute(1, 2, 0).numpy()
+    expected = (
+        functional.interpolate(
+            torch.from_numpy(image).permute(2, 0, 1)[None].float(),
+            size=size,
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        .clamp(0, 255)
+        .round()[0]
+        .permute(1, 2, 0)
+        .numpy()
+    )
     actual = resize_bicubic(image, size)
     assert actual.dtype == np.uint8 and actual.flags.c_contiguous
     assert np.abs(actual.astype(np.float32) - expected).max() <= 1
@@ -52,8 +58,12 @@ def test_camera_geometry_letterbox_and_unrelated_arrays():
     image = np.full((2, 4, 3), 100, dtype=np.uint8)
     frame = {"camera": image, "state": np.zeros(6, dtype=np.float32)}
     geometry = {
-        "cameras": ["camera"], "target_size": [4, 4], "resize_edge": 4,
-        "crop_fraction": None, "letterbox": True, "image_size": [4, 4],
+        "cameras": ["camera"],
+        "target_size": [4, 4],
+        "resize_edge": 4,
+        "crop_fraction": None,
+        "letterbox": True,
+        "image_size": [4, 4],
     }
     result = resize_images(frame, geometry)
     np.testing.assert_array_equal(result["camera"], np.pad(image, ((1, 1), (0, 0), (0, 0))))
@@ -67,10 +77,21 @@ def test_runtime_resizes_both_startup_and_live_frames(tmp_path, monkeypatch):
     expected = state[None]
     frame = {"observation.images.camera": image, "observation.state": state}
     info = {
-        "backend": "torch_tensorrt", "file": "model.pt2", "raw_frame": True,
-        "inputs": list(frame), "output": "action", "test_case": "case.safetensors", "tolerance": 0,
-        "image_resize": {"cameras": ["observation.images.camera"], "target_size": [3, 3],
-                         "resize_edge": 6, "crop_fraction": 0.5, "letterbox": False, "image_size": [3, 3]},
+        "backend": "torch_tensorrt",
+        "file": "model.pt2",
+        "raw_frame": True,
+        "inputs": list(frame),
+        "output": "action",
+        "test_case": "case.safetensors",
+        "tolerance": 0,
+        "image_resize": {
+            "cameras": ["observation.images.camera"],
+            "target_size": [3, 3],
+            "resize_edge": 6,
+            "crop_fraction": 0.5,
+            "letterbox": False,
+            "image_size": [3, 3],
+        },
     }
     (tmp_path / "export.json").write_text(json.dumps(info))
     save_file({**frame, "expected_actions": expected}, tmp_path / "case.safetensors")

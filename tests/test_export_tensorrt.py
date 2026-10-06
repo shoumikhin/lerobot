@@ -51,10 +51,16 @@ def fake_cuda(monkeypatch):
         return (0,)
 
     cuda = SimpleNamespace(
-        cudaMalloc=malloc, cudaFree=free, cudaMemcpyAsync=memcpy,
+        cudaMalloc=malloc,
+        cudaFree=free,
+        cudaMemcpyAsync=memcpy,
         cudaMemcpyKind=SimpleNamespace(cudaMemcpyHostToDevice=1, cudaMemcpyDeviceToHost=2),
-        cudaStreamCreate=lambda: (0, 123), cudaStreamSynchronize=synchronize,
-        cudaStreamDestroy=lambda stream: (0,), allocations=allocations, pending=pending, copies=copies,
+        cudaStreamCreate=lambda: (0, 123),
+        cudaStreamSynchronize=synchronize,
+        cudaStreamDestroy=lambda stream: (0,),
+        allocations=allocations,
+        pending=pending,
+        copies=copies,
     )
     monkeypatch.setattr(backend, "cuda_runtime", lambda: cuda)
     return cuda
@@ -87,7 +93,8 @@ def fake_engine(monkeypatch, fake_cuda):
 
     engine = SimpleNamespace(
         create_execution_context=lambda strategy: Context(),
-        get_tensor_shape=lambda name: (1, 3), get_tensor_dtype=lambda name: "float",
+        get_tensor_shape=lambda name: (1, 3),
+        get_tensor_dtype=lambda name: "float",
         device_memory_size_v2=64,
     )
     trt = SimpleNamespace(
@@ -140,11 +147,14 @@ def test_engine_synchronizes_copies_after_execution_failure(tmp_path, fake_cuda,
 
 def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
     cuda = SimpleNamespace(
-        cudaMalloc=MagicMock(return_value=(0, 4096)), cudaFree=MagicMock(return_value=(0,)),
+        cudaMalloc=MagicMock(return_value=(0, 4096)),
+        cudaFree=MagicMock(return_value=(0,)),
         cudaStreamSynchronize=MagicMock(return_value=(0,)),
     )
     monkeypatch.setattr(backend, "cuda_runtime", lambda: cuda)
-    trt = SimpleNamespace(IGpuAllocator=type("Allocator", (), {}), Runtime=lambda logger: SimpleNamespace(), Logger=MagicMock())
+    trt = SimpleNamespace(
+        IGpuAllocator=type("Allocator", (), {}), Runtime=lambda logger: SimpleNamespace(), Logger=MagicMock()
+    )
     monkeypatch.setitem(sys.modules, "tensorrt", trt)
     monkeypatch.setattr(backend, "runtime", functools.cache(backend.runtime.__wrapped__))
     allocator = backend.runtime().gpu_allocator
@@ -204,10 +214,12 @@ def test_split_loop_passes_one_timestep_for_both_contracts(tmp_path, monkeypatch
     monkeypatch.setattr(backend, "TensorRTEngine", Engine)
     monkeypatch.setattr(backend, "CudaStream", lambda: None)
     monkeypatch.setattr(backend, "CudaBuffer", lambda *a: None)
-    programs = {name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
-                for name in ("prefix", "step", "actions")}
+    programs = {
+        name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
+        for name in ("prefix", "step", "actions")
+    }
     loop = backend.TensorRTDenoisingLoop(tmp_path, programs, 4)
     result = loop(np.ones(3), np.ones(noise_shape, dtype=np.float32))
     assert result.shape == noise_shape
     assert times == [1.0, 0.75, 0.5, 0.25]
-    np.testing.assert_allclose(result, (1 - .25) * (1 - .1875) * (1 - .125) * (1 - .0625))
+    np.testing.assert_allclose(result, (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625))

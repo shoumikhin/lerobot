@@ -63,9 +63,15 @@ class CudaBuffer:
     def numpy(self, stream: CudaStream) -> np.ndarray:
         value = np.empty(self.shape, self.dtype)
         cuda = cuda_runtime()
-        check_cuda(cuda.cudaMemcpyAsync(
-            value.ctypes.data, self.ptr, self.nbytes, cuda.cudaMemcpyKind.cudaMemcpyDeviceToHost, stream.handle
-        ))
+        check_cuda(
+            cuda.cudaMemcpyAsync(
+                value.ctypes.data,
+                self.ptr,
+                self.nbytes,
+                cuda.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                stream.handle,
+            )
+        )
         stream.synchronize()
         return value
 
@@ -149,8 +155,12 @@ class TensorRTEngine:
     """Run a fixed-shape engine; related engines can share a stream and scratch allocation."""
 
     def __init__(
-        self, path: Path, input_names: list[str], output_names: list[str],
-        own_scratch: bool = True, stream: CudaStream | None = None,
+        self,
+        path: Path,
+        input_names: list[str],
+        output_names: list[str],
+        own_scratch: bool = True,
+        stream: CudaStream | None = None,
     ):
         import tensorrt as trt
 
@@ -207,10 +217,15 @@ class TensorRTEngine:
                     if name not in self._inputs:
                         self._inputs[name] = CudaBuffer(value.shape, dtype)
                     buffer = self._inputs[name]
-                    check_cuda(cuda.cudaMemcpyAsync(
-                        buffer.ptr, value.ctypes.data, buffer.nbytes,
-                        cuda.cudaMemcpyKind.cudaMemcpyHostToDevice, self._stream.handle,
-                    ))
+                    check_cuda(
+                        cuda.cudaMemcpyAsync(
+                            buffer.ptr,
+                            value.ctypes.data,
+                            buffer.nbytes,
+                            cuda.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                            self._stream.handle,
+                        )
+                    )
                 if not self._context.set_tensor_address(name, buffer.ptr):
                     raise RuntimeError(f"TensorRT could not bind input {name}")
             if not self._context.execute_async_v3(self._stream.handle):
@@ -239,8 +254,11 @@ class TensorRTDenoisingLoop:
         self._stream = CudaStream()
         self._prefix, self._step, self._actions = engines = [
             TensorRTEngine(
-                folder / program["file"], program["inputs"], program["outputs"],
-                own_scratch=False, stream=self._stream,
+                folder / program["file"],
+                program["inputs"],
+                program["outputs"],
+                own_scratch=False,
+                stream=self._stream,
             )
             for program in (programs["prefix"], programs["step"], programs["actions"])
         ]

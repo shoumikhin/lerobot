@@ -120,7 +120,10 @@ class ExportInferenceEngine(InferenceEngine):
         logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
 
     def _run_chunk(
-        self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None,
+        self,
+        frame: dict[str, np.ndarray],
+        task: str,
+        noise: np.ndarray | None = None,
         initialize: bool = False,
     ) -> np.ndarray:
         if self._image_resize is not None:
@@ -151,7 +154,9 @@ class ExportInferenceEngine(InferenceEngine):
             }
         if self._noise_shape is not None:
             observation[NOISE] = (
-                noise if noise is not None else np.random.standard_normal(self._noise_shape).astype(np.float32)
+                noise
+                if noise is not None
+                else np.random.standard_normal(self._noise_shape).astype(np.float32)
             )
         program = getattr(self._program, "initialize", self._program) if initialize else self._program
         actions = program(*(observation[name] for name in self._input_names))

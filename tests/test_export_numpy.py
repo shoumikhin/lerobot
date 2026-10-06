@@ -47,8 +47,10 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
             if torch_inputs:
                 if isinstance(inputs[0], np.ndarray):
                     probes.append(path.name)
-                    raise RuntimeError("Unsupported python type <class 'numpy.ndarray'>. "
-                                       "Ensure that inputs are passed as a flat list of tensors.")
+                    raise RuntimeError(
+                        "Unsupported python type <class 'numpy.ndarray'>. "
+                        "Ensure that inputs are passed as a flat list of tensors."
+                    )
                 inputs = [value.numpy() for value in inputs]
             calls.append(path.name)
             assert all(isinstance(value, np.ndarray) for value in inputs)
@@ -57,7 +59,9 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
 
     runtime = SimpleNamespace(load_program=load)
-    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
     monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
     info = {
         "backend": "executorch_tensorrt",
@@ -84,9 +88,14 @@ def test_executorch_output_survives_next_execution(tmp_path, monkeypatch):
         buffer[:] = inputs[0]
         return [buffer]
 
-    runtime = SimpleNamespace(load_program=lambda *args, **kw: SimpleNamespace(
-        load_method=lambda name: SimpleNamespace(execute=execute)))
-    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    runtime = SimpleNamespace(
+        load_program=lambda *args, **kw: SimpleNamespace(
+            load_method=lambda name: SimpleNamespace(execute=execute)
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
     program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
     first = program(np.ones((1, 2), dtype=np.float32))
     program(np.zeros((1, 2), dtype=np.float32))
@@ -103,14 +112,21 @@ def test_executorch_bfloat16_compatibility_preserves_values_and_ownership(tmp_pa
     def execute(inputs):
         input_types.append(type(inputs[0]))
         if not isinstance(inputs[0], torch.Tensor):
-            raise RuntimeError("Unsupported python type <class 'numpy.ndarray'>. "
-                               "Ensure that inputs are passed as a flat list of tensors.")
+            raise RuntimeError(
+                "Unsupported python type <class 'numpy.ndarray'>. "
+                "Ensure that inputs are passed as a flat list of tensors."
+            )
         buffer.copy_(inputs[0])
         return [buffer]
 
-    runtime = SimpleNamespace(load_program=lambda *args, **kw: SimpleNamespace(
-        load_method=lambda name: SimpleNamespace(execute=execute)))
-    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    runtime = SimpleNamespace(
+        load_program=lambda *args, **kw: SimpleNamespace(
+            load_method=lambda name: SimpleNamespace(execute=execute)
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
     program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
     first = program.initialize(np.array([[1.25, -2.5]], dtype=ml_dtypes.bfloat16))
     second = program(np.zeros((1, 2), dtype=ml_dtypes.bfloat16))
@@ -132,9 +148,14 @@ def test_executorch_does_not_retry_execution_errors(tmp_path, monkeypatch, error
             return inputs
         raise error
 
-    runtime = SimpleNamespace(load_program=lambda *args, **kw: SimpleNamespace(
-        load_method=lambda name: SimpleNamespace(execute=execute)))
-    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    runtime = SimpleNamespace(
+        load_program=lambda *args, **kw: SimpleNamespace(
+            load_method=lambda name: SimpleNamespace(execute=execute)
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
     program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
     inputs = np.ones((1, 2), dtype=np.float32)
     if after_load:
@@ -172,9 +193,15 @@ def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(
         names.reverse()
     frame = {"observation.state": state, "observation.images.camera": image}
     info = {
-        "backend": "onnx_tensorrt", "file": "model.engine", "inputs": [*names, "noise"],
-        "output": "action", "noise_shape": [4, 3], "task": "pick", "task_fixed": True,
-        "test_case": "case.safetensors", "tolerance": 0.0,
+        "backend": "onnx_tensorrt",
+        "file": "model.engine",
+        "inputs": [*names, "noise"],
+        "output": "action",
+        "noise_shape": [4, 3],
+        "task": "pick",
+        "task_fixed": True,
+        "test_case": "case.safetensors",
+        "tolerance": 0.0,
     }
     if declared_layout:
         info["raw_frame"] = True
@@ -199,8 +226,11 @@ def test_raw_frame_engine_preserves_inputs_noise_and_action_queue(
     monkeypatch.setattr(module, "load_program", lambda *args: Program())
     engine = ExportInferenceEngine(tmp_path, "pick", "replay", {"camera": "observation.images.camera"})
     np.testing.assert_array_equal(calls[0], noise)
-    live = {"observation.state": state, "camera": np.asfortranarray(image),
-            "unused.image": np.zeros(1, dtype=np.uint8)}
+    live = {
+        "observation.state": state,
+        "camera": np.asfortranarray(image),
+        "unused.image": np.zeros(1, dtype=np.uint8),
+    }
     np.testing.assert_array_equal(engine.get_action(live), state)
     np.testing.assert_array_equal(engine.get_action(live), 2 * state)
     assert len(calls) == 2
@@ -215,16 +245,27 @@ def test_legacy_text_pipeline_keeps_state_not_listed_as_program_input(tmp_path, 
     from lerobot.rollout.inference.export import engine as module
 
     state = np.array([1, 2], dtype=np.float32)
-    (tmp_path / "export.json").write_text(json.dumps({
-        "backend": "onnx_tensorrt", "file": "model.engine", "inputs": ["tokens"],
-        "output": "action", "test_case": "case.safetensors", "tolerance": 0.0,
-        "text_steps": "text.json",
-    }))
+    (tmp_path / "export.json").write_text(
+        json.dumps(
+            {
+                "backend": "onnx_tensorrt",
+                "file": "model.engine",
+                "inputs": ["tokens"],
+                "output": "action",
+                "test_case": "case.safetensors",
+                "tolerance": 0.0,
+                "text_steps": "text.json",
+            }
+        )
+    )
     save_file({"observation.state": state, "expected_actions": state[None]}, tmp_path / "case.safetensors")
+
     def pipeline(frame):
         return {"tokens": frame["observation.state"]}
 
-    monkeypatch.setattr("lerobot.processor.PolicyProcessorPipeline.from_pretrained", lambda *a, **kw: pipeline)
+    monkeypatch.setattr(
+        "lerobot.processor.PolicyProcessorPipeline.from_pretrained", lambda *a, **kw: pipeline
+    )
     monkeypatch.setattr(module, "load_program", lambda *a: lambda tokens: tokens[:, None])
     engine = ExportInferenceEngine(tmp_path, "pick", "replay")
     np.testing.assert_array_equal(engine.get_action({"observation.state": state}), state)

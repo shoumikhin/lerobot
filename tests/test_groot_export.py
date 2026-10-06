@@ -18,7 +18,9 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("cameras,t,p,m,gh,gw", [(2, 2, 16, 2, 16, 16), (1, 1, 2, 2, 4, 4), (2, 3, 3, 2, 4, 6)])
+@pytest.mark.parametrize(
+    "cameras,t,p,m,gh,gw", [(2, 2, 16, 2, 16, 16), (1, 1, 2, 2, 4, 4), (2, 3, 3, 2, 4, 6)]
+)
 def test_patch_packing_preserves_order_with_at_most_eight_dimensions(monkeypatch, cameras, t, p, m, gh, gw):
     pytest.importorskip("transformers")
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "examples" / "export"))
@@ -49,5 +51,9 @@ def test_patch_packing_preserves_order_with_at_most_eight_dimensions(monkeypatch
     torch.testing.assert_close(pixels, expected, rtol=0, atol=0)
     torch.testing.assert_close(state, frame[-1][None, None], rtol=0, atol=0)
     program = torch.export.export(observation, frame).run_decompositions()
-    ranks = [node.meta["val"].ndim for node in program.graph.nodes if isinstance(node.meta.get("val"), torch.Tensor)]
+    ranks = [
+        node.meta["val"].ndim
+        for node in program.graph.nodes
+        if isinstance(node.meta.get("val"), torch.Tensor)
+    ]
     assert max(ranks) <= 8
