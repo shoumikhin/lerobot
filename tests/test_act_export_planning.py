@@ -1,0 +1,79 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import runpy
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.mark.parametrize("deferred,export_only", [(False, False), (True, False), (False, True)])
+def test_executorch_export_shares_host_inputs_only(tmp_path, monkeypatch, deferred, export_only):
+    torch = MagicMock()
+    tensorrt = MagicMock()
+    config = MagicMock()
+    planning = MagicMock()
+    export = MagicMock(output_dir=tmp_path)
+    save_for_build_engine = MagicMock()
+    args = SimpleNamespace(
+        policy_path="policy",
+        output_dir=tmp_path,
+        job_name="act",
+        export_only=export_only,
+        tolerance=0.5,
+        workspace_gib=None,
+        optimization_level=None,
+    )
+    modules = {
+        "torch": torch,
+        "torch_tensorrt": tensorrt,
+        "executorch.exir": SimpleNamespace(ExecutorchBackendConfig=config),
+        "executorch.exir.passes": SimpleNamespace(MemoryPlanningPass=planning),
+        "act_recipe": SimpleNamespace(
+            ACTExport=MagicMock(return_value=export),
+            parse_args=lambda *a: args,
+            save_for_build_engine=save_for_build_engine,
+            EXPORTED_PROGRAM="model.pt2",
+        ),
+        "tensorrt": SimpleNamespace(IStreamWriter=object),
+        "lerobot.rollout.inference.export": SimpleNamespace(ExportInferenceEngine=MagicMock()),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    scripts = Path(__file__).resolve().parents[1] / "examples" / "export"
+    if deferred:
+        namespace = runpy.run_path(str(scripts / "build_engine.py"))
+        namespace["build_executorch"](tmp_path, "model.pte", args)
+    else:
+        runpy.run_path(str(scripts / "act_executorch_tensorrt.py"), run_name="__main__")
+    if export_only:
+        tensorrt.save.assert_not_called()
+        save_for_build_engine.assert_called_once_with(
+            export, torch.export.export.return_value, tmp_path / "model.pte"
+        )
+        planning.assert_not_called()
+        config.assert_not_called()
+        return
+    planning.assert_called_once_with(alloc_graph_input=False)
+    config.assert_called_once_with(memory_planning_pass=planning.return_value)
+    tensorrt.save.assert_called_once_with(
+        tensorrt.dynamo.compile.return_value,
+        str(tmp_path / "model.pte"),
+        output_format="executorch",
+        retrace=False,
+        backend_config=config.return_value,
+    )

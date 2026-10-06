@@ -34,6 +34,8 @@ from pathlib import Path
 import tensorrt as trt
 import torch
 from act_recipe import EXPORTED_PROGRAM
+from executorch.exir import ExecutorchBackendConfig
+from executorch.exir.passes import MemoryPlanningPass
 
 from lerobot.rollout.inference.export import ExportInferenceEngine
 
@@ -93,7 +95,15 @@ def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) 
     del program
     gc.collect()
     torch.cuda.empty_cache()
-    torch_tensorrt.save(engine, str(folder / program_file), output_format="executorch", retrace=False)
+    torch_tensorrt.save(
+        engine,
+        str(folder / program_file),
+        output_format="executorch",
+        retrace=False,
+        backend_config=ExecutorchBackendConfig(
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False)
+        ),
+    )
     # The startup check loads the engine again; a compiled GraphModule is only freed by the cycle collector.
     del engine
     gc.collect()

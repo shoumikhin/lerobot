@@ -28,6 +28,8 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 import torch
 import torch_tensorrt
 from act_recipe import ACTExport, parse_args, save_for_build_engine
+from executorch.exir import ExecutorchBackendConfig
+from executorch.exir.passes import MemoryPlanningPass
 
 
 def main() -> None:
@@ -43,7 +45,15 @@ def main() -> None:
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
-    torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
+    torch_tensorrt.save(
+        engine,
+        str(pte_path),
+        output_format="executorch",
+        retrace=False,
+        backend_config=ExecutorchBackendConfig(
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False)
+        ),
+    )
     export.write(pte_path)
 
 
