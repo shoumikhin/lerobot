@@ -40,7 +40,7 @@ def main() -> None:
         raise SystemExit(
             "--export_only is not supported here: build_engine.py does not build AOTInductor packages."
         )
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     package_path = export.output_dir / "model.pt2"
 
     start = time.perf_counter()

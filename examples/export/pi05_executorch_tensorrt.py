@@ -36,7 +36,7 @@ from pi05_recipe import PI05Export, parse_args
 
 def main() -> None:
     args = parse_args(__doc__, "executorch_tensorrt")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     pte_path = export.output_dir / "model.pte"
 
     start = time.perf_counter()

@@ -78,6 +78,8 @@ python examples/export/pi05_executorch_tensorrt.py \
     --output_dir=outputs/export/pi05_executorch_tensorrt
 ```
 
+pi0.5 takes raw camera frames and state. State normalization and prompt construction run inside the program, so no tokenizer is needed at runtime. Use `--cameras observation.images.base_0_rgb observation.images.left_wrist_0_rgb` to export for two cameras; the policy pads and masks the missing camera slot. At rollout, use `--rename_map` if the robot's camera names differ from these keys.
+
 The `executorch_cuda` scripts compile CUDA kernels with `nvcc`, so add it to your `PATH` first: `export PATH=/usr/local/cuda/bin:$PATH`.
 
 GR00T and pi0.5 run only on the Thor. Their bfloat16 weights do not fit in the Orin Nano's memory.

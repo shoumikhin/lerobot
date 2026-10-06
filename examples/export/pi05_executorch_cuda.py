@@ -38,7 +38,7 @@ def main() -> None:
     args = parse_args(__doc__, "executorch_cuda")
     if args.export_only:
         raise SystemExit("--export_only is not supported here: build_engine.py builds TensorRT engines only.")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     pte_path = export.output_dir / "model.pte"
 
     start = time.perf_counter()
