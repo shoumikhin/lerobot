@@ -107,6 +107,7 @@ from types import SimpleNamespace
 import numpy as np
 from safetensors.numpy import save_file
 
+from lerobot.configs import parser
 from lerobot.rollout.configs import RolloutConfig
 from lerobot.rollout.inference.export import ExportInferenceEngine
 from lerobot.robots.config import RobotConfig
@@ -145,8 +146,12 @@ sys.modules["executorch.runtime"] = SimpleNamespace(Runtime=SimpleNamespace(get=
 class ExportRobotConfig(RobotConfig):
     pass
 
-sys.argv = ["lerobot-rollout", f"--policy.path={folder}"]
-cfg = RolloutConfig(robot=ExportRobotConfig())
+@parser.wrap()
+def parse_config(cfg: RolloutConfig):
+    return cfg
+
+sys.argv = ["lerobot-rollout", f"--policy.path={folder}", "--robot.type=test_export_robot"]
+cfg = parse_config()
 assert cfg.policy.type == "act" and cfg.policy.action_feature_names == ["joint.pos"]
 engine = ExportInferenceEngine(folder, task="", robot_type="test_export_robot")
 frame = {"observation.state": state, "observation.images.camera": image}
