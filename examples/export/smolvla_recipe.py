@@ -17,13 +17,13 @@
 """The SmolVLA export recipe: what both backend scripts compile, and the folder they write.
 
 As for ACT, the compiled module is what `lerobot-rollout` runs for one action chunk, all of it LeRobot's
-own code: the checkpoint's saved preprocessor, the policy's `predict_action_chunk`, and the saved
-postprocessor. Two things differ from ACT:
+own code, from the robot's frame to the actions in robot units. Two things differ from ACT:
 
-- The task text. A TensorRT engine cannot tokenize, so the preprocessor's text steps (the newline and
-  the tokenizer) run before the program, which takes the token ids and the attention mask.
-- The noise. Each chunk starts from random noise. The program takes it as an input, so the rollout draws
-  it, and the test case gives the program the noise the PyTorch policy got.
+- The task text. A program cannot tokenize, so the preprocessor's text steps (the newline and the
+  tokenizer) run once here, and the program holds the task's token ids as constants. So the folder runs
+  the task it was exported for, and `export.json` marks it `task_fixed`.
+- The noise. Each chunk starts from random noise. The program takes it as its last input, so the rollout
+  draws it, and the test case gives the program the noise the PyTorch policy got.
 
 The robot's cameras and the task come from the dataset the policy was trained on, because SmolVLA's
 checkpoint only names placeholder cameras. The folder's config names the robot's cameras, so the rollout's
@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from act_recipe import TEST_CASE, gpu_processors, make_output_dir
+from act_recipe import TEST_CASE, gpu_processors, make_output_dir, to_policy_input
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
@@ -54,26 +54,35 @@ TEXT_STEPS = "text_steps.json"
 
 
 class SmolVLAChunk(nn.Module):
-    """One action chunk: the robot's observation, the task tokens and the noise in, the actions out."""
+    """One action chunk: the robot's frame and the noise in, the actions to play out, in robot units."""
 
     def __init__(
         self,
         policy: SmolVLAPolicy,
         preprocessor: PolicyProcessorPipeline,
         postprocessor: PolicyProcessorPipeline,
-        input_names: list[str],
+        frame_names: list[str],
+        tokens: Tensor,
+        attention_mask: Tensor,
     ):
         super().__init__()
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
-        self.input_names = input_names
+        self.frame_names = frame_names
+        self.input_names = [*frame_names, NOISE]
+        self.register_buffer("tokens", tokens)
+        self.register_buffer("attention_mask", attention_mask)
 
     def forward(self, *inputs: Tensor) -> Tensor:
-        *observation, noise = inputs
-        batch = self.preprocessor(dict(zip(self.input_names[:-1], observation, strict=True)))
-        actions = self.policy.predict_action_chunk(batch, noise=noise)
-        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])
+        *frame, noise = inputs
+        observation = {
+            name: to_policy_input(name, x) for name, x in zip(self.frame_names, frame, strict=True)
+        }
+        observation[OBS_LANGUAGE_TOKENS] = self.tokens
+        observation[OBS_LANGUAGE_ATTENTION_MASK] = self.attention_mask
+        actions = self.policy.predict_action_chunk(self.preprocessor(observation), noise=noise[None])
+        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
 
 
 class SmolVLAExport:
@@ -107,15 +116,21 @@ class SmolVLAExport:
             for name, feature in dataset_to_policy_features(metadata.features).items()
             if name in self.frame
         }
-        observation = self.text_steps(
+        prompt = self.text_steps(
             prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
         )
-        names = [*self.frame, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK, NOISE]
         config = self.policy.config
-        self.noise = torch.randn(1, config.chunk_size, config.max_action_dim, device="cuda")
-        self.inputs = (*(observation[name] for name in names[:-1]), self.noise)
-        self.module = SmolVLAChunk(self.policy, tensor_steps, postprocessor, names)
-        self.input_names = names
+        self.noise = torch.randn(config.chunk_size, config.max_action_dim, device="cuda")
+        self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
+        self.module = SmolVLAChunk(
+            self.policy,
+            tensor_steps,
+            postprocessor,
+            list(self.frame),
+            prompt[OBS_LANGUAGE_TOKENS],
+            prompt[OBS_LANGUAGE_ATTENTION_MASK],
+        )
+        self.input_names = self.module.input_names
 
     def release_policy(self) -> None:
         """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
@@ -125,19 +140,19 @@ class SmolVLAExport:
         torch.cuda.empty_cache()
 
     def write(self, backend: str, program_file: str, tolerance: float) -> None:
-        """Save the test case, the policy config, the text steps and `export.json` beside the program."""
+        """Save the test case, the policy config and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
-        self.text_steps.save_pretrained(self.output_dir, config_filename=TEXT_STEPS)
         info = {
             "backend": backend,
             "file": program_file,
             "inputs": self.input_names,
-            "text_steps": TEXT_STEPS,
             "task": self.task,
+            # The program holds the task's token ids.
+            "task_fixed": True,
             "noise_shape": list(self.noise.shape),
             "output": ACTION,
             "test_case": TEST_CASE,
@@ -160,7 +175,7 @@ class SmolVLAExport:
         self.policy.reset()
         observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
         with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(preprocessor(observation), noise=self.noise)
+            actions = self.policy.predict_action_chunk(preprocessor(observation), noise=self.noise[None])
             actions = postprocessor(actions[:, : self.policy.config.n_action_steps])
         return actions[0].cpu().numpy()
 
