@@ -26,49 +26,12 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
 import time
-from pathlib import Path
 
 import torch
 import torch_tensorrt
 from act_recipe import ACTExport, parse_args
-from executorch.exir import ExecutorchBackendConfig
-from executorch.exir._serialize._program import _ExtendedHeader, _flatbuffer_to_program, _get_extended_header
-from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
-from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
-from executorch.exir.schema import DeviceType, Tensor
 
 EXPORTED_PROGRAM = "model.pt2"
-
-# No copies at the program's edges: it reads the caller's GPU inputs directly and returns GPU outputs.
-# Outputs stay planned in the program's own GPU memory, because a Python caller cannot provide one.
-GPU_RESIDENT = ExecutorchBackendConfig(
-    propagate_device_config=PropagateDeviceConfig(
-        skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
-    ),
-    enable_non_cpu_memory_planning=True,
-    memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
-)
-
-
-def check_program(path: Path, backend: str = "TensorRTBackend") -> None:
-    """Fail unless the program is one `backend` delegate and nothing else, reading and writing GPU memory."""
-    # Read only the program's description, not the engine after it, which can be several GB.
-    with path.open("rb") as file:
-        header = _get_extended_header(file.read(_ExtendedHeader.NUM_HEAD_BYTES))
-        file.seek(0)
-        plan = _flatbuffer_to_program(file.read(header.program_size)).execution_plan[0]
-    delegates = [delegate.id for delegate in plan.delegates]
-    operators = [operator.name for operator in plan.operators]
-    on_host = [
-        index
-        for index in (*plan.inputs, *plan.outputs)
-        if isinstance(plan.values[index].val, Tensor)
-        and getattr(plan.values[index].val.extra_tensor_info, "device_type", DeviceType.CPU)
-        != DeviceType.CUDA
-    ]
-    if delegates != [backend] or operators or on_host:
-        raise SystemExit(f"{path}: delegates {delegates}, operators {operators}, CPU tensors {on_host}.")
-    print(f"{path} is one {backend} delegate, with its inputs and outputs on the GPU")
 
 
 def main() -> None:
@@ -87,12 +50,9 @@ def main() -> None:
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
-    torch_tensorrt.save(
-        engine, str(pte_path), output_format="executorch", retrace=False, backend_config=GPU_RESIDENT
-    )
+    torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path)
     export.write("executorch_tensorrt", pte_path.name, args.tolerance)
 
 

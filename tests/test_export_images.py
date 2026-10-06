@@ -51,8 +51,10 @@ def test_bicubic_preserves_constant_edges(value):
 def test_camera_geometry_letterbox_and_unrelated_arrays():
     image = np.full((2, 4, 3), 100, dtype=np.uint8)
     frame = {"camera": image, "state": np.zeros(6, dtype=np.float32)}
-    geometry = {"cameras": ["camera"], "target_size": [4, 4], "resize_edge": 4,
-                "crop_fraction": None, "letterbox": True, "image_size": [4, 4]}
+    geometry = {
+        "cameras": ["camera"], "target_size": [4, 4], "resize_edge": 4,
+        "crop_fraction": None, "letterbox": True, "image_size": [4, 4],
+    }
     result = resize_images(frame, geometry)
     np.testing.assert_array_equal(result["camera"], np.pad(image, ((1, 1), (0, 0), (0, 0))))
     assert result["state"] is frame["state"]

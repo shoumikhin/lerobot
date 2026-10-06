@@ -30,13 +30,13 @@ import time
 
 import torch
 import torch_tensorrt
-from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT, check_program
+from act_executorch_tensorrt import EXPORTED_PROGRAM
 from pi05_recipe import PI05Export, parse_args
 
 
 def main() -> None:
     args = parse_args(__doc__, "executorch_tensorrt")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     pte_path = export.output_dir / "model.pte"
 
     start = time.perf_counter()
@@ -50,12 +50,9 @@ def main() -> None:
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
-    torch_tensorrt.save(
-        engine, str(pte_path), output_format="executorch", retrace=False, backend_config=GPU_RESIDENT
-    )
+    torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path)
     export.write("executorch_tensorrt", pte_path.name, args.tolerance)
 
 

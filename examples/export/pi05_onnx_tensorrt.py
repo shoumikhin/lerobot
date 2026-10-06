@@ -61,7 +61,7 @@ def export_onnx(programs: dict, folder: Path) -> dict:
 
 def main() -> None:
     args = parse_args(__doc__, "onnx_tensorrt")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     if args.step_engine:
         files = export_onnx(export.denoising_programs(), export.output_dir)
     else:

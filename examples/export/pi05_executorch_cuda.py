@@ -31,7 +31,6 @@ import time
 
 import torch
 from act_executorch_cuda import lower_to_cuda
-from act_executorch_tensorrt import GPU_RESIDENT, check_program
 from pi05_recipe import PI05Export, parse_args
 
 
@@ -39,7 +38,7 @@ def main() -> None:
     args = parse_args(__doc__, "executorch_cuda")
     if args.export_only:
         raise SystemExit("--export_only is not supported here: build_engine.py builds TensorRT engines only.")
-    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name)
+    export = PI05Export(args.policy_path, args.task, args.output_dir, args.job_name, args.cameras)
     pte_path = export.output_dir / "model.pte"
 
     start = time.perf_counter()
@@ -48,12 +47,11 @@ def main() -> None:
     lowered = lower_to_cuda(program)
     del program
     export.release_policy()
-    executorch_program = lowered.to_executorch(GPU_RESIDENT)
+    executorch_program = lowered.to_executorch()
     executorch_program.save(str(pte_path))
     executorch_program.write_tensor_data_to_file(str(export.output_dir))
     print(f"Exported {pte_path} in {time.perf_counter() - start:.0f} s")
 
-    check_program(pte_path, "CudaBackend")
     export.write("executorch_cuda", pte_path.name, args.tolerance)
 
 

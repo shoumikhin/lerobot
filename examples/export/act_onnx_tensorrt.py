@@ -54,7 +54,6 @@ def build_engine(
     workspace_gib: float | None = None,
     tactic_gib: float | None = None,
     optimization_level: int | None = None,
-    max_aux_streams: int | None = None,
 ) -> None:
     """Build a TensorRT engine that keeps the ONNX file's own dtypes, as the ExecuTorch route does."""
     logger = trt.Logger(trt.Logger.WARNING)
@@ -70,8 +69,6 @@ def build_engine(
         config.set_memory_pool_limit(trt.MemoryPoolType.TACTIC_DRAM, int(tactic_gib * GIB))
     if optimization_level is not None:
         config.builder_optimization_level = optimization_level
-    if max_aux_streams is not None:
-        config.max_aux_streams = max_aux_streams
     with engine_path.open("wb") as file:
         if not builder.build_serialized_network_to_stream(network, config, FileWriter(file)):
             raise SystemExit("TensorRT could not build the engine.")

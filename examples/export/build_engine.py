@@ -23,9 +23,6 @@ to each device, and build its engine there:
     python examples/export/build_engine.py outputs/export/pi05_onnx_tensorrt
 
 Then run the folder with `lerobot-rollout --policy.path=<folder>`.
-
-With `--int8_weights` (ONNX only), the large matrix weights are stored in INT8 and the layers still
-compute in bfloat16, so the engines take about half the memory. pi0.5 needs it to fit an 8 GB Orin Nano.
 """
 
 import argparse
@@ -36,14 +33,13 @@ from pathlib import Path
 
 import torch
 from act_onnx_tensorrt import GIB, build_engine
-from int8_weights import int8_weights
 
 from lerobot.rollout.inference.export import ExportInferenceEngine
 
 
 def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) -> None:
     import torch_tensorrt
-    from act_executorch_tensorrt import EXPORTED_PROGRAM, GPU_RESIDENT, check_program
+    from act_executorch_tensorrt import EXPORTED_PROGRAM
 
     program = torch.export.load(folder / EXPORTED_PROGRAM)  # nosec B614: a folder the user exported
     inputs = program.example_inputs[0]
@@ -56,18 +52,11 @@ def build_executorch(folder: Path, program_file: str, args: argparse.Namespace) 
     del program
     gc.collect()
     torch.cuda.empty_cache()
-    torch_tensorrt.save(
-        engine,
-        str(folder / program_file),
-        output_format="executorch",
-        retrace=False,
-        backend_config=GPU_RESIDENT,
-    )
+    torch_tensorrt.save(engine, str(folder / program_file), output_format="executorch", retrace=False)
     # The startup check loads the engine again; a compiled GraphModule is only freed by the cycle collector.
     del engine
     gc.collect()
     torch.cuda.empty_cache()
-    check_program(folder / program_file)
 
 
 def main() -> None:
@@ -82,30 +71,19 @@ def main() -> None:
     parser.add_argument(
         "--optimization_level", type=int, choices=range(6), help="Lower builds faster, with less memory."
     )
-    parser.add_argument(
-        "--int8_weights",
-        action="store_true",
-        help="Rewrite the ONNX files to store their large weights in INT8 (ONNX only).",
-    )
     args = parser.parse_args()
     info = json.loads((args.folder / "export.json").read_text())
-    if args.int8_weights and info["backend"] != "onnx_tensorrt":
-        parser.error("--int8_weights only applies to an onnx_tensorrt folder.")
 
     if info["backend"] == "onnx_tensorrt":
         # A chunk exported with --step_engine has one ONNX file per engine, named like its program.
         for name, program in info.get("programs", {"model": info}).items():
             start = time.perf_counter()
-            if args.int8_weights:
-                print(f"{int8_weights(args.folder / f'{name}.onnx')} weights of {name}.onnx stored in INT8")
             build_engine(
                 args.folder / f"{name}.onnx",
                 args.folder / program["file"],
                 args.workspace_gib,
                 args.tactic_gib,
                 args.optimization_level,
-                # On the Orin, parallel streams turn every INT8 weight back to bfloat16 up front, all at once.
-                max_aux_streams=0 if (args.folder / f"{name}_int8_weights.safetensors").exists() else None,
             )
             print(f"Built {args.folder / program['file']} in {time.perf_counter() - start:.0f} s")
     else:
