@@ -170,6 +170,19 @@ class LLMForExport(nn.Module):
         return hidden_states
 
 
+def resize_pixels(images: Tensor, size: list[int]) -> Tensor:
+    """Match uint8 resize while keeping CUDA's integer pixel values in float storage."""
+    if images.shape[-2:] == tuple(size):
+        return images
+    if images.device.type == "cpu":
+        return tvF.resize(images.to(torch.uint8), size, InterpolationMode.BICUBIC, antialias=True).float()
+    return (
+        F.interpolate(images, size=size, mode="bicubic", align_corners=False, antialias=True)
+        .clamp(0, 255)
+        .round()
+    )
+
+
 class GrootObservation(nn.Module):
     """The saved processor's tensor operations for one raw robot frame."""
 
@@ -235,7 +248,7 @@ class GrootObservation(nn.Module):
             {n: to_policy_input(n, x) for n, x in zip(self.frame_names, frame, strict=True)}
         )
         images = torch.cat([obs[n] for n in self.cameras])
-        images = (images.clamp(0, 1) * 255).to(torch.uint8)
+        images = (images.clamp(0, 1) * 255).trunc()
         if self.target_size:
             if self.letterbox:
                 h, w = images.shape[-2:]
@@ -243,13 +256,13 @@ class GrootObservation(nn.Module):
                 images = tvF.pad(
                     images, [(side - w) // 2, (side - h) // 2, (side - w + 1) // 2, (side - h + 1) // 2]
                 )
-            images = tvF.resize(images, [self.resize_edge] * 2, InterpolationMode.BICUBIC, antialias=True)
+            images = resize_pixels(images, [self.resize_edge] * 2)
             if self.crop_fraction is not None and 0 < self.crop_fraction < 1:
                 crop = max(1, round(self.resize_edge * self.crop_fraction))
                 offset = (self.resize_edge - crop) // 2
                 images = images[..., offset : offset + crop, offset : offset + crop]
-            images = tvF.resize(images, list(self.target_size), InterpolationMode.BICUBIC, antialias=True)
-        images = tvF.resize(images, self.image_size, InterpolationMode.BICUBIC, antialias=True).float()
+            images = resize_pixels(images, list(self.target_size))
+        images = resize_pixels(images, self.image_size)
         if self.normalize:
             images = (images - self.image_mean) / self.image_std
         elif self.rescale:
