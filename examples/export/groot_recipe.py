@@ -26,9 +26,10 @@ one fixed image grid, and the language model with the rope positions as an input
 
 For one task and one camera size, everything those loops compute is the same on every frame: the token
 ids, the rope positions, and the rows the image features go to. So they are computed here, once, and held
-as constants. The program takes raw uint8 HWC cameras, float32 state and unbatched noise. Image resize,
-crop, normalization and patch packing, state normalization and action unnormalization run inside the
-program. The folder records the task it was exported for; no tokenizer runs at inference.
+as constants. The runtime resizes raw cameras with NumPy antialiased bicubic sampling. The program
+takes the resized uint8 HWC cameras, float32 state and unbatched noise. Image normalization and patch
+packing, state normalization and action unnormalization run inside the program. The folder records
+the task it was exported for; no tokenizer runs at inference.
 """
 
 import argparse
@@ -44,8 +45,6 @@ from act_recipe import TEST_CASE, gpu_processors, make_output_dir, to_policy_inp
 from safetensors.numpy import save_file
 from smolvla_recipe import random_robot_frame
 from torch import Tensor, nn
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms.v2 import functional as tvF  # noqa: N812
 from transformers.feature_extraction_utils import BatchFeature
 
 from lerobot.datasets import LeRobotDatasetMetadata
@@ -54,6 +53,7 @@ from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep, GrootN17VLMEncodeStep
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.rollout.inference.export.images import resize_images
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
@@ -170,21 +170,8 @@ class LLMForExport(nn.Module):
         return hidden_states
 
 
-def resize_pixels(images: Tensor, size: list[int]) -> Tensor:
-    """Match uint8 resize while keeping CUDA's integer pixel values in float storage."""
-    if images.shape[-2:] == tuple(size):
-        return images
-    if images.device.type == "cpu":
-        return tvF.resize(images.to(torch.uint8), size, InterpolationMode.BICUBIC, antialias=True).float()
-    return (
-        F.interpolate(images, size=size, mode="bicubic", align_corners=False, antialias=True)
-        .clamp(0, 255)
-        .round()
-    )
-
-
 class GrootObservation(nn.Module):
-    """The saved processor's tensor operations for one raw robot frame."""
+    """The saved processor's tensor operations after runtime camera resizing."""
 
     def __init__(self, preprocessor: PolicyProcessorPipeline, frame: dict[str, np.ndarray], batch: dict):
         super().__init__()
@@ -206,12 +193,10 @@ class GrootObservation(nn.Module):
         )
         if not self.cameras or not set(self.cameras) <= sample.keys():
             raise ValueError("The frame must provide the checkpoint's camera keys.")
-        self.target_size = encode.image_target_size
-        self.resize_edge = encode.shortest_image_edge or (self.target_size[0] if self.target_size else None)
-        self.crop_fraction = encode.crop_fraction
-        if self.crop_fraction is None and encode.image_crop_size and self.target_size:
-            self.crop_fraction = encode.image_crop_size[0] / self.target_size[0]
-        self.letterbox = encode.letter_box_transform
+        target_size = encode.image_target_size
+        crop_fraction = encode.crop_fraction
+        if crop_fraction is None and encode.image_crop_size and target_size:
+            crop_fraction = encode.image_crop_size[0] / target_size[0]
         self.patch_size, self.temporal_patch_size, self.merge_size = (
             ip.patch_size,
             ip.temporal_patch_size,
@@ -221,7 +206,14 @@ class GrootObservation(nn.Module):
         if len(grids) != len(self.cameras) or any(g != grids[0] for g in grids) or grids[0][0] != 1:
             raise ValueError("Raw-frame export requires equal, single-frame camera grids.")
         _, self.grid_h, self.grid_w = grids[0]
-        self.image_size = [self.grid_h * ip.patch_size, self.grid_w * ip.patch_size]
+        self.image_resize = {
+            "cameras": self.cameras,
+            "target_size": target_size,
+            "resize_edge": encode.shortest_image_edge or (target_size[0] if target_size else None),
+            "crop_fraction": crop_fraction,
+            "letterbox": encode.letter_box_transform,
+            "image_size": [self.grid_h * ip.patch_size, self.grid_w * ip.patch_size],
+        }
         self.rescale, self.normalize = ip.do_rescale, ip.do_normalize
         self.rescale_factor = ip.rescale_factor
         scale = 1 / ip.rescale_factor if self.rescale else 1
@@ -249,20 +241,6 @@ class GrootObservation(nn.Module):
         )
         images = torch.cat([obs[n] for n in self.cameras])
         images = (images.clamp(0, 1) * 255).trunc()
-        if self.target_size:
-            if self.letterbox:
-                h, w = images.shape[-2:]
-                side = max(h, w)
-                images = tvF.pad(
-                    images, [(side - w) // 2, (side - h) // 2, (side - w + 1) // 2, (side - h + 1) // 2]
-                )
-            images = resize_pixels(images, [self.resize_edge] * 2)
-            if self.crop_fraction is not None and 0 < self.crop_fraction < 1:
-                crop = max(1, round(self.resize_edge * self.crop_fraction))
-                offset = (self.resize_edge - crop) // 2
-                images = images[..., offset : offset + crop, offset : offset + crop]
-            images = resize_pixels(images, list(self.target_size))
-        images = resize_pixels(images, self.image_size)
         if self.normalize:
             images = (images - self.image_mean) / self.image_std
         elif self.rescale:
@@ -391,8 +369,10 @@ class GrootExport:
         )
         self.expected_actions = self.rollout_actions(preprocessor, postprocessor)
         observation = GrootObservation(preprocessor, self.frame, batch).cuda()
+        self.image_resize = observation.image_resize
         self.module = GrootChunk(self.policy, batch, postprocessor, observation).eval()
-        self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
+        resized_frame = resize_images(self.frame, self.image_resize)
+        self.inputs = (*(torch.from_numpy(x).cuda() for x in resized_frame.values()), self.noise)
         self.input_names = [*self.frame, NOISE]
 
     def release_policy(self) -> None:
@@ -427,6 +407,8 @@ class GrootExport:
             "backend": backend,
             "file": program_file,
             "inputs": self.input_names,
+            "raw_frame": True,
+            "image_resize": self.image_resize,
             "task": self.task,
             # The task's token ids and rope positions are constants inside the program.
             "task_fixed": True,
