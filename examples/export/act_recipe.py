@@ -14,13 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The ACT export recipe: what both backend scripts compile, and the folder they write.
+"""The ACT export recipe: what every backend script compiles, and the folder they write.
 
-The compiled module is what `lerobot-rollout` runs for one action chunk after
-`prepare_observation_for_inference`, all of it LeRobot's own code: the checkpoint's saved
-preprocessor, the policy's `predict_action_chunk` trimmed to `n_action_steps` as `select_action`
-does, and the saved postprocessor. The folder also gets a test case, the actions `lerobot-rollout`
-plays with PyTorch for one random frame, which the exported engine replays before it runs.
+The compiled module is what `lerobot-rollout` runs for one action chunk, all of it LeRobot's own
+code: `prepare_observation_for_inference`'s image conversion, the checkpoint's saved preprocessor,
+the policy's `predict_action_chunk` trimmed to `n_action_steps` as `select_action` does, and the
+saved postprocessor. So the program takes the robot's frame as the robot gives it (uint8 HWC
+images, float32 state) and returns the chunk's actions in robot units, and running it needs no
+PyTorch code. The folder also gets a test case, the actions `lerobot-rollout` plays with PyTorch
+for one random frame, which the exported program replays before it runs.
 """
 
 import argparse
@@ -37,7 +39,6 @@ from torch import Tensor, nn
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.rollout.inference import SyncInferenceEngine
 from lerobot.utils.constants import ACTION
@@ -46,7 +47,7 @@ TEST_CASE = "test_case.safetensors"
 
 
 class ACTChunk(nn.Module):
-    """One action chunk: the observation tensors in, the actions to play out, in robot units."""
+    """One action chunk: the robot's frame in, the actions to play out, in robot units."""
 
     def __init__(
         self, policy: ACTPolicy, preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
@@ -57,10 +58,19 @@ class ACTChunk(nn.Module):
         self.postprocessor = postprocessor
         self.input_names = list(policy.config.input_features)
 
-    def forward(self, *inputs: Tensor) -> Tensor:
-        observation = self.preprocessor(dict(zip(self.input_names, inputs, strict=True)))
-        actions = self.policy.predict_action_chunk(observation)
-        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])
+    def forward(self, *frame: Tensor) -> Tensor:
+        observation = {
+            name: to_policy_input(name, x) for name, x in zip(self.input_names, frame, strict=True)
+        }
+        actions = self.policy.predict_action_chunk(self.preprocessor(observation))
+        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
+
+
+def to_policy_input(name: str, x: Tensor) -> Tensor:
+    """What `prepare_observation_for_inference` does to one array of the robot's frame, inside the program."""
+    if "image" in name:
+        x = (x.float() / 255).permute(2, 0, 1)
+    return x.unsqueeze(0)
 
 
 class ACTExport:
@@ -79,8 +89,7 @@ class ACTExport:
         self.module = ACTChunk(self.policy, *gpu_processors(self.config, policy_path))
         self.input_names = self.module.input_names
         self.frame = random_robot_frame(self.policy)
-        observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"))
-        self.inputs = tuple(observation[name] for name in self.input_names)
+        self.inputs = tuple(torch.from_numpy(self.frame[name]).cuda() for name in self.input_names)
 
     def release_policy(self) -> None:
         """Compute the test case's actions, the policy's last use, then free it for the TensorRT step."""
