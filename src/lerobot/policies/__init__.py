@@ -23,10 +23,12 @@ if TYPE_CHECKING:
 
     from .act.configuration_act import ACTConfig as ACTConfig
     from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+    from .dm05.configuration_dm05 import DM05Config as DM05Config
     from .eo1.configuration_eo1 import EO1Config as EO1Config
     from .evo1.configuration_evo1 import Evo1Config as Evo1Config
     from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
     from .fastwam.configuration_fastwam import FastWAMConfig as FastWAMConfig
+    from .fineart_vla.configuration_fineart_vla import FineARTVLAConfig as FineARTVLAConfig
     from .flux3.configuration_flux3 import Flux3Config as Flux3Config
     from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
     from .groot.configuration_groot import GrootConfig as GrootConfig
@@ -52,6 +54,7 @@ else:
             "ActionInterpolator": "lerobot.utils.action_interpolator.ActionInterpolator",
             "ACTConfig": ".act.configuration_act.ACTConfig",
             "DiffusionConfig": ".diffusion.configuration_diffusion.DiffusionConfig",
+            "DM05Config": ".dm05.configuration_dm05.DM05Config",
             "EO1Config": ".eo1.configuration_eo1.EO1Config",
             "Evo1Config": ".evo1.configuration_evo1.Evo1Config",
             "get_policy_class": ".factory.get_policy_class",
@@ -59,6 +62,7 @@ else:
             "make_policy_config": ".factory.make_policy_config",
             "make_pre_post_processors": ".factory.make_pre_post_processors",
             "FastWAMConfig": ".fastwam.configuration_fastwam.FastWAMConfig",
+            "FineARTVLAConfig": ".fineart_vla.configuration_fineart_vla.FineARTVLAConfig",
             "Flux3Config": ".flux3.configuration_flux3.Flux3Config",
             "GaussianActorConfig": ".gaussian_actor.configuration_gaussian_actor.GaussianActorConfig",
             "GrootConfig": ".groot.configuration_groot.GrootConfig",
@@ -89,8 +93,10 @@ __all__ = [
     # Configuration classes
     "ACTConfig",
     "DiffusionConfig",
+    "DM05Config",
     "EO1Config",
     "FastWAMConfig",
+    "FineARTVLAConfig",
     "Flux3Config",
     "GaussianActorConfig",
     "Evo1Config",
