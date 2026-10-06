@@ -23,8 +23,10 @@ from lerobot.rollout.inference.export.engine import ExportInferenceEngine, load_
 
 
 @pytest.mark.parametrize("noise_shape", [(1, 2, 3), (2, 3)])
-def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape):
+@pytest.mark.parametrize("torch_inputs", [False, True])
+def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch_inputs):
     calls = []
+    probes = []
     times = []
 
     def step(mask, key, sample, timestep):
@@ -42,6 +44,12 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape):
 
     def load(path, data_path=None):
         def execute(inputs):
+            if torch_inputs:
+                if isinstance(inputs[0], np.ndarray):
+                    probes.append(path.name)
+                    raise RuntimeError("Unsupported python type <class 'numpy.ndarray'>. "
+                                       "Ensure that inputs are passed as a flat list of tensors.")
+                inputs = [value.numpy() for value in inputs]
             calls.append(path.name)
             assert all(isinstance(value, np.ndarray) for value in inputs)
             return programs[path.name](*inputs)
@@ -57,12 +65,16 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape):
         "num_steps": 4,
     }
     program = load_program(tmp_path, info)
-    actions = program(np.ones((1, 3)), np.ones(noise_shape))
+    actions = program.initialize(np.ones((1, 3)), np.ones(noise_shape))
+    assert probes == (["prefix.pte", "step.pte", "actions.pte"] if torch_inputs else [])
     assert actions.shape == noise_shape
     assert calls == ["prefix.pte", *(["step.pte"] * 4), "actions.pte"]
     assert times == [1.0, 0.75, 0.5, 0.25]
     expected = 10 * (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625)
     np.testing.assert_allclose(actions, expected)
+    program(np.ones((1, 3)), np.ones(noise_shape))
+    assert probes == (["prefix.pte", "step.pte", "actions.pte"] if torch_inputs else [])
+    assert len(calls) == 12
 
 
 def test_executorch_output_survives_next_execution(tmp_path, monkeypatch):
@@ -91,7 +103,8 @@ def test_executorch_bfloat16_compatibility_preserves_values_and_ownership(tmp_pa
     def execute(inputs):
         input_types.append(type(inputs[0]))
         if not isinstance(inputs[0], torch.Tensor):
-            raise TypeError("Tensor inputs required")
+            raise RuntimeError("Unsupported python type <class 'numpy.ndarray'>. "
+                               "Ensure that inputs are passed as a flat list of tensors.")
         buffer.copy_(inputs[0])
         return [buffer]
 
@@ -99,12 +112,39 @@ def test_executorch_bfloat16_compatibility_preserves_values_and_ownership(tmp_pa
         load_method=lambda name: SimpleNamespace(execute=execute)))
     monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
     program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
-    first = program(np.array([[1.25, -2.5]], dtype=ml_dtypes.bfloat16))
+    first = program.initialize(np.array([[1.25, -2.5]], dtype=ml_dtypes.bfloat16))
     second = program(np.zeros((1, 2), dtype=ml_dtypes.bfloat16))
     assert first.dtype == np.dtype(ml_dtypes.bfloat16)
     np.testing.assert_array_equal(first.astype(np.float32), [[1.25, -2.5]])
     np.testing.assert_array_equal(second.astype(np.float32), [[0, 0]])
     assert input_types == [np.ndarray, torch.Tensor, torch.Tensor]
+
+
+@pytest.mark.parametrize("error_type", [TypeError, RuntimeError])
+@pytest.mark.parametrize("after_load", [False, True])
+def test_executorch_does_not_retry_execution_errors(tmp_path, monkeypatch, error_type, after_load):
+    calls = []
+    error = error_type("Unsupported python type <class 'numpy.ndarray'>" if after_load else "Invalid shape")
+
+    def execute(inputs):
+        calls.append(inputs)
+        if after_load and len(calls) == 1:
+            return inputs
+        raise error
+
+    runtime = SimpleNamespace(load_program=lambda *args, **kw: SimpleNamespace(
+        load_method=lambda name: SimpleNamespace(execute=execute)))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime)))
+    program = load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
+    inputs = np.ones((1, 2), dtype=np.float32)
+    if after_load:
+        program.initialize(inputs)
+    run = program if after_load else program.initialize
+    with pytest.raises(error_type) as caught:
+        run(inputs)
+    assert caught.value is error
+    assert len(calls) == (2 if after_load else 1)
+    assert all(isinstance(call[0], np.ndarray) for call in calls)
 
 
 def test_executorch_invalid_step_count(tmp_path):

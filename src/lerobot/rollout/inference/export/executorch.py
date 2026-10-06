@@ -35,24 +35,28 @@ class ExecuTorchProgram:
     def input_shape(self) -> tuple[int, ...]:
         return tuple(self._method.metadata.input_tensor_meta(0).sizes())
 
+    def initialize(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Select the input type while running the saved test case at load time."""
+        try:
+            return self(*inputs)
+        except (TypeError, RuntimeError) as error:
+            if "Unsupported python type <class 'numpy.ndarray'>" not in str(error):
+                raise
+        self._torch_inputs = True
+        return self(*inputs)
+
     def __call__(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         arrays = [np.ascontiguousarray(value) for value in inputs]
-        if not self._torch_inputs:
-            try:
-                outputs = self._method.execute(arrays)
-            except TypeError:
-                # Older bindings accept only torch tensors.
-                self._torch_inputs = True
         if self._torch_inputs:
             import torch
 
-            tensors = [
+            arrays = [
                 torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
                 if value.dtype.name == "bfloat16"
                 else torch.from_numpy(value)
                 for value in arrays
             ]
-            outputs = self._method.execute(tensors)
+        outputs = self._method.execute(arrays)
         result = []
         for output in outputs:
             if output.__dlpack_device__()[0] == 1:
@@ -89,14 +93,23 @@ class ExecuTorchDenoisingLoop:
     def input_shape(self) -> tuple[int, ...]:
         return self._prefix.input_shape
 
+    def initialize(self, *inputs: np.ndarray) -> np.ndarray:
+        return self._run(inputs, initialize=True)
+
     def __call__(self, *inputs: np.ndarray) -> np.ndarray:
+        return self._run(inputs)
+
+    def _run(self, inputs: tuple[np.ndarray, ...], initialize: bool = False) -> np.ndarray:
         *observation, noise = inputs
-        cache = self._prefix(*observation)
+        prefix = self._prefix.initialize if initialize else self._prefix
+        cache = prefix(*observation)
         if not isinstance(cache, tuple):
             cache = (cache,)
         dt = -1.0 / self._num_steps
         sample = noise
         for step in range(self._num_steps):
             timestep = np.array([1.0 + step * dt], dtype=np.float32)
-            sample = sample + dt * self._step(*cache, sample, timestep)
-        return self._actions(sample)
+            run_step = self._step.initialize if initialize and step == 0 else self._step
+            sample = sample + dt * run_step(*cache, sample, timestep)
+        actions = self._actions.initialize if initialize else self._actions
+        return actions(sample)

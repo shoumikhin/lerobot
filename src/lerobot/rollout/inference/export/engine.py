@@ -119,7 +119,8 @@ class ExportInferenceEngine(InferenceEngine):
         logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
 
     def _run_chunk(
-        self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None
+        self, frame: dict[str, np.ndarray], task: str, noise: np.ndarray | None = None,
+        initialize: bool = False,
     ) -> np.ndarray:
         observation = {}
         names = [name for name in self._input_names if name != NOISE] if self._raw_frame else frame
@@ -147,7 +148,8 @@ class ExportInferenceEngine(InferenceEngine):
             observation[NOISE] = (
                 noise if noise is not None else np.random.standard_normal(self._noise_shape).astype(np.float32)
             )
-        actions = self._program(*(observation[name] for name in self._input_names))
+        program = getattr(self._program, "initialize", self._program) if initialize else self._program
+        actions = program(*(observation[name] for name in self._input_names))
         return (actions if self._raw_frame else actions[0]).copy()
 
     def _check_task(self, task: str) -> None:
@@ -166,7 +168,7 @@ class ExportInferenceEngine(InferenceEngine):
             and input_shape is not None
             and input_shape == case[self._input_names[0]].shape
         )
-        actual = self._run_chunk(case, task, case.pop(NOISE, None))
+        actual = self._run_chunk(case, task, case.pop(NOISE, None), initialize=True)
         error = float(np.abs(actual - expected).max()) if actual.shape == expected.shape else np.inf
         logger.info("Exported policy test case: largest difference %.2e (tolerance %g)", error, tolerance)
         if not error <= tolerance:

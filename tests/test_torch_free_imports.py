@@ -97,7 +97,8 @@ def test_imports_without_torch(module):
 
 
 @pytest.mark.parametrize("raw_frame", [False, True])
-def test_act_export_config_and_engine_run_without_torch(tmp_path, raw_frame):
+@pytest.mark.parametrize("input_type", ["numpy", "dlpack", "torch"])
+def test_act_export_config_and_engine_input_compatibility(tmp_path, raw_frame, input_type):
     code = r'''
 import json
 import sys
@@ -115,6 +116,8 @@ from lerobot.robots.config import RobotConfig
 
 folder = Path(sys.argv[1])
 raw_frame = sys.argv[2] == "True"
+input_type = sys.argv[3]
+calls = []
 info = {
     "backend": "executorch_cuda", "file": "model.pte",
     "inputs": ["observation.state", "observation.images.camera"],
@@ -137,6 +140,14 @@ class Method:
         sizes=lambda: (1,) if raw_frame else (1, 1)))
 
     def execute(self, inputs):
+        calls.append(type(inputs[0]).__module__)
+        if input_type == "torch":
+            if isinstance(inputs[0], np.ndarray):
+                raise RuntimeError("Unsupported python type <class 'numpy.ndarray'>. "
+                                   "Ensure that inputs are passed as a flat list of tensors.")
+            inputs = [value.numpy() for value in inputs]
+        elif input_type == "dlpack":
+            inputs = [np.from_dlpack(value) for value in inputs]
         state, image = inputs
         assert isinstance(state, np.ndarray)
         if raw_frame:
@@ -164,13 +175,17 @@ def parse_config(cfg: RolloutConfig):
 sys.argv = ["lerobot-rollout", f"--policy.path={folder}", "--robot.type=test_export_robot"]
 cfg = parse_config()
 assert cfg.policy.type == "act" and cfg.policy.action_feature_names == ["joint.pos"]
+assert "torch" not in sys.modules
 engine = ExportInferenceEngine(folder, task="", robot_type="test_export_robot")
+assert calls == (["numpy", "torch"] if input_type == "torch" else ["numpy"])
 frame = {"observation.state": state, "observation.images.camera": image}
 np.testing.assert_array_equal(engine.get_action(frame), [2.0])
 np.testing.assert_array_equal(engine.get_action(frame), [4.0])
-assert "torch" not in sys.modules
+assert calls == (["numpy", "torch", "torch"] if input_type == "torch" else ["numpy", "numpy"])
+assert ("torch" in sys.modules) == (input_type == "torch")
 '''
     result = subprocess.run(
-        [sys.executable, "-c", code, str(tmp_path), str(raw_frame)], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code, str(tmp_path), str(raw_frame), input_type],
+        capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stderr
