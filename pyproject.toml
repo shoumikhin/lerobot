@@ -267,7 +267,7 @@ lawam = [
 ]
 
 # Features
-export = ["cuda-bindings>=12.0,<14.0; sys_platform != 'darwin'"]
+export = ["cuda-bindings>=12.0,<14.0; sys_platform != 'darwin'", "ml-dtypes>=0.5,<1.0"]
 async = ["lerobot[grpcio-dep]", "lerobot[matplotlib-dep]"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
 

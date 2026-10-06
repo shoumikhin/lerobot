@@ -134,6 +134,17 @@ def load_engine(path: Path):
     return engine
 
 
+def numpy_dtype(dtype):
+    """NumPy needs an extension dtype for TensorRT's bfloat16 bindings."""
+    import tensorrt as trt
+
+    if dtype == trt.bfloat16:
+        from ml_dtypes import bfloat16
+
+        return np.dtype(bfloat16)
+    return np.dtype(trt.nptype(dtype))
+
+
 class TensorRTEngine:
     """Run a fixed-shape engine; related engines can share a stream and scratch allocation."""
 
@@ -153,11 +164,11 @@ class TensorRTEngine:
         self._stream = stream if stream is not None else CudaStream()
         self._input_names = input_names
         self._input_shapes = [tuple(self._engine.get_tensor_shape(name)) for name in input_names]
-        self._input_dtypes = [np.dtype(trt.nptype(self._engine.get_tensor_dtype(name))) for name in input_names]
+        self._input_dtypes = [numpy_dtype(self._engine.get_tensor_dtype(name)) for name in input_names]
         self._inputs = {}
         self._output_names = output_names
         self._outputs = [
-            CudaBuffer(self._engine.get_tensor_shape(name), trt.nptype(self._engine.get_tensor_dtype(name)))
+            CudaBuffer(self._engine.get_tensor_shape(name), numpy_dtype(self._engine.get_tensor_dtype(name)))
             for name in output_names
         ]
         for name, output in zip(output_names, self._outputs, strict=True):

@@ -92,6 +92,7 @@ def fake_engine(monkeypatch, fake_cuda):
     )
     trt = SimpleNamespace(
         nptype=lambda dtype: np.float32,
+        bfloat16="bfloat16",
         ExecutionContextAllocationStrategy=SimpleNamespace(STATIC=0, USER_MANAGED=1),
     )
     monkeypatch.setitem(sys.modules, "tensorrt", trt)
@@ -154,6 +155,18 @@ def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
     assert cuda.cudaStreamSynchronize.call_count == 2
     cuda.cudaMalloc.return_value = (2, 0)
     assert allocator.allocate(512, 256, 0) == 0
+
+
+def test_bfloat16_bindings_use_extension_dtype(monkeypatch):
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    trt = SimpleNamespace(bfloat16="bfloat16", nptype=MagicMock(side_effect=TypeError))
+    monkeypatch.setitem(sys.modules, "tensorrt", trt)
+    dtype = backend.numpy_dtype(trt.bfloat16)
+    assert dtype == np.dtype(ml_dtypes.bfloat16)
+    assert dtype.itemsize == 2
+    values = np.asarray([1.25, -2.5], dtype=dtype)
+    np.testing.assert_array_equal(values.astype(np.float32), [1.25, -2.5])
+    trt.nptype.assert_not_called()
 
 
 def test_cuda_error_is_not_ignored():
