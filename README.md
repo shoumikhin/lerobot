@@ -37,6 +37,10 @@ lerobot-info
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
 
+## Compiled Policies on Jetson
+
+This fork adds compiled-policy export examples and runs their output through `lerobot-rollout`, with either a real robot or a replay plugin. See the [Jetson export guide](examples/export/README.md) for installation, compiler routes, commands, provisional benchmarks and current limits. The benchmark tables are pending a final rerun; they do not establish a general performance advantage.
+
 ## Robots & Control
 
 <div align="center">
