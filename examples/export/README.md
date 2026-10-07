@@ -218,7 +218,7 @@ Orin Nano:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |           330 (490) |       **223** |            579 |            1651 |    1140 |
 | SmolVLA |           520 (669) |       **370** |           1499 |            2818 |    2034 |
-| pi0.5   |             pending |      **4875** |  fails to load |         not run | not run |
+| pi0.5   |         5330 (5498) |      **4875** |  fails to load |         not run | not run |
 | GR00T   |             pending |       not run |        not run |         not run | not run |
 
 ExecuTorch-TensorRT uses less memory than PyTorch in the measured comparisons. ONNX-TensorRT uses less than the current ExecuTorch-TensorRT bindings. The estimated removal of PyTorch is not a measured win. Orin pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT; Torch-TensorRT fails while loading it.
