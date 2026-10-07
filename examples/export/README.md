@@ -1,12 +1,12 @@
 # Compiled LeRobot policies on an NVIDIA Jetson
 
-Export a trained LeRobot policy, then run the compiled folder with `lerobot-rollout`, the same command used for a PyTorch checkpoint. These examples cover ACT, SmolVLA, pi0.5 and GR00T N1.7 through several compiler routes. Latency, memory use and export support depend on the policy, route and device; the results below are provisional.
+Export a trained LeRobot policy, then run the compiled folder with `lerobot-rollout`, the same command used for a PyTorch checkpoint. These examples cover ACT, SmolVLA, pi0.5 and GR00T N1.7 through several compiler routes. Latency, memory use and export support depend on the policy, route and device; some results below are still pending.
 
 ## Hardware
 
 - [SO-101](../../docs/source/so101.mdx) arm with a scene camera and a wrist camera
 - [Jetson AGX Thor](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/), to train, export and run
-- [Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/), to export and run ACT with TensorRT (see Limits)
+- [Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/), to export and run ACT (see Limits)
 
 ## Routes
 
@@ -21,7 +21,7 @@ A route is how the policy is compiled. Each writes a folder that `lerobot-rollou
 
 ## Install
 
-On each Jetson (JetPack 7.2.1), with [uv](https://docs.astral.sh/uv/). These instructions assume the latest nightly packages contain the required export and runtime fixes. The final integrated rerun is still pending.
+On each Jetson (JetPack 7.2.1), with [uv](https://docs.astral.sh/uv/). These instructions assume the latest nightly packages contain the required export and runtime fixes. The results below were measured with ExecuTorch and Torch-TensorRT built from source with those fixes.
 
 ```bash
 git clone --branch export https://github.com/shoumikhin/lerobot.git
@@ -143,69 +143,87 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> Provisional numbers, pending final rerun. The chunk and action-agreement tables use earlier export scripts and package builds, not this final fork. The separate rollout table uses newer raw-frame folders and public ExecuTorch bindings. These are different measurements, not a single ranking.
+> Partly provisional. Every number below was measured on 2026-10-06 with this fork and with ExecuTorch and Torch-TensorRT built from source, including the fixes the install step expects in the nightlies. Cells marked "pending" are not measured yet: pi0.5 on both boards, the other GR00T routes, and SmolVLA, pi0.5 and GR00T on the Orin Nano. Until those are in, these tables do not rank pi0.5 or GR00T.
 
-Measured on JetPack 7.2.1 with locked CPU, GPU and memory clock settings. Chunk latency is the median of 100 chunks after 20 warm-up chunks, then the median across 3 fresh processes. `torch.compile` has 3 processes for ACT and only 1 for each other policy. These timings exclude compilation and are not control-loop latency.
+Thor: JetPack 7.2.1, power mode MAXN, CPU, GPU and memory clocks locked. Orin Nano Super: JetPack 7.2.1, GPU clock locked at 1020 MHz. Every folder was exported on the board that ran it.
 
 ### Latency per action chunk, ms
 
+The median time to compute one action chunk: 100 chunks after 20 warm-up chunks in each of 3 fresh processes, then the median of the 3. Loading and compiling are not included, and this is not control-loop latency. `torch.compile` uses mode `default` on Thor (the `lerobot-rollout` default) and `max-autotune` on the Orin Nano. GR00T times include its image resize (see Limits).
+
 | policy  | device    | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt` | `torch_tensorrt` | PyTorch | `torch.compile` |
 | ------- | --------- | --------------------- | ----------------- | --------------- | ---------------- | ------- | --------------- |
-| ACT     | Thor      | 3.57                  | 37.8              | 3.70            | 3.71             | 15.9    | 13.2            |
-| ACT     | Orin Nano | 26.1                  | 132.5             | 26.7            | 26.4             | 64.3    | 60.7            |
-| SmolVLA | Thor      | 28.7                  | no script         | 31.8            | 30.0             | 167.1   | 46.2            |
-| SmolVLA | Orin Nano | 126.6                 | no script         | 131.4           | 137.7            | 763.2   | 171.5           |
-| pi0.5   | Thor      | 106.0                 | 125.0             | 115.4           | 107.4            | 247.5   | 127.1           |
-| GR00T   | Thor      | 59.6                  | 76.7              | 63.2            | 61.1             | 213.3   | 209.4           |
+| ACT     | Thor      | 3.43                  | 37.64             | 3.50            | 3.70             | 15.91   | 12.80           |
+| ACT     | Orin Nano | 25.65                 | 131.5             | 26.36           | 26.26            | 64.60   | 61.53           |
+| SmolVLA | Thor      | 28.17                 | no script         | 30.95           | 29.20            | 166.7   | 44.47           |
+| SmolVLA | Orin Nano | pending               | no script         | pending         | pending          | pending | pending         |
+| pi0.5   | Thor      | pending               | pending           | pending         | pending          | pending | pending         |
+| pi0.5   | Orin Nano | pending               | pending           | pending         | pending          | pending | pending         |
+| GR00T   | Thor      | 93.30                 | pending           | pending         | pending          | pending | pending         |
+| GR00T   | Orin Nano | pending               | pending           | pending         | pending          | pending | pending         |
 
-The Orin SmolVLA row uses older folders with host-side preprocessing. The GR00T CUDA row also uses an older export; the current raw-frame script has a compiler failure (see Limits). pi0.5 and GR00T Orin rows are omitted because the earlier artifacts do not establish a reproducible export from these scripts.
-
-A separate newer ACT test with runtime replay and shared host inputs measured **3.7645 ms** for ExecuTorch-TensorRT and **3.8072 ms** for ONNX-TensorRT on Thor with public bindings. This is a **near tie**, not an established speed advantage: sequential-run variation exceeds the difference. It used 12 fresh-frame calls per process with 3.3 seconds between calls; reused-frame results did not show the same benefit. Only ACT has native validation of this input-sharing change.
+ExecuTorch-TensorRT has the lowest chunk time in every row measured so far. On ACT its lead over the next TensorRT route is small, about 2%: 3.43 against 3.50 ms for ONNX-TensorRT on Thor, and 25.65 against 26.26 ms for Torch-TensorRT on the Orin Nano. On SmolVLA it takes 3.5% less time than Torch-TensorRT and 9% less than ONNX-TensorRT. It is 4.6 times faster than PyTorch on ACT (Thor), 2.5 times on ACT (Orin Nano) and 5.9 times on SmolVLA.
 
 ### Rollout latency and memory
 
-These earlier raw-frame measurements ran the official `lerobot-rollout` for 60 seconds on Thor. Inference is the last status-line value, not a median. Memory is the median process resident set (RSS) over the final 30 seconds, including loaded libraries. It is not peak usage or total board/GPU memory. Do not add it to a GPU memory reading: allocations can overlap on a Jetson.
+The official `lerobot-rollout` with the [replay robot](replay_robot) at 30 Hz for 60 seconds. Inference is the median time per chunk on the status line at the end of the run (up to the last 30 chunks). Memory is the median process resident set (RSS) over the final 30 seconds, read from outside the process. It includes loaded libraries. It is not GPU memory, and the two should not be added, because a Jetson shares one memory between the CPU and the GPU.
 
-| policy  | route                 | inference, ms | process RSS, MiB |
-| ------- | --------------------- | ------------- | ---------------- |
-| ACT     | `executorch_tensorrt` | 4.6           | 916.33           |
-| ACT     | `executorch_cuda`     | 37.3          | 842.43           |
-| ACT     | `onnx_tensorrt`       | 4.0           | 660.73           |
-| SmolVLA | `executorch_tensorrt` | 30.2          | 1032.02          |
-| SmolVLA | `onnx_tensorrt`       | 31.8          | 602.25           |
+| policy  | device    | route                 | loop, Hz | inference, ms   | process RSS, MiB |
+| ------- | --------- | --------------------- | -------- | --------------- | ---------------- |
+| ACT     | Thor      | `executorch_tensorrt` | 29.94    | 4.1             | 1107.6           |
+| ACT     | Thor      | `executorch_cuda`     | 29.89    | 38.7            | 802.6            |
+| ACT     | Thor      | `onnx_tensorrt`       | 29.94    | 4.0             | 644.8            |
+| ACT     | Thor      | `torch_tensorrt`      | 29.94    | 4.6             | 1555.6           |
+| ACT     | Thor      | PyTorch               | 29.78    | 16.4            | 2036.3           |
+| ACT     | Thor      | `torch.compile`       | 29.94    | 14.9            | 2043.0           |
+| ACT     | Orin Nano | `executorch_tensorrt` | 29.92    | 26.8            | 1171.3           |
+| ACT     | Orin Nano | `executorch_cuda`     | 29.02    | 132.4           | 960.4            |
+| ACT     | Orin Nano | `onnx_tensorrt`       | 29.92    | 26.6            | 751.7            |
+| ACT     | Orin Nano | `torch_tensorrt`      | 29.92    | 27.8            | 1628.4           |
+| ACT     | Orin Nano | PyTorch               | 29.38    | 66.2            | 1904.1           |
+| SmolVLA | Thor      | `executorch_tensorrt` | 29.93    | 28.9            | 1249.9           |
+| SmolVLA | Thor      | `onnx_tensorrt`       | 29.94    | 31.6            | 753.6            |
+| SmolVLA | Thor      | `torch_tensorrt`      | 29.94    | 30.1            | 2417.5           |
+| SmolVLA | Thor      | PyTorch               | 27.45    | 171.9           | 3068.6           |
+| SmolVLA | Thor      | `torch.compile`       | n/a      | still compiling | 4033.4           |
 
-The ACT measurements above predate the newer near-tie test. ONNX-TensorRT used less process memory in these runs. No general latency or memory superiority claim follows from these provisional tables.
+ONNX-TensorRT uses the least process memory in every rollout: 644.8 MiB against 1107.6 MiB for ExecuTorch-TensorRT on ACT (Thor), 751.7 against 1171.3 on ACT (Orin Nano), and 753.6 against 1249.9 on SmolVLA. ExecuTorch-CUDA also uses less memory than ExecuTorch-TensorRT on ACT, but it is 11 times slower per chunk on Thor and 5 times slower on the Orin Nano. ExecuTorch-TensorRT uses less memory than Torch-TensorRT, PyTorch and `torch.compile` in every rollout.
+
+Rollout inference is close between the TensorRT routes. On ACT, ONNX-TensorRT was 0.1 ms lower on Thor and 0.2 ms lower on the Orin Nano. On SmolVLA, ExecuTorch-TensorRT was 1.2 ms lower than Torch-TensorRT and 2.7 ms lower than ONNX-TensorRT. `torch.compile` compiles during the first chunk of a rollout. For SmolVLA that took 215 seconds, longer than the 60 second run, so its row has no loop rate; its compiled chunk time is in the table above.
 
 ### Action agreement
 
-Mean absolute difference from the PyTorch policy, in robot action units, over 50 observations on Thor. ACT, SmolVLA and GR00T use dataset frames; pi0.5 uses random observations. The last column compares PyTorch with a different starting-noise draw. It is context for the policy's randomness, not an accuracy allowance.
+Largest and mean absolute difference from the PyTorch policy, in robot action units, over every action of 50 dataset observations. SmolVLA, pi0.5 and GR00T start from random noise, so both sides get the same noise. Every measured folder passed: its largest difference stayed under the tolerance saved in the folder (0.5 for ACT, 5 for the others). That is under 0.1% of a joint's range for ACT and under 3% for SmolVLA and GR00T. The last column compares PyTorch with itself under a different noise draw, for scale. GR00T runs in bf16; against fp32 PyTorch its largest and mean difference are 3.74 and 0.115. These checks show that the export computes the same actions as PyTorch, not that the robot completes the task.
 
-| policy  | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt` | `torch_tensorrt` | PyTorch, other noise |
-| ------- | --------------------- | ----------------- | --------------- | ---------------- | -------------------- |
-| ACT     | 0.01                  | 0.01              | 0.01            | 0.01             | no noise             |
-| SmolVLA | 0.17                  | no script         | 0.15            | 0.17             | 3.21                 |
-| pi0.5   | 0.32                  | 0.26              | 0.36            | 0.32             | 11.42                |
-| GR00T   | 0.28                  | 0.25              | 0.28            | 0.28             | 7.80                 |
+| policy  | device    | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt` | `torch_tensorrt` | PyTorch, other noise |
+| ------- | --------- | --------------------- | ----------------- | --------------- | ---------------- | -------------------- |
+| ACT     | Thor      | 0.11 / 0.005          | 0.13 / 0.003      | 0.12 / 0.005    | 0.11 / 0.005     | no noise             |
+| ACT     | Orin Nano | 0.10 / 0.005          | 0.07 / 0.002      | 0.11 / 0.005    | 0.10 / 0.005     | no noise             |
+| SmolVLA | Thor      | 2.23 / 0.070          | no script         | 1.46 / 0.061    | 2.23 / 0.070     | 1.84                 |
+| SmolVLA | Orin Nano | pending               | no script         | pending         | pending          | pending              |
+| pi0.5   | Thor      | pending               | pending           | pending         | pending          | pending              |
+| pi0.5   | Orin Nano | pending               | pending           | pending         | pending          | pending              |
+| GR00T   | Thor      | 2.97 / 0.092          | pending           | pending         | pending          | 3.49                 |
+| GR00T   | Orin Nano | pending               | pending           | pending         | pending          | pending              |
 
 ## Which routes load PyTorch
 
-Observed from the running process's `/proc/<pid>/maps` on Thor with raw-frame ACT and SmolVLA folders and public ExecuTorch bindings:
+Distinct `libtorch` and `libc10` libraries mapped by the running `lerobot-rollout` process, read from `/proc/<pid>/maps` in the ACT rollouts on both boards and the SmolVLA rollouts on Thor:
 
-| route                    | distinct mapped PyTorch libraries |
-| ------------------------ | --------------------------------- |
-| `onnx_tensorrt`          | 0                                 |
-| `executorch_tensorrt`    | 8                                 |
-| `executorch_cuda` (ACT)  | 8                                 |
-| `torch_tensorrt`         | yes, by design                    |
-| PyTorch, `torch.compile` | yes, by design                    |
+| route                    | mapped PyTorch libraries |
+| ------------------------ | ------------------------ |
+| `onnx_tensorrt`          | 0                        |
+| `executorch_tensorrt`    | 8                        |
+| `executorch_cuda` (ACT)  | 8                        |
+| `torch_tensorrt`         | 8                        |
+| PyTorch, `torch.compile` | 8                        |
 
-The counts cover `libtorch` and `libc10` paths in those runs, not every dependency. The public ExecuTorch Python bindings load PyTorch today. Legacy text-processing folders can load it separately.
+The public ExecuTorch Python bindings load PyTorch today.
 
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. ACT has completed TensorRT exports and rollouts there, but the current raw-frame SmolVLA exports and pi0.5 split-engine build ran out of available memory. Exporting the graph elsewhere does not remove the target engine builder's memory needs. GR00T raw-frame export on Orin is unverified.
-- **Older Orin artifacts are not a current export recipe.** Earlier SmolVLA and pi0.5 folders can run, but pi0.5's measured three-program ExecuTorch folder was not produced by a fork export script. Do not treat it as proof that the current scripts can export pi0.5 on Orin.
-- **GR00T resize runs outside the program**, using NumPy antialiased bicubic sampling because the operator is not supported by every compiler route. Its cost must be included in a full rollout comparison; the older chunk table is not a timing of this new path.
+- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's ExecuTorch-TensorRT export finished only by using about 4 GiB of swap. SmolVLA's other routes, pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
+- **GR00T resize runs outside the program**, using NumPy antialiased bicubic sampling because the operator is not supported by every compiler route. The chunk times above include it.
 - **Legacy SmolVLA text-step folders load PyTorch** for tokenization, including with ONNX-TensorRT. Current raw-frame exports keep the fixed task's tokens in the program.
-- **CUDA route coverage is incomplete.** SmolVLA has no `executorch_cuda` script. GR00T's current raw-frame CUDA export fails with the tested stock compiler; a full-model retry is still needed. Current ACT CUDA export on Orin is also unverified.
-- **Replay and saved-case agreement do not prove physical task success.** Older pi0.5 rollouts stopped at camera validation; the camera selection and full rename map above are required before a final rerun can validate that path.
+- **CUDA route coverage is incomplete.** SmolVLA has no `executorch_cuda` script. GR00T's raw-frame CUDA export failed with the stock compiler in an earlier test; this run's retry is pending.
+- **Replay and saved-case agreement do not prove physical task success.** Older pi0.5 rollouts stopped at camera validation; this run uses the camera selection and rename map above, and its pi0.5 rows are pending.

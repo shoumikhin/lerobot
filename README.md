@@ -39,7 +39,7 @@ lerobot-info
 
 ## Compiled Policies on Jetson
 
-This fork adds compiled-policy export examples and runs their output through `lerobot-rollout`, with either a real robot or a replay plugin. See the [Jetson export guide](examples/export/README.md) for installation, compiler routes, commands, provisional benchmarks and current limits. The benchmark tables are pending a final rerun; they do not establish a general performance advantage.
+This fork adds compiled-policy export examples and runs their output through `lerobot-rollout`, with either a real robot or a replay plugin. See the [Jetson export guide](examples/export/README.md) for installation, compiler routes, commands, benchmarks and current limits. ACT and SmolVLA are measured; pi0.5, most GR00T routes and the larger policies on the Orin Nano are still pending. In the measured rows, ExecuTorch-TensorRT has the lowest chunk time (2 to 9% less than the next TensorRT route), and ONNX-TensorRT uses the least process memory.
 
 ## Robots & Control
 
