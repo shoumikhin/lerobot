@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained GR00T N1.7 policy as an AOTInductor package that runs on TensorRT.
+"""Export a trained GR00T N1.7 policy as AOTInductor packages that run on TensorRT.
 
 Run it on the device the policy will run on, because a TensorRT engine only runs on the GPU
 model that built it:
@@ -24,27 +24,27 @@ model that built it:
         --dataset.repo_id=<user>/so101_dataset
 
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
-Unlike the other two backends, the package runs only with PyTorch and Torch-TensorRT installed.
+Unlike the other backends, the packages run only with PyTorch and Torch-TensorRT installed.
 """
+
+from pathlib import Path
 
 import torch
 import torch_tensorrt
-from groot_recipe import GrootExport, parse_args
+from groot_recipe import TENSORRT_OPTIONS, export_parts, parse_args
+from torch import nn
 
 
-def main() -> None:
-    args = parse_args(__doc__, "torch_tensorrt")
-    export = GrootExport(args)
-    package_path = export.output_dir / "model.pt2"
-
+def compile_part(
+    module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
+):
     with torch.no_grad():
-        program = torch.export.export(export.module, export.inputs)
-    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
-    del program
-    export.release_policy()
-    torch_tensorrt.save(engine, str(package_path), output_format="aot_inductor", arg_inputs=export.inputs)
-    export.write(package_path)
+        program = torch.export.export(module, inputs)
+    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
+    torch_tensorrt.save(engine, str(path), output_format="aot_inductor", arg_inputs=inputs)
 
 
 if __name__ == "__main__":
-    main()
+    export_parts(
+        parse_args(__doc__, "torch_tensorrt"), __file__, "{name}.pt2", compile_part, device_resident=True
+    )

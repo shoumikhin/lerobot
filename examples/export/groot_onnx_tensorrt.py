@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained GR00T N1.7 policy to ONNX, then build a TensorRT engine from it.
+"""Export a trained GR00T N1.7 policy to ONNX, then build TensorRT engines from it.
 
 Run it on the device the policy will run on, because a TensorRT engine only runs on the GPU
 model that built it:
@@ -26,33 +26,32 @@ model that built it:
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
 """
 
+from pathlib import Path
+
 import torch
 from build_engine import build_engine
-from groot_recipe import GrootExport, parse_args
+from groot_recipe import TENSORRT_OPTIONS, export_parts, free_memory, parse_args
+from torch import nn
 
-from lerobot.utils.constants import ACTION
 
-
-def main() -> None:
-    args = parse_args(__doc__, "onnx_tensorrt")
-    export = GrootExport(args)
-    onnx_path = export.output_dir / "model.onnx"
-    engine_path = export.output_dir / "model.engine"
-
+def compile_part(
+    module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
+):
+    onnx_path = path.with_suffix(".onnx")
     with torch.no_grad():
         torch.onnx.export(
-            export.module,
-            export.inputs,
-            onnx_path,
-            dynamo=True,
-            input_names=export.input_names,
-            output_names=[ACTION],
+            module, inputs, onnx_path, dynamo=True, input_names=input_names, output_names=output_names
         )
-    export.release_policy()
-    if not args.export_only:
-        build_engine(onnx_path, engine_path)
-    export.write(engine_path)
+    # CPU memory can swap during the build, GPU memory cannot.
+    module.cpu()
+    free_memory()
+    build_engine(
+        onnx_path,
+        path,
+        workspace_gib=TENSORRT_OPTIONS["workspace_size"] / (1 << 30),
+        optimization_level=TENSORRT_OPTIONS["optimization_level"],
+    )
 
 
 if __name__ == "__main__":
-    main()
+    export_parts(parse_args(__doc__, "onnx_tensorrt"), __file__, "{name}.engine", compile_part)

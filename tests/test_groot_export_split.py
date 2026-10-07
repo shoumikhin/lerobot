@@ -15,11 +15,13 @@
 import importlib
 import json
 import os
+import runpy
 import sys
 from argparse import Namespace
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -387,6 +389,125 @@ def test_actions_apply_the_postprocessor_after_slicing(recipe):
     torch.testing.assert_close(part(values), values[:2, :3] * 7 + 3)
     saved = torch.export.export(part, (values,)).module()(values)
     torch.testing.assert_close(saved, part(values))
+
+
+@pytest.mark.parametrize("backend", ["onnx_tensorrt", "torch_tensorrt"])
+def test_split_script_launches_every_recipe_part(recipe, monkeypatch, tmp_path, backend):
+    monkeypatch.setattr(
+        recipe.PreTrainedConfig, "from_pretrained", lambda path: SimpleNamespace(base_model_path="base")
+    )
+    monkeypatch.setattr(
+        recipe.GR00TN17Config,
+        "from_pretrained",
+        lambda path: SimpleNamespace(select_layer=16, diffusion_model_cfg={"num_layers": 25}),
+    )
+    monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=MagicMock()))
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", MagicMock())
+    load = MagicMock(side_effect=AssertionError("The parent must not load the whole policy"))
+    monkeypatch.setattr(recipe, "GrootExport", load)
+    calls = MagicMock()
+    monkeypatch.setattr(recipe.subprocess, "run", calls)
+    script = Path(recipe.__file__).with_name(f"groot_{backend}.py")
+    output = tmp_path / "export"
+    argv = [str(script), "--policy.path=checkpoint", "--dataset.repo_id=dataset", f"--output_dir={output}"]
+    monkeypatch.setattr(sys, "argv", argv)
+    runpy.run_path(str(script), run_name="__main__")
+    names = [
+        "vision",
+        *(f"language_model_{i}" for i in range(3)),
+        *(f"step_{i}" for i in range(4)),
+        "actions",
+    ]
+    assert calls.call_count == len(names)
+    for call, name in zip(calls.call_args_list, names, strict=True):
+        assert call.args == ([sys.executable, *argv, f"--output_dir={output}", f"--part={name}"],)
+        assert call.kwargs == {"check": True}
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("backend,suffix", [("onnx_tensorrt", ".engine"), ("torch_tensorrt", ".pt2")])
+def test_split_script_compiles_named_parts_and_writes_chain(recipe, monkeypatch, tmp_path, backend, suffix):
+    class Part(torch.nn.Module):
+        def forward(self, x):
+            return x + 1, x * 2
+
+    names = ["vision", "language_model_0", "step_0", "actions"]
+    module = Part().eval()
+    inputs = (torch.arange(4, dtype=torch.float32),)
+    input_names, output_names = ["x_t"], ["hidden", "state"]
+    export = recipe.GrootExport.__new__(recipe.GrootExport)
+    export.__dict__.update(
+        output_dir=tmp_path,
+        backend=backend,
+        frame={"observation.state": np.zeros(2, np.float32)},
+        noise=inputs[0],
+        expected_actions=np.ones(4, np.float32),
+        config=SimpleNamespace(save_pretrained=lambda path: None),
+        input_features={},
+        input_names=["observation.state", "noise"],
+        image_resize=None,
+        task="pick",
+        tolerance=5.0,
+        num_steps=2,
+        timesteps=[0, 500],
+        start=recipe.time.perf_counter(),
+    )
+    monkeypatch.setattr(recipe, "part_names", lambda path: names)
+    load = MagicMock(return_value=export)
+    monkeypatch.setattr(recipe, "GrootExport", load)
+    monkeypatch.setattr(
+        export, "parts", lambda: iter((name, module, inputs, input_names, output_names) for name in names)
+    )
+    events = []
+    monkeypatch.setattr(module, "cpu", lambda: events.append("cpu"))
+    monkeypatch.setattr(recipe, "free_memory", lambda: events.append("free"))
+    onnx = MagicMock(side_effect=lambda *args, **kwargs: events.append("onnx"))
+    monkeypatch.setattr(torch.onnx, "export", onnx)
+    build = MagicMock(side_effect=lambda *args, **kwargs: events.append("build"))
+    monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=build))
+    trt = MagicMock()
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", trt)
+    script = Path(recipe.__file__).with_name(f"groot_{backend}.py")
+    for name in names:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [str(script), "--policy.path=checkpoint", "--dataset.repo_id=dataset", f"--part={name}"],
+        )
+        runpy.run_path(str(script), run_name="__main__")
+        assert load.call_args.kwargs == {"split": True}
+        if name != "actions":
+            assert not (tmp_path / "export.json").exists()
+    if backend == "onnx_tensorrt":
+        assert onnx.call_count == build.call_count == len(names)
+        for name, call in zip(names, onnx.call_args_list, strict=True):
+            assert call.args == (module, inputs, tmp_path / f"{name}.onnx")
+            assert call.kwargs == {"dynamo": True, "input_names": input_names, "output_names": output_names}
+        for name, call in zip(names, build.call_args_list, strict=True):
+            assert call.args == (tmp_path / f"{name}.onnx", tmp_path / f"{name}.engine")
+            assert call.kwargs == {
+                "workspace_gib": recipe.TENSORRT_OPTIONS["workspace_size"] / (1 << 30),
+                "optimization_level": recipe.TENSORRT_OPTIONS["optimization_level"],
+            }
+        assert events == [
+            event for i in range(len(names)) for event in [*(["free"] * i), "onnx", "cpu", "free", "build"]
+        ]
+    else:
+        assert trt.dynamo.compile.call_count == trt.save.call_count == len(names)
+        for call in trt.dynamo.compile.call_args_list:
+            assert call.kwargs == {"arg_inputs": inputs, **recipe.TENSORRT_OPTIONS}
+            torch.testing.assert_close(call.args[0].module()(*inputs), module(*inputs))
+        for name, call in zip(names, trt.save.call_args_list, strict=True):
+            assert call.args == (trt.dynamo.compile.return_value, str(tmp_path / f"{name}.pt2"))
+            assert call.kwargs == {"output_format": "aot_inductor", "arg_inputs": inputs}
+    info = json.loads((tmp_path / "export.json").read_text())
+    assert info["backend"] == backend
+    assert info["device_resident"] is (backend == "torch_tensorrt")
+    assert info["programs"] == {
+        name: {"file": f"{name}{suffix}", "inputs": input_names, "outputs": output_names} for name in names
+    }
+    assert "file" not in info
+    assert info["dt"] == 0.5 and info["timesteps"] == [0, 500]
 
 
 def test_part_names_cover_remainders_and_reject_unknown_parts(recipe, monkeypatch):
