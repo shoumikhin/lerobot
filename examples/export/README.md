@@ -143,7 +143,7 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 > [!NOTE]
 > Cells marked pending are still being measured.
 
-Five ways to run each policy: PyTorch, `torch.compile`, and three TensorRT routes. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
+Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
 
 ### Accuracy
 
@@ -151,21 +151,21 @@ Difference from PyTorch's actions on 50 dataset samples: largest / average, in d
 
 Thor:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |       0 |         pending |   0.11 / 0.005 |        0.11 / 0.005 |  0.12 / 0.005 |
-| SmolVLA |    1.84 |         pending |   2.23 / 0.070 |        2.23 / 0.070 |  1.46 / 0.061 |
-| pi0.5   |    5.61 |         pending |   2.98 / 0.108 |        2.98 / 0.108 |  4.80 / 0.125 |
-| GR00T   |    3.49 |         pending |   2.97 / 0.092 |        2.97 / 0.092 |  1.60 / 0.088 |
+|         |        ONNX-TensorRT |  ExecuTorch-TensorRT |       Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | -------------------: | -------------------: | -------------------: | --------------: | ------: |
+| ACT     |     0.12 / **0.005** | **0.11** / **0.005** | **0.11** / **0.005** |         pending |       0 |
+| SmolVLA | **1.46** / **0.061** |         2.23 / 0.070 |         2.23 / 0.070 |         pending |    1.84 |
+| pi0.5   |         4.80 / 0.125 | **2.98** / **0.108** | **2.98** / **0.108** |         pending |    5.61 |
+| GR00T   | **1.60** / **0.088** |         2.97 / 0.092 |         2.97 / 0.092 |         pending |    3.49 |
 
 Orin Nano:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |       0 |         pending |   0.10 / 0.005 |        0.10 / 0.005 |  0.11 / 0.005 |
-| SmolVLA |    1.83 |         pending |   1.59 / 0.054 |        1.59 / 0.054 |  1.46 / 0.058 |
-| pi0.5   | pending |         pending |        pending |             pending |       pending |
-| GR00T   | pending |         pending |        pending |             pending |       pending |
+|         |    ONNX-TensorRT |  ExecuTorch-TensorRT |       Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | ---------------: | -------------------: | -------------------: | --------------: | ------: |
+| ACT     | 0.11 / **0.005** | **0.10** / **0.005** | **0.10** / **0.005** |         pending |       0 |
+| SmolVLA | **1.46** / 0.058 |     1.59 / **0.054** |     1.59 / **0.054** |         pending |    1.83 |
+| pi0.5   |          pending |              pending |              pending |         pending | pending |
+| GR00T   |          pending |              pending |              pending |         pending | pending |
 
 All routes match PyTorch within the check that runs before the robot moves.
 
@@ -175,21 +175,21 @@ Median time to compute one action chunk, in milliseconds. Lower is better.
 
 Thor:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |   15.91 |           12.80 |           3.70 |                3.43 |          3.50 |
-| SmolVLA |   166.7 |           44.47 |          29.20 |               28.17 |         30.95 |
-| pi0.5   |   244.2 |           129.9 |          106.3 |               105.4 |         124.7 |
-| GR00T   |   211.5 |           206.7 |          88.98 |               93.30 |         97.84 |
+|         | ONNX-TensorRT | ExecuTorch-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | ------------: | ------------------: | -------------: | --------------: | ------: |
+| ACT     |          3.50 |            **3.43** |           3.70 |           12.80 |   15.91 |
+| SmolVLA |         30.95 |           **28.17** |          29.20 |           44.47 |   166.7 |
+| pi0.5   |         124.7 |           **105.4** |          106.3 |           129.9 |   244.2 |
+| GR00T   |         97.84 |               93.30 |      **88.98** |           206.7 |   211.5 |
 
 Orin Nano:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |   64.60 |           61.53 |          26.26 |               25.65 |         26.36 |
-| SmolVLA |   762.0 |           172.3 |          136.0 |               125.6 |         130.5 |
-| pi0.5   | pending |         pending |        pending |             pending |       pending |
-| GR00T   | pending |         pending |        pending |             pending |       pending |
+|         | ONNX-TensorRT | ExecuTorch-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | ------------: | ------------------: | -------------: | --------------: | ------: |
+| ACT     |         26.36 |           **25.65** |          26.26 |           61.53 |   64.60 |
+| SmolVLA |         130.5 |           **125.6** |          136.0 |           172.3 |   762.0 |
+| pi0.5   |       pending |             pending |        pending |         pending | pending |
+| GR00T   |       pending |             pending |        pending |         pending | pending |
 
 ExecuTorch-TensorRT is 2 to 6 times faster than PyTorch, and the fastest route on ACT, SmolVLA and pi0.5. Torch-TensorRT is the fastest on GR00T.
 
@@ -199,21 +199,21 @@ Board memory used while running, in MiB, the highest across runs. Lower is bette
 
 Thor:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |    2327 |            2489 |           1510 |           829 (520) |           557 |
-| SmolVLA |    3940 |            4354 |           3233 |         1535 (1190) |          1278 |
-| pi0.5   |   11610 |           12215 |           6247 |         6082 (5790) |          6230 |
-| GR00T   |   15402 |           16684 |           6190 |         6007 (5700) |          5486 |
+|         | ONNX-TensorRT | ExecuTorch-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | ------------: | ------------------: | -------------: | --------------: | ------: |
+| ACT     |       **557** |           829 (520) |           1510 |            2489 |    2327 |
+| SmolVLA |      **1278** |         1535 (1190) |           3233 |            4354 |    3940 |
+| pi0.5   |          6230 |     **6082** (5790) |           6247 |           12215 |   11610 |
+| GR00T   |      **5486** |         6007 (5700) |           6190 |           16684 |   15402 |
 
 Orin Nano:
 
-|         | PyTorch | `torch.compile` | Torch-TensorRT | ExecuTorch-TensorRT | ONNX-TensorRT |
-| ------- | ------: | --------------: | -------------: | ------------------: | ------------: |
-| ACT     |    1140 |         not run |            579 |           493 (330) |           223 |
-| SmolVLA |    2034 |         not run |           1499 |           940 (790) |           370 |
-| pi0.5   | pending |         pending |        pending |             pending |       pending |
-| GR00T   | pending |         pending |        pending |             pending |       pending |
+|         | ONNX-TensorRT | ExecuTorch-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
+| ------- | ------------: | ------------------: | -------------: | --------------: | ------: |
+| ACT     |       **223** |           493 (330) |            579 |         not run |    1140 |
+| SmolVLA |       **370** |           940 (790) |           1499 |         not run |    2034 |
+| pi0.5   |       pending |             pending |        pending |         pending | pending |
+| GR00T   |       pending |             pending |        pending |         pending | pending |
 
 ExecuTorch-TensorRT uses about half of PyTorch's memory or less. ONNX-TensorRT uses less today; it is the only route that does not load PyTorch.
 
