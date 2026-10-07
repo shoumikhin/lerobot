@@ -44,8 +44,13 @@ def resize_bicubic(image: np.ndarray, size: tuple[int, int] | list[int]) -> np.n
         return image
     columns, x_weights = _axis_weights(image.shape[1], size[1])
     rows, y_weights = _axis_weights(image.shape[0], size[0])
-    horizontal = (image[:, columns].astype(np.float32) * x_weights[None, :, :, None]).sum(axis=2)
-    resized = (horizontal[rows] * y_weights[:, :, None, None]).sum(axis=1)
+    # Reuse private workspaces to avoid a second allocation for each multiply.
+    horizontal = image[:, columns].astype(np.float32)
+    horizontal *= x_weights[None, :, :, None]
+    horizontal = horizontal.sum(axis=2)
+    resized = horizontal[rows]
+    resized *= y_weights[:, :, None, None]
+    resized = resized.sum(axis=1)
     return np.ascontiguousarray(np.rint(resized.clip(0, 255)), dtype=np.uint8)
 
 
