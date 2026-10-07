@@ -29,6 +29,7 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 import torch
 import torch_tensorrt
 from act_recipe import save_for_build_engine
+from executorch.exir.backend.compile_spec_schema import CompileSpec
 from smolvla_recipe import SmolVLAExport, parse_args
 
 
@@ -45,7 +46,13 @@ def main() -> None:
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
     del program
     export.release_policy()
-    torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
+    torch_tensorrt.save(
+        engine,
+        str(pte_path),
+        output_format="executorch",
+        retrace=False,
+        compile_specs=[CompileSpec("use_cuda_graphs", b"1")],
+    )
     export.write(pte_path)
 
 

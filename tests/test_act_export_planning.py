@@ -27,6 +27,7 @@ def test_executorch_export_shares_host_inputs_only(tmp_path, monkeypatch, deferr
     tensorrt = MagicMock()
     config = MagicMock()
     planning = MagicMock()
+    compile_spec = MagicMock()
     export = MagicMock(output_dir=tmp_path)
     save_for_build_engine = MagicMock()
     args = SimpleNamespace(
@@ -43,6 +44,7 @@ def test_executorch_export_shares_host_inputs_only(tmp_path, monkeypatch, deferr
         "torch_tensorrt": tensorrt,
         "executorch.exir": SimpleNamespace(ExecutorchBackendConfig=config),
         "executorch.exir.passes": SimpleNamespace(MemoryPlanningPass=planning),
+        "executorch.exir.backend.compile_spec_schema": SimpleNamespace(CompileSpec=compile_spec),
         "act_recipe": SimpleNamespace(
             ACTExport=MagicMock(return_value=export),
             parse_args=lambda *a: args,
@@ -76,4 +78,32 @@ def test_executorch_export_shares_host_inputs_only(tmp_path, monkeypatch, deferr
         output_format="executorch",
         retrace=False,
         backend_config=config.return_value,
+        **({} if deferred else {"compile_specs": [compile_spec.return_value]}),
     )
+    if deferred:
+        compile_spec.assert_not_called()
+    else:
+        compile_spec.assert_called_once_with("use_cuda_graphs", b"1")
+
+
+def test_smolvla_direct_export_enables_cuda_graphs(tmp_path, monkeypatch):
+    torch = MagicMock()
+    tensorrt = MagicMock()
+    compile_spec = MagicMock()
+    export = MagicMock(output_dir=tmp_path)
+    modules = {
+        "torch": torch,
+        "torch_tensorrt": tensorrt,
+        "executorch.exir.backend.compile_spec_schema": SimpleNamespace(CompileSpec=compile_spec),
+        "act_recipe": SimpleNamespace(save_for_build_engine=MagicMock()),
+        "smolvla_recipe": SimpleNamespace(
+            SmolVLAExport=MagicMock(return_value=export),
+            parse_args=lambda *args: SimpleNamespace(export_only=False),
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    script = Path(__file__).resolve().parents[1] / "examples" / "export" / "smolvla_executorch_tensorrt.py"
+    runpy.run_path(str(script), run_name="__main__")
+    compile_spec.assert_called_once_with("use_cuda_graphs", b"1")
+    assert tensorrt.save.call_args.kwargs["compile_specs"] == [compile_spec.return_value]
