@@ -339,7 +339,7 @@ class VLAJEPAActionHead(nn.Module):
                 dtype=conditioning_tokens.dtype,
                 device=conditioning_tokens.device,
             )
-        actions = noise
+        actions = noise.to(device=conditioning_tokens.device, dtype=conditioning_tokens.dtype)
         dt = 1.0 / max(self.num_inference_timesteps, 1)
         for step in range(self.num_inference_timesteps):
             t_cont = step / float(max(self.num_inference_timesteps, 1))

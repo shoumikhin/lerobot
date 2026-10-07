@@ -590,7 +590,8 @@ class ConditionalFlowMatchingHead(nn.Module):
                 device=device,
                 dtype=model_dtype,
             )
-        x_t = noise * time_valid.unsqueeze(-1).to(dtype=noise.dtype)
+        x_t = noise.to(device=device, dtype=model_dtype)
+        x_t = x_t * time_valid.unsqueeze(-1).to(dtype=x_t.dtype)
 
         dt = 1.0 / float(num_inference_steps)
 

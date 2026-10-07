@@ -665,7 +665,7 @@ class GR00TN17ActionHead(nn.Module):
             )
         else:
             # The RTC prefix below writes into the actions in place, so keep the caller's tensor intact.
-            actions = noise.clone()
+            actions = noise.to(device=device, dtype=vl_embeds.dtype).clone()
         vel_strength = torch.ones_like(actions)
 
         if "action" in action_input:

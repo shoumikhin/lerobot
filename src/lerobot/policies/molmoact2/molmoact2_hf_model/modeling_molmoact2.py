@@ -3141,7 +3141,7 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
                 generator=generator,
             )
         trajectory = self._mask_action_dim_tensor(
-            noise,
+            noise.to(device=device, dtype=trajectory_dtype),
             action_dim_is_pad=action_dim_is_pad,
             enabled=self.config.mask_action_dim_padding,
         )

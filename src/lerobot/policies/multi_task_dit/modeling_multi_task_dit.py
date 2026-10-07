@@ -715,7 +715,7 @@ class DiffusionObjective(nn.Module):
                 dtype=dtype,
                 device=device,
             )
-        sample = noise
+        sample = noise.to(device=device, dtype=dtype)
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
         for t in self.noise_scheduler.timesteps:
@@ -780,7 +780,7 @@ class FlowMatchingObjective(nn.Module):
 
         if noise is None:
             noise = torch.randn((batch_size, self.horizon, self.action_dim), dtype=dtype, device=device)
-        x = noise
+        x = noise.to(device=device, dtype=dtype)
 
         num_steps = self.config.num_integration_steps
         time_grid = torch.linspace(0, 1, num_steps + 1, device=device)

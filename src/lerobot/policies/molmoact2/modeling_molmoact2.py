@@ -1836,7 +1836,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 dtype=torch.float32,
                 generator=generator,
             )
-        trajectory = noise
+        trajectory = noise.to(device=device, dtype=torch.float32)
         if self.config.mask_action_dim_padding:
             trajectory = _mask_action_dim_tensor(trajectory, action_dim_is_pad)
 

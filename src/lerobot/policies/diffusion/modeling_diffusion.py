@@ -262,7 +262,7 @@ class DiffusionModel(nn.Module):
 
         # Sample prior.
         sample = (
-            noise
+            noise.to(device=device, dtype=dtype)
             if noise is not None
             else torch.randn(
                 size=(batch_size, self.config.horizon, _action_dim(self.config)),

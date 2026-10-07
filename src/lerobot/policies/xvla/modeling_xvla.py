@@ -253,7 +253,7 @@ class XVLAModel(nn.Module):
             noise = torch.randn(
                 batch_size, self.chunk_size, action_dim, device=proprio.device, dtype=target_dtype
             )
-        x1 = noise
+        x1 = noise.to(device=proprio.device, dtype=target_dtype)
         action = torch.zeros_like(x1)
 
         steps = max(1, int(steps))

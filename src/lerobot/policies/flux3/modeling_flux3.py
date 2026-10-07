@@ -527,6 +527,8 @@ class Flux3Policy(PreTrainedPolicy):
         rng = torch.Generator().manual_seed(seed)
         if video_noise is None:
             video_noise = torch.randn(1, packing.LATENT_CHANNELS, n_pred, *cfg.latent_hw, generator=rng)
+        else:
+            video_noise = video_noise.to(device=device, dtype=torch.float32)
         x_video, x_video_ids = batched_prc_vid(
             video_noise,
             self.packer.predicted_video_times(cfg, 1),
@@ -534,6 +536,8 @@ class Flux3Policy(PreTrainedPolicy):
         times = self.packer.action_times(cfg, 1)
         if action_noise is None:
             action_noise = torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=rng)
+        else:
+            action_noise = action_noise.to(device=device, dtype=torch.float32)
         x_action, x_action_ids = batched_prc_audio(action_noise, times_to_ids(times))
         # The solver state stays fp32 (scaled joint targets would lose ~0.01 rad per bf16 round trip);
         # inputs are cast at the model boundary.

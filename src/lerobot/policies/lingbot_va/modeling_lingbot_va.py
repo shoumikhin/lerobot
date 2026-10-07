@@ -446,8 +446,8 @@ class LingBotVAPolicy(PreTrainedPolicy):
         """Run one autoregressive chunk and return actions ``[B, chunk_size, n_used]`` (normalized).
 
         ``noise`` is the starting action sample ``[1, action_dim, frame_chunk_size, action_per_frame, 1]``
-        and ``video_noise`` the starting video latent ``[1, 48, frame_chunk_size, latent_h, latent_w]``, both
-        in the policy's dtype and device. When None, each is drawn with ``torch.randn`` as before.
+        and ``video_noise`` the starting video latent ``[1, 48, frame_chunk_size, latent_h, latent_w]``. When
+        None, each is drawn with ``torch.randn`` as before.
         """
         self.eval()
         self._ensure_frozen_modules()
@@ -772,13 +772,13 @@ class LingBotVAPolicy(PreTrainedPolicy):
                 1, 48, frame_chunk_size, latent_h, latent_w, device=device, dtype=self.dtype
             )
         else:
-            latents = video_noise.clone()
+            latents = video_noise.to(device=device, dtype=self.dtype).clone()
         if noise is None:
             actions = torch.randn(
                 1, cfg.action_dim, frame_chunk_size, cfg.action_per_frame, 1, device=device, dtype=self.dtype
             )
         else:
-            actions = noise.clone()
+            actions = noise.to(device=device, dtype=self.dtype).clone()
 
         self._scheduler.set_timesteps(cfg.num_inference_steps)
         self._action_scheduler.set_timesteps(cfg.action_num_inference_steps)
