@@ -326,3 +326,53 @@ def test_legacy_text_pipeline_keeps_state_not_listed_as_program_input(tmp_path, 
     monkeypatch.setattr(module, "load_program", lambda *a: lambda tokens: tokens[:, None])
     engine = ExportInferenceEngine(tmp_path, "pick", "replay")
     np.testing.assert_array_equal(engine.get_action({"observation.state": state}), state)
+
+
+def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, monkeypatch):
+    """A device-resident chain hands each program's tensors to the next; only the actions reach NumPy."""
+    torch = pytest.importorskip("torch")
+    received = []
+
+    def load(path, data_path=None):
+        def execute(inputs):
+            received.append((path.name, [type(value) for value in inputs]))
+            if path.name == "prefix.pte":
+                return [inputs[0] * 2]
+            if path.name == "step.pte":
+                return [inputs[0] + inputs[1] * 0]
+            return [inputs[0] * 10]
+
+        return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
+
+    runtime = SimpleNamespace(load_program=load)
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(synchronize=lambda: None))
+    names = {
+        "prefix": (["observation.state"], ["past_key_0"]),
+        "step": (["past_key_0", "x_t", "timestep"], ["v_t"]),
+        "actions": (["x_t"], ["action"]),
+    }
+    info = {
+        "backend": "executorch_tensorrt",
+        "device_resident": True,
+        "inputs": ["observation.state", "noise"],
+        "programs": {
+            name: {"file": f"{name}.pte", "inputs": inputs, "outputs": outputs}
+            for name, (inputs, outputs) in names.items()
+        },
+        "num_steps": 2,
+    }
+
+    actions = load_program(tmp_path, info).initialize(
+        np.ones((1, 3), np.float32), np.zeros((1, 3), np.float32)
+    )
+
+    assert [name for name, _ in received] == ["prefix.pte", "step.pte", "step.pte", "actions.pte"]
+    assert all(kind is torch.Tensor for _, kinds in received for kind in kinds), received
+    assert isinstance(actions, np.ndarray)
+    # x <- x + dt * v with v = the cache (2), dt = -1/2, twice, from x = 0; then x 10.
+    np.testing.assert_allclose(actions, np.full((1, 3), -20.0))

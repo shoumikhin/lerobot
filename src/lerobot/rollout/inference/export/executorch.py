@@ -15,6 +15,7 @@
 """Run an exported policy's ExecuTorch program, on its TensorRT or CUDA backend."""
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -48,14 +49,7 @@ class ExecuTorchProgram:
     def __call__(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         arrays = [np.ascontiguousarray(value) for value in inputs]
         if self._torch_inputs:
-            import torch
-
-            arrays = [
-                torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
-                if value.dtype.name == "bfloat16"
-                else torch.from_numpy(value)
-                for value in arrays
-            ]
+            arrays = [to_torch(value) for value in arrays]
         outputs = self._method.execute(arrays)
         result = []
         for output in outputs:
@@ -68,11 +62,50 @@ class ExecuTorchProgram:
                     pass
             import torch
 
-            tensor = torch.from_dlpack(output).cpu()
-            if tensor.dtype == torch.bfloat16:
-                from ml_dtypes import bfloat16
-
-                result.append(tensor.view(torch.uint16).numpy().view(bfloat16).copy())
-            else:
-                result.append(tensor.numpy().copy())
+            result.append(to_numpy(torch.from_dlpack(output)))
         return result[0] if len(result) == 1 else tuple(result)
+
+
+class DeviceResidentProgram(ExecuTorchProgram):
+    """Run a `.pte` program exported to take and return CUDA tensors, with no copies at its boundary.
+
+    `run_device` returns the outputs as CUDA torch tensors, which the next program in a chain reads as they are.
+    """
+
+    def run_device(self, *inputs: np.ndarray | Any) -> tuple[Any, ...]:
+        import torch
+
+        tensors = [
+            value if isinstance(value, torch.Tensor) else to_torch(np.ascontiguousarray(value)).cuda()
+            for value in inputs
+        ]
+        # The delegate runs on its own CUDA stream, so the PyTorch work that wrote the inputs must finish first.
+        torch.cuda.current_stream().synchronize()
+        return tuple(self._method.execute(tensors))
+
+    def initialize(self, *inputs: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        return self(*inputs)
+
+    def __call__(self, *inputs: np.ndarray | Any) -> np.ndarray | tuple[np.ndarray, ...]:
+        outputs = [to_numpy(value) for value in self.run_device(*inputs)]
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+
+def to_torch(array: np.ndarray):
+    """A torch tensor sharing the array's memory; PyTorch cannot read NumPy's bfloat16 extension dtype."""
+    import torch
+
+    if array.dtype.name == "bfloat16":
+        return torch.from_numpy(array.view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(array)
+
+
+def to_numpy(tensor) -> np.ndarray:
+    import torch
+
+    tensor = tensor.cpu()
+    if tensor.dtype == torch.bfloat16:
+        from ml_dtypes import bfloat16
+
+        return tensor.view(torch.uint16).numpy().view(bfloat16).copy()
+    return tensor.numpy().copy()

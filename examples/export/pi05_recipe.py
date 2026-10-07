@@ -120,13 +120,15 @@ def export_parts(
     script: str,
     file_name: str,
     compile_part: Callable[[nn.Module, tuple, list[str], list[str], Path], None],
+    device_resident: bool = False,
 ) -> None:
     """Export the chunk one program per process, each loading only its own part of the policy.
 
     Without `--part`, make the folder and run `script` again once per part: a process returns all its
     memory when it exits, and one that built a part keeps some of it. With `--part`, run the parts before
     it in PyTorch to make its example inputs, then `compile_part(module, inputs, input_names, output_names,
-    path)` writes it to `file_name` formatted with the part's name. The last part also writes `export.json`.
+    path)` writes it to `file_name` formatted with the part's name. The last part also writes `export.json`,
+    which says whether the programs take and return CUDA tensors (`device_resident`).
     """
     if args.part is None:
         output_dir = make_output_dir(args.output_dir, args.job_name)
@@ -146,7 +148,7 @@ def export_parts(
         compile_part(module, inputs, input_names, output_names, export.output_dir / programs[name]["file"])
         print(f"Wrote {programs[name]['file']}", flush=True)
         if name == "actions":
-            export.write(programs)
+            export.write(programs, device_resident)
         return
 
 
@@ -426,7 +428,7 @@ class PI05Export:
             self.expected_actions = actions(x_t).cpu().numpy()
         yield "actions", actions, (self.noise,), ["x_t"], [ACTION]
 
-    def write(self, programs: dict[str, dict]) -> None:
+    def write(self, programs: dict[str, dict], device_resident: bool = False) -> None:
         """Save the raw test case, the policy config and `export.json`, which lists each program's file, inputs and outputs."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
@@ -436,6 +438,7 @@ class PI05Export:
         info = {
             "backend": self.backend,
             "programs": programs,
+            "device_resident": device_resident,
             "num_steps": self.config.num_inference_steps,
             "inputs": self.input_names,
             "raw_frame": True,

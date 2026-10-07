@@ -816,7 +816,9 @@ def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, b
 
     loaded = []
     monkeypatch.setattr(
-        export_engine, "load_one", lambda path, name: loaded.append((path.name, name)) or path.name
+        export_engine,
+        "load_one",
+        lambda path, name, device_resident: loaded.append((path.name, name)) or path.name,
     )
     monkeypatch.setattr(
         export_tensorrt, "load_engines", lambda folder, programs: dict.fromkeys(programs, "engine")

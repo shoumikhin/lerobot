@@ -68,7 +68,10 @@ def load_program(folder: Path, info: dict) -> Program:
 
             return ProgramChain(load_engines(folder, info["programs"]), info)
         files = {name: folder / program["file"] for name, program in info["programs"].items()}
-        return ProgramChain({name: load_one(path, backend) for name, path in files.items()}, info)
+        device_resident = info.get("device_resident", False)
+        return ProgramChain(
+            {name: load_one(path, backend, device_resident) for name, path in files.items()}, info
+        )
     if backend == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 
@@ -76,15 +79,19 @@ def load_program(folder: Path, info: dict) -> Program:
     return load_one(folder / info["file"], backend)
 
 
-def load_one(path: Path, backend: str) -> Program:
-    """Load one ExecuTorch program or AOTInductor package."""
+def load_one(path: Path, backend: str, device_resident: bool = False) -> Program:
+    """Load one ExecuTorch program or AOTInductor package.
+
+    A device-resident ExecuTorch program takes and returns CUDA tensors, so a chain keeps its values on the GPU.
+    """
     if backend == "torch_tensorrt":
         from .aoti import AOTInductorPackage
 
         return AOTInductorPackage(path)
-    from .executorch import ExecuTorchProgram
+    from .executorch import DeviceResidentProgram, ExecuTorchProgram
 
-    return ExecuTorchProgram(path, tensorrt=backend == "executorch_tensorrt")
+    program = DeviceResidentProgram if device_resident else ExecuTorchProgram
+    return program(path, tensorrt=backend == "executorch_tensorrt")
 
 
 class ProgramChain:
