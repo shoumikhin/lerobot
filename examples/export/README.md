@@ -202,7 +202,7 @@ Thor:
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |       **520** (829) |           557 |           1510 |            2489 |    2327 |
-| SmolVLA |     **1190** (1535) |          1278 |           3233 |            4354 |    3940 |
+| SmolVLA |     **1190** (1535) |          1278 |           3233 |            4422 |    3940 |
 | pi0.5   |     **5790** (6082) |          6230 |           6247 |           12215 |   11610 |
 | GR00T   |         5700 (6007) |      **5486** |           6190 |           16684 |   15402 |
 
@@ -210,8 +210,8 @@ Orin Nano:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |           330 (493) |       **223** |            579 |         not run |    1140 |
-| SmolVLA |           790 (940) |       **370** |           1499 |         not run |    2034 |
+| ACT     |           330 (493) |       **223** |            579 |            1651 |    1140 |
+| SmolVLA |           790 (940) |       **370** |           1499 |         pending |    2034 |
 | pi0.5   |             pending |       pending |        pending |         pending | pending |
 | GR00T   |             pending |       pending |        pending |         pending | pending |
 
