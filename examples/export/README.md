@@ -147,7 +147,7 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> ExecuTorch-TensorRT was remeasured with updated export and runtime fixes. GR00T uses the device-resident split recipe on both boards. Unrun routes are labeled separately.
+> GR00T's ExecuTorch-TensorRT row uses the split recipe, while its ONNX-TensorRT and Torch-TensorRT rows still use the earlier single program, so the GR00T rows are not yet one recipe. The other GR00T cells on the Orin Nano are not run yet.
 
 Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. pi0.5 is exported as a chain of small programs on every route (see Compile a policy), so it fits the 8 GB Orin Nano. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
 
