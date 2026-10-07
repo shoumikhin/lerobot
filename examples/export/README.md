@@ -81,7 +81,7 @@ The omitted camera slot uses the policy's own padding. Map the robot's names to 
 
 ### Export once, build on each device
 
-With `--export_only`, the ACT and SmolVLA `executorch_tensorrt` and `onnx_tensorrt` scripts, and the GR00T `onnx_tensorrt` script, save the exported graph without building its TensorRT engine. Copy the folder to the target device, then build there:
+With `--export_only`, the ACT and SmolVLA `executorch_tensorrt` and `onnx_tensorrt` scripts save the exported graph without building its TensorRT engine. Copy the folder to the target device, then build there:
 
 ```bash
 python examples/export/act_onnx_tensorrt.py \
@@ -91,11 +91,11 @@ python examples/export/act_onnx_tensorrt.py \
 python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 ```
 
-`--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` can limit build resources, but do not guarantee the engine fits.
+For these deferred exports, `--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` can limit build resources, but do not guarantee the engine fits.
 
 Every pi0.5 script exports the chunk as a chain of programs: the image and prompt embeddings, the language model in groups of three layers, one denoising step, and the actions. Each program is built in its own process, which reads only its own weights from the checkpoint, so the export runs on a device with less memory than the whole policy. `lerobot-rollout` runs the chain.
 
-The GR00T `executorch_tensorrt` script also builds a chain: vision, groups of six language layers, groups of eight diffusion blocks, and actions. Its intermediate tensors stay on the GPU. Run this script on each target board; it does not accept `--export_only`.
+Every GR00T script builds the same chain: vision, groups of six language layers, groups of eight diffusion blocks, and actions. Each part is built in its own process. ExecuTorch-TensorRT and Torch-TensorRT keep intermediate tensors on the GPU. ONNX-TensorRT shares GPU buffers between programs and updates the diffusion state on the host. Run these split recipes on each target board; the deferred `--export_only` workflow above is for ACT and SmolVLA.
 
 The direct ACT and SmolVLA ExecuTorch-TensorRT scripts enable CUDA graph replay because it reduced chunk latency on both boards. pi0.5 and GR00T keep replay disabled. The deferred builder keeps the default setting.
 
@@ -147,9 +147,9 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> GR00T's ExecuTorch-TensorRT row uses the split recipe, while its ONNX-TensorRT and Torch-TensorRT rows still use the earlier single program, so the GR00T rows are not yet one recipe. The other GR00T cells on the Orin Nano are not run yet.
+> GR00T's ExecuTorch-TensorRT and Torch-TensorRT cells use the split recipe. Its Thor ONNX-TensorRT cells still use the earlier single-program measurements, so the measured GR00T rows are not yet one recipe. The other GR00T cells on the Orin Nano are not run yet.
 
-Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. pi0.5 is exported as a chain of small programs on every route (see Compile a policy), so it fits the 8 GB Orin Nano. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
+Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. pi0.5 and GR00T use a chain of small programs for all three export routes. Splitting reduces build memory, but does not guarantee the complete folder fits. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
 
 ### Accuracy
 
@@ -162,7 +162,7 @@ Thor:
 | ACT     |        0.11 / 0.005 |     0.12 / 0.005 |   0.11 / 0.005 | **0.06** / **0.001** |
 | SmolVLA |        2.23 / 0.070 | **1.46** / 0.061 |   2.23 / 0.070 |     1.83 / **0.057** |
 | pi0.5   |        2.44 / 0.121 |     4.72 / 0.140 |   2.44 / 0.121 | **1.60** / **0.099** |
-| GR00T   |        2.97 / 0.094 |     1.60 / 0.088 |   2.97 / 0.092 | **1.08** / **0.068** |
+| GR00T   |        2.97 / 0.094 |     1.60 / 0.088 |   2.97 / 0.094 | **1.08** / **0.068** |
 
 Orin Nano:
 
@@ -173,11 +173,11 @@ Orin Nano:
 | pi0.5   |     3.80 / **0.138** | **3.16** / **0.138** |    fails to load |              not run |
 | GR00T   | **1.42** / **0.094** |              not run |          not run |              not run |
 
-Every measured compiled route shown with numbers passed its saved startup check and the 50-observation comparison. Pending or unrun routes are not passing results.
+Every numerical accuracy cell passed the 50-observation comparison. Exported folders also passed their saved startup checks; the `torch.compile` checks do not have one. Pending or unrun routes are not passing results.
 
 ### Latency
 
-Median time to compute one action chunk, in milliseconds, from three fresh processes with 100 measured chunks after 20 warmups. The Thor `torch.compile` pi0.5 and GR00T cells use one process. Lower is better.
+Median of three per-process medians for one action chunk, in milliseconds. Each fresh process measures 100 chunks after 20 warmups. The Thor `torch.compile` pi0.5 and GR00T cells still use one process. Lower is better.
 
 Thor:
 
@@ -186,7 +186,7 @@ Thor:
 | ACT     |            **3.43** |          3.50 |           3.70 |           12.80 |   15.91 |
 | SmolVLA |           **28.13** |         30.95 |          29.20 |           44.47 |   166.7 |
 | pi0.5   |               120.4 |     **116.0** |          119.2 |           129.9 |   244.2 |
-| GR00T   |               102.4 |         97.84 |      **88.98** |           206.7 |   211.5 |
+| GR00T   |               102.4 |         97.84 |      **94.70** |           206.7 |   211.5 |
 
 Orin Nano:
 
@@ -197,11 +197,11 @@ Orin Nano:
 | pi0.5   |               630.7 |     **625.5** |  fails to load |         not run | not run |
 | GR00T   |           **290.4** |       not run |        not run |         not run | not run |
 
-ExecuTorch-TensorRT is the fastest measured route on ACT and SmolVLA on both boards. On Thor, Torch-TensorRT is fastest on GR00T and ONNX-TensorRT on pi0.5. ONNX-TensorRT is also faster on Orin pi0.5.
+ExecuTorch-TensorRT is the fastest measured route on ACT and SmolVLA on both boards. ONNX-TensorRT is fastest on pi0.5 on both boards. The GR00T comparison still mixes split and single-program measurements.
 
 ### Memory
 
-Board memory used while running, in MiB, the highest steady value across three valid runs. Process memory alone misses some GPU allocations on a Jetson. Lower is better. ExecuTorch-TensorRT cells read N (M): N is the estimate once ExecuTorch removes PyTorch from its Python bindings, and M is measured today. Estimates reuse the previous library-overhead subtraction, rounded to 10 MiB; they are not new measurements. An unavailable estimate is labeled explicitly. Bold compares the first number.
+Board memory used while running, in MiB, the highest steady value across three valid runs. Process memory alone misses some GPU allocations on a Jetson. Lower is better. ExecuTorch-TensorRT cells read estimated (measured): estimates subtract the previously measured PyTorch library overhead, rounded to 10 MiB; they are not direct measurements or an available measured runtime. An unavailable estimate is labeled explicitly. Bold compares the first number.
 
 Thor:
 
@@ -210,7 +210,7 @@ Thor:
 | ACT     |           560 (873) |       **557** |           1510 |            2489 |    2327 |
 | SmolVLA |     **1190** (1534) |          1278 |           3233 |            4422 |    3940 |
 | pi0.5   |         6530 (6822) |      **5914** |           7072 |           12215 |   11610 |
-| GR00T   |     **5470** (5779) |          5486 |           6190 |           16684 |   15402 |
+| GR00T   |     **5470** (5779) |          5486 |           6520 |           16684 |   15402 |
 
 Orin Nano:
 
@@ -225,7 +225,7 @@ ExecuTorch-TensorRT uses less memory than PyTorch in the measured comparisons. O
 
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. SmolVLA, pi0.5 and GR00T may need swap to compile there. The GR00T ExecuTorch-TensorRT split recipe builds one weight group at a time; other GR00T routes on this board have not been measured.
+- **Orin Nano memory.** The board has 8 GB. SmolVLA, pi0.5 and GR00T may need swap to compile there. All GR00T export recipes build one weight group at a time. Unrun cells are not evidence of a memory limit.
 - **GR00T resizes images outside the program**, with NumPy, because not every route supports that operator. Its latency includes the resize.
 - **Older SmolVLA folders load PyTorch** for tokenization, even with ONNX-TensorRT. New exports keep the task's tokens in the program.
 - **These checks prove the compiled policy matches PyTorch, not that the robot completes the task.**
