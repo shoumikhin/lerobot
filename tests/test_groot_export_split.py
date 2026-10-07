@@ -321,6 +321,44 @@ def test_export_parts_uses_a_fresh_process_for_each_part(recipe, monkeypatch, tm
     ]
 
 
+@pytest.mark.parametrize("device_resident", [False, True])
+def test_export_parts_saves_the_device_contract(recipe, monkeypatch, tmp_path, device_resident):
+    export = recipe.GrootExport.__new__(recipe.GrootExport)
+    export.__dict__.update(
+        output_dir=tmp_path,
+        backend="executorch_tensorrt",
+        frame={"observation.state": np.zeros(2, np.float32)},
+        noise=torch.zeros(3, 4),
+        expected_actions=np.zeros((3, 2), np.float32),
+        config=SimpleNamespace(save_pretrained=lambda path: None),
+        input_features={},
+        input_names=["observation.state", "noise"],
+        image_resize=None,
+        task="pick",
+        tolerance=5.0,
+        num_steps=2,
+        timesteps=[0, 500],
+        start=recipe.time.perf_counter(),
+    )
+    monkeypatch.setattr(recipe, "part_names", lambda path: ["actions"])
+    monkeypatch.setattr(recipe, "GrootExport", lambda args, split: export)
+    monkeypatch.setattr(
+        export,
+        "parts",
+        lambda: iter([("actions", torch.nn.Identity(), (export.noise,), ["x_t"], ["action"])]),
+    )
+    compiled = []
+    args = Namespace(part="actions", policy_path="checkpoint")
+    recipe.export_parts(
+        args, "export", "{name}.pte", lambda *args: compiled.append(args[-1]), device_resident=device_resident
+    )
+    info = json.loads((tmp_path / "export.json").read_text())
+    assert compiled == [tmp_path / "actions.pte"]
+    assert info["device_resident"] is device_resident
+    assert info["programs"]["actions"]["file"] == "actions.pte"
+    assert info["dt"] == 0.5 and info["timesteps"] == [0, 500]
+
+
 def test_part_loader_preserves_precision_without_changing_policy_config(recipe, monkeypatch):
     calls = []
     export = recipe.GrootExport.__new__(recipe.GrootExport)
