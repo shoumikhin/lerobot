@@ -41,7 +41,8 @@ from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import _transformers_available, require_package
 
-from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
+from ..common.openpi_checkpoint import _drop_unloaded
+from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs, _parameters_on_meta
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
     GROOT_N1_5,
@@ -198,6 +199,52 @@ class GrootPolicy(PreTrainedPolicy):
             for tensor in (*model.parameters(), *model.buffers()):
                 tensor.data = tensor.data.clone().to(config.device)
         return model
+
+    @classmethod
+    def load_checkpoint_modules(
+        cls: builtins.type[T], model_file: str, config: GrootConfig, modules: list[str]
+    ) -> T:
+        """Build the policy without weights and load only the weights of `modules` from `model_file`.
+
+        For exporting one part of a policy too large for the machine's memory. GR00T is built from its config
+        with its parameters on the meta device, so no base weights are downloaded or read. Only the listed
+        submodules, like `_groot_model.action_head`, get real tensors, read one at a time in the dtype the
+        model computes in: bfloat16 with `use_bf16`, else `config.dtype`. Every other submodule holding
+        parameters is replaced by None, so code that reaches one fails instead of reading random weights.
+        Raises if a listed submodule has a parameter the file does not hold. Returns in evaluation mode.
+        """
+        require_package("transformers", extra="groot")
+        dtype = torch.bfloat16 if config.use_bf16 else config.dtype
+        with _parameters_on_meta():
+            model = GR00TN17(
+                GR00TN17Config.from_pretrained(config.base_model_path, **cls._groot_config_overrides(config)),
+                load_backbone_weights=False,
+            )
+        policy = cls(config, _groot_model=model)
+        prefixes = tuple(f"{name}." for name in modules)
+        lm_head, embedding = (f"_groot_model.{name}" for name in _TIED_WEIGHT_NAMES)
+        tied = {lm_head: embedding, embedding: lm_head}
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            keys = set(checkpoint.keys())
+            sources = {}
+            for name in policy.state_dict():
+                key = name if name in keys else tied.get(name)
+                if name.startswith(prefixes) and key in keys:
+                    sources[name] = key
+            # A CPU copy first, because a device copy straight from the memory-mapped file can keep its pages.
+            tensors = {
+                name: checkpoint.get_tensor(key).to(dtype=dtype, copy=True).to(config.device)
+                for name, key in sources.items()
+            }
+        policy.load_state_dict(tensors, strict=False, assign=True)
+        for name in modules:
+            missing = [p for p, param in policy.get_submodule(name).named_parameters() if param.is_meta]
+            if missing:
+                raise KeyError(f"{model_file} does not hold {name}.{missing[0]} and {len(missing) - 1} more")
+        policy.eval()
+        _drop_unloaded(policy)
+        # Buffers built from the config, like rotary tables, are not in the checkpoint and are still on the CPU.
+        return policy.to(config.device)
 
     @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, Any]]:
