@@ -242,7 +242,11 @@ class PI05Step(nn.Module):
         past_key_values = DynamicCache(
             tuple((keys, values, None) for keys, values in zip(cache[::2], cache[1::2], strict=True))
         )
-        return self.model.denoise_step(prefix_pad_masks, past_key_values, x_t[None], timestep)[0]
+        # The expert keeps its adaptive norms' projections in float32 for training; in bfloat16 they take
+        # 0.2 GiB instead of 0.4 GiB, which a device that must hold every part at once needs.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            velocity = self.model.denoise_step(prefix_pad_masks, past_key_values, x_t[None], timestep)
+        return velocity[0].float()
 
 
 class PI05Actions(nn.Module):
@@ -288,6 +292,7 @@ class PI05LanguageModelLayers(nn.Module):
         language_model.config._attn_implementation = "eager"
         self.layers = nn.ModuleList(language_model.layers[i] for i in layers)
         self.rotary_emb = language_model.rotary_emb
+        self.last = layers.stop == len(language_model.layers)
 
     def forward(self, hidden_states: Tensor, prefix_pad_masks: Tensor) -> tuple[Tensor, ...]:
         att_masks = torch.zeros_like(prefix_pad_masks)
@@ -308,7 +313,9 @@ class PI05LanguageModelLayers(nn.Module):
             )
         # Each layer writes its keys and values at its index in the whole model.
         own = [cache.layers[layer.self_attn.layer_idx] for layer in self.layers]
-        return hidden_states, *(tensor for layer in own for tensor in (layer.keys, layer.values))
+        keys_values = tuple(tensor for layer in own for tensor in (layer.keys, layer.values))
+        # The step reads only the KV cache, so the last layer's attention output and MLP would be dead weight.
+        return keys_values if self.last else (hidden_states, *keys_values)
 
 
 class CompactEmbedding(nn.Module):
@@ -423,9 +430,13 @@ class PI05Export:
             )
             inputs = (hidden, prefix_pad_masks)
             with torch.no_grad():
-                hidden, *keys_values = layer_group(*inputs)
-            outputs = [f"hidden_{group}", *(f"past_{kind}_{i}" for i in layers for kind in ("key", "value"))]
-            cache.update(zip(outputs[1:], keys_values, strict=True))
+                keys_values = layer_group(*inputs)
+            cache_names = [f"past_{kind}_{i}" for i in layers for kind in ("key", "value")]
+            outputs = cache_names
+            if not layer_group.last:
+                outputs = [f"hidden_{group}", *cache_names]
+                hidden, *keys_values = keys_values
+            cache.update(zip(cache_names, keys_values, strict=True))
             yield f"language_model_{group}", layer_group, inputs, [hidden_name, "prefix_pad_masks"], outputs
             del layer_group
             hidden_name = outputs[0]
