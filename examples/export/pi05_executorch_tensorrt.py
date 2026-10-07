@@ -58,7 +58,12 @@ def main() -> None:
             subprocess.run(command, check=True)
         return
     export = PI05Export(args, split=args.step_engine)
-    options = {"min_block_size": 1, "offload_module_to_cpu": args.offload_module_to_cpu}
+    # The denoising step's time embedding is computed in float64, which TensorRT does not support.
+    options = {
+        "min_block_size": 1,
+        "offload_module_to_cpu": args.offload_module_to_cpu,
+        "truncate_double": True,
+    }
     if args.workspace_gib is not None:
         options["workspace_size"] = int(args.workspace_gib * (1 << 30))
     if args.optimization_level is not None:
