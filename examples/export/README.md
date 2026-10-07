@@ -147,7 +147,7 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> GR00T's ExecuTorch-TensorRT and Torch-TensorRT cells use the split recipe. Its Thor ONNX-TensorRT cells still use the earlier single-program measurements, so the measured GR00T rows are not yet one recipe. The other GR00T cells on the Orin Nano are not run yet.
+> GR00T's measured TensorRT cells use the same split recipe. Its remaining Orin Nano routes are not run yet.
 
 Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. pi0.5 and GR00T use a chain of small programs for all three export routes. Splitting reduces build memory, but does not guarantee the complete folder fits. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
 
@@ -162,7 +162,7 @@ Thor:
 | ACT     |        0.11 / 0.005 |     0.12 / 0.005 |   0.11 / 0.005 | **0.06** / **0.001** |
 | SmolVLA |        2.23 / 0.070 | **1.46** / 0.061 |   2.23 / 0.070 |     1.83 / **0.057** |
 | pi0.5   |        2.44 / 0.121 |     4.72 / 0.140 |   2.44 / 0.121 | **1.60** / **0.099** |
-| GR00T   |        2.97 / 0.094 |     1.60 / 0.088 |   2.97 / 0.094 | **1.08** / **0.068** |
+| GR00T   |        2.97 / 0.094 |     1.53 / 0.087 |   2.97 / 0.094 | **1.08** / **0.068** |
 
 Orin Nano:
 
@@ -186,7 +186,7 @@ Thor:
 | ACT     |            **3.43** |          3.50 |           3.70 |           12.80 |   15.91 |
 | SmolVLA |           **28.13** |         30.95 |          29.20 |           44.47 |   166.7 |
 | pi0.5   |               120.4 |     **116.0** |          119.2 |           129.9 |   244.2 |
-| GR00T   |               102.4 |         97.84 |      **94.70** |           206.7 |   211.5 |
+| GR00T   |               102.4 |         96.38 |      **94.70** |           206.7 |   211.5 |
 
 Orin Nano:
 
@@ -197,7 +197,7 @@ Orin Nano:
 | pi0.5   |               630.7 |     **625.5** |  fails to load |         not run | not run |
 | GR00T   |           **290.4** |       not run |        not run |         not run | not run |
 
-ExecuTorch-TensorRT is the fastest measured route on ACT and SmolVLA on both boards. ONNX-TensorRT is fastest on pi0.5 on both boards. The GR00T comparison still mixes split and single-program measurements.
+ExecuTorch-TensorRT is the fastest measured route on ACT and SmolVLA on both boards. ONNX-TensorRT is fastest on pi0.5 on both boards. Torch-TensorRT is fastest on GR00T on Thor; the other GR00T routes on Orin Nano remain unmeasured.
 
 ### Memory
 
@@ -210,7 +210,7 @@ Thor:
 | ACT     |           560 (873) |       **557** |           1510 |            2489 |    2327 |
 | SmolVLA |     **1190** (1534) |          1278 |           3233 |            4422 |    3940 |
 | pi0.5   |         6530 (6822) |      **5914** |           7072 |           12215 |   11610 |
-| GR00T   |     **5470** (5779) |          5486 |           6520 |           16684 |   15402 |
+| GR00T   |         5470 (5779) |      **5429** |           6520 |           16684 |   15402 |
 
 Orin Nano:
 
