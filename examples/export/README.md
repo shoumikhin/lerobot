@@ -166,43 +166,51 @@ ExecuTorch-TensorRT has the lowest chunk time of the TensorRT routes on ACT and 
 
 ### Rollout latency and memory
 
-The official `lerobot-rollout` with the [replay robot](replay_robot) at 30 Hz for 60 seconds. Inference is the median time per chunk on the status line at the end of the run (up to the last 30 chunks). Memory is the median process resident set (RSS) over the final 30 seconds, read from outside the process. It includes loaded libraries. It is not GPU memory, and the two should not be added, because a Jetson shares one memory between the CPU and the GPU.
+The official `lerobot-rollout` with the [replay robot](replay_robot) at 30 Hz for 60 seconds. Inference is the median time per chunk on the status line at the end of the run (up to the last 30 chunks). Board memory is how much the whole board's available memory (`MemAvailable` in `/proc/meminfo`) dropped from just before the process started to the median of the final 30 seconds. Load peak is the largest drop at any point, loading included; it decides what fits on the 8 GB Orin Nano. Each value is the median of 3 runs, with the lowest and highest in parentheses, and n=2 where only 2 runs counted. We measure the whole board because process RSS (resident memory) on a Jetson misses some GPU allocations.
 
-| policy  | device    | route                 | loop, Hz | inference, ms   | process RSS, MiB |
-| ------- | --------- | --------------------- | -------- | --------------- | ---------------- |
-| ACT     | Thor      | `executorch_tensorrt` | 29.94    | 4.1             | 1107.6           |
-| ACT     | Thor      | `executorch_cuda`     | 29.89    | 38.7            | 802.6            |
-| ACT     | Thor      | `onnx_tensorrt`       | 29.94    | 4.0             | 644.8            |
-| ACT     | Thor      | `torch_tensorrt`      | 29.94    | 4.6             | 1555.6           |
-| ACT     | Thor      | PyTorch               | 29.78    | 16.4            | 2036.3           |
-| ACT     | Thor      | `torch.compile`       | 29.94    | 14.9            | 2043.0           |
-| ACT     | Orin Nano | `executorch_tensorrt` | 29.92    | 26.8            | 1171.3           |
-| ACT     | Orin Nano | `executorch_cuda`     | 29.02    | 132.4           | 960.4            |
-| ACT     | Orin Nano | `onnx_tensorrt`       | 29.92    | 26.6            | 751.7            |
-| ACT     | Orin Nano | `torch_tensorrt`      | 29.92    | 27.8            | 1628.4           |
-| ACT     | Orin Nano | PyTorch               | 29.38    | 66.2            | 1904.1           |
-| SmolVLA | Thor      | `executorch_tensorrt` | 29.93    | 28.9            | 1249.9           |
-| SmolVLA | Thor      | `onnx_tensorrt`       | 29.94    | 31.6            | 753.6            |
-| SmolVLA | Thor      | `torch_tensorrt`      | 29.94    | 30.1            | 2417.5           |
-| SmolVLA | Thor      | PyTorch               | 27.45    | 171.9           | 3068.6           |
-| SmolVLA | Thor      | `torch.compile`       | n/a      | still compiling | 4033.4           |
-| SmolVLA | Orin Nano | `executorch_tensorrt` | 28.31    | 126.9           | 1946.9           |
-| SmolVLA | Orin Nano | `onnx_tensorrt`       | 28.27    | 130.6           | 1561.0           |
-| SmolVLA | Orin Nano | `torch_tensorrt`      | 28.15    | 137.1           | 2286.1           |
-| SmolVLA | Orin Nano | PyTorch               | 19.97    | 791.7           | 3386.5           |
-| pi0.5   | Thor      | `executorch_tensorrt` | 28.66    | 105.2           | 1334.6           |
-| pi0.5   | Thor      | `executorch_cuda`     | 27.51    | 176.3           | 774.0            |
-| pi0.5   | Thor      | `onnx_tensorrt`       | 28.30    | 128.7           | 860.6            |
-| pi0.5   | Thor      | `torch_tensorrt`      | 28.57    | 112.1           | 1563.3           |
-| pi0.5   | Thor      | PyTorch               | 26.19    | 240.4           | 2408.2           |
-| pi0.5   | Thor      | `torch.compile`       | n/a      | still compiling | 3287.7           |
-| GR00T   | Thor      | `executorch_tensorrt` | 28.58    | 96.4            | 1236.3           |
-| GR00T   | Thor      | `onnx_tensorrt`       | 28.51    | 99.7            | 759.4            |
-| GR00T   | Thor      | `torch_tensorrt`      | 28.69    | 90.6            | 1487.0           |
-| GR00T   | Thor      | PyTorch               | 25.36    | 213.4           | 2983.4           |
-| GR00T   | Thor      | `torch.compile`       | n/a      | still compiling | 3635.8           |
+| policy  | device    | route                 | loop, Hz | inference, ms   | board memory, MiB           | load peak, MiB              |
+| ------- | --------- | --------------------- | -------- | --------------- | --------------------------- | --------------------------- |
+| ACT     | Thor      | `executorch_tensorrt` | 29.94    | 4.1             | 816 (805 to 829)            | 817 (807 to 830)            |
+| ACT     | Thor      | `executorch_cuda`     | 29.89    | 38.7            | 845 (777 to 846)            | 848 (814 to 854)            |
+| ACT     | Thor      | `onnx_tensorrt`       | 29.94    | 4.0             | 544 (529 to 557)            | 590 (576 to 593)            |
+| ACT     | Thor      | `torch_tensorrt`      | 29.94    | 4.6             | 1400 (1273 to 1510)         | 1983 (1798 to 2050)         |
+| ACT     | Thor      | PyTorch               | 29.78    | 16.4            | 2032 (2024 to 2327)         | 2032 (2026 to 2364)         |
+| ACT     | Thor      | `torch.compile`       | 29.94    | 14.9            | 2462 (2442 to 2489)         | 2466 (2449 to 2494)         |
+| ACT     | Orin Nano | `executorch_tensorrt` | 29.92    | 26.8            | 489 (462 to 493)            | 504 (493 to 789)            |
+| ACT     | Orin Nano | `executorch_cuda`     | 29.02    | 132.4           | 440 (435 to 446)            | 445 (445 to 457)            |
+| ACT     | Orin Nano | `onnx_tensorrt`       | 29.92    | 26.6            | 216 (208 to 223)            | 268 (237 to 268)            |
+| ACT     | Orin Nano | `torch_tensorrt`      | 29.92    | 27.8            | 457 (397 to 579)            | 1307 (1199 to 1493)         |
+| ACT     | Orin Nano | PyTorch               | 29.38    | 66.2            | 1117 (1111 to 1140)         | 1206 (1120 to 1234)         |
+| SmolVLA | Thor      | `executorch_tensorrt` | 29.93    | 28.9            | 1534 (1532 to 1535)         | 1547 (1541 to 1609)         |
+| SmolVLA | Thor      | `onnx_tensorrt`       | 29.94    | 31.6            | 1277 (1270 to 1278)         | 1309 (1303 to 1315)         |
+| SmolVLA | Thor      | `torch_tensorrt`      | 29.94    | 30.1            | 2740 (2554 to 3233)         | 6104 (5615 to 6190)         |
+| SmolVLA | Thor      | PyTorch               | 27.45    | 171.9           | 3719 (3589 to 3940)         | 3887 (3721 to 3977)         |
+| SmolVLA | Thor      | `torch.compile`       | n/a      | still compiling | 4305 (4256 to 4354, n=2)    | 4360 (4266 to 4454, n=2)    |
+| SmolVLA | Orin Nano | `executorch_tensorrt` | 28.31    | 126.9           | 884 (636 to 940)            | 891 (650 to 942)            |
+| SmolVLA | Orin Nano | `onnx_tensorrt`       | 28.27    | 130.6           | 354 (314 to 370)            | 390 (376 to 404)            |
+| SmolVLA | Orin Nano | `torch_tensorrt`      | 28.15    | 137.1           | 1338 (1314 to 1499)         | 5381 (5339 to 5396)         |
+| SmolVLA | Orin Nano | PyTorch               | 19.97    | 791.7           | 1983 (1902 to 2034)         | 2089 (1905 to 2094)         |
+| pi0.5   | Thor      | `executorch_tensorrt` | 28.66    | 105.2           | 6081 (6072 to 6082)         | 6084 (6084 to 6090)         |
+| pi0.5   | Thor      | `executorch_cuda`     | 27.51    | 176.3           | 7356 (7342 to 7357)         | 7358 (7344 to 7358)         |
+| pi0.5   | Thor      | `onnx_tensorrt`       | 28.30    | 128.7           | 6217 (6204 to 6230)         | 6322 (6265 to 6514)         |
+| pi0.5   | Thor      | `torch_tensorrt`      | 28.57    | 112.1           | 6237 (5976 to 6247)         | 42586 (42365 to 42633)      |
+| pi0.5   | Thor      | PyTorch               | 26.19    | 240.4           | 11609 (11550 to 11610)      | 11845 (11556 to 11975)      |
+| pi0.5   | Thor      | `torch.compile`       | n/a      | still compiling | 12195 (12187 to 12215)      | 12206 (12191 to 12243)      |
+| GR00T   | Thor      | `executorch_tensorrt` | 28.58    | 96.4            | 6007 (5979 to 6007)         | 6031 (6012 to 6043)         |
+| GR00T   | Thor      | `onnx_tensorrt`       | 28.51    | 99.7            | 5445 (5427 to 5486)         | 5783 (5445 to 5793)         |
+| GR00T   | Thor      | `torch_tensorrt`      | 28.69    | 90.6            | 6169 (6162 to 6190)         | 43342 (43326 to 43372)      |
+| GR00T   | Thor      | PyTorch               | 25.36    | 213.4           | 15275 (15178 to 15402)      | 16126 (15282 to 16145)      |
+| GR00T   | Thor      | `torch.compile`       | n/a      | still compiling | 16682 (16680 to 16684, n=2) | 16689 (16688 to 16689, n=2) |
 
-Process RSS is not a fair memory comparison between routes on a Jetson. The CPU and the GPU share one memory, and whether a GPU allocation shows up in a process's RSS depends on how it was made. ONNX-TensorRT shows 759.4 MiB for GR00T, whose engine file alone is about 5 GB. So this column does not rank the routes by memory; board-level memory for every route is being measured.
+ExecuTorch-TensorRT uses about half the board memory of PyTorch or less in every measured row, and half of `torch.compile`'s or less: 816 against 2032 MiB on ACT, 1534 against 3719 MiB on SmolVLA, 6081 against 11609 MiB on pi0.5 and 6007 against 15275 MiB on GR00T on Thor, and 489 against 1117 MiB on ACT and 884 against 1983 MiB on SmolVLA on the Orin Nano.
+
+ONNX-TensorRT uses less board memory than ExecuTorch-TensorRT on ACT, SmolVLA and GR00T: 544 against 816 MiB, 1277 against 1534 MiB and 5445 against 6007 MiB on Thor, and 216 against 489 MiB and 354 against 884 MiB on the Orin Nano. On pi0.5 the two are close: 6217 MiB for ONNX-TensorRT against 6081 MiB for ExecuTorch-TensorRT. ONNX-TensorRT is the only route that does not load PyTorch, which is the likely reason.
+
+The public ExecuTorch Python bindings load PyTorch today, and ExecuTorch is working to remove that dependency. Subtracting the memory those PyTorch libraries take gives an estimate, not a measurement: ExecuTorch-TensorRT would use about 520 MiB on ACT, 1190 MiB on SmolVLA, 5790 MiB on pi0.5 and 5700 MiB on GR00T on Thor, and about 330 MiB on ACT on the Orin Nano. ExecuTorch-CUDA would use about 560 MiB on ACT on Thor and about 290 MiB on the Orin Nano. With these estimates, ExecuTorch-TensorRT would use the least memory on Thor for ACT, SmolVLA and pi0.5, while ONNX-TensorRT would still use the least on GR00T, and on ACT on the Orin Nano.
+
+Torch-TensorRT's load peak reaches about 42 GiB on pi0.5 and GR00T on Thor (42586 and 43342 MiB), about 7 times its steady memory, just before the loop starts. ExecuTorch-TensorRT's load peak stays within 25 MiB of its steady memory on both. On the Orin Nano, Torch-TensorRT peaks at 5381 MiB while loading SmolVLA, against 891 MiB for ExecuTorch-TensorRT and 390 MiB for ONNX-TensorRT.
+
+The `torch.compile` memory runs reused a warm compile cache, so they finished compiling in under 50 seconds. On SmolVLA and GR00T, one of the 3 runs was still compiling for most of the final 30 seconds, so those rows use the other 2 runs (n=2).
 
 Rollout inference is close between the TensorRT routes on ACT, SmolVLA and GR00T, and between ExecuTorch-TensorRT and Torch-TensorRT on pi0.5. On ACT, ONNX-TensorRT was 0.1 ms lower on Thor and 0.2 ms lower on the Orin Nano. On SmolVLA, ExecuTorch-TensorRT was 1.2 ms lower than Torch-TensorRT and 2.7 ms lower than ONNX-TensorRT on Thor, and 3.7 and 10.2 ms lower than ONNX-TensorRT and Torch-TensorRT on the Orin Nano. On GR00T, Torch-TensorRT was 5.8 ms lower than ExecuTorch-TensorRT, which was 3.3 ms lower than ONNX-TensorRT. On pi0.5, ExecuTorch-TensorRT was 6.9 ms lower than Torch-TensorRT (105.2 against 112.1 ms) and 23.5 ms lower than ONNX-TensorRT (128.7 ms). pi0.5 and GR00T take about 100 ms per chunk with ExecuTorch-TensorRT, longer than one 33 ms control tick, so their loops ran a little under 30 Hz: 28.66 and 28.58 Hz, against 26.19 and 25.36 Hz with PyTorch (28.30 and 28.51 Hz with ONNX-TensorRT, 28.57 and 28.69 Hz with Torch-TensorRT). pi0.5 with ExecuTorch-CUDA took 176.3 ms per chunk and ran at 27.51 Hz. SmolVLA on the Orin Nano also takes longer than a tick, so its TensorRT loops ran at 28.15 to 28.31 Hz, and PyTorch at 19.97 Hz. `torch.compile` compiles during the first chunk of a rollout. That took 215 seconds for SmolVLA, 259 seconds for pi0.5 and 103 seconds for GR00T, longer than the 60 second run, so those rows have no loop rate; their compiled chunk times are in the table above.
 
@@ -237,7 +245,7 @@ The public ExecuTorch Python bindings load PyTorch today.
 
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's three TensorRT exports finished only by using swap, with peaks of 4.0 to 5.6 GiB. pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
+- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's three TensorRT exports finished only by using swap, with peaks of 4.0 to 5.6 GiB. When running, the load peaks there are 504 MiB for ACT and 891 MiB for SmolVLA with ExecuTorch-TensorRT, 268 and 390 MiB with ONNX-TensorRT, and 1307 and 5381 MiB with Torch-TensorRT. pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
 - **GR00T resize runs outside the program**, using NumPy antialiased bicubic sampling because the operator is not supported by every compiler route. The chunk times above include it.
 - **Legacy SmolVLA text-step folders load PyTorch** for tokenization, including with ONNX-TensorRT. Current raw-frame exports keep the fixed task's tokens in the program.
 - **CUDA route coverage is incomplete.** SmolVLA has no `executorch_cuda` script. GR00T's `executorch_cuda` export fails on Thor: the stock compiler stops with `AttributeError: 'NotImplementedType' object has no attribute 'expr'`.
