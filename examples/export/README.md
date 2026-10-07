@@ -151,21 +151,21 @@ Difference from PyTorch's actions on 50 dataset samples, with the same random no
 
 Thor:
 
-|         |  ExecuTorch-TensorRT |        ONNX-TensorRT |       Torch-TensorRT | `torch.compile` |
-| ------- | -------------------: | -------------------: | -------------------: | --------------: |
-| ACT     | **0.11** / **0.005** |     0.12 / **0.005** | **0.11** / **0.005** |         pending |
-| SmolVLA |         2.23 / 0.070 | **1.46** / **0.061** |         2.23 / 0.070 |         pending |
-| pi0.5   | **2.98** / **0.108** |         4.80 / 0.125 | **2.98** / **0.108** |         pending |
-| GR00T   |         2.97 / 0.092 | **1.60** / **0.088** |         2.97 / 0.092 |         pending |
+|         | ExecuTorch-TensorRT |    ONNX-TensorRT | Torch-TensorRT |      `torch.compile` |
+| ------- | ------------------: | ---------------: | -------------: | -------------------: |
+| ACT     |        0.11 / 0.005 |     0.12 / 0.005 |   0.11 / 0.005 | **0.06** / **0.001** |
+| SmolVLA |        2.23 / 0.070 | **1.46** / 0.061 |   2.23 / 0.070 |     1.83 / **0.057** |
+| pi0.5   |        2.98 / 0.108 |     4.80 / 0.125 |   2.98 / 0.108 | **1.60** / **0.099** |
+| GR00T   |        2.97 / 0.092 |     1.60 / 0.088 |   2.97 / 0.092 | **1.08** / **0.068** |
 
 Orin Nano:
 
-|         |  ExecuTorch-TensorRT |    ONNX-TensorRT |       Torch-TensorRT | `torch.compile` |
-| ------- | -------------------: | ---------------: | -------------------: | --------------: |
-| ACT     | **0.10** / **0.005** | 0.11 / **0.005** | **0.10** / **0.005** |         pending |
-| SmolVLA |     1.59 / **0.054** | **1.46** / 0.058 |     1.59 / **0.054** |         pending |
-| pi0.5   |              pending |          pending |              pending |         pending |
-| GR00T   |              pending |          pending |              pending |         pending |
+|         | ExecuTorch-TensorRT |    ONNX-TensorRT |   Torch-TensorRT |      `torch.compile` |
+| ------- | ------------------: | ---------------: | ---------------: | -------------------: |
+| ACT     |        0.10 / 0.005 |     0.11 / 0.005 |     0.10 / 0.005 | **0.07** / **0.002** |
+| SmolVLA |    1.59 / **0.054** | **1.46** / 0.058 | 1.59 / **0.054** |         2.05 / 0.059 |
+| pi0.5   |             pending |          pending |          pending |              pending |
+| GR00T   |             pending |          pending |          pending |              pending |
 
 All routes match PyTorch within the check that runs before the robot moves.
 
