@@ -42,6 +42,7 @@ export it one part at a time.
 import argparse
 import gc
 import json
+import math
 import time
 from collections.abc import Iterator
 from copy import copy
@@ -99,6 +100,13 @@ def free_memory() -> None:
     """Return freed GPU memory, so the next part or the TensorRT build can use it."""
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def part_names(policy_path: str, layers_per_program: int) -> list[str]:
+    """The names of the programs `PI05Export.parts` yields, in order."""
+    depth = get_gemma_config(PreTrainedConfig.from_pretrained(policy_path).paligemma_variant).depth
+    groups = range(math.ceil(depth / layers_per_program))
+    return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
 
 
 class StatePrompt(nn.Module):
@@ -327,7 +335,10 @@ class PI05Export:
     """
 
     def __init__(self, args: argparse.Namespace, split: bool = False):
-        self.output_dir = make_output_dir(args.output_dir, args.job_name)
+        # Each part's process writes into the folder the first one made.
+        self.output_dir = (
+            args.output_dir if split and args.part else make_output_dir(args.output_dir, args.job_name)
+        )
         self.policy_path = args.policy_path
         self.backend, self.tolerance = args.backend, args.tolerance
         self.task = args.task
@@ -542,6 +553,7 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
             action="store_true",
             help="Export the chunk as separate programs, each loading only its own weights from the checkpoint.",
         )
+        parser.add_argument("--part", help="Build only this program of --step_engine, in an existing folder.")
         parser.add_argument(
             "--layers_per_program",
             type=int,

@@ -27,20 +27,36 @@ Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 
 With `--step_engine`, the chunk becomes a chain of programs: the image and prompt embeddings, the
 language model in groups of `--layers_per_program` layers, one denoising step, and the actions.
-Each program loads only its own weights from the checkpoint, and is saved and freed before the
-next one loads, so a device with less memory than the whole policy can export it.
+Each program is built in its own process, which loads only that program's weights from the
+checkpoint, so a device with less memory than the whole policy can export it.
 """
+
+import subprocess
+import sys
 
 import torch
 import torch_tensorrt
-from act_recipe import save_for_build_engine
-from pi05_recipe import PI05Export, free_memory, parse_args
+from act_recipe import make_output_dir, save_for_build_engine
+from pi05_recipe import PI05Export, free_memory, parse_args, part_names
 
 
 def main() -> None:
     args = parse_args(__doc__, "executorch_tensorrt")
     if args.step_engine and args.export_only:
         raise SystemExit("--step_engine exports each program on the device itself; drop --export_only.")
+    if args.step_engine and args.part is None:
+        # A process returns all its memory when it exits; one that built a part keeps some of it.
+        output_dir = make_output_dir(args.output_dir, args.job_name)
+        for name in part_names(args.policy_path, args.layers_per_program):
+            command = [
+                sys.executable,
+                __file__,
+                *sys.argv[1:],
+                f"--output_dir={output_dir}",
+                f"--part={name}",
+            ]
+            subprocess.run(command, check=True)
+        return
     export = PI05Export(args, split=args.step_engine)
     options = {"min_block_size": 1, "offload_module_to_cpu": args.offload_module_to_cpu}
     if args.workspace_gib is not None:
@@ -50,6 +66,12 @@ def main() -> None:
     if args.step_engine:
         programs = {}
         for name, module, inputs, input_names, output_names in export.parts(args.layers_per_program):
+            programs[name] = {"file": f"{name}.pte", "inputs": input_names, "outputs": output_names}
+            if name != args.part:
+                # The parts before this one run in PyTorch only, to make its example inputs.
+                del module
+                free_memory()
+                continue
             print(f"{name}: exporting", flush=True)
             with torch.no_grad():
                 program = torch.export.export(module, inputs)
@@ -58,13 +80,10 @@ def main() -> None:
             torch_tensorrt.save(
                 engine, str(export.output_dir / f"{name}.pte"), output_format="executorch", retrace=False
             )
-            programs[name] = {"file": f"{name}.pte", "inputs": input_names, "outputs": output_names}
             print(f"Wrote {name}.pte", flush=True)
-            # Only one part may hold memory when the next one loads.
-            del module, program, engine
-            free_memory()
-        export.write(programs)
-        return
+            if name == "actions":
+                export.write(programs)
+            return
 
     pte_path = export.output_dir / "model.pte"
     with torch.no_grad():
