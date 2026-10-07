@@ -63,9 +63,17 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
         sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
     )
     monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
+    names = {
+        "prefix": (["observation.state"], ["prefix_pad_masks", "past_key_0"]),
+        "step": (["prefix_pad_masks", "past_key_0", "x_t", "timestep"], ["v_t"]),
+        "actions": (["x_t"], ["action"]),
+    }
     info = {
         "backend": "executorch_tensorrt",
-        "programs": {name: {"file": f"{name}.pte"} for name in ("prefix", "step", "actions")},
+        "programs": {
+            name: {"file": f"{name}.pte", "inputs": inputs, "outputs": outputs}
+            for name, (inputs, outputs) in names.items()
+        },
         "num_steps": 4,
     }
     program = load_program(tmp_path, info)
@@ -79,6 +87,53 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
     program(np.ones((1, 3)), np.ones(noise_shape))
     assert probes == (["prefix.pte", "step.pte", "actions.pte"] if torch_inputs else [])
     assert len(calls) == 12
+
+
+def test_executorch_chained_prefix_programs(tmp_path, monkeypatch):
+    """A prefix split into programs runs them in order, each reading the values its inputs name."""
+    calls = []
+    programs = {
+        "embed.pte": lambda state: [state + 1, np.array([[True]])],
+        "layers_0.pte": lambda hidden, mask: [2 * hidden, 3 * hidden],
+        "layers_1.pte": lambda hidden, mask: [hidden, 5 * hidden],
+        "step.pte": lambda mask, key_0, key_1, sample, timestep: [sample * 0 + key_0 + key_1],
+        "actions.pte": lambda sample: [sample],
+    }
+
+    def load(path, data_path=None):
+        def execute(inputs):
+            calls.append(path.name)
+            return programs[path.name](*inputs)
+
+        return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
+
+    runtime = SimpleNamespace(load_program=load)
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
+    names = {
+        "embed": (["observation.state"], ["prefix_embs", "prefix_pad_masks"]),
+        "layers_0": (["prefix_embs", "prefix_pad_masks"], ["hidden_0", "past_key_0"]),
+        "layers_1": (["hidden_0", "prefix_pad_masks"], ["hidden_1", "past_key_1"]),
+        "step": (["prefix_pad_masks", "past_key_0", "past_key_1", "x_t", "timestep"], ["v_t"]),
+        "actions": (["x_t"], ["action"]),
+    }
+    info = {
+        "backend": "executorch_tensorrt",
+        "programs": {
+            name: {"file": f"{name}.pte", "inputs": inputs, "outputs": outputs}
+            for name, (inputs, outputs) in names.items()
+        },
+        "num_steps": 2,
+    }
+
+    program = load_program(tmp_path, info)
+    actions = program(np.ones((1, 2)), np.zeros((1, 2)))
+
+    assert calls == ["embed.pte", "layers_0.pte", "layers_1.pte", "step.pte", "step.pte", "actions.pte"]
+    # state 1 -> embeddings 2 -> past_key_0 = 3 * 2, hidden_0 = 4 -> past_key_1 = 5 * 4; two steps of -0.5 * 26.
+    np.testing.assert_allclose(actions, np.full((1, 2), -26.0))
 
 
 def test_executorch_output_survives_next_execution(tmp_path, monkeypatch):

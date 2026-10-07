@@ -24,25 +24,55 @@ model that built it:
         --task="Pick up the block and place it in the cup"
 
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
+
+With `--step_engine`, the chunk becomes a chain of programs: the image and prompt embeddings, the
+language model in groups of `--layers_per_program` layers, one denoising step, and the actions.
+Each program loads only its own weights from the checkpoint, and is saved and freed before the
+next one loads, so a device with less memory than the whole policy can export it.
 """
 
 import torch
 import torch_tensorrt
 from act_recipe import save_for_build_engine
-from pi05_recipe import PI05Export, parse_args
+from pi05_recipe import PI05Export, free_memory, parse_args
 
 
 def main() -> None:
     args = parse_args(__doc__, "executorch_tensorrt")
-    export = PI05Export(args)
-    pte_path = export.output_dir / "model.pte"
+    if args.step_engine and args.export_only:
+        raise SystemExit("--step_engine exports each program on the device itself; drop --export_only.")
+    export = PI05Export(args, split=args.step_engine)
+    options = {"min_block_size": 1, "offload_module_to_cpu": args.offload_module_to_cpu}
+    if args.workspace_gib is not None:
+        options["workspace_size"] = int(args.workspace_gib * (1 << 30))
+    if args.optimization_level is not None:
+        options["optimization_level"] = args.optimization_level
+    if args.step_engine:
+        programs = {}
+        for name, module, inputs, input_names, output_names in export.parts(args.layers_per_program):
+            print(f"{name}: exporting", flush=True)
+            with torch.no_grad():
+                program = torch.export.export(module, inputs)
+            print(f"{name}: building the TensorRT engine", flush=True)
+            engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **options)
+            torch_tensorrt.save(
+                engine, str(export.output_dir / f"{name}.pte"), output_format="executorch", retrace=False
+            )
+            programs[name] = {"file": f"{name}.pte", "inputs": input_names, "outputs": output_names}
+            print(f"Wrote {name}.pte", flush=True)
+            # Only one part may hold memory when the next one loads.
+            del module, program, engine
+            free_memory()
+        export.write(programs)
+        return
 
+    pte_path = export.output_dir / "model.pte"
     with torch.no_grad():
         program = torch.export.export(export.module, export.inputs)
     if args.export_only:
         save_for_build_engine(export, program, pte_path)
         return
-    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
+    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, **options)
     del program
     export.release_policy()
     torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
