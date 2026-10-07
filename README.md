@@ -39,7 +39,7 @@ lerobot-info
 
 ## Compiled Policies on Jetson
 
-This fork adds compiled-policy export examples and runs their output through `lerobot-rollout`, with either a real robot or a replay plugin. See the [Jetson export guide](examples/export/README.md) for installation, compiler routes, commands, benchmarks and current limits. ACT and SmolVLA are measured on both boards, and pi0.5 and GR00T on Thor, on every route their scripts support (GR00T's `executorch_cuda` export fails). pi0.5 and GR00T on the Orin Nano are still pending. ExecuTorch-TensorRT has the lowest chunk time of the TensorRT routes on ACT, SmolVLA and pi0.5 (0.9 to 3.7% less than the next one), and Torch-TensorRT on GR00T (4.6% less than ExecuTorch-TensorRT). ExecuTorch-TensorRT uses about half the board memory of PyTorch or less; ONNX-TensorRT uses the least on ACT, SmolVLA and GR00T, and ExecuTorch-TensorRT on pi0.5.
+This fork adds compiled-policy export examples and runs their output through `lerobot-rollout`, with either a real robot or a replay plugin. See the [Jetson export guide](examples/export/README.md) for installation, compiler routes, commands, benchmarks and current limits. It compares PyTorch, `torch.compile`, Torch-TensorRT, ExecuTorch-TensorRT and ONNX-TensorRT on accuracy, latency and memory for ACT, SmolVLA, pi0.5 and GR00T on Jetson AGX Thor and Jetson Orin Nano. pi0.5 and GR00T on the Orin Nano are still pending. ExecuTorch-TensorRT is 2 to 6 times faster than PyTorch and the fastest route on ACT, SmolVLA and pi0.5, and uses about half of PyTorch's memory or less.
 
 ## Robots & Control
 
