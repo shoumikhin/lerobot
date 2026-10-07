@@ -110,6 +110,7 @@ class ProgramChain:
         if info["num_steps"] <= 0:
             raise ValueError("num_steps must be positive")
         self._programs = programs
+        self._device_resident = info.get("device_resident", False)
         self._names: list[str] = info["inputs"]
         self._inputs = {name: program["inputs"] for name, program in info["programs"].items()}
         self._outputs = {name: program["outputs"] for name, program in info["programs"].items()}
@@ -143,12 +144,23 @@ class ProgramChain:
         *inner, velocity = self._steps
         sample_name, time_name = self._inputs[self._steps[0]][-2:]
         sample = values[NOISE]
-        for step, timestep in enumerate(self._timesteps):
-            values[sample_name], values[time_name] = sample, np.array([timestep], dtype=np.float32)
+        timesteps = np.asarray(self._timesteps, dtype=np.float32)
+        if self._device_resident:
+            import torch
+
+            sample, timesteps = (
+                torch.from_numpy(np.ascontiguousarray(value)).cuda() for value in (sample, timesteps)
+            )
+        for step, timestep in enumerate(timesteps):
+            values[sample_name], values[time_name] = sample, timestep[None]
             for name in inner:
                 self._run_program(name, values, initialize and step == 0)
-            run = _call(self._programs[velocity], initialize and step == 0)
-            sample = sample + self._dt * run(*(values[n] for n in self._inputs[velocity]))
+            program = self._programs[velocity]
+            run = program.run_device if self._device_resident else _call(program, initialize and step == 0)
+            result = run(*(values[n] for n in self._inputs[velocity]))
+            if self._device_resident:
+                (result,) = result
+            sample = sample + self._dt * result
         values[sample_name] = sample
 
     def _run_program(self, name: str, values: dict, initialize: bool) -> None:

@@ -108,6 +108,7 @@ def export_parts(
     script: str,
     file_name: str,
     compile_part: Callable[[nn.Module, tuple, list[str], list[str], Path], None],
+    device_resident: bool = False,
 ) -> None:
     """Compile one part per process, releasing the compiler's memory between parts."""
     names = part_names(args.policy_path)
@@ -133,7 +134,7 @@ def export_parts(
         compile_part(module, inputs, input_names, output_names, export.output_dir / programs[name]["file"])
         print(f"Wrote {programs[name]['file']}", flush=True)
         if name == "actions":
-            export.write(programs)
+            export.write(programs, device_resident)
         return
 
 
@@ -792,7 +793,7 @@ class GrootExport:
             actions = postprocessor(actions[:, : self.policy._action_queue_steps])
         return actions[0].float().cpu().numpy()
 
-    def write(self, program_path: Path | dict) -> None:
+    def write(self, program_path: Path | dict, device_resident: bool = False) -> None:
         """Save the raw test case, policy config and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
@@ -804,6 +805,7 @@ class GrootExport:
             **(
                 {
                     "programs": program_path,
+                    "device_resident": device_resident,
                     "num_steps": self.num_steps,
                     "timesteps": self.timesteps,
                     "dt": 1.0 / self.num_steps,

@@ -328,18 +328,31 @@ def test_legacy_text_pipeline_keeps_state_not_listed_as_program_input(tmp_path, 
     np.testing.assert_array_equal(engine.get_action({"observation.state": state}), state)
 
 
-def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, monkeypatch):
-    """A device-resident chain hands each program's tensors to the next; only the actions reach NumPy."""
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("positive", [False, True])
+def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, monkeypatch, split, positive):
+    """Only final actions cross to NumPy, including when the velocity uses several programs."""
     torch = pytest.importorskip("torch")
-    received = []
+    from lerobot.rollout.inference.export import executorch
+
+    received, downloaded, times = [], [], []
+    to_numpy = executorch.to_numpy
+
+    def download(tensor):
+        downloaded.append(tensor)
+        return to_numpy(tensor)
 
     def load(path, data_path=None):
         def execute(inputs):
             received.append((path.name, [type(value) for value in inputs]))
             if path.name == "prefix.pte":
                 return [inputs[0] * 2]
-            if path.name == "step.pte":
+            if path.name in ("step.pte", "step_0.pte"):
+                assert inputs[-1].shape == (1,) and inputs[-1].dtype == torch.float32
+                times.append(inputs[-1].item())
                 return [inputs[0] + inputs[1] * 0]
+            if path.name == "step_1.pte":
+                return [inputs[0]]
             return [inputs[0] * 10]
 
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
@@ -351,11 +364,16 @@ def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, mo
     monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(synchronize=lambda: None))
-    names = {
-        "prefix": (["observation.state"], ["past_key_0"]),
-        "step": (["past_key_0", "x_t", "timestep"], ["v_t"]),
-        "actions": (["x_t"], ["action"]),
-    }
+    monkeypatch.setattr(executorch, "to_numpy", download)
+    names = {"prefix": (["observation.state"], ["past_key_0"])}
+    if split:
+        names.update(
+            step_0=(["past_key_0", "x_t", "timestep"], ["hidden"]),
+            step_1=(["hidden"], ["v_t"]),
+        )
+    else:
+        names["step"] = (["past_key_0", "x_t", "timestep"], ["v_t"])
+    names["actions"] = (["x_t"], ["action"])
     info = {
         "backend": "executorch_tensorrt",
         "device_resident": True,
@@ -366,13 +384,18 @@ def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, mo
         },
         "num_steps": 2,
     }
+    if positive:
+        info.update(dt=0.5, timesteps=[0, 500])
+    program = load_program(tmp_path, info)
+    inputs = (np.ones((1, 3), np.float32), np.zeros((1, 3), np.float32))
+    actions = program.initialize(*inputs)
 
-    actions = load_program(tmp_path, info).initialize(
-        np.ones((1, 3), np.float32), np.zeros((1, 3), np.float32)
-    )
-
-    assert [name for name, _ in received] == ["prefix.pte", "step.pte", "step.pte", "actions.pte"]
+    steps = ["step_0.pte", "step_1.pte"] if split else ["step.pte"]
+    assert [name for name, _ in received] == ["prefix.pte", *steps, *steps, "actions.pte"]
     assert all(kind is torch.Tensor for _, kinds in received for kind in kinds), received
+    assert times == ([0, 500] if positive else [1.0, 0.5])
     assert isinstance(actions, np.ndarray)
-    # x <- x + dt * v with v = the cache (2), dt = -1/2, twice, from x = 0; then x 10.
-    np.testing.assert_allclose(actions, np.full((1, 3), -20.0))
+    assert len(downloaded) == 1
+    np.testing.assert_allclose(actions, np.full((1, 3), 20.0 if positive else -20.0))
+    np.testing.assert_array_equal(program(*inputs), actions)
+    assert len(downloaded) == 2

@@ -30,6 +30,9 @@ from pathlib import Path
 
 import torch
 import torch_tensorrt
+from executorch.exir import ExecutorchBackendConfig
+from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
+from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
 from groot_recipe import TENSORRT_OPTIONS, export_parts, parse_args
 from torch import nn
 
@@ -40,8 +43,23 @@ def compile_part(
     with torch.no_grad():
         program = torch.export.export(module, inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
-    torch_tensorrt.save(engine, str(path), output_format="executorch", retrace=False)
+    torch_tensorrt.save(
+        engine,
+        str(path),
+        output_format="executorch",
+        arg_inputs=inputs,
+        retrace=False,
+        backend_config=ExecutorchBackendConfig(
+            propagate_device_config=PropagateDeviceConfig(
+                skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
+            ),
+            enable_non_cpu_memory_planning=True,
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
+        ),
+    )
 
 
 if __name__ == "__main__":
-    export_parts(parse_args(__doc__, "executorch_tensorrt"), __file__, "{name}.pte", compile_part)
+    export_parts(
+        parse_args(__doc__, "executorch_tensorrt"), __file__, "{name}.pte", compile_part, device_resident=True
+    )
