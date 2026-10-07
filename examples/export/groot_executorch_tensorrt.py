@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained GR00T N1.7 policy as an ExecuTorch program that runs on TensorRT.
+"""Export a trained GR00T N1.7 policy as a chain of ExecuTorch programs that run on TensorRT.
 
 Run it on the device the policy will run on, because a TensorRT engine only runs on the GPU
 model that built it:
@@ -26,28 +26,22 @@ model that built it:
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
 """
 
+from pathlib import Path
+
 import torch
 import torch_tensorrt
-from act_recipe import save_for_build_engine
-from groot_recipe import GrootExport, parse_args
+from groot_recipe import TENSORRT_OPTIONS, export_parts, parse_args
+from torch import nn
 
 
-def main() -> None:
-    args = parse_args(__doc__, "executorch_tensorrt")
-    export = GrootExport(args)
-    pte_path = export.output_dir / "model.pte"
-
+def compile_part(
+    module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
+):
     with torch.no_grad():
-        program = torch.export.export(export.module, export.inputs)
-    if args.export_only:
-        save_for_build_engine(export, program, pte_path)
-        return
-    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=export.inputs, min_block_size=1)
-    del program
-    export.release_policy()
-    torch_tensorrt.save(engine, str(pte_path), output_format="executorch", retrace=False)
-    export.write(pte_path)
+        program = torch.export.export(module, inputs)
+    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
+    torch_tensorrt.save(engine, str(path), output_format="executorch", retrace=False)
 
 
 if __name__ == "__main__":
-    main()
+    export_parts(parse_args(__doc__, "executorch_tensorrt"), __file__, "{name}.pte", compile_part)

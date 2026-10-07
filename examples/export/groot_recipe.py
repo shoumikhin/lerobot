@@ -30,12 +30,20 @@ as constants. The runtime resizes raw cameras with NumPy antialiased bicubic sam
 takes the resized uint8 HWC cameras, float32 state and unbatched noise. Image normalization and patch
 packing, state normalization and action unnormalization run inside the program. The folder records
 the task it was exported for; no tokenizer runs at inference.
+
+The ExecuTorch TensorRT route exports a chain, one part per process: vision, groups of six language
+layers, groups of eight diffusion blocks, and action postprocessing. Only one weight group is loaded
+at a time. The diffusion groups repeat for each positive Euler step, using the checkpoint's time buckets.
 """
 
 import argparse
 import gc
 import json
+import math
+import subprocess
+import sys
 import time
+from collections.abc import Callable, Iterator
 from copy import copy
 from pathlib import Path
 
@@ -47,9 +55,11 @@ from safetensors.numpy import save_file
 from smolvla_recipe import random_robot_frame
 from torch import Tensor, nn
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.utils import cached_file
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.datasets import LeRobotDatasetMetadata
-from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear
+from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep, GrootN17VLMEncodeStep
 from lerobot.policies.utils import prepare_observation_for_inference
@@ -59,6 +69,72 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 NOISE = "noise"
+VISION = "_groot_model.backbone.model.model.visual"
+LANGUAGE_MODEL = "_groot_model.backbone.model.model.language_model"
+ACTION_HEAD = "_groot_model.action_head"
+LANGUAGE_LAYERS_PER_PROGRAM = 6
+DIT_BLOCKS_PER_PROGRAM = 8
+TENSORRT_OPTIONS = {
+    "min_block_size": 1,
+    "truncate_double": True,
+    "offload_module_to_cpu": True,
+    "optimization_level": 3,
+    "workspace_size": 1 << 30,
+}
+
+
+def free_memory() -> None:
+    """Release the previous part before loading another one."""
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def part_names(policy_path: str) -> list[str]:
+    """The fixed layer groups used by the split recipe."""
+    config = PreTrainedConfig.from_pretrained(policy_path)
+    model = GR00TN17Config.from_pretrained(config.base_model_path)
+    language_groups = math.ceil(model.select_layer / LANGUAGE_LAYERS_PER_PROGRAM)
+    step_groups = math.ceil(model.diffusion_model_cfg["num_layers"] / DIT_BLOCKS_PER_PROGRAM)
+    return [
+        "vision",
+        *(f"language_model_{i}" for i in range(language_groups)),
+        *(f"step_{i}" for i in range(step_groups)),
+        "actions",
+    ]
+
+
+def export_parts(
+    args: argparse.Namespace,
+    script: str,
+    file_name: str,
+    compile_part: Callable[[nn.Module, tuple, list[str], list[str], Path], None],
+) -> None:
+    """Compile one part per process, releasing the compiler's memory between parts."""
+    names = part_names(args.policy_path)
+    if args.part is None:
+        output_dir = make_output_dir(args.output_dir, args.job_name)
+        for name in names:
+            subprocess.run(
+                [sys.executable, script, *sys.argv[1:], f"--output_dir={output_dir}", f"--part={name}"],
+                check=True,
+            )
+        return
+    if args.part not in names:
+        raise ValueError(f"Unknown part {args.part!r}; choose from {names}.")
+    export = GrootExport(args, split=True)
+    programs = {}
+    for name, module, inputs, input_names, output_names in export.parts():
+        programs[name] = {"file": file_name.format(name=name), "inputs": input_names, "outputs": output_names}
+        if name != args.part:
+            del module
+            free_memory()
+            continue
+        print(f"{name}: exporting", flush=True)
+        compile_part(module, inputs, input_names, output_names, export.output_dir / programs[name]["file"])
+        print(f"Wrote {programs[name]['file']}", flush=True)
+        if name == "actions":
+            export.write(programs)
+        return
 
 
 # From NVIDIA's export_onnx_n1d7.py: rotary with real numbers, where Qwen3-VL's own uses complex ones.
@@ -259,6 +335,164 @@ class GrootObservation(nn.Module):
         return pixels, F.pad(state[:, None], (0, self.max_state_dim - state.shape[-1]))
 
 
+class GrootVision(nn.Module):
+    """The raw frame to image features, deepstack features and normalized state."""
+
+    def __init__(self, vision: nn.Module, observation: GrootObservation, grid_thw: Tensor, use_bf16: bool):
+        super().__init__()
+        self.observation = observation
+        self.vision = Qwen3VisionForExport(vision, grid_thw)
+        self.use_bf16 = use_bf16
+
+    def forward(self, *frame: Tensor) -> tuple[Tensor, ...]:
+        pixels, state = self.observation(*frame)
+        with torch.autocast(pixels.device.type, torch.bfloat16, enabled=self.use_bf16):
+            image_embeds, deepstack = self.vision(pixels)
+        return image_embeds, *deepstack.unbind(0), state
+
+
+def select_embodiment(module: nn.Module, embodiment_id: Tensor) -> None:
+    """Keep only the category weights used by this robot."""
+    for layer in module.modules():
+        if isinstance(layer, CategorySpecificLinear):
+            layer.W = nn.Parameter(layer.W[embodiment_id].detach(), requires_grad=False)
+            layer.b = nn.Parameter(layer.b[embodiment_id].detach(), requires_grad=False)
+
+
+class GrootLanguageModel(nn.Module):
+    """A decoder slice, with image insertion first and action head feature processing last."""
+
+    def __init__(self, text_model, action_head, constants: dict, start: int, stop: int, use_bf16: bool):
+        super().__init__()
+        if not 0 <= start < stop <= len(text_model.layers):
+            raise ValueError("Invalid language model layer range.")
+        self.start, self.last = start, stop == len(text_model.layers)
+        self.layers = nn.ModuleList(text_model.layers[start:stop])
+        self.rotary_emb = text_model.rotary_emb
+        self.use_bf16 = use_bf16
+        for name in ("attention_mask", "position_ids", "visual_pos_masks"):
+            self.register_buffer(name, constants[name])
+        if start == 0:
+            self.register_buffer("text_embeds", constants["text_embeds"])
+            self.register_buffer("image_token_mask", constants["image_token_mask"])
+        if self.last:
+            self.vlln = action_head.vlln
+            self.vl_self_attention = action_head.vl_self_attention
+            self.state_encoder = action_head.state_encoder
+            self.register_buffer("embodiment_id", torch.zeros_like(constants["embodiment_id"]))
+            select_embodiment(self.state_encoder, constants["embodiment_id"])
+
+    def forward(self, hidden: Tensor, state: Tensor, *deepstack: Tensor):
+        with torch.autocast(hidden.device.type, torch.bfloat16, enabled=self.use_bf16):
+            if self.start == 0:
+                hidden = self.text_embeds.masked_scatter(
+                    self.image_token_mask, hidden.to(self.text_embeds.dtype)
+                )
+            mask = LLMForExport._simple_causal_mask(
+                hidden.dtype, hidden.device, *hidden.shape[:2], self.attention_mask
+            )
+            positions = self.rotary_emb(hidden, self.position_ids)
+            for index, layer in enumerate(self.layers, self.start):
+                hidden = layer(
+                    hidden,
+                    attention_mask=mask,
+                    position_ids=self.position_ids[0],
+                    past_key_values=None,
+                    position_embeddings=positions,
+                )
+                if index < len(deepstack):
+                    hidden = LLMForExport._deepstack_add(
+                        hidden, self.visual_pos_masks, deepstack[index].to(hidden.dtype)
+                    )
+            if self.last:
+                # GR00T consumes the decoder output before Qwen's final norm.
+                features = self.vl_self_attention(self.vlln(hidden))
+                state_features = self.state_encoder(state.reshape(state.shape[0], 1, -1), self.embodiment_id)
+                return features, state_features
+            return hidden
+
+
+class GrootStep(nn.Module):
+    """A diffusion block slice; the first encodes actions and time, the last returns velocity."""
+
+    def __init__(self, action_head, constants: dict, start: int, stop: int, use_bf16: bool):
+        super().__init__()
+        model = action_head.model
+        if not 0 <= start < stop <= len(model.transformer_blocks):
+            raise ValueError("Invalid diffusion block range.")
+        self.start, self.last = start, stop == len(model.transformer_blocks)
+        self.blocks = nn.ModuleList(model.transformer_blocks[start:stop])
+        self.interleave = model.config.interleave_self_attention
+        self.alternate = action_head.config.use_alternate_vl_dit
+        self.attend_text_every = model.attend_text_every_n_blocks if self.alternate else 1
+        if self.alternate and not self.interleave:
+            raise ValueError("AlternateVLDiT requires interleaved self attention.")
+        self.use_bf16 = use_bf16
+        self.horizon = action_head.action_horizon
+        self.register_buffer("image_mask", constants["image_mask"] & constants["backbone_attention_mask"])
+        self.register_buffer("text_mask", ~constants["image_mask"] & constants["backbone_attention_mask"])
+        self.register_buffer("embodiment_id", torch.zeros_like(constants["embodiment_id"]))
+        if start == 0:
+            self.action_encoder = action_head.action_encoder
+            self.position_embedding = (
+                action_head.position_embedding if action_head.config.add_pos_embed else None
+            )
+            self.timestep_encoder = model.timestep_encoder
+            select_embodiment(self.action_encoder, constants["embodiment_id"])
+        if self.last:
+            self.norm_out, self.proj_out_1, self.proj_out_2 = (
+                model.norm_out,
+                model.proj_out_1,
+                model.proj_out_2,
+            )
+            self.action_decoder = action_head.action_decoder
+            select_embodiment(self.action_decoder, constants["embodiment_id"])
+
+    def forward(self, vl_embeds: Tensor, *inputs: Tensor):
+        with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
+            if self.start == 0:
+                state_features, actions, time = inputs
+                time = time.long()
+                hidden = self.action_encoder(actions[None], time, self.embodiment_id)
+                if self.position_embedding is not None:
+                    positions = torch.arange(hidden.shape[1], device=hidden.device)
+                    hidden = hidden + self.position_embedding(positions)[None]
+                hidden = torch.cat((state_features, hidden), dim=1)
+                temb = self.timestep_encoder(time)
+            else:
+                hidden, temb = inputs
+            hidden, vl_embeds = hidden.contiguous(), vl_embeds.contiguous()
+            for index, block in enumerate(self.blocks, self.start):
+                self_attention = self.interleave and index % 2 == 1
+                mask = None
+                if self.alternate and not self_attention:
+                    mask = self.text_mask if index % (2 * self.attend_text_every) == 0 else self.image_mask
+                hidden = block(
+                    hidden,
+                    encoder_hidden_states=None if self_attention else vl_embeds,
+                    encoder_attention_mask=mask,
+                    temb=temb,
+                )
+            if self.last:
+                shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+                hidden = self.norm_out(hidden) * (1 + scale[:, None]) + shift[:, None]
+                prediction = self.action_decoder(self.proj_out_2(hidden), self.embodiment_id)
+                return prediction[0, -self.horizon :].float()
+            return hidden, temb
+
+
+class GrootActions(nn.Module):
+    """Slice the denoised chunk and restore the robot's action units."""
+
+    def __init__(self, horizon: int, action_dim: int, postprocessor: PolicyProcessorPipeline):
+        super().__init__()
+        self.horizon, self.action_dim = horizon, action_dim
+        self.postprocessor = postprocessor
+
+    def forward(self, actions: Tensor) -> Tensor:
+        return self.postprocessor(actions[None, : self.horizon, : self.action_dim])[0]
+
+
 class GrootChunk(nn.Module):
     """One action chunk: the raw frame and noise in, unbatched robot actions out."""
 
@@ -342,7 +576,10 @@ class GrootChunk(nn.Module):
 class GrootExport:
     """Loads a trained GR00T N1.7 checkpoint, and writes the exported folder around a compiled program."""
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, *, split: bool = False):
+        if split:
+            self.init_parts(args)
+            return
         self.output_dir = make_output_dir(args.output_dir, args.job_name)
         self.policy_path = args.policy_path
         self.backend, self.tolerance = args.backend, args.tolerance
@@ -372,6 +609,168 @@ class GrootExport:
         self.input_names = [*self.frame, NOISE]
         self.start = time.perf_counter()
 
+    def init_parts(self, args: argparse.Namespace) -> None:
+        """Prepare the fixed prompt and frame with only the vision weights loaded."""
+        self.output_dir, self.policy_path = args.output_dir, args.policy_path
+        self.backend, self.tolerance = args.backend, args.tolerance
+        self.config = PreTrainedConfig.from_pretrained(self.policy_path)
+        self.config.device = "cuda"
+        self.model_file = cached_file(self.policy_path, "model.safetensors")
+        self.policy = self.load_part(VISION)
+        model = self.policy._groot_model
+        self.model_config = model.config
+        self.horizon = self.policy._action_queue_steps
+        preprocessor, self.postprocessor = gpu_processors(self.config, self.policy_path)
+        metadata = LeRobotDatasetMetadata(args.dataset, root=args.dataset_root)
+        self.task = str(metadata.tasks.index[0])
+        self.frame = random_robot_frame(metadata.features)
+        self.input_features = {
+            name: feature
+            for name, feature in dataset_to_policy_features(metadata.features).items()
+            if name in self.frame
+        }
+        self.batch = preprocessor(self.observation())
+        self.frame_processor = GrootObservation(preprocessor, self.frame, self.batch).cuda()
+        self.image_resize = self.frame_processor.image_resize
+        qwen = model.backbone.model.model
+        ids, mask = self.batch["input_ids"], self.batch["attention_mask"]
+        image_mask = ids == qwen.config.image_token_id
+        positions, _ = qwen.get_rope_index(
+            input_ids=ids,
+            mm_token_type_ids=self.batch.get("mm_token_type_ids", image_mask.int()),
+            image_grid_thw=self.batch["image_grid_thw"],
+            attention_mask=mask,
+        )
+        self.constants = {
+            "attention_mask": mask.long(),
+            "position_ids": positions,
+            "visual_pos_masks": image_mask,
+            "image_mask": image_mask,
+            "backbone_attention_mask": mask == 1,
+            "embodiment_id": self.batch["embodiment_id"],
+        }
+        self.noise = torch.randn(
+            self.model_config.action_horizon, self.model_config.max_action_dim, device="cuda"
+        )
+        resized = resize_images(self.frame, self.image_resize)
+        self.inputs = (*(torch.from_numpy(x).cuda() for x in resized.values()), self.noise)
+        self.input_names, self.expected_actions = [*self.frame, NOISE], None
+        self.num_steps = self.model_config.num_inference_timesteps
+        self.timesteps = [
+            int(i / self.num_steps * self.model_config.num_timestep_buckets) for i in range(self.num_steps)
+        ]
+        self.start = time.perf_counter()
+
+    def load_part(self, *modules: str) -> GrootPolicy:
+        """Load only this part, preserving the checkpoint's precision before autocast."""
+        config = copy(self.config)
+        # Casting norms, embeddings and category biases changes residual additions outside autocast.
+        config.use_bf16 = False
+        return GrootPolicy.load_checkpoint_modules(self.model_file, config, list(modules))
+
+    def parts(self) -> Iterator[tuple[str, nn.Module, tuple, list[str], list[str]]]:
+        """Yield each program with example tensors, keeping only one weight group alive."""
+        module = GrootVision(
+            self.policy._groot_model.backbone.visual,
+            self.frame_processor,
+            self.batch["image_grid_thw"],
+            self.config.use_bf16,
+        ).eval()
+        del self.policy
+        with torch.no_grad():
+            hidden, *deepstack, state = module(*self.inputs[:-1])
+        deepstack_names = [f"deepstack_{i}" for i in range(len(deepstack))]
+        yield (
+            "vision",
+            module,
+            self.inputs[:-1],
+            self.input_names[:-1],
+            ["image_embeds", *deepstack_names, "state"],
+        )
+        del module
+        free_memory()
+        policy = self.load_part(f"{LANGUAGE_MODEL}.embed_tokens")
+        with torch.no_grad():
+            text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
+        self.constants["text_embeds"] = text
+        self.constants["image_token_mask"] = self.constants["image_mask"][..., None].expand_as(text)
+        del policy
+        depth, hidden_name = self.model_config.select_layer, "image_embeds"
+        for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
+            stop = min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth)
+            modules = [f"{LANGUAGE_MODEL}.layers.{i}" for i in range(first, stop)]
+            if stop == depth:
+                modules += [f"{ACTION_HEAD}.{n}" for n in ("vlln", "vl_self_attention", "state_encoder")]
+            free_memory()
+            policy = self.load_part(*modules)
+            module = GrootLanguageModel(
+                policy._groot_model.backbone.language_model,
+                policy._groot_model.action_head,
+                self.constants,
+                first,
+                stop,
+                self.config.use_bf16,
+            ).eval()
+            del policy
+            inputs = (hidden, state, *deepstack)
+            with torch.no_grad():
+                result = module(*inputs)
+            outputs = ["vl_embeds", "state_features"] if module.last else [f"language_hidden_{group}"]
+            yield f"language_model_{group}", module, inputs, [hidden_name, "state", *deepstack_names], outputs
+            if module.last:
+                vl_embeds, state_features = result
+            else:
+                hidden = result
+            hidden_name = outputs[0]
+            del module
+        actions = self.noise
+        depth = self.model_config.diffusion_model_cfg["num_layers"]
+        for iteration, bucket in enumerate(self.timesteps):
+            step_inputs = (
+                state_features,
+                actions,
+                torch.tensor([bucket], dtype=torch.float32, device=actions.device),
+            )
+            for group, first in enumerate(range(0, depth, DIT_BLOCKS_PER_PROGRAM)):
+                stop = min(first + DIT_BLOCKS_PER_PROGRAM, depth)
+                modules = [f"{ACTION_HEAD}.model.transformer_blocks.{i}" for i in range(first, stop)]
+                if first == 0:
+                    modules += [f"{ACTION_HEAD}.action_encoder", f"{ACTION_HEAD}.model.timestep_encoder"]
+                    if self.model_config.add_pos_embed:
+                        modules.append(f"{ACTION_HEAD}.position_embedding")
+                if stop == depth:
+                    modules += [f"{ACTION_HEAD}.model.{n}" for n in ("norm_out", "proj_out_1", "proj_out_2")]
+                    modules.append(f"{ACTION_HEAD}.action_decoder")
+                free_memory()
+                module = GrootStep(
+                    self.load_part(*modules)._groot_model.action_head,
+                    self.constants,
+                    first,
+                    stop,
+                    self.config.use_bf16,
+                ).eval()
+                inputs = (vl_embeds, *step_inputs)
+                names = (
+                    ["vl_embeds", "state_features", "x_t", "time_bucket"]
+                    if first == 0
+                    else ["vl_embeds", "step_hidden", "temb"]
+                )
+                with torch.no_grad():
+                    result = module(*inputs)
+                outputs = ["velocity"] if module.last else ["step_hidden", "temb"]
+                if iteration == 0:
+                    yield f"step_{group}", module, inputs, names, outputs
+                if module.last:
+                    actions = actions + (1.0 / self.num_steps) * result
+                else:
+                    step_inputs = result
+                del module
+        free_memory()
+        module = GrootActions(self.horizon, self.config.output_features[ACTION].shape[0], self.postprocessor)
+        with torch.no_grad():
+            self.expected_actions = module(actions).float().cpu().numpy()
+        yield "actions", module, (actions,), ["x_t"], [ACTION]
+
     def release_policy(self) -> None:
         """Free the policy for the TensorRT step: the test case's actions are already computed."""
         del self.policy, self.module
@@ -393,7 +792,7 @@ class GrootExport:
             actions = postprocessor(actions[:, : self.policy._action_queue_steps])
         return actions[0].float().cpu().numpy()
 
-    def write(self, program_path: Path) -> None:
+    def write(self, program_path: Path | dict) -> None:
         """Save the raw test case, policy config and `export.json` beside the program."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
@@ -402,7 +801,16 @@ class GrootExport:
         config.save_pretrained(self.output_dir)
         info = {
             "backend": self.backend,
-            "file": program_path.name,
+            **(
+                {
+                    "programs": program_path,
+                    "num_steps": self.num_steps,
+                    "timesteps": self.timesteps,
+                    "dt": 1.0 / self.num_steps,
+                }
+                if isinstance(program_path, dict)
+                else {"file": program_path.name}
+            ),
             "inputs": self.input_names,
             "raw_frame": True,
             "image_resize": self.image_resize,
@@ -442,7 +850,13 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=5.0, help="Largest allowed action error, robot units."
     )
-    add_backend_args(parser, backend)
+    parser.add_argument(
+        "--part", help="Build only this program in an existing folder. The script sets it itself."
+    )
+    if backend == "executorch_tensorrt":
+        parser.set_defaults(backend=backend)
+    else:
+        add_backend_args(parser, backend)
     return parser.parse_args()
 
 

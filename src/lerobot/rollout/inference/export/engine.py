@@ -98,10 +98,12 @@ class ProgramChain:
     """Run a chunk exported as a chain of programs, in the order `export.json` lists them.
 
     Each program reads the values its `inputs` name: the frame's arrays and the noise, or the `outputs` of
-    a program before it. The program named `step` runs once per Euler step: its last two inputs are the
-    noisy actions, starting from the noise, and the time, and it returns the velocity. The chain returns
-    what the last program returns. A program with a `run_device` method hands its outputs to the next
-    programs without copying them to the host.
+    a program before it. The program named `step`, or the programs `step_0`, `step_1` and so on, run once
+    per Euler step: the first one's last two inputs are the noisy actions, starting from the noise, and
+    the time, and the last one returns the velocity. The times are `timesteps` and the step size `dt`, by
+    default from 1 down to 0 in `num_steps` steps. The chain returns what the last program returns. A
+    program with a `run_device` method hands its outputs to the next programs without copying them to
+    the host.
     """
 
     def __init__(self, programs: dict[str, Program], info: dict):
@@ -111,7 +113,11 @@ class ProgramChain:
         self._names: list[str] = info["inputs"]
         self._inputs = {name: program["inputs"] for name, program in info["programs"].items()}
         self._outputs = {name: program["outputs"] for name, program in info["programs"].items()}
-        self._num_steps: int = info["num_steps"]
+        self._steps = [name for name in programs if name == "step" or name.startswith("step_")]
+        self._dt: float = info.get("dt", -1.0 / info["num_steps"])
+        self._timesteps: list[float] = info.get(
+            "timesteps", [1.0 + step * self._dt for step in range(info["num_steps"])]
+        )
 
     @property
     def input_shape(self) -> tuple[int, ...] | None:
@@ -127,20 +133,30 @@ class ProgramChain:
         values = dict(zip(self._names, inputs, strict=True))
         *names, last = self._programs
         for name in names:
-            program, input_names = self._programs[name], self._inputs[name]
-            if name == "step":
-                cache = [values[n] for n in input_names[:-2]]
-                sample, dt = values[NOISE], -1.0 / self._num_steps
-                for step in range(self._num_steps):
-                    timestep = np.array([1.0 + step * dt], dtype=np.float32)
-                    sample = sample + dt * _call(program, initialize and step == 0)(*cache, sample, timestep)
-                values[input_names[-2]] = sample
-                continue
-            run = getattr(program, "run_device", None) or _call(program, initialize)
-            outputs = run(*(values[n] for n in input_names))
-            outputs = outputs if isinstance(outputs, tuple) else (outputs,)
-            values.update(zip(self._outputs[name], outputs, strict=True))
+            if name not in self._steps:
+                self._run_program(name, values, initialize)
+            elif name == self._steps[0]:
+                self._denoise(values, initialize)
         return _call(self._programs[last], initialize)(*(values[n] for n in self._inputs[last]))
+
+    def _denoise(self, values: dict, initialize: bool) -> None:
+        *inner, velocity = self._steps
+        sample_name, time_name = self._inputs[self._steps[0]][-2:]
+        sample = values[NOISE]
+        for step, timestep in enumerate(self._timesteps):
+            values[sample_name], values[time_name] = sample, np.array([timestep], dtype=np.float32)
+            for name in inner:
+                self._run_program(name, values, initialize and step == 0)
+            run = _call(self._programs[velocity], initialize and step == 0)
+            sample = sample + self._dt * run(*(values[n] for n in self._inputs[velocity]))
+        values[sample_name] = sample
+
+    def _run_program(self, name: str, values: dict, initialize: bool) -> None:
+        program = self._programs[name]
+        run = getattr(program, "run_device", None) or _call(program, initialize)
+        outputs = run(*(values[n] for n in self._inputs[name]))
+        outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        values.update(zip(self._outputs[name], outputs, strict=True))
 
 
 def _call(program: Program, initialize: bool) -> Program:
