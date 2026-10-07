@@ -18,6 +18,7 @@
 
 import torch
 from safetensors import safe_open
+from torch import nn
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.pretrained import (
@@ -86,3 +87,55 @@ def load_complete_checkpoint(
     else:
         print("All keys loaded successfully!")
     return policy
+
+
+def load_checkpoint_modules(
+    policy_cls: type[T], model_file: str, config: PreTrainedConfig, modules: list[str], **kwargs
+) -> T:
+    """Build `policy_cls` on the meta device and load only the weights of `modules` from `model_file`.
+
+    For exporting one part of a policy too large for the machine's memory: only the listed submodules,
+    like `model.paligemma_with_expert.gemma_expert`, get real tensors, read one at a time from the file.
+    Every other submodule holding parameters is replaced by None, as the policy already does for modules
+    it never runs, so code that reaches one fails instead of reading random weights, and an export of
+    the part saves only its own weights. Raises if a listed submodule has a parameter the file does not
+    hold. The same promises as `load_complete_checkpoint` apply. The policy comes back in evaluation
+    mode, as from `from_pretrained`, since a policy's own `train` may reach a module that is now None.
+    """
+    if not vars(policy_cls).get("_supports_meta_load", False):
+        raise ValueError(f"{policy_cls.__name__} does not support loading on the meta device.")
+    prefixes = tuple(f"{name}." for name in modules)
+    with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+        with _parameters_on_meta():
+            policy = policy_cls(config, **kwargs)
+        targets = policy.state_dict(keep_vars=True)
+        # A file key gives zero, one or two model names (lm_head is also copied), and the last one wins, as in a full load.
+        sources = {}
+        for key in checkpoint.keys():  # noqa: SIM118
+            for name in policy._fix_pytorch_state_dict_keys({key: torch.empty(0, device="meta")}, config):
+                name = name if name.startswith("model.") else f"model.{name}"
+                if name.startswith(prefixes) and name in targets:
+                    sources[name] = key
+        # A CPU copy first, because a device copy straight from the memory-mapped file can keep its pages.
+        tensors = {
+            name: checkpoint.get_tensor(key).to(dtype=targets[name].dtype, copy=True).to(config.device)
+            for name, key in sources.items()
+        }
+        policy.load_state_dict(tensors, strict=False, assign=True)
+    for name in modules:
+        missing = [p for p, param in policy.get_submodule(name).named_parameters() if param.is_meta]
+        if missing:
+            raise KeyError(f"{model_file} does not hold {name}.{missing[0]} and {len(missing) - 1} more")
+    policy.eval()
+    _drop_unloaded(policy)
+    # Buffers the constructor computed, like rotary tables, are not in the checkpoint and are still on the CPU.
+    return policy.to(config.device)
+
+
+def _drop_unloaded(module: nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        parameters = list(child.parameters())
+        if parameters and all(parameter.is_meta for parameter in parameters):
+            setattr(module, name, None)
+        else:
+            _drop_unloaded(child)
