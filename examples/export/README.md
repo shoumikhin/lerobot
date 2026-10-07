@@ -91,7 +91,9 @@ python examples/export/act_onnx_tensorrt.py \
 python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 ```
 
-`--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` can limit build resources, but do not guarantee the engine fits. With `--step_engine`, `pi05_onnx_tensorrt.py` splits pi0.5 into three engines: the prompt and cameras, a denoising step, and the actions. This option is not available in the direct ExecuTorch-TensorRT exporter.
+`--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` can limit build resources, but do not guarantee the engine fits.
+
+Every pi0.5 script exports the chunk as a chain of programs: the image and prompt embeddings, the language model in groups of three layers, one denoising step, and the actions. Each program is built in its own process, which reads only its own weights from the checkpoint, so the export runs on a device with less memory than the whole policy. `lerobot-rollout` runs the chain.
 
 ## Run it
 

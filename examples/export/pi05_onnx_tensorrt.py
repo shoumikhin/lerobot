@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained pi0.5 policy to ONNX, then build a TensorRT engine from it.
+"""Export a trained pi0.5 policy to ONNX, then build TensorRT engines from it.
 
 Run it on the device the policy will run on, because a TensorRT engine only runs on the GPU
 model that built it:
@@ -24,54 +24,34 @@ model that built it:
         --task="Pick up the block and place it in the cup"
 
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
-
-With `--step_engine`, the chunk becomes three engines instead of one: the prefix (the cameras and
-the prompt to the KV cache), one denoising step, and the actions. The runtime runs the step engine
-once per Euler step, so no engine holds the whole 10-step loop.
 """
 
 from pathlib import Path
 
 import torch
 from build_engine import build_engine
-from pi05_recipe import PI05Export, parse_args
+from pi05_recipe import TENSORRT_OPTIONS, export_parts, free_memory, parse_args
+from torch import nn
 
-from lerobot.utils.constants import ACTION
 
-
-def export_onnx(programs: dict, folder: Path) -> dict:
-    """Export each program to `<name>.onnx`; return each engine's file, inputs and outputs."""
-    files = {}
+def compile_part(
+    module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
+):
+    onnx_path = path.with_suffix(".onnx")
     with torch.no_grad():
-        for name, (module, inputs, input_names, output_names) in programs.items():
-            torch.onnx.export(
-                module,
-                inputs,
-                folder / f"{name}.onnx",
-                dynamo=True,
-                input_names=input_names,
-                output_names=output_names,
-            )
-            files[name] = {"file": f"{name}.engine", "inputs": input_names, "outputs": output_names}
-    return files
-
-
-def main() -> None:
-    args = parse_args(__doc__, "onnx_tensorrt")
-    export = PI05Export(args)
-    if args.step_engine:
-        files = export_onnx(export.denoising_programs(), export.output_dir)
-    else:
-        files = export_onnx(
-            {"model": (export.module, export.inputs, export.input_names, [ACTION])}, export.output_dir
+        torch.onnx.export(
+            module, inputs, onnx_path, dynamo=True, input_names=input_names, output_names=output_names
         )
-    export.release_policy()
-
-    if not args.export_only:
-        for name, program in files.items():
-            build_engine(export.output_dir / f"{name}.onnx", export.output_dir / program["file"])
-    export.write(files if args.step_engine else export.output_dir / files["model"]["file"])
+    # As offload_module_to_cpu does on the other routes: CPU memory can swap during the build, GPU memory cannot.
+    module.cpu()
+    free_memory()
+    build_engine(
+        onnx_path,
+        path,
+        workspace_gib=TENSORRT_OPTIONS["workspace_size"] / (1 << 30),
+        optimization_level=TENSORRT_OPTIONS["optimization_level"],
+    )
 
 
 if __name__ == "__main__":
-    main()
+    export_parts(parse_args(__doc__, "onnx_tensorrt"), __file__, "{name}.engine", compile_part)

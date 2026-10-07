@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The pi0.5 export recipe: what both backend scripts compile, and the folder they write.
+"""The pi0.5 export recipe: what every backend script compiles, and the folder they write.
 
-As for SmolVLA, the compiled module is one action chunk of LeRobot's own code: the checkpoint's saved
-preprocessor, the policy's `predict_action_chunk` and the saved postprocessor, with the starting noise
-as the program's last input. One thing differs:
+As for SmolVLA, the compiled programs are one action chunk of LeRobot's own code: the checkpoint's saved
+preprocessor, the policy's denoising loop and the saved postprocessor, with the starting noise as the
+chunk's last input. One thing differs:
 
 - The state. pi0.5 reads the normalized state as bin numbers in the prompt. The program digitizes it
   and assembles the prompt from token pieces prepared at export time. No tokenizer runs at inference.
@@ -34,30 +34,25 @@ The program also keeps only the rows of the 257,152-row vocabulary that the task
 the task's own words, the fixed words around it, and the state's bins written as numbers. That saves
 about 1 GiB, and ties the folder to the task, so `export.json` marks it `task_fixed`.
 
-A split export (`PI05Export(args, split=True)` and `parts`) never loads the whole policy: each part
-reads only its own weights from the checkpoint, so a device with less memory than the policy can
-export it one part at a time.
+The export never loads the whole policy. The chunk is a chain of programs: the image and prompt
+embeddings, the language model in groups of three layers, one denoising step, and the actions. Each
+program is built in its own process, which reads only its own weights from the checkpoint, so a device
+with less memory than the policy, like an 8 GB Jetson Orin Nano, can export it.
 """
 
 import argparse
 import gc
 import json
 import math
+import subprocess
+import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from copy import copy
 from pathlib import Path
 
-import numpy as np
 import torch
-from act_recipe import (
-    TEST_CASE,
-    add_backend_args,
-    gpu_processors,
-    make_output_dir,
-    random_robot_frame,
-    to_policy_input,
-)
+from act_recipe import TEST_CASE, gpu_processors, make_output_dir, random_robot_frame, to_policy_input
 from safetensors.numpy import save_file
 from smolvla_recipe import NOISE
 from torch import Tensor, nn
@@ -69,7 +64,6 @@ from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch, get_gemma_config
 from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
-from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline, TokenizerProcessorStep
 from lerobot.utils.constants import (
     ACTION,
@@ -94,6 +88,18 @@ STEP_MODULES = (
     "model.time_mlp_in",
     "model.time_mlp_out",
 )
+# The most language model layers whose TensorRT build fits an 8 GB Jetson Orin Nano beside the rest.
+LAYERS_PER_PROGRAM = 3
+# TensorRT's default optimization level. On the Orin Nano, level 5 built the step program, but it did not load.
+TENSORRT_OPTIONS = {
+    "min_block_size": 1,
+    # The denoising step's time embedding is computed in float64, which TensorRT does not support.
+    "truncate_double": True,
+    # Where the CPU and GPU share memory, as on a Jetson, CPU memory can swap during the build; GPU memory cannot.
+    "offload_module_to_cpu": True,
+    "optimization_level": 3,
+    "workspace_size": 1 << 30,
+}
 
 
 def free_memory() -> None:
@@ -102,11 +108,46 @@ def free_memory() -> None:
     torch.cuda.empty_cache()
 
 
-def part_names(policy_path: str, layers_per_program: int) -> list[str]:
+def part_names(policy_path: str) -> list[str]:
     """The names of the programs `PI05Export.parts` yields, in order."""
     depth = get_gemma_config(PreTrainedConfig.from_pretrained(policy_path).paligemma_variant).depth
-    groups = range(math.ceil(depth / layers_per_program))
+    groups = range(math.ceil(depth / LAYERS_PER_PROGRAM))
     return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
+
+
+def export_parts(
+    args: argparse.Namespace,
+    script: str,
+    file_name: str,
+    compile_part: Callable[[nn.Module, tuple, list[str], list[str], Path], None],
+) -> None:
+    """Export the chunk one program per process, each loading only its own part of the policy.
+
+    Without `--part`, make the folder and run `script` again once per part: a process returns all its
+    memory when it exits, and one that built a part keeps some of it. With `--part`, run the parts before
+    it in PyTorch to make its example inputs, then `compile_part(module, inputs, input_names, output_names,
+    path)` writes it to `file_name` formatted with the part's name. The last part also writes `export.json`.
+    """
+    if args.part is None:
+        output_dir = make_output_dir(args.output_dir, args.job_name)
+        for name in part_names(args.policy_path):
+            command = [sys.executable, script, *sys.argv[1:], f"--output_dir={output_dir}", f"--part={name}"]
+            subprocess.run(command, check=True)
+        return
+    export = PI05Export(args)
+    programs = {}
+    for name, module, inputs, input_names, output_names in export.parts():
+        programs[name] = {"file": file_name.format(name=name), "inputs": input_names, "outputs": output_names}
+        if name != args.part:
+            del module
+            free_memory()
+            continue
+        print(f"{name}: exporting", flush=True)
+        compile_part(module, inputs, input_names, output_names, export.output_dir / programs[name]["file"])
+        print(f"Wrote {programs[name]['file']}", flush=True)
+        if name == "actions":
+            export.write(programs)
+        return
 
 
 class StatePrompt(nn.Module):
@@ -168,66 +209,6 @@ class PI05Observation(nn.Module):
         )
         batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK] = self.prompt(batch[OBS_STATE])
         return batch
-
-
-class PI05Chunk(nn.Module):
-    """One action chunk: the raw frame and noise in, unbatched actions in robot units out."""
-
-    def __init__(
-        self,
-        policy: PI05Policy,
-        preprocessor: PI05Observation,
-        postprocessor: PolicyProcessorPipeline,
-        input_names: list[str],
-    ):
-        super().__init__()
-        self.policy = policy
-        self.preprocessor = preprocessor
-        self.postprocessor = postprocessor
-        self.input_names = input_names
-
-    def forward(self, *inputs: Tensor) -> Tensor:
-        *observation, noise = inputs
-        batch = self.preprocessor(*observation)
-        actions = self.policy.predict_action_chunk(batch, noise=noise[None])
-        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
-
-
-class PI05Prefix(nn.Module):
-    """What `sample_actions` runs once per chunk: the cameras and the prompt in, the KV cache out."""
-
-    def __init__(self, policy: PI05Policy, preprocessor: PI05Observation, input_names: list[str]):
-        super().__init__()
-        self.policy = policy
-        self.preprocessor = preprocessor
-        self.input_names = input_names
-
-    def forward(self, *observation: Tensor) -> tuple[Tensor, ...]:
-        batch = self.preprocessor(*observation)
-        images, img_masks = self.policy._preprocess_images(batch)
-        states, state_masks = self.policy._prepare_memory_states(batch)
-        model = self.policy.model
-        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
-            images,
-            img_masks,
-            batch[OBS_LANGUAGE_TOKENS],
-            batch[OBS_LANGUAGE_ATTENTION_MASK],
-            states,
-            state_masks,
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
-        model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
-        _, past_key_values = model.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
-        # A program passes only tensors, so the cache leaves as each layer's keys and values.
-        return prefix_pad_masks, *(tensor for keys, values, _ in past_key_values for tensor in (keys, values))
 
 
 class PI05Step(nn.Module):
@@ -311,7 +292,7 @@ class PI05LanguageModelLayers(nn.Module):
                 use_cache=True,
                 position_embeddings=position_embeddings,
             )
-        # Each layer writes its keys and values at its index in the whole model.
+        # Each layer writes its keys and values at its index in the whole model; a program passes only tensors.
         own = [cache.layers[layer.self_attn.layer_idx] for layer in self.layers]
         keys_values = tuple(tensor for layer in own for tensor in (layer.keys, layer.values))
         # The step reads only the KV cache, so the last layer's attention output and MLP would be dead weight.
@@ -336,28 +317,27 @@ class CompactEmbedding(nn.Module):
 
 
 class PI05Export:
-    """Loads a trained pi0.5 checkpoint, and writes the exported folder around a compiled program.
+    """Reads a trained pi0.5 checkpoint one part at a time, and writes the exported folder around its programs.
 
-    With `split`, it loads only the embedding weights, and `parts` loads every later part on its own.
+    It loads only the embedding weights, and `parts` loads every later part on its own.
     """
 
-    def __init__(self, args: argparse.Namespace, split: bool = False):
-        # Each part's process writes into the folder the first one made.
-        self.output_dir = (
-            args.output_dir if split and args.part else make_output_dir(args.output_dir, args.job_name)
-        )
+    def __init__(self, args: argparse.Namespace):
+        # Each part's process writes into the folder `export_parts` made.
+        self.output_dir = args.output_dir
         self.policy_path = args.policy_path
         self.backend, self.tolerance = args.backend, args.tolerance
         self.task = args.task
-        if split:
-            self.config = PreTrainedConfig.from_pretrained(self.policy_path)
-            self.model_file = cached_file(self.policy_path, "model.safetensors")
-            self.policy = self.load_part(*EMBED_MODULES)
-        else:
-            self.policy = PI05Policy.from_pretrained(self.policy_path).to("cuda").eval()
-        self.config = self.policy.config
-        preprocessor, postprocessor = self.processors()
+        self.config = PreTrainedConfig.from_pretrained(self.policy_path)
+        self.model_file = cached_file(self.policy_path, "model.safetensors")
+        self.policy = self.load_part(*EMBED_MODULES)
+        config = self.config = self.policy.config
+        if config.use_visual_memory or config.use_proprioceptive_memory:
+            raise ValueError("Raw-frame export requires a policy without observation memory.")
+        preprocessor, self.postprocessor = gpu_processors(config, self.policy_path)
         tokenizer = next(s for s in preprocessor.steps if isinstance(s, TokenizerProcessorStep))
+        # The prompt carries the state, so its length can change every step; the program takes one shape.
+        tokenizer.padding = "max_length"
         tensor_steps = PolicyProcessorPipeline(
             steps=[
                 s
@@ -365,10 +345,6 @@ class PI05Export:
                 if not isinstance(s, Pi05PrepareStateTokenizerProcessorStep | TokenizerProcessorStep)
             ]
         )
-        if self.config.use_visual_memory or self.config.use_proprioceptive_memory:
-            raise ValueError("Raw-frame export requires a policy without observation memory.")
-
-        config = self.policy.config
         # pi0.5 fills in its empty cameras itself, so the robot does not send them.
         empty_cameras = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(config.empty_cameras)}
         available = set(config.image_features) - empty_cameras
@@ -384,46 +360,40 @@ class PI05Export:
         prompt = StatePrompt(tokenizer, self.task, self.frame[OBS_STATE].size).cuda()
         names = [*self.frame, NOISE]
         self.noise = torch.randn(config.chunk_size, config.max_action_dim, device="cuda")
-        # A split export cannot run the whole policy, so `parts` chains its parts' PyTorch outputs instead.
-        self.expected_actions = None if split else self.rollout_actions()
+        # The whole policy never loads, so `parts` chains its parts' PyTorch outputs for the test case.
+        self.expected_actions = None
         language_model = self.policy.model.paligemma_with_expert.paligemma.model.language_model
         token_ids = torch.cat((prompt.prefix, prompt.pieces.flatten(), prompt.suffix)).unique()
         language_model.embed_tokens = CompactEmbedding(language_model.embed_tokens, token_ids)
         self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
-        observation = PI05Observation(list(self.frame), tensor_steps, prompt)
-        self.module = PI05Chunk(self.policy, observation, postprocessor, names)
+        self.observation = PI05Observation(list(self.frame), tensor_steps, prompt)
         self.input_names = names
         self.start = time.perf_counter()
-
-    def release_policy(self) -> None:
-        """Free the policy for the TensorRT step."""
-        del self.policy, self.module
-        free_memory()
 
     def load_part(self, *modules: str) -> PI05Policy:
         """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
         return load_checkpoint_modules(PI05Policy, self.model_file, self.config, list(modules))
 
-    def parts(self, layers_per_program: int) -> Iterator[tuple[str, nn.Module, tuple, list[str], list[str]]]:
+    def parts(self) -> Iterator[tuple[str, nn.Module, tuple, list[str], list[str]]]:
         """Yield the chunk's programs one at a time, each with only its own weights in memory.
 
         Each program comes with its example inputs, input names and output names: the embeddings, the
-        language model in groups of `layers_per_program` layers, one denoising step and the actions.
+        language model in groups of `LAYERS_PER_PROGRAM` layers, one denoising step and the actions.
         Each part runs once in PyTorch to make the next part's inputs, and the test case's actions are
         those parts chained. Drop each module before taking the next, so only one part is ever loaded.
         """
         observation, names = self.inputs[:-1], self.input_names[:-1]
-        postprocessor = self.module.postprocessor
-        embed = PI05Embed(self.policy, self.module.preprocessor, names)
-        self.release_policy()
+        embed = PI05Embed(self.policy, self.observation, names)
+        del self.policy
+        free_memory()
         with torch.no_grad():
             hidden, prefix_pad_masks = embed(*observation)
         yield "embed", embed, observation, names, ["prefix_embs", "prefix_pad_masks"]
         del embed
         hidden_name, cache = "prefix_embs", {}
         depth = get_gemma_config(self.config.paligemma_variant).depth
-        for group, first in enumerate(range(0, depth, layers_per_program)):
-            layers = range(first, min(first + layers_per_program, depth))
+        for group, first in enumerate(range(0, depth, LAYERS_PER_PROGRAM)):
+            layers = range(first, min(first + LAYERS_PER_PROGRAM, depth))
             free_memory()
             layer_group = PI05LanguageModelLayers(
                 self.load_part(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
@@ -451,55 +421,22 @@ class PI05Export:
         yield "step", step, step_inputs, ["prefix_pad_masks", *cache, "x_t", "timestep"], ["v_t"]
         del step
         free_memory()
-        actions = PI05Actions(self.load_part(), postprocessor)
+        actions = PI05Actions(self.load_part(), self.postprocessor)
         with torch.no_grad():
             self.expected_actions = actions(x_t).cpu().numpy()
         yield "actions", actions, (self.noise,), ["x_t"], [ACTION]
 
-    def denoising_programs(self) -> dict[str, tuple[nn.Module, tuple[Tensor, ...], list[str], list[str]]]:
-        """The chunk as three programs, each with its example inputs, input names and output names.
-
-        The prefix runs once per chunk, the denoising step once per Euler step and the actions at the end.
-        No engine holds the whole 10-step loop.
-        """
-        config = self.policy.config
-        if config.use_visual_memory or config.use_proprioceptive_memory:
-            raise SystemExit("--step_engine does not support a policy with visual or proprioceptive memory.")
-        observation, observation_names = self.inputs[:-1], self.input_names[:-1]
-        prefix = PI05Prefix(self.policy, self.module.preprocessor, observation_names)
-        with torch.no_grad():
-            cache = prefix(*observation)
-        layers = range((len(cache) - 1) // 2)
-        cache_names = ["prefix_pad_masks", *(f"past_{kind}_{i}" for i in layers for kind in ("key", "value"))]
-        step_inputs = (*cache, self.noise, torch.ones(1, device="cuda"))
-        return {
-            "prefix": (prefix, observation, observation_names, cache_names),
-            "step": (PI05Step(self.policy.model), step_inputs, [*cache_names, "x_t", "timestep"], ["v_t"]),
-            "actions": (
-                PI05Actions(self.policy, self.module.postprocessor),
-                (self.noise,),
-                ["x_t"],
-                [ACTION],
-            ),
-        }
-
-    def write(self, program: Path | dict) -> None:
-        """Save the raw test case, the policy config and `export.json` beside the program.
-
-        `program` is the program's path or, for a chunk split into engines, each engine's file, inputs and outputs.
-        """
+    def write(self, programs: dict[str, dict]) -> None:
+        """Save the raw test case, the policy config and `export.json`, which lists each program's file, inputs and outputs."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
-        if isinstance(program, dict):
-            files = {"programs": program, "num_steps": self.config.num_inference_steps}
-        else:
-            files = {"file": program.name}
         info = {
             "backend": self.backend,
-            **files,
+            "programs": programs,
+            "num_steps": self.config.num_inference_steps,
             "inputs": self.input_names,
             "raw_frame": True,
             "task": self.task,
@@ -512,23 +449,6 @@ class PI05Export:
         }
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
         print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")
-
-    def processors(self) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
-        """The checkpoint's processors on the GPU, with the tokenizer padding every prompt to one width."""
-        preprocessor, postprocessor = gpu_processors(self.policy.config, self.policy_path)
-        # The prompt carries the state, so its length can change every step; the program takes one shape.
-        next(s for s in preprocessor.steps if isinstance(s, TokenizerProcessorStep)).padding = "max_length"
-        return preprocessor, postprocessor
-
-    def rollout_actions(self) -> np.ndarray:
-        """The chunk the PyTorch policy computes for the test frame, task and noise, as lerobot-rollout runs it."""
-        preprocessor, postprocessor = self.processors()
-        self.policy.reset()
-        observation = prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
-        with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(preprocessor(observation), noise=self.noise[None])
-            actions = postprocessor(actions[:, : self.policy.config.n_action_steps])
-        return actions[0].cpu().numpy()
 
 
 def parse_args(description: str, backend: str) -> argparse.Namespace:
@@ -551,35 +471,8 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--tolerance", type=float, default=5.0, help="Largest allowed action error, robot units."
     )
-    add_backend_args(parser, backend)
-    if backend == "onnx_tensorrt":
-        parser.add_argument(
-            "--step_engine",
-            action="store_true",
-            help="Export the prefix, one denoising step and the actions as three engines.",
-        )
-    if backend == "executorch_tensorrt":
-        parser.add_argument(
-            "--step_engine",
-            action="store_true",
-            help="Export the chunk as separate programs, each loading only its own weights from the checkpoint.",
-        )
-        parser.add_argument("--part", help="Build only this program of --step_engine, in an existing folder.")
-        parser.add_argument(
-            "--layers_per_program",
-            type=int,
-            default=6,
-            help="Language model layers in each program with --step_engine; fewer need less memory.",
-        )
-        parser.add_argument(
-            "--workspace_gib", type=float, help="Most scratch memory a TensorRT layer may use."
-        )
-        parser.add_argument(
-            "--optimization_level", type=int, choices=range(6), help="Lower builds faster, with less memory."
-        )
-        parser.add_argument(
-            "--offload_module_to_cpu",
-            action="store_true",
-            help="Move each program's PyTorch weights to the CPU while TensorRT builds its engine.",
-        )
+    parser.add_argument(
+        "--part", help="Build only this program, in an existing folder. The script sets it itself."
+    )
+    parser.set_defaults(backend=backend)
     return parser.parse_args()

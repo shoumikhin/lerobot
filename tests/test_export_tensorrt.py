@@ -185,9 +185,12 @@ def test_cuda_error_is_not_ignored():
 
 
 @pytest.mark.parametrize("noise_shape", [(1, 4, 3), (4, 3)])
-def test_split_loop_passes_one_timestep_for_both_contracts(tmp_path, monkeypatch, noise_shape):
+def test_chained_engines_share_scratch_and_keep_the_cache_on_device(tmp_path, monkeypatch, noise_shape):
+    from lerobot.rollout.inference.export.engine import ProgramChain
+
     times = []
     cache = object()
+    scratch = []
 
     class Engine:
         scratch_bytes = 64
@@ -195,9 +198,10 @@ def test_split_loop_passes_one_timestep_for_both_contracts(tmp_path, monkeypatch
 
         def __init__(self, path, *args, **kwargs):
             self.name = path.stem
+            self.kwargs = kwargs
 
-        def use_scratch(self, scratch):
-            pass
+        def use_scratch(self, buffer):
+            scratch.append(buffer)
 
         def run_device(self, state):
             return (cache,)
@@ -212,14 +216,18 @@ def test_split_loop_passes_one_timestep_for_both_contracts(tmp_path, monkeypatch
             return sample * timestep
 
     monkeypatch.setattr(backend, "TensorRTEngine", Engine)
-    monkeypatch.setattr(backend, "CudaStream", lambda: None)
-    monkeypatch.setattr(backend, "CudaBuffer", lambda *a: None)
+    monkeypatch.setattr(backend, "CudaStream", lambda: "stream")
+    monkeypatch.setattr(backend, "CudaBuffer", lambda *a: object())
     programs = {
-        name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
-        for name in ("prefix", "step", "actions")
+        "prefix": {"file": "prefix.engine", "inputs": ["state"], "outputs": ["past_key_0"]},
+        "step": {"file": "step.engine", "inputs": ["past_key_0", "x_t", "timestep"], "outputs": ["v_t"]},
+        "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
-    loop = backend.TensorRTDenoisingLoop(tmp_path, programs, 4)
-    result = loop(np.ones(3), np.ones(noise_shape, dtype=np.float32))
+    engines = backend.load_engines(tmp_path, programs)
+    assert all(engine.kwargs == {"own_scratch": False, "stream": "stream"} for engine in engines.values())
+    assert len(scratch) == 3 and all(buffer is scratch[0] for buffer in scratch)
+    chain = ProgramChain(engines, {"inputs": ["state", "noise"], "programs": programs, "num_steps": 4})
+    result = chain(np.ones(3), np.ones(noise_shape, dtype=np.float32))
     assert result.shape == noise_shape
     assert times == [1.0, 0.75, 0.5, 0.25]
     np.testing.assert_allclose(result, (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625))

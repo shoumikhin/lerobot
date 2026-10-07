@@ -23,6 +23,9 @@ A policy that reads the task also gets the token ids its saved text steps make f
 flow-matching policy gets the starting noise as its last input, drawn here for every chunk. A
 program compiled for one task holds that task in its weights, and `export.json` says so with
 `task_fixed`: the engine then refuses any other task.
+
+A policy too large for one program, like pi0.5, is exported as a chain of programs that `export.json`
+lists under `programs`; `ProgramChain` runs them in order with any backend.
 """
 
 from __future__ import annotations
@@ -55,33 +58,86 @@ def export_dir(path: str | Path | None) -> Path | None:
 
 
 def load_program(folder: Path, info: dict) -> Program:
-    """Load the folder's program with the backend `export.json` names."""
-    if info["backend"] == "onnx_tensorrt" and "programs" in info:
-        from .tensorrt import TensorRTDenoisingLoop
+    """Load the folder's program, or its chain of programs, with the backend `export.json` names."""
+    backend = info["backend"]
+    if backend not in ("executorch_tensorrt", "executorch_cuda", "onnx_tensorrt", "torch_tensorrt"):
+        raise ValueError(f"Unknown export backend {backend!r} in {folder / EXPORT_INFO}")
+    if "programs" in info:
+        if backend == "onnx_tensorrt":
+            from .tensorrt import load_engines
 
-        return TensorRTDenoisingLoop(folder, info["programs"], info["num_steps"])
-    if info["backend"] == "executorch_tensorrt" and "programs" in info:
-        from .executorch import ExecuTorchDenoisingLoop
-
-        return ExecuTorchDenoisingLoop(folder, info["programs"], info["num_steps"])
-    path = folder / info["file"]
-    if info["backend"] == "executorch_tensorrt":
-        from .executorch import ExecuTorchProgram
-
-        return ExecuTorchProgram(path)
-    if info["backend"] == "executorch_cuda":
-        from .executorch import ExecuTorchProgram
-
-        return ExecuTorchProgram(path, tensorrt=False)
-    if info["backend"] == "onnx_tensorrt":
+            return ProgramChain(load_engines(folder, info["programs"]), info)
+        files = {name: folder / program["file"] for name, program in info["programs"].items()}
+        return ProgramChain({name: load_one(path, backend) for name, path in files.items()}, info)
+    if backend == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 
-        return TensorRTEngine(path, info["inputs"], [info["output"]])
-    if info["backend"] == "torch_tensorrt":
+        return TensorRTEngine(folder / info["file"], info["inputs"], [info["output"]])
+    return load_one(folder / info["file"], backend)
+
+
+def load_one(path: Path, backend: str) -> Program:
+    """Load one ExecuTorch program or AOTInductor package."""
+    if backend == "torch_tensorrt":
         from .aoti import AOTInductorPackage
 
         return AOTInductorPackage(path)
-    raise ValueError(f"Unknown export backend {info['backend']!r} in {folder / EXPORT_INFO}")
+    from .executorch import ExecuTorchProgram
+
+    return ExecuTorchProgram(path, tensorrt=backend == "executorch_tensorrt")
+
+
+class ProgramChain:
+    """Run a chunk exported as a chain of programs, in the order `export.json` lists them.
+
+    Each program reads the values its `inputs` name: the frame's arrays and the noise, or the `outputs` of
+    a program before it. The program named `step` runs once per Euler step: its last two inputs are the
+    noisy actions, starting from the noise, and the time, and it returns the velocity. The chain returns
+    what the last program returns. A program with a `run_device` method hands its outputs to the next
+    programs without copying them to the host.
+    """
+
+    def __init__(self, programs: dict[str, Program], info: dict):
+        if info["num_steps"] <= 0:
+            raise ValueError("num_steps must be positive")
+        self._programs = programs
+        self._names: list[str] = info["inputs"]
+        self._inputs = {name: program["inputs"] for name, program in info["programs"].items()}
+        self._outputs = {name: program["outputs"] for name, program in info["programs"].items()}
+        self._num_steps: int = info["num_steps"]
+
+    @property
+    def input_shape(self) -> tuple[int, ...] | None:
+        return getattr(next(iter(self._programs.values())), "input_shape", None)
+
+    def initialize(self, *inputs: np.ndarray) -> np.ndarray:
+        return self._run(inputs, initialize=True)
+
+    def __call__(self, *inputs: np.ndarray) -> np.ndarray:
+        return self._run(inputs)
+
+    def _run(self, inputs: tuple[np.ndarray, ...], initialize: bool = False) -> np.ndarray:
+        values = dict(zip(self._names, inputs, strict=True))
+        *names, last = self._programs
+        for name in names:
+            program, input_names = self._programs[name], self._inputs[name]
+            if name == "step":
+                cache = [values[n] for n in input_names[:-2]]
+                sample, dt = values[NOISE], -1.0 / self._num_steps
+                for step in range(self._num_steps):
+                    timestep = np.array([1.0 + step * dt], dtype=np.float32)
+                    sample = sample + dt * _call(program, initialize and step == 0)(*cache, sample, timestep)
+                values[input_names[-2]] = sample
+                continue
+            run = getattr(program, "run_device", None) or _call(program, initialize)
+            outputs = run(*(values[n] for n in input_names))
+            outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+            values.update(zip(self._outputs[name], outputs, strict=True))
+        return _call(self._programs[last], initialize)(*(values[n] for n in self._inputs[last]))
+
+
+def _call(program: Program, initialize: bool) -> Program:
+    return getattr(program, "initialize", program) if initialize else program
 
 
 class ExportInferenceEngine(InferenceEngine):

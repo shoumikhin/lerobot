@@ -70,6 +70,7 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
     }
     info = {
         "backend": "executorch_tensorrt",
+        "inputs": ["observation.state", "noise"],
         "programs": {
             name: {"file": f"{name}.pte", "inputs": inputs, "outputs": outputs}
             for name, (inputs, outputs) in names.items()
@@ -121,6 +122,7 @@ def test_executorch_chained_prefix_programs(tmp_path, monkeypatch):
     }
     info = {
         "backend": "executorch_tensorrt",
+        "inputs": ["observation.state", "noise"],
         "programs": {
             name: {"file": f"{name}.pte", "inputs": inputs, "outputs": outputs}
             for name, (inputs, outputs) in names.items()
@@ -223,11 +225,11 @@ def test_executorch_does_not_retry_execution_errors(tmp_path, monkeypatch, error
     assert all(isinstance(call[0], np.ndarray) for call in calls)
 
 
-def test_executorch_invalid_step_count(tmp_path):
-    from lerobot.rollout.inference.export.executorch import ExecuTorchDenoisingLoop
+def test_program_chain_invalid_step_count():
+    from lerobot.rollout.inference.export.engine import ProgramChain
 
     with pytest.raises(ValueError, match="num_steps"):
-        ExecuTorchDenoisingLoop(tmp_path, {}, 0)
+        ProgramChain({}, {"num_steps": 0, "inputs": [], "programs": {}})
 
 
 @pytest.mark.parametrize("image_first", [False, True])

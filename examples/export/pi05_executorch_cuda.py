@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export a trained pi0.5 policy as an ExecuTorch program that runs on ExecuTorch's CUDA backend.
+"""Export a trained pi0.5 policy as ExecuTorch programs that run on ExecuTorch's CUDA backend.
 
-The CUDA backend compiles the policy with AOTInductor into CUDA and Triton kernels, without
-TensorRT, and saves the weights in a `.ptd` file beside the program. Run it on the device the
-policy will run on, because the kernels are tuned for the GPU that compiles them:
+The CUDA backend compiles each program with AOTInductor into CUDA and Triton kernels, without
+TensorRT, and saves its weights in a `.ptd` file beside it. Run it on the device the policy will
+run on, because the kernels are tuned for the GPU that compiles them:
 
     python examples/export/pi05_executorch_cuda.py \
         --policy.path=outputs/train/pi05_so101/checkpoints/last/pretrained_model \
@@ -27,33 +27,33 @@ policy will run on, because the kernels are tuned for the GPU that compiles them
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
 """
 
+from pathlib import Path
+
 import torch
 from executorch.backends.cuda.cuda_backend import CudaBackend
 from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
-from pi05_recipe import PI05Export, parse_args
+from pi05_recipe import export_parts, parse_args
+from torch import nn
 
 
-def main() -> None:
-    args = parse_args(__doc__, "executorch_cuda")
-    export = PI05Export(args)
-    pte_path = export.output_dir / "model.pte"
-
+def compile_part(
+    module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
+):
     with torch.no_grad():
-        program = torch.export.export(export.module, export.inputs)
+        program = torch.export.export(module, inputs)
     # Compile the whole program into one CUDA delegate, as ExecuTorch's CUDA example does.
     lowered = to_edge_transform_and_lower(
         program,
         partitioner=[CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])],
         compile_config=EdgeCompileConfig(_check_ir_validity=False, _skip_dim_order=True),
     )
-    del program
-    export.release_policy()
     executorch_program = lowered.to_executorch()
-    executorch_program.save(str(pte_path))
-    executorch_program.write_tensor_data_to_file(str(export.output_dir))
-    export.write(pte_path)
+    # Every program's weights file has the same name, so each program gets its own folder.
+    path.parent.mkdir()
+    executorch_program.save(str(path))
+    executorch_program.write_tensor_data_to_file(str(path.parent))
 
 
 if __name__ == "__main__":
-    main()
+    export_parts(parse_args(__doc__, "executorch_cuda"), __file__, "{name}/{name}.pte", compile_part)

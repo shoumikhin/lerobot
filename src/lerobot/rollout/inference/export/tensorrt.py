@@ -152,7 +152,10 @@ def numpy_dtype(dtype):
 
 
 class TensorRTEngine:
-    """Run a fixed-shape engine; related engines can share a stream and scratch allocation."""
+    """Run a fixed-shape engine; related engines can share a stream and scratch allocation.
+
+    `run_device` keeps the outputs in device buffers, which another engine on the same stream can read.
+    """
 
     def __init__(
         self,
@@ -245,38 +248,19 @@ class TensorRTEngine:
         self._engine = None
 
 
-class TensorRTDenoisingLoop:
-    """Integrate a three-engine export while its attention cache stays on the device."""
+def load_engines(folder: Path, programs: dict[str, dict]) -> dict[str, TensorRTEngine]:
+    """Load a chain's engines on one stream, with one scratch allocation the size of the largest.
 
-    def __init__(self, folder: Path, programs: dict[str, dict], num_steps: int):
-        if num_steps <= 0:
-            raise ValueError("num_steps must be positive")
-        self._stream = CudaStream()
-        self._prefix, self._step, self._actions = engines = [
-            TensorRTEngine(
-                folder / program["file"],
-                program["inputs"],
-                program["outputs"],
-                own_scratch=False,
-                stream=self._stream,
-            )
-            for program in (programs["prefix"], programs["step"], programs["actions"])
-        ]
-        self._scratch = CudaBuffer((max(engine.scratch_bytes for engine in engines),), np.uint8)
-        for engine in engines:
-            engine.use_scratch(self._scratch)
-        self._num_steps = num_steps
-
-    @property
-    def input_shape(self) -> tuple[int, ...]:
-        return self._prefix.input_shape
-
-    def __call__(self, *inputs: np.ndarray) -> np.ndarray:
-        *observation, noise = inputs
-        cache = self._prefix.run_device(*observation)
-        dt = -1.0 / self._num_steps
-        sample = noise
-        for step in range(self._num_steps):
-            timestep = np.array([1.0 + step * dt], dtype=np.float32)
-            sample = sample + dt * self._step(*cache, sample, timestep)
-        return self._actions(sample)
+    The engines run one after another, so none needs its own scratch.
+    """
+    stream = CudaStream()
+    engines = {
+        name: TensorRTEngine(
+            folder / program["file"], program["inputs"], program["outputs"], own_scratch=False, stream=stream
+        )
+        for name, program in programs.items()
+    }
+    scratch = CudaBuffer((max(engine.scratch_bytes for engine in engines.values()),), np.uint8)
+    for engine in engines.values():
+        engine.use_scratch(scratch)
+    return engines

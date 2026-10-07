@@ -808,44 +808,77 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
     assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_trt.IGpuAllocator)
 
 
-def test_tensorrt_denoising_loop_runs_the_step_engine_once_per_euler_step():
-    """The prefix runs once, the step engine once per Euler step from time 1 down, then the actions engine."""
-    from lerobot.rollout.inference.export.tensorrt import TensorRTDenoisingLoop
+@pytest.mark.parametrize(
+    "backend", ["executorch_tensorrt", "executorch_cuda", "onnx_tensorrt", "torch_tensorrt"]
+)
+def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, backend):
+    from lerobot.rollout.inference.export import engine as export_engine, tensorrt as export_tensorrt
 
-    cache = (np.array([[True]]), np.array([2.0]))
-    times = []
+    loaded = []
+    monkeypatch.setattr(
+        export_engine, "load_one", lambda path, name: loaded.append((path.name, name)) or path.name
+    )
+    monkeypatch.setattr(
+        export_tensorrt, "load_engines", lambda folder, programs: dict.fromkeys(programs, "engine")
+    )
+    programs = {
+        name: {"file": f"{name}.bin", "inputs": [], "outputs": []} for name in ("embed", "step", "actions")
+    }
+    info = {"backend": backend, "inputs": ["noise"], "programs": programs, "num_steps": 10}
 
-    def step(*inputs):
-        *step_cache, x_t, timestep = inputs
-        assert all(given is made for given, made in zip(step_cache, cache, strict=True))
+    chain = export_engine.load_program(tmp_path, info)
+
+    assert isinstance(chain, export_engine.ProgramChain)
+    if backend == "onnx_tensorrt":
+        assert loaded == [] and chain._programs == dict.fromkeys(programs, "engine")
+    else:
+        assert loaded == [(f"{name}.bin", backend) for name in programs]
+
+
+def test_program_chain_runs_each_program_once_and_the_step_once_per_euler_step():
+    """Programs run in order, each reading the values its inputs name; the step integrates from the noise."""
+    from lerobot.rollout.inference.export.engine import ProgramChain
+
+    calls, times = [], []
+
+    def program(name, function):
+        def run(*inputs):
+            calls.append(name)
+            return function(*inputs)
+
+        return run
+
+    def step(mask, key_0, key_1, x_t, timestep):
         times.append(timestep.item())
         return x_t * timestep
 
-    loop = TensorRTDenoisingLoop.__new__(TensorRTDenoisingLoop)
-    loop._prefix = SimpleNamespace(run_device=lambda state: cache)
-    loop._step = step
-    loop._actions = lambda x_0: 10 * x_0
-    loop._num_steps = 4
+    programs = {
+        "embed": program("embed", lambda state: (state + 1, np.array([[True]]))),
+        "language_model_0": program("language_model_0", lambda hidden, mask: (2 * hidden, 3 * hidden)),
+        "language_model_1": program("language_model_1", lambda hidden, mask: 5 * hidden),
+        "step": program("step", step),
+        "actions": program("actions", lambda x_0: 10 * x_0),
+    }
+    names = {
+        "embed": (["observation.state"], ["prefix_embs", "prefix_pad_masks"]),
+        "language_model_0": (["prefix_embs", "prefix_pad_masks"], ["hidden_0", "past_key_0"]),
+        "language_model_1": (["hidden_0", "prefix_pad_masks"], ["past_key_1"]),
+        "step": (["prefix_pad_masks", "past_key_0", "past_key_1", "x_t", "timestep"], ["v_t"]),
+        "actions": (["x_t"], ["action"]),
+    }
+    info = {
+        "inputs": ["observation.state", "noise"],
+        "programs": {name: {"inputs": i, "outputs": o} for name, (i, o) in names.items()},
+        "num_steps": 4,
+    }
 
-    actions = loop(np.zeros((1, 3)), np.ones((1, 2, 3)))
+    actions = ProgramChain(programs, info)(np.zeros((1, 3)), np.ones((1, 2, 3)))
 
+    assert calls == ["embed", "language_model_0", "language_model_1", *["step"] * 4, "actions"]
     assert times == [1.0, 0.75, 0.5, 0.25]
     # x <- x + dt * v with dt = -1/4 and v = x * t, from x = 1.
     expected = 10 * (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625)
     np.testing.assert_allclose(actions, np.full((1, 2, 3), expected))
-
-
-def test_load_program_runs_a_chunk_split_into_engines_as_a_denoising_loop(tmp_path, monkeypatch):
-    from lerobot.rollout.inference.export import engine as export_engine, tensorrt as export_tensorrt
-
-    monkeypatch.setattr(export_tensorrt, "TensorRTDenoisingLoop", lambda *args: args)
-    programs = {
-        name: {"file": f"{name}.engine", "inputs": [], "outputs": []}
-        for name in ("prefix", "step", "actions")
-    }
-    info = {"backend": "onnx_tensorrt", "programs": programs, "num_steps": 10}
-
-    assert export_engine.load_program(tmp_path, info) == (tmp_path, programs, 10)
 
 
 def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, monkeypatch):

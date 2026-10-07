@@ -126,15 +126,13 @@ def main() -> None:
     info = json.loads((args.folder / "export.json").read_text())
 
     if info["backend"] == "onnx_tensorrt":
-        # A chunk exported with --step_engine has one ONNX file per engine, named like its program.
-        for name, program in info.get("programs", {"model": info}).items():
-            build_engine(
-                args.folder / f"{name}.onnx",
-                args.folder / program["file"],
-                args.workspace_gib,
-                args.tactic_gib,
-                args.optimization_level,
-            )
+        build_engine(
+            args.folder / "model.onnx",
+            args.folder / info["file"],
+            args.workspace_gib,
+            args.tactic_gib,
+            args.optimization_level,
+        )
     else:
         start = time.perf_counter()
         build_executorch(args.folder, info["file"], args)
