@@ -101,7 +101,7 @@ def recipe(monkeypatch):
     return importlib.import_module("groot_recipe")
 
 
-def tiny_head(alternate=True, interleave=True):
+def tiny_head(alternate=True, interleave=True, num_layers=5):
     from lerobot.policies.groot.groot_n1_7 import GR00TN17ActionHead, GR00TN17Config
 
     config = GR00TN17Config(
@@ -116,7 +116,7 @@ def tiny_head(alternate=True, interleave=True):
         num_inference_timesteps=3,
         use_alternate_vl_dit=alternate,
         diffusion_model_cfg={
-            "num_layers": 5,
+            "num_layers": num_layers,
             "num_attention_heads": 4,
             "attention_head_dim": 8,
             "output_dim": 16,
@@ -297,6 +297,102 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
             if not part.last:
                 hidden, temb = result if part.start == 0 else (result, inputs[-1])
                 inputs = (features, hidden, temb)
+
+
+def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tmp_path):
+    onnx = pytest.importorskip("onnx")
+    onnxruntime = pytest.importorskip("onnxruntime")
+    pytest.importorskip("onnxscript")
+
+    from lerobot.rollout.inference.export.engine import ProgramChain
+    from lerobot.utils.constants import ACTION
+
+    class Prefix(torch.nn.Module):
+        last = True
+
+        def forward(self, features, state):
+            return features, state
+
+    torch.manual_seed(14)
+    head = tiny_head(num_layers=25)
+    features, state, noise = torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4)
+    text = SimpleNamespace(get_input_embeddings=lambda: torch.nn.Embedding(32, 32))
+    export = recipe.GrootExport.__new__(recipe.GrootExport)
+    export.__dict__.update(
+        policy=SimpleNamespace(_groot_model=SimpleNamespace(backbone=SimpleNamespace(visual=None))),
+        frame_processor=None,
+        batch={"image_grid_thw": None, "input_ids": torch.zeros(1, 5, dtype=torch.long)},
+        config=SimpleNamespace(use_bf16=False, output_features={ACTION: SimpleNamespace(shape=(3,))}),
+        model_config=SimpleNamespace(
+            select_layer=1, diffusion_model_cfg={"num_layers": 25}, add_pos_embed=False
+        ),
+        constants=constants(),
+        inputs=(features, state, noise),
+        input_names=["features", "state", "noise"],
+        noise=noise,
+        timesteps=[0, 333, 666],
+        num_steps=3,
+        horizon=2,
+        postprocessor=torch.nn.Identity(),
+    )
+    # Keep the prefix tiny while exercising the real recipe's diffusion modules and names.
+    monkeypatch.setattr(recipe, "GrootVision", lambda *args: Prefix())
+    monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: Prefix())
+    monkeypatch.setattr(
+        export,
+        "load_part",
+        lambda *args: SimpleNamespace(
+            _groot_model=SimpleNamespace(
+                backbone=SimpleNamespace(language_model=text), action_head=deepcopy(head)
+            )
+        ),
+    )
+    sessions = {}
+
+    def check_engine(onnx_path, engine_path, **options):
+        onnx.checker.check_model(onnx.load(onnx_path), full_check=True)
+        sessions[engine_path.stem] = onnxruntime.InferenceSession(
+            str(onnx_path), providers=["CPUExecutionProvider"]
+        )
+
+    monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=check_engine))
+    script = Path(recipe.__file__).with_name("groot_onnx_tensorrt.py")
+    compile_part = runpy.run_path(str(script))["compile_part"]
+    programs, metadata = {}, {}
+
+    class Program:
+        def __init__(self, session, input_names):
+            self.session, self.input_names = session, input_names
+
+        def __call__(self, *arrays):
+            outputs = self.session.run(None, dict(zip(self.input_names, arrays, strict=True)))
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    for name, module, inputs, input_names, output_names in export.parts():
+        if not (name.startswith("step_") or name == "actions"):
+            continue
+        compile_part(module, inputs, input_names, output_names, tmp_path / f"{name}.engine")
+        session = sessions[name]
+        assert [value.name for value in session.get_inputs()] == input_names
+        assert [value.name for value in session.get_outputs()] == output_names
+        programs[name] = Program(session, input_names)
+        metadata[name] = {"inputs": input_names, "outputs": output_names}
+        with torch.no_grad():
+            expected = module(*inputs)
+        expected = expected if isinstance(expected, tuple) else (expected,)
+        actual = session.run(None, dict(zip(input_names, [x.numpy() for x in inputs], strict=True)))
+        for got, want in zip(actual, expected, strict=True):
+            np.testing.assert_allclose(got, want.numpy(), rtol=1e-5, atol=1e-5)
+    assert list(programs) == ["step_0", "step_1", "step_2", "step_3", "actions"]
+    info = {
+        "inputs": ["vl_embeds", "state_features", "noise"],
+        "programs": metadata,
+        "num_steps": export.num_steps,
+        "timesteps": export.timesteps,
+        "dt": 1 / export.num_steps,
+    }
+    actual = ProgramChain(programs, info)(features.numpy(), state.numpy(), noise.numpy())
+    np.testing.assert_allclose(actual, export.expected_actions, rtol=1e-5, atol=1e-5)
 
 
 def test_export_parts_uses_a_fresh_process_for_each_part(recipe, monkeypatch, tmp_path):

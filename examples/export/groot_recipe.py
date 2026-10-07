@@ -754,16 +754,16 @@ class GrootExport:
                 names = (
                     ["vl_embeds", "state_features", "x_t", "time_bucket"]
                     if first == 0
-                    else ["vl_embeds", "step_hidden", "temb"]
+                    else ["vl_embeds", f"step_hidden_{group - 1}", "temb"]
                 )
                 with torch.no_grad():
                     result = module(*inputs)
                 if module.last:
                     outputs = ["velocity"]
                 elif first == 0:
-                    outputs = ["step_hidden", "temb"]
+                    outputs = [f"step_hidden_{group}", "temb"]
                 else:
-                    outputs = ["step_hidden"]
+                    outputs = [f"step_hidden_{group}"]
                 if iteration == 0:
                     yield f"step_{group}", module, inputs, names, outputs
                 if module.last:
