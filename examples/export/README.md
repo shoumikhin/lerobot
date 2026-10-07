@@ -217,22 +217,9 @@ Orin Nano:
 
 ExecuTorch-TensorRT uses about half of PyTorch's memory or less. ONNX-TensorRT uses less today; it is the only route that does not load PyTorch.
 
-## Which routes load PyTorch
-
-Distinct `libtorch` and `libc10` libraries mapped by the running `lerobot-rollout` process, read from `/proc/<pid>/maps` in every rollout above:
-
-| route                    | mapped PyTorch libraries |
-| ------------------------ | ------------------------ |
-| `onnx_tensorrt`          | 0                        |
-| `executorch_tensorrt`    | 8                        |
-| `torch_tensorrt`         | 8                        |
-| PyTorch, `torch.compile` | 8                        |
-
-The public ExecuTorch Python bindings load PyTorch today.
-
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's three TensorRT exports finished only by using swap, with peaks of 4.0 to 5.6 GiB. When running, the load peaks there are 504 MiB for ACT and 891 MiB for SmolVLA with ExecuTorch-TensorRT, 268 and 390 MiB with ONNX-TensorRT, and 1307 and 5381 MiB with Torch-TensorRT. pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
-- **GR00T resize runs outside the program**, using NumPy antialiased bicubic sampling because the operator is not supported by every compiler route. The chunk times above include it.
-- **Legacy SmolVLA text-step folders load PyTorch** for tokenization, including with ONNX-TensorRT. Current raw-frame exports keep the fixed task's tokens in the program.
-- **Replay and saved-case agreement do not prove physical task success.** Older pi0.5 rollouts stopped at camera validation. In this run the pi0.5 checkpoint already used the robot's camera names, so its rollouts needed no rename map.
+- **Orin Nano memory.** The board has 8 GB. SmolVLA needs swap to compile there. pi0.5 and GR00T are still being measured.
+- **GR00T resizes images outside the program**, with NumPy, because not every route supports that operator. Its latency includes the resize.
+- **Older SmolVLA folders load PyTorch** for tokenization, even with ONNX-TensorRT. New exports keep the task's tokens in the program.
+- **These checks prove the compiled policy matches PyTorch, not that the robot completes the task.**
