@@ -479,7 +479,7 @@ class GrootStep(nn.Module):
                 hidden = self.norm_out(hidden) * (1 + scale[:, None]) + shift[:, None]
                 prediction = self.action_decoder(self.proj_out_2(hidden), self.embodiment_id)
                 return prediction[0, -self.horizon :].float()
-            return hidden, temb
+            return (hidden, temb) if self.start == 0 else hidden
 
 
 class GrootActions(nn.Module):
@@ -758,13 +758,18 @@ class GrootExport:
                 )
                 with torch.no_grad():
                     result = module(*inputs)
-                outputs = ["velocity"] if module.last else ["step_hidden", "temb"]
+                if module.last:
+                    outputs = ["velocity"]
+                elif first == 0:
+                    outputs = ["step_hidden", "temb"]
+                else:
+                    outputs = ["step_hidden"]
                 if iteration == 0:
                     yield f"step_{group}", module, inputs, names, outputs
                 if module.last:
                     actions = actions + (1.0 / self.num_steps) * result
                 else:
-                    step_inputs = result
+                    step_inputs = result if first == 0 else (result, step_inputs[-1])
                 del module
         free_memory()
         module = GrootActions(self.horizon, self.config.output_features[ACTION].shape[0], self.postprocessor)

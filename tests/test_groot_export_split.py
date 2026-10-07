@@ -269,7 +269,7 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
     programs["actions"] = Program(recipe.GrootActions(2, 3, torch.nn.Identity()), "actions")
     names = {
         "step_0": (["vl", "state", "x_t", "time"], ["hidden", "temb"]),
-        "step_1": (["vl", "hidden", "temb"], ["hidden", "temb"]),
+        "step_1": (["vl", "hidden", "temb"], ["hidden"]),
         "step_2": (["vl", "hidden", "temb"], ["velocity"]),
         "actions": (["x_t"], ["actions"]),
     }
@@ -293,7 +293,8 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, result, rtol=0, atol=0)
             if not part.last:
-                inputs = (features, *result)
+                hidden, temb = result if part.start == 0 else (result, inputs[-1])
+                inputs = (features, hidden, temb)
 
 
 def test_export_parts_uses_a_fresh_process_for_each_part(recipe, monkeypatch, tmp_path):
