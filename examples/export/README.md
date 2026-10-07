@@ -81,7 +81,7 @@ The omitted camera slot uses the policy's own padding. Map the robot's names to 
 
 ### Export once, build on each device
 
-With `--export_only`, the `executorch_tensorrt` and `onnx_tensorrt` scripts save the exported graph without building its TensorRT engine. Copy the folder to the target device, then build there:
+With `--export_only`, the ACT, SmolVLA and GR00T `executorch_tensorrt` and `onnx_tensorrt` scripts save the exported graph without building its TensorRT engine. Copy the folder to the target device, then build there:
 
 ```bash
 python examples/export/act_onnx_tensorrt.py \
@@ -143,9 +143,9 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> Cells marked pending are still being measured.
+> Cells marked pending are still being measured. GR00T on the Orin Nano is not exported yet.
 
-Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
+Five ways to run each policy: three TensorRT routes, `torch.compile` and PyTorch. Bold marks the best value in each row. pi0.5 is exported as a chain of small programs on every route (see Compile a policy), so it fits the 8 GB Orin Nano. Thor runs at MAXN power with locked clocks; the Orin Nano runs with a locked GPU clock.
 
 ### Accuracy
 
@@ -157,17 +157,17 @@ Thor:
 | ------- | ------------------: | ---------------: | -------------: | -------------------: |
 | ACT     |        0.11 / 0.005 |     0.12 / 0.005 |   0.11 / 0.005 | **0.06** / **0.001** |
 | SmolVLA |        2.23 / 0.070 | **1.46** / 0.061 |   2.23 / 0.070 |     1.83 / **0.057** |
-| pi0.5   |        2.98 / 0.108 |     4.80 / 0.125 |   2.98 / 0.108 | **1.60** / **0.099** |
+| pi0.5   |        2.44 / 0.121 |     4.72 / 0.140 |   2.44 / 0.121 | **1.60** / **0.099** |
 | GR00T   |        2.97 / 0.092 |     1.60 / 0.088 |   2.97 / 0.092 | **1.08** / **0.068** |
 
 Orin Nano:
 
-|         | ExecuTorch-TensorRT |    ONNX-TensorRT |   Torch-TensorRT |      `torch.compile` |
-| ------- | ------------------: | ---------------: | ---------------: | -------------------: |
-| ACT     |        0.10 / 0.005 |     0.11 / 0.005 |     0.10 / 0.005 | **0.07** / **0.002** |
-| SmolVLA |    1.59 / **0.054** | **1.46** / 0.058 | 1.59 / **0.054** |         2.05 / 0.059 |
-| pi0.5   |             pending |          pending |          pending |              pending |
-| GR00T   |             pending |          pending |          pending |              pending |
+|         | ExecuTorch-TensorRT |        ONNX-TensorRT |   Torch-TensorRT |      `torch.compile` |
+| ------- | ------------------: | -------------------: | ---------------: | -------------------: |
+| ACT     |        0.10 / 0.005 |         0.11 / 0.005 |     0.10 / 0.005 | **0.07** / **0.002** |
+| SmolVLA |    1.59 / **0.054** |     **1.46** / 0.058 | 1.59 / **0.054** |         2.05 / 0.059 |
+| pi0.5   |    3.80 / **0.138** | **3.16** / **0.138** |    fails to load |              pending |
+| GR00T   |             pending |              pending |          pending |              pending |
 
 All routes stay within the tolerance that each exported folder checks before the robot moves.
 
@@ -181,7 +181,7 @@ Thor:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |            **3.43** |          3.50 |           3.70 |           12.80 |   15.91 |
 | SmolVLA |           **28.17** |         30.95 |          29.20 |           44.47 |   166.7 |
-| pi0.5   |           **105.4** |         124.7 |          106.3 |           129.9 |   244.2 |
+| pi0.5   |               121.7 |     **116.0** |          119.2 |           129.9 |   244.2 |
 | GR00T   |               93.30 |         97.84 |      **88.98** |           206.7 |   211.5 |
 
 Orin Nano:
@@ -190,10 +190,10 @@ Orin Nano:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |           **25.65** |         26.36 |          26.26 |           61.53 |   64.60 |
 | SmolVLA |           **125.6** |         130.5 |          136.0 |           172.3 |   762.0 |
-| pi0.5   |             pending |       pending |        pending |         pending | pending |
+| pi0.5   |               748.8 |     **625.5** |  fails to load |         not run | not run |
 | GR00T   |             pending |       pending |        pending |         pending | pending |
 
-ExecuTorch-TensorRT is 2 to 6 times faster than PyTorch, and the fastest route on ACT, SmolVLA and pi0.5. Torch-TensorRT is the fastest on GR00T.
+ExecuTorch-TensorRT is 2 to 6 times faster than PyTorch, and the fastest route on ACT and SmolVLA. Torch-TensorRT is the fastest on GR00T, and ONNX-TensorRT on pi0.5.
 
 ### Memory
 
@@ -205,7 +205,7 @@ Thor:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |       **520** (829) |           557 |           1510 |            2489 |    2327 |
 | SmolVLA |     **1190** (1535) |          1278 |           3233 |            4422 |    3940 |
-| pi0.5   |     **5790** (6082) |          6230 |           6247 |           12215 |   11610 |
+| pi0.5   |         6610 (6903) |      **5914** |           7072 |           12215 |   11610 |
 | GR00T   |         5700 (6007) |      **5486** |           6190 |           16684 |   15402 |
 
 Orin Nano:
@@ -214,14 +214,14 @@ Orin Nano:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |           330 (493) |       **223** |            579 |            1651 |    1140 |
 | SmolVLA |           790 (940) |       **370** |           1499 |            2818 |    2034 |
-| pi0.5   |             pending |       pending |        pending |         pending | pending |
+| pi0.5   |         5560 (5731) |      **4875** |  fails to load |         not run | not run |
 | GR00T   |             pending |       pending |        pending |         pending | pending |
 
-ExecuTorch-TensorRT uses about half of PyTorch's memory or less. Today ONNX-TensorRT uses less, as the only route that does not load PyTorch. Without PyTorch, ExecuTorch-TensorRT would use the least on Thor for ACT, SmolVLA and pi0.5.
+ExecuTorch-TensorRT uses about half of PyTorch's memory or less. Today ONNX-TensorRT uses less, as the only route that does not load PyTorch. Without PyTorch, ExecuTorch-TensorRT would use the least on Thor for ACT and SmolVLA. On the Orin Nano, pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT, while Torch-TensorRT runs out of memory loading it.
 
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. SmolVLA needs swap to compile there. pi0.5 and GR00T are still being measured.
+- **Orin Nano memory.** The board has 8 GB. SmolVLA and pi0.5 need swap to compile there. GR00T is not exported there yet.
 - **GR00T resizes images outside the program**, with NumPy, because not every route supports that operator. Its latency includes the resize.
 - **Older SmolVLA folders load PyTorch** for tokenization, even with ONNX-TensorRT. New exports keep the task's tokens in the program.
 - **These checks prove the compiled policy matches PyTorch, not that the robot completes the task.**
