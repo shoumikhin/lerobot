@@ -167,7 +167,7 @@ Orin Nano:
 | pi0.5   |             pending |          pending |          pending |              pending |
 | GR00T   |             pending |          pending |          pending |              pending |
 
-All routes match PyTorch within the check that runs before the robot moves.
+All routes stay within the tolerance that each exported folder checks before the robot moves.
 
 ### Latency
 
