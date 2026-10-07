@@ -6,7 +6,7 @@ Export a trained LeRobot policy, then run the compiled folder with `lerobot-roll
 
 - [SO-101](../../docs/source/so101.mdx) arm with a scene camera and a wrist camera
 - [Jetson AGX Thor](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/), to train, export and run
-- [Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/), to export and run ACT (see Limits)
+- [Jetson Orin Nano Super](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/nano-super-developer-kit/), to export and run ACT and SmolVLA (see Limits)
 
 ## Routes
 
@@ -143,7 +143,7 @@ Add `--robot.log_path=actions.npz` to save actions and timestamps. Replay tests 
 ## Results
 
 > [!NOTE]
-> Partly provisional. Every number below was measured on 2026-10-06 with this fork and with ExecuTorch and Torch-TensorRT built from source, including the fixes the install step expects in the nightlies. Cells marked "pending" are not measured yet: the `executorch_cuda` and `torch_tensorrt` routes of pi0.5 and GR00T on Thor, and SmolVLA `torch.compile` and rollouts, pi0.5 and GR00T on the Orin Nano. Until those are in, these tables do not rank Torch-TensorRT for pi0.5 or GR00T.
+> Partly provisional. Every number below was measured on 2026-10-06 with this fork and with ExecuTorch and Torch-TensorRT built from source, including the fixes the install step expects in the nightlies. Cells marked "pending" are not measured yet: the `executorch_cuda` routes of pi0.5 and GR00T and pi0.5 `torch_tensorrt` on Thor, and SmolVLA `torch.compile`, pi0.5 and GR00T on the Orin Nano. Until those are in, these tables do not rank Torch-TensorRT for pi0.5.
 
 Thor: JetPack 7.2.1, power mode MAXN, CPU, GPU and memory clocks locked. Orin Nano Super: JetPack 7.2.1, GPU clock locked at 1020 MHz. Every folder was exported on the board that ran it.
 
@@ -159,10 +159,10 @@ The median time to compute one action chunk: 100 chunks after 20 warm-up chunks 
 | SmolVLA | Orin Nano | 125.6                 | no script         | 130.5           | 136.0            | 762.0   | pending         |
 | pi0.5   | Thor      | 105.4                 | pending           | 124.7           | pending          | 244.2   | 129.9           |
 | pi0.5   | Orin Nano | pending               | pending           | pending         | pending          | pending | pending         |
-| GR00T   | Thor      | 93.30                 | pending           | 97.84           | pending          | 211.5   | 206.7           |
+| GR00T   | Thor      | 93.30                 | pending           | 97.84           | 88.98            | 211.5   | 206.7           |
 | GR00T   | Orin Nano | pending               | pending           | pending         | pending          | pending | pending         |
 
-Where the TensorRT routes have been compared (ACT and SmolVLA on both boards, pi0.5 and GR00T against ONNX-TensorRT on Thor), ExecuTorch-TensorRT has the lowest chunk time. On ACT its lead over the next TensorRT route is small, about 2%: 3.43 against 3.50 ms for ONNX-TensorRT on Thor, and 25.65 against 26.26 ms for Torch-TensorRT on the Orin Nano. On SmolVLA it takes 3.5% less time than Torch-TensorRT and 9% less than ONNX-TensorRT on Thor, and 3.7% less than ONNX-TensorRT and 7.6% less than Torch-TensorRT on the Orin Nano. On Thor it takes 15% less time than ONNX-TensorRT on pi0.5 (105.4 against 124.7 ms) and 4.6% less on GR00T (93.30 against 97.84 ms). It is faster than PyTorch in every measured row: 4.6 times on ACT (Thor), 2.5 times on ACT (Orin Nano), 5.9 times on SmolVLA (Thor), 6.1 times on SmolVLA (Orin Nano), 2.3 times on pi0.5 and 2.3 times on GR00T. It also beats `torch.compile` in every measured row, by 1.2 times (pi0.5) to 3.7 times (ACT on Thor).
+ExecuTorch-TensorRT has the lowest chunk time of the TensorRT routes on ACT and SmolVLA on both boards, and on pi0.5 against ONNX-TensorRT on Thor. On GR00T, Torch-TensorRT is faster. On ACT its lead over the next TensorRT route is small, about 2%: 3.43 against 3.50 ms for ONNX-TensorRT on Thor, and 25.65 against 26.26 ms for Torch-TensorRT on the Orin Nano. On SmolVLA it takes 3.5% less time than Torch-TensorRT and 9% less than ONNX-TensorRT on Thor, and 3.7% less than ONNX-TensorRT and 7.6% less than Torch-TensorRT on the Orin Nano. On pi0.5 it takes 15% less time than ONNX-TensorRT (105.4 against 124.7 ms). On GR00T, Torch-TensorRT takes 4.6% less time than ExecuTorch-TensorRT (88.98 against 93.30 ms), which takes 4.6% less than ONNX-TensorRT (97.84 ms). It is faster than PyTorch in every measured row: 4.6 times on ACT (Thor), 2.5 times on ACT (Orin Nano), 5.9 times on SmolVLA (Thor), 6.1 times on SmolVLA (Orin Nano), 2.3 times on pi0.5 and 2.3 times on GR00T. It also beats `torch.compile` in every measured row, by 1.2 times (pi0.5) to 3.7 times (ACT on Thor).
 
 ### Rollout latency and memory
 
@@ -186,22 +186,27 @@ The official `lerobot-rollout` with the [replay robot](replay_robot) at 30 Hz fo
 | SmolVLA | Thor      | `torch_tensorrt`      | 29.94    | 30.1            | 2417.5           |
 | SmolVLA | Thor      | PyTorch               | 27.45    | 171.9           | 3068.6           |
 | SmolVLA | Thor      | `torch.compile`       | n/a      | still compiling | 4033.4           |
+| SmolVLA | Orin Nano | `executorch_tensorrt` | 28.31    | 126.9           | 1946.9           |
+| SmolVLA | Orin Nano | `onnx_tensorrt`       | 28.27    | 130.6           | 1561.0           |
+| SmolVLA | Orin Nano | `torch_tensorrt`      | 28.15    | 137.1           | 2286.1           |
+| SmolVLA | Orin Nano | PyTorch               | 19.97    | 791.7           | 3386.5           |
 | pi0.5   | Thor      | `executorch_tensorrt` | 28.66    | 105.2           | 1334.6           |
 | pi0.5   | Thor      | `onnx_tensorrt`       | 28.30    | 128.7           | 860.6            |
 | pi0.5   | Thor      | PyTorch               | 26.19    | 240.4           | 2408.2           |
 | pi0.5   | Thor      | `torch.compile`       | n/a      | still compiling | 3287.7           |
 | GR00T   | Thor      | `executorch_tensorrt` | 28.58    | 96.4            | 1236.3           |
 | GR00T   | Thor      | `onnx_tensorrt`       | 28.51    | 99.7            | 759.4            |
+| GR00T   | Thor      | `torch_tensorrt`      | 28.69    | 90.6            | 1487.0           |
 | GR00T   | Thor      | PyTorch               | 25.36    | 213.4           | 2983.4           |
 | GR00T   | Thor      | `torch.compile`       | n/a      | still compiling | 3635.8           |
 
-ONNX-TensorRT uses the least process memory wherever it ran: 644.8 MiB against 1107.6 MiB for ExecuTorch-TensorRT on ACT (Thor), 751.7 against 1171.3 on ACT (Orin Nano), 753.6 against 1249.9 on SmolVLA, 860.6 against 1334.6 on pi0.5, and 759.4 against 1236.3 on GR00T. ExecuTorch-CUDA also uses less memory than ExecuTorch-TensorRT on ACT, but it is 11 times slower per chunk on Thor and 5 times slower on the Orin Nano. ExecuTorch-TensorRT uses less memory than Torch-TensorRT, PyTorch and `torch.compile` in every rollout.
+ONNX-TensorRT uses the least process memory wherever it ran: 644.8 MiB against 1107.6 MiB for ExecuTorch-TensorRT on ACT (Thor), 751.7 against 1171.3 on ACT (Orin Nano), 753.6 against 1249.9 on SmolVLA (Thor), 1561.0 against 1946.9 on SmolVLA (Orin Nano), 860.6 against 1334.6 on pi0.5, and 759.4 against 1236.3 on GR00T. ExecuTorch-CUDA also uses less memory than ExecuTorch-TensorRT on ACT, but it is 11 times slower per chunk on Thor and 5 times slower on the Orin Nano. ExecuTorch-TensorRT uses less memory than Torch-TensorRT, PyTorch and `torch.compile` in every rollout.
 
-Rollout inference is close between the TensorRT routes on ACT, SmolVLA and GR00T. On ACT, ONNX-TensorRT was 0.1 ms lower on Thor and 0.2 ms lower on the Orin Nano. On SmolVLA, ExecuTorch-TensorRT was 1.2 ms lower than Torch-TensorRT and 2.7 ms lower than ONNX-TensorRT, and on GR00T 3.3 ms lower than ONNX-TensorRT. On pi0.5 the gap is larger: 105.2 ms with ExecuTorch-TensorRT against 128.7 ms with ONNX-TensorRT. pi0.5 and GR00T take about 100 ms per chunk with ExecuTorch-TensorRT, longer than one 33 ms control tick, so their loops ran a little under 30 Hz: 28.66 and 28.58 Hz, against 26.19 and 25.36 Hz with PyTorch (28.30 and 28.51 Hz with ONNX-TensorRT). `torch.compile` compiles during the first chunk of a rollout. That took 215 seconds for SmolVLA, 259 seconds for pi0.5 and 103 seconds for GR00T, longer than the 60 second run, so those rows have no loop rate; their compiled chunk times are in the table above.
+Rollout inference is close between the TensorRT routes on ACT, SmolVLA and GR00T. On ACT, ONNX-TensorRT was 0.1 ms lower on Thor and 0.2 ms lower on the Orin Nano. On SmolVLA, ExecuTorch-TensorRT was 1.2 ms lower than Torch-TensorRT and 2.7 ms lower than ONNX-TensorRT on Thor, and 3.7 and 10.2 ms lower than ONNX-TensorRT and Torch-TensorRT on the Orin Nano. On GR00T, Torch-TensorRT was 5.8 ms lower than ExecuTorch-TensorRT, which was 3.3 ms lower than ONNX-TensorRT. On pi0.5 the gap is larger: 105.2 ms with ExecuTorch-TensorRT against 128.7 ms with ONNX-TensorRT. pi0.5 and GR00T take about 100 ms per chunk with ExecuTorch-TensorRT, longer than one 33 ms control tick, so their loops ran a little under 30 Hz: 28.66 and 28.58 Hz, against 26.19 and 25.36 Hz with PyTorch (28.30 and 28.51 Hz with ONNX-TensorRT, 28.69 Hz for GR00T with Torch-TensorRT). SmolVLA on the Orin Nano also takes longer than a tick, so its TensorRT loops ran at 28.15 to 28.31 Hz, and PyTorch at 19.97 Hz. `torch.compile` compiles during the first chunk of a rollout. That took 215 seconds for SmolVLA, 259 seconds for pi0.5 and 103 seconds for GR00T, longer than the 60 second run, so those rows have no loop rate; their compiled chunk times are in the table above.
 
 ### Action agreement
 
-Largest and mean absolute difference from the PyTorch policy, in robot action units, over every action of 50 dataset observations. SmolVLA, pi0.5 and GR00T start from random noise, so both sides get the same noise. Every measured folder passed: its largest difference stayed under the tolerance saved in the folder (0.5 for ACT, 5 for the others). That is under 0.1% of a joint's range for ACT and at most 3.1% for SmolVLA, pi0.5 and GR00T. The last column is the mean difference between PyTorch and itself under a different noise draw, for scale. pi0.5 and GR00T run in bf16; against fp32 PyTorch their largest and mean differences with ExecuTorch-TensorRT are 2.18 and 0.112 for pi0.5, and 3.74 and 0.115 for GR00T (2.09 and 0.113, and 2.55 and 0.111, with ONNX-TensorRT). These checks show that the export computes the same actions as PyTorch, not that the robot completes the task.
+Largest and mean absolute difference from the PyTorch policy, in robot action units, over every action of 50 dataset observations. SmolVLA, pi0.5 and GR00T start from random noise, so both sides get the same noise. Every measured folder passed: its largest difference stayed under the tolerance saved in the folder (0.5 for ACT, 5 for the others). That is under 0.1% of a joint's range for ACT and at most 3.1% for SmolVLA, pi0.5 and GR00T. The last column is the mean difference between PyTorch and itself under a different noise draw, for scale. pi0.5 and GR00T run in bf16; against fp32 PyTorch their largest and mean differences with ExecuTorch-TensorRT are 2.18 and 0.112 for pi0.5, and 3.74 and 0.115 for GR00T (the same for GR00T with Torch-TensorRT; 2.09 and 0.113, and 2.55 and 0.111, with ONNX-TensorRT). These checks show that the export computes the same actions as PyTorch, not that the robot completes the task.
 
 | policy  | device    | `executorch_tensorrt` | `executorch_cuda` | `onnx_tensorrt` | `torch_tensorrt` | PyTorch, other noise |
 | ------- | --------- | --------------------- | ----------------- | --------------- | ---------------- | -------------------- |
@@ -211,7 +216,7 @@ Largest and mean absolute difference from the PyTorch policy, in robot action un
 | SmolVLA | Orin Nano | 1.59 / 0.054          | no script         | 1.46 / 0.058    | 1.59 / 0.054     | 1.83                 |
 | pi0.5   | Thor      | 2.98 / 0.108          | pending           | 4.80 / 0.125    | pending          | 5.61                 |
 | pi0.5   | Orin Nano | pending               | pending           | pending         | pending          | pending              |
-| GR00T   | Thor      | 2.97 / 0.092          | pending           | 1.60 / 0.088    | pending          | 3.49                 |
+| GR00T   | Thor      | 2.97 / 0.092          | pending           | 1.60 / 0.088    | 2.97 / 0.092     | 3.49                 |
 | GR00T   | Orin Nano | pending               | pending           | pending         | pending          | pending              |
 
 ## Which routes load PyTorch
@@ -230,7 +235,7 @@ The public ExecuTorch Python bindings load PyTorch today.
 
 ## Limits
 
-- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's three TensorRT exports finished only by using swap, with peaks of 4.0 to 5.6 GiB. SmolVLA `torch.compile` and rollouts, pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
+- **Orin Nano memory.** The board has 8 GB. ACT exported and ran there on all four routes. SmolVLA's three TensorRT exports finished only by using swap, with peaks of 4.0 to 5.6 GiB. SmolVLA `torch.compile`, pi0.5 and GR00T are still pending there. Exporting the graph elsewhere does not remove the target engine builder's memory needs.
 - **GR00T resize runs outside the program**, using NumPy antialiased bicubic sampling because the operator is not supported by every compiler route. The chunk times above include it.
 - **Legacy SmolVLA text-step folders load PyTorch** for tokenization, including with ONNX-TensorRT. Current raw-frame exports keep the fixed task's tokens in the program.
 - **CUDA route coverage is incomplete.** SmolVLA has no `executorch_cuda` script. GR00T's raw-frame CUDA export failed with the stock compiler in an earlier test; this run's retry is pending.
