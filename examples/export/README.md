@@ -201,7 +201,7 @@ ExecuTorch-TensorRT is the fastest route on ACT and SmolVLA on both boards, and 
 
 ### Memory
 
-Board memory used while running, in MiB, the highest steady value across three valid runs. Process memory alone misses some GPU allocations on a Jetson. Lower is better. ExecuTorch-TensorRT cells read estimated (measured): estimates subtract the previously measured PyTorch library overhead, rounded to 10 MiB; they are not direct measurements or an available measured runtime. GR00T on the Orin Nano uses the smallest overhead measured on that board. An unavailable estimate is labeled explicitly. Bold compares the first number.
+Board memory used while running, in MiB, the highest steady value across three valid runs, plus any memory the run pushed to swap. Process memory alone misses some GPU allocations on a Jetson. Lower is better. ExecuTorch-TensorRT cells read estimated (measured): estimates subtract the previously measured PyTorch library overhead, rounded to 10 MiB; they are not direct measurements or an available measured runtime. GR00T on the Orin Nano uses the smallest overhead measured on that board. An unavailable estimate is labeled explicitly. Bold compares the first number.
 
 Thor:
 
@@ -217,11 +217,11 @@ Orin Nano:
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` |       PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------------: |
 | ACT     |           330 (490) |       **223** |            579 |            1651 |          1140 |
-| SmolVLA |           520 (669) |       **370** |           1499 |            2818 |          2034 |
-| pi0.5   |         5330 (5498) |      **4875** |  fails to load |   out of memory | out of memory |
-| GR00T   |         4510 (4658) |          4411 |       **4295** |   out of memory | out of memory |
+| SmolVLA |           520 (669) |       **370** |           1708 |            2957 |          2034 |
+| pi0.5   |         5560 (5727) |      **4875** |  fails to load |   out of memory | out of memory |
+| GR00T   |         4510 (4658) |      **4411** |           7605 |   out of memory | out of memory |
 
-Every TensorRT route uses less memory than PyTorch. ONNX-TensorRT uses the least on most rows, as the only route that does not load PyTorch. On the Orin Nano, pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT, and Torch-TensorRT fails while loading it.
+ONNX-TensorRT uses the least memory on most rows, as the only route that does not load PyTorch. On the Orin Nano, pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT, and Torch-TensorRT fails while loading it. GR00T with Torch-TensorRT needs most of the board's 8 GB and pushes about 3 GB to swap.
 
 ## Limits
 
