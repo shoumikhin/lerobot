@@ -26,6 +26,8 @@ program compiled for one task holds that task in its weights, and `export.json` 
 
 A policy too large for one program, like pi0.5 or GR00T, is exported as a chain of programs that
 `export.json` lists under `programs`; `ProgramChain` runs them in order with any backend.
+
+An ONNX-TensorRT folder whose `export.json` sets `cuda_graphs` replays each engine from a CUDA graph.
 """
 
 from __future__ import annotations
@@ -62,11 +64,12 @@ def load_program(folder: Path, info: dict) -> Program:
     backend = info["backend"]
     if backend not in ("executorch_tensorrt", "executorch_cuda", "onnx_tensorrt", "torch_tensorrt"):
         raise ValueError(f"Unknown export backend {backend!r} in {folder / EXPORT_INFO}")
+    cuda_graphs = info.get("cuda_graphs", False)
     if "programs" in info:
         if backend == "onnx_tensorrt":
             from .tensorrt import load_engines
 
-            return ProgramChain(load_engines(folder, info["programs"]), info)
+            return ProgramChain(load_engines(folder, info["programs"], cuda_graphs), info)
         files = {name: folder / program["file"] for name, program in info["programs"].items()}
         device_resident = info.get("device_resident", False)
         return ProgramChain(
@@ -75,7 +78,7 @@ def load_program(folder: Path, info: dict) -> Program:
     if backend == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 
-        return TensorRTEngine(folder / info["file"], info["inputs"], [info["output"]])
+        return TensorRTEngine(folder / info["file"], info["inputs"], [info["output"]], cuda_graphs=cuda_graphs)
     return load_one(folder / info["file"], backend)
 
 

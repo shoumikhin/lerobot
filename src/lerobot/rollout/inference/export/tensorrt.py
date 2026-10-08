@@ -157,6 +157,8 @@ class TensorRTEngine:
     """Run a fixed-shape engine; related engines can share a stream and scratch allocation.
 
     `run_device` keeps the outputs in device buffers, which another engine on the same stream can read.
+    With `cuda_graphs`, the first run records the engine's work in a CUDA graph and later runs replay it,
+    so every run must pass the same input buffers.
     """
 
     def __init__(
@@ -166,6 +168,7 @@ class TensorRTEngine:
         output_names: list[str],
         own_scratch: bool = True,
         stream: CudaStream | None = None,
+        cuda_graphs: bool = False,
     ):
         import tensorrt as trt
 
@@ -189,6 +192,9 @@ class TensorRTEngine:
         for name, output in zip(output_names, self._outputs, strict=True):
             if not self._context.set_tensor_address(name, output.ptr):
                 raise RuntimeError(f"TensorRT could not bind output {name}")
+        self._cuda_graphs = cuda_graphs
+        self._graph = None
+        self._graph_inputs = None
 
     @property
     def input_shape(self) -> tuple[int, ...]:
@@ -210,6 +216,7 @@ class TensorRTEngine:
                 raise ValueError(f"{name} has shape {tuple(value.shape)}; the engine was built for {shape}.")
         cuda = cuda_runtime()
         host_inputs = []
+        addresses = []
         try:
             for name, dtype, value in zip(self._input_names, self._input_dtypes, inputs, strict=True):
                 if isinstance(value, CudaBuffer):
@@ -233,24 +240,53 @@ class TensorRTEngine:
                     )
                 if not self._context.set_tensor_address(name, buffer.ptr):
                     raise RuntimeError(f"TensorRT could not bind input {name}")
-            if not self._context.execute_async_v3(self._stream.handle):
+                addresses.append(buffer.ptr)
+            if self._cuda_graphs:
+                self._replay(tuple(addresses))
+            elif not self._context.execute_async_v3(self._stream.handle):
                 raise RuntimeError("TensorRT could not run the engine.")
         finally:
             # Input arrays must remain alive until their queued copies finish, including on errors.
             self._stream.synchronize()
         return tuple(self._outputs)
 
+    def _replay(self, addresses: tuple[int, ...]) -> None:
+        """Launch the engine's CUDA graph, recorded on the first run the way NVIDIA documents for TensorRT."""
+        cuda = cuda_runtime()
+        stream = self._stream.handle
+        if self._graph is None:
+            # The first enqueue updates TensorRT's internal state, so the graph records the second one.
+            if not self._context.execute_async_v3(stream):
+                raise RuntimeError("TensorRT could not run the engine.")
+            check_cuda(
+                cuda.cudaStreamBeginCapture(stream, cuda.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal)
+            )
+            recorded = self._context.execute_async_v3(stream)
+            graph = check_cuda(cuda.cudaStreamEndCapture(stream))
+            if not recorded:
+                raise RuntimeError("TensorRT could not record the engine in a CUDA graph.")
+            self._graph = check_cuda(cuda.cudaGraphInstantiate(graph, 0))
+            check_cuda(cuda.cudaGraphDestroy(graph))
+            self._graph_inputs = addresses
+        elif addresses != self._graph_inputs:
+            raise ValueError("The CUDA graph reads the input buffers it recorded; pass the same ones every run.")
+        check_cuda(cuda.cudaGraphLaunch(self._graph, stream))
+
     def __call__(self, *inputs: np.ndarray | CudaBuffer) -> np.ndarray | tuple[np.ndarray, ...]:
         outputs = [value.numpy(self._stream) for value in self.run_device(*inputs)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def __del__(self):
-        # Destroy the context before releasing its bound buffers and shared scratch.
+        # Destroy the graph and the context before releasing their bound buffers and shared scratch.
+        if getattr(self, "_graph", None) is not None:
+            cuda_runtime().cudaGraphExecDestroy(self._graph)
         self._context = None
         self._engine = None
 
 
-def load_engines(folder: Path, programs: dict[str, dict]) -> dict[str, TensorRTEngine]:
+def load_engines(
+    folder: Path, programs: dict[str, dict], cuda_graphs: bool = False
+) -> dict[str, TensorRTEngine]:
     """Load a chain's engines on one stream, with one scratch allocation the size of the largest.
 
     The engines run one after another, so none needs its own scratch.
@@ -258,7 +294,12 @@ def load_engines(folder: Path, programs: dict[str, dict]) -> dict[str, TensorRTE
     stream = CudaStream()
     engines = {
         name: TensorRTEngine(
-            folder / program["file"], program["inputs"], program["outputs"], own_scratch=False, stream=stream
+            folder / program["file"],
+            program["inputs"],
+            program["outputs"],
+            own_scratch=False,
+            stream=stream,
+            cuda_graphs=cuda_graphs,
         )
         for name, program in programs.items()
     }

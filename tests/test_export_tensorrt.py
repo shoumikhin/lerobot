@@ -145,6 +145,34 @@ def test_engine_synchronizes_copies_after_execution_failure(tmp_path, fake_cuda,
     assert not fake_cuda.pending
 
 
+def test_engine_records_one_cuda_graph_and_replays_it(tmp_path, fake_cuda, fake_engine):
+    graphs = []
+
+    def end_capture(stream):
+        graphs.append(fake_cuda.pending.pop())
+        return 0, "graph"
+
+    def launch(graph, stream):
+        fake_cuda.pending.append(graphs[0])
+        return (0,)
+
+    fake_cuda.cudaStreamCaptureMode = SimpleNamespace(cudaStreamCaptureModeGlobal=0)
+    fake_cuda.cudaStreamBeginCapture = lambda stream, mode: (0,)
+    fake_cuda.cudaStreamEndCapture = end_capture
+    fake_cuda.cudaGraphInstantiate = lambda graph, flags: (0, "instance")
+    fake_cuda.cudaGraphDestroy = lambda graph: (0,)
+    fake_cuda.cudaGraphLaunch = launch
+    fake_cuda.cudaGraphExecDestroy = MagicMock(return_value=(0,))
+    engine = backend.TensorRTEngine(tmp_path / "model.engine", ["x"], ["y"], cuda_graphs=True)
+    np.testing.assert_array_equal(engine(np.ones((1, 3))), [[2, 2, 2]])
+    np.testing.assert_array_equal(engine(np.full((1, 3), 3.0)), [[6, 6, 6]])
+    assert len(graphs) == 1
+    with pytest.raises(ValueError, match="same ones every run"):
+        engine.run_device(backend.CudaBuffer((1, 3), np.float32))
+    del engine
+    fake_cuda.cudaGraphExecDestroy.assert_called_once_with("instance")
+
+
 def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
     cuda = SimpleNamespace(
         cudaMalloc=MagicMock(return_value=(0, 4096)),
@@ -224,7 +252,10 @@ def test_chained_engines_share_scratch_and_keep_the_cache_on_device(tmp_path, mo
         "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
     engines = backend.load_engines(tmp_path, programs)
-    assert all(engine.kwargs == {"own_scratch": False, "stream": "stream"} for engine in engines.values())
+    assert all(
+        engine.kwargs == {"own_scratch": False, "stream": "stream", "cuda_graphs": False}
+        for engine in engines.values()
+    )
     assert len(scratch) == 3 and all(buffer is scratch[0] for buffer in scratch)
     chain = ProgramChain(engines, {"inputs": ["state", "noise"], "programs": programs, "num_steps": 4})
     result = chain(np.ones(3), np.ones(noise_shape, dtype=np.float32))

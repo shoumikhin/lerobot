@@ -821,7 +821,9 @@ def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, b
         lambda path, name, device_resident: loaded.append((path.name, name)) or path.name,
     )
     monkeypatch.setattr(
-        export_tensorrt, "load_engines", lambda folder, programs: dict.fromkeys(programs, "engine")
+        export_tensorrt,
+        "load_engines",
+        lambda folder, programs, cuda_graphs: dict.fromkeys(programs, "engine"),
     )
     programs = {
         name: {"file": f"{name}.bin", "inputs": [], "outputs": []} for name in ("embed", "step", "actions")
