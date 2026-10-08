@@ -93,7 +93,7 @@ python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 
 `build_engine.py` takes `--workspace_gib`, `--tactic_gib` (ONNX only) and `--optimization_level` to use less memory while it builds. They do not guarantee that the engine fits.
 
-The ACT and SmolVLA ExecuTorch-TensorRT scripts turn on CUDA graphs (the GPU records its work once and replays it), because that made a chunk faster on both boards. `build_engine.py`, pi0.5 and GR00T leave them off.
+The ACT and SmolVLA ExecuTorch-TensorRT and ONNX-TensorRT scripts turn on CUDA graphs (the GPU records its work once and replays it), because that made a chunk faster on both boards. `build_engine.py`, pi0.5, GR00T and the Torch-TensorRT scripts leave them off.
 
 ### Large policies are exported in parts
 
@@ -202,8 +202,8 @@ Thor:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |            **3.43** |          3.50 |           3.70 |           12.80 |   15.91 |
-| SmolVLA |           **28.13** |         30.95 |          29.20 |           44.47 |   166.7 |
+| ACT     |                3.44 |      **3.39** |           3.63 |           12.80 |   15.91 |
+| SmolVLA |           **28.17** |         29.76 |          29.19 |           44.47 |   166.7 |
 | pi0.5   |               120.4 |     **116.0** |          119.2 |           129.9 |   244.2 |
 | GR00T   |               95.62 |         94.66 |      **93.28** |           205.8 |   211.1 |
 
@@ -211,12 +211,12 @@ Orin Nano:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |           **25.34** |         26.36 |          26.26 |           61.53 |   64.60 |
-| SmolVLA |           **125.6** |         130.5 |          136.0 |           172.3 |   762.0 |
+| ACT     |           **25.41** |         25.58 |          26.38 |           61.53 |   64.60 |
+| SmolVLA |               125.8 |     **121.0** |          135.4 |           172.3 |   762.0 |
 | pi0.5   |               630.7 |     **625.5** |            OOM |             OOM |     OOM |
 | GR00T   |           **272.9** |         275.0 |          276.4 |             OOM |     OOM |
 
-ExecuTorch-TensorRT is the fastest route for ACT and SmolVLA on both boards, and for GR00T on the Orin Nano. ONNX-TensorRT is the fastest for pi0.5 on both boards. Torch-TensorRT is the fastest for GR00T on Thor, where the three TensorRT routes are within 2.4 ms of each other.
+The three TensorRT routes run ACT and SmolVLA with CUDA graphs on, within about 1 ms of each other. ExecuTorch-TensorRT is the fastest for ACT on Thor and SmolVLA on Thor, and for GR00T on the Orin Nano. ONNX-TensorRT is the fastest for ACT on the Orin Nano, for SmolVLA on the Orin Nano, and for pi0.5 on both boards. Torch-TensorRT is the fastest for GR00T on Thor.
 
 ### Memory
 
