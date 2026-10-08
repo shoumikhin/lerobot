@@ -73,19 +73,29 @@ def load_program(folder: Path, info: dict) -> Program:
         files = {name: folder / program["file"] for name, program in info["programs"].items()}
         device_resident = info.get("device_resident", False)
         return ProgramChain(
-            {name: load_one(path, backend, device_resident) for name, path in files.items()}, info
+            {
+                name: load_one(path, backend, device_resident, shared_scratch=True)
+                for name, path in files.items()
+            },
+            info,
         )
     if backend == "onnx_tensorrt":
         from .tensorrt import TensorRTEngine
 
-        return TensorRTEngine(folder / info["file"], info["inputs"], [info["output"]], cuda_graphs=cuda_graphs)
+        return TensorRTEngine(
+            folder / info["file"], info["inputs"], [info["output"]], cuda_graphs=cuda_graphs
+        )
     return load_one(folder / info["file"], backend)
 
 
-def load_one(path: Path, backend: str, device_resident: bool = False) -> Program:
+def load_one(
+    path: Path, backend: str, device_resident: bool = False, shared_scratch: bool = False
+) -> Program:
     """Load one ExecuTorch program or AOTInductor package.
 
     A device-resident ExecuTorch program takes and returns CUDA tensors, so a chain keeps its values on the GPU.
+    The ExecuTorch-TensorRT programs of a chain run one after another, so they share one activation scratch.
+    A lone program keeps its own scratch, because the delegate turns off CUDA graph replay on the shared one.
     """
     if backend == "torch_tensorrt":
         from .aoti import AOTInductorPackage
@@ -94,7 +104,7 @@ def load_one(path: Path, backend: str, device_resident: bool = False) -> Program
     from .executorch import DeviceResidentProgram, ExecuTorchProgram
 
     program = DeviceResidentProgram if device_resident else ExecuTorchProgram
-    return program(path, tensorrt=backend == "executorch_tensorrt")
+    return program(path, tensorrt=backend == "executorch_tensorrt", shared_scratch=shared_scratch)
 
 
 class ProgramChain:

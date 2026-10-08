@@ -818,7 +818,8 @@ def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, b
     monkeypatch.setattr(
         export_engine,
         "load_one",
-        lambda path, name, device_resident: loaded.append((path.name, name)) or path.name,
+        lambda path, name, device_resident, shared_scratch: loaded.append((path.name, name, shared_scratch))
+        or path.name,
     )
     monkeypatch.setattr(
         export_tensorrt,
@@ -836,7 +837,7 @@ def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, b
     if backend == "onnx_tensorrt":
         assert loaded == [] and chain._programs == dict.fromkeys(programs, "engine")
     else:
-        assert loaded == [(f"{name}.bin", backend) for name in programs]
+        assert loaded == [(f"{name}.bin", backend, True) for name in programs]
 
 
 def test_program_chain_runs_each_program_once_and_the_step_once_per_euler_step():

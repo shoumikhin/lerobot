@@ -23,13 +23,19 @@ import numpy as np
 class ExecuTorchProgram:
     """Run a `.pte` program with host arrays and read its outputs through DLPack."""
 
-    def __init__(self, path: Path, tensorrt: bool = True):
+    def __init__(self, path: Path, tensorrt: bool = True, shared_scratch: bool = False):
         if tensorrt:
             import torch_tensorrt_executorch_runtime  # noqa: F401
         from executorch.runtime import Runtime
 
+        runtime = Runtime.get()
+        # Engines read this process-wide option when they load; older runtimes keep one scratch per engine.
+        if tensorrt and hasattr(runtime.backend_registry, "set_option"):
+            runtime.backend_registry.set_option(
+                "TensorRTBackend", {"use_shared_activation_scratch": shared_scratch}
+            )
         data_path = next(path.parent.glob("*.ptd"), None)
-        self._method = Runtime.get().load_program(path, data_path=data_path).load_method("forward")
+        self._method = runtime.load_program(path, data_path=data_path).load_method("forward")
         self._torch_inputs = False
 
     @property

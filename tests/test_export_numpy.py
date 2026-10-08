@@ -58,7 +58,7 @@ def test_executorch_three_program_loop(tmp_path, monkeypatch, noise_shape, torch
 
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
 
-    runtime = SimpleNamespace(load_program=load)
+    runtime = SimpleNamespace(load_program=load, backend_registry=SimpleNamespace())
     monkeypatch.setitem(
         sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
     )
@@ -108,7 +108,7 @@ def test_executorch_chained_prefix_programs(tmp_path, monkeypatch):
 
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
 
-    runtime = SimpleNamespace(load_program=load)
+    runtime = SimpleNamespace(load_program=load, backend_registry=SimpleNamespace())
     monkeypatch.setitem(
         sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
     )
@@ -230,6 +230,50 @@ def test_program_chain_invalid_step_count():
 
     with pytest.raises(ValueError, match="num_steps"):
         ProgramChain({}, {"num_steps": 0, "inputs": [], "programs": {}})
+
+
+@pytest.mark.parametrize("backend", ["executorch_tensorrt", "executorch_cuda"])
+@pytest.mark.parametrize("layout", ["single", "chain", "device_resident_chain"])
+@pytest.mark.parametrize("has_set_option", [False, True])
+def test_executorch_shares_activation_scratch_only_within_a_tensorrt_chain(
+    tmp_path, monkeypatch, backend, layout, has_set_option
+):
+    """Each TensorRT program of a chain turns the shared scratch on before it loads; a lone one turns it off.
+
+    A runtime without `set_option` loads the same programs, each engine with its own scratch.
+    """
+    events = []
+
+    def load(path, data_path=None):
+        events.append(("load", path.name))
+        return SimpleNamespace(load_method=lambda name: SimpleNamespace())
+
+    registry = SimpleNamespace()
+    if has_set_option:
+        registry.set_option = lambda name, options: events.append(("set", name, options))
+    runtime = SimpleNamespace(load_program=load, backend_registry=registry)
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
+    )
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
+    names = ["prefix", "step"]
+    info = {
+        "backend": backend,
+        "device_resident": layout == "device_resident_chain",
+        "inputs": ["noise"],
+        "programs": {name: {"file": f"{name}.pte", "inputs": [], "outputs": []} for name in names},
+        "num_steps": 1,
+    }
+    if layout == "single":
+        names = ["model"]
+        info = {"backend": backend, "file": "model.pte"}
+
+    load_program(tmp_path, info)
+
+    option = [("set", "TensorRTBackend", {"use_shared_activation_scratch": layout != "single"})]
+    if backend == "executorch_cuda" or not has_set_option:
+        option = []
+    assert events == [event for name in names for event in (*option, ("load", f"{name}.pte"))]
 
 
 @pytest.mark.parametrize("image_first", [False, True])
@@ -357,7 +401,7 @@ def test_device_resident_chain_passes_cuda_tensors_between_programs(tmp_path, mo
 
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
 
-    runtime = SimpleNamespace(load_program=load)
+    runtime = SimpleNamespace(load_program=load, backend_registry=SimpleNamespace())
     monkeypatch.setitem(
         sys.modules, "executorch.runtime", SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime))
     )
