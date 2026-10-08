@@ -15,25 +15,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The GR00T N1.7 export recipe: what both backend scripts compile, and the folder they write.
+"""The GR00T N1.7 export recipe: what every backend script compiles, and the folder they write.
 
-As for SmolVLA, the compiled module is one action chunk of LeRobot's own GR00T, with the starting noise as
-its last input and the checkpoint's saved postprocessor at the end. What differs is how the backbone gets
-in. Qwen3-VL's own forward computes the rope index and the vision grid with Python loops over the inputs,
-which no exporter can follow. NVIDIA's deployment code for GR00T (Isaac-GR00T,
+As for SmolVLA, the compiled programs are one action chunk of LeRobot's own GR00T, with the starting noise
+as the chunk's last input and the checkpoint's saved postprocessor at the end. What differs is how the
+backbone gets in. Qwen3-VL's own forward computes the rope index and the vision grid with Python loops over
+the inputs, which no exporter can follow. NVIDIA's deployment code for GR00T (Isaac-GR00T,
 scripts/deployment/export_onnx_n1d7.py) avoids them with two wrappers, ported below: the vision tower for
 one fixed image grid, and the language model with the rope positions as an input.
 
 For one task and one camera size, everything those loops compute is the same on every frame: the token
 ids, the rope positions, and the rows the image features go to. So they are computed here, once, and held
-as constants. The runtime resizes raw cameras with NumPy antialiased bicubic sampling. The program
+as constants. The runtime resizes the raw cameras with NumPy antialiased bicubic sampling, and the program
 takes the resized uint8 HWC cameras, float32 state and unbatched noise. Image normalization and patch
-packing, state normalization and action unnormalization run inside the program. The folder records
-the task it was exported for; no tokenizer runs at inference.
+packing, state normalization and action unnormalization run inside the program. The folder records the
+task it was exported for; no tokenizer runs at inference.
 
-The ExecuTorch TensorRT route exports a chain, one part per process: vision, groups of six language
-layers, groups of eight diffusion blocks, and action postprocessing. Only one weight group is loaded
-at a time. The diffusion groups repeat for each positive Euler step, using the checkpoint's time buckets.
+The split routes export a chain, one part per process: vision, groups of six language layers, groups of
+eight diffusion blocks, and the actions. Only one weight group is loaded at a time. The diffusion groups
+run once per Euler step, at the checkpoint's time buckets.
 """
 
 import argparse
@@ -50,7 +50,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from act_recipe import TEST_CASE, add_backend_args, gpu_processors, make_output_dir, to_policy_input
+from act_recipe import TEST_CASE, gpu_processors, make_output_dir, to_policy_input
 from safetensors.numpy import save_file
 from smolvla_recipe import random_robot_frame
 from torch import Tensor, nn
@@ -74,6 +74,7 @@ LANGUAGE_MODEL = "_groot_model.backbone.model.model.language_model"
 ACTION_HEAD = "_groot_model.action_head"
 LANGUAGE_LAYERS_PER_PROGRAM = 6
 DIT_BLOCKS_PER_PROGRAM = 8
+# The same Torch-TensorRT options as pi0.5's split recipe, for the same reasons.
 TENSORRT_OPTIONS = {
     "min_block_size": 1,
     "truncate_double": True,
@@ -84,13 +85,13 @@ TENSORRT_OPTIONS = {
 
 
 def free_memory() -> None:
-    """Release the previous part before loading another one."""
+    """Return freed GPU memory, so the next part or the TensorRT build can use it."""
     gc.collect()
     torch.cuda.empty_cache()
 
 
 def part_names(policy_path: str) -> list[str]:
-    """The fixed layer groups used by the split recipe."""
+    """The names of the programs `GrootExport.parts` yields, in order."""
     config = PreTrainedConfig.from_pretrained(policy_path)
     model = GR00TN17Config.from_pretrained(config.base_model_path)
     language_groups = math.ceil(model.select_layer / LANGUAGE_LAYERS_PER_PROGRAM)
@@ -110,7 +111,10 @@ def export_parts(
     compile_part: Callable[[nn.Module, tuple, list[str], list[str], Path], None],
     device_resident: bool = False,
 ) -> None:
-    """Compile one part per process, releasing the compiler's memory between parts."""
+    """Export the chunk one program per process, each loading only its own part of the policy.
+
+    It works as pi0.5's `export_parts` does, and also rejects an unknown `--part`.
+    """
     names = part_names(args.policy_path)
     if args.part is None:
         output_dir = make_output_dir(args.output_dir, args.job_name)
@@ -138,7 +142,7 @@ def export_parts(
         return
 
 
-# From NVIDIA's export_onnx_n1d7.py: rotary with real numbers, where Qwen3-VL's own uses complex ones.
+# From NVIDIA's export_onnx_n1d7.py: the vision rotary embedding written out with plain tensor operations.
 def _apply_rotary_real(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     orig_dtype = x.dtype
     x = x.float()
@@ -249,7 +253,7 @@ class LLMForExport(nn.Module):
 
 
 class GrootObservation(nn.Module):
-    """The saved processor's tensor operations after runtime camera resizing."""
+    """The saved preprocessor's tensor steps: the resized frame in, image patches and normalized state out."""
 
     def __init__(self, preprocessor: PolicyProcessorPipeline, frame: dict[str, np.ndarray], batch: dict):
         super().__init__()
@@ -275,11 +279,9 @@ class GrootObservation(nn.Module):
         crop_fraction = encode.crop_fraction
         if crop_fraction is None and encode.image_crop_size and target_size:
             crop_fraction = encode.image_crop_size[0] / target_size[0]
-        self.patch_size, self.temporal_patch_size, self.merge_size = (
-            ip.patch_size,
-            ip.temporal_patch_size,
-            ip.merge_size,
-        )
+        self.patch_size = ip.patch_size
+        self.temporal_patch_size = ip.temporal_patch_size
+        self.merge_size = ip.merge_size
         grids = batch["image_grid_thw"].tolist()
         if len(grids) != len(self.cameras) or any(g != grids[0] for g in grids) or grids[0][0] != 1:
             raise ValueError("Raw-frame export requires equal, single-frame camera grids.")
@@ -337,7 +339,7 @@ class GrootObservation(nn.Module):
 
 
 class GrootVision(nn.Module):
-    """The raw frame to image features, deepstack features and normalized state."""
+    """The vision part: the resized frame in, the image features, deepstack features and normalized state out."""
 
     def __init__(self, vision: nn.Module, observation: GrootObservation, grid_thw: Tensor, use_bf16: bool):
         super().__init__()
@@ -353,7 +355,7 @@ class GrootVision(nn.Module):
 
 
 def select_embodiment(module: nn.Module, embodiment_id: Tensor) -> None:
-    """Keep only the category weights used by this robot."""
+    """Keep only this robot's weights: the action head holds one set per embodiment it can be trained on."""
     for layer in module.modules():
         if isinstance(layer, CategorySpecificLinear):
             layer.W = nn.Parameter(layer.W[embodiment_id].detach(), requires_grad=False)
@@ -361,7 +363,7 @@ def select_embodiment(module: nn.Module, embodiment_id: Tensor) -> None:
 
 
 class GrootLanguageModel(nn.Module):
-    """A decoder slice, with image insertion first and action head feature processing last."""
+    """Some language model layers; the first group inserts the image features, the last runs the action head's encoders."""
 
     def __init__(self, text_model, action_head, constants: dict, start: int, stop: int, use_bf16: bool):
         super().__init__()
@@ -414,7 +416,7 @@ class GrootLanguageModel(nn.Module):
 
 
 class GrootStep(nn.Module):
-    """A diffusion block slice; the first encodes actions and time, the last returns velocity."""
+    """Some diffusion blocks; the first group encodes the noisy actions and the time, the last returns the velocity."""
 
     def __init__(self, action_head, constants: dict, start: int, stop: int, use_bf16: bool):
         super().__init__()
@@ -441,11 +443,9 @@ class GrootStep(nn.Module):
             self.timestep_encoder = model.timestep_encoder
             select_embodiment(self.action_encoder, constants["embodiment_id"])
         if self.last:
-            self.norm_out, self.proj_out_1, self.proj_out_2 = (
-                model.norm_out,
-                model.proj_out_1,
-                model.proj_out_2,
-            )
+            self.norm_out = model.norm_out
+            self.proj_out_1 = model.proj_out_1
+            self.proj_out_2 = model.proj_out_2
             self.action_decoder = action_head.action_decoder
             select_embodiment(self.action_decoder, constants["embodiment_id"])
 
@@ -483,7 +483,7 @@ class GrootStep(nn.Module):
 
 
 class GrootActions(nn.Module):
-    """Slice the denoised chunk and restore the robot's action units."""
+    """The end of the chunk: the denoised actions in, the actions to play out, in robot units."""
 
     def __init__(self, horizon: int, action_dim: int, postprocessor: PolicyProcessorPipeline):
         super().__init__()
@@ -495,7 +495,7 @@ class GrootActions(nn.Module):
 
 
 class GrootChunk(nn.Module):
-    """One action chunk: the raw frame and noise in, unbatched robot actions out."""
+    """One action chunk in one program: the resized frame and the noise in, the actions to play out, in robot units."""
 
     def __init__(
         self,
@@ -516,38 +516,32 @@ class GrootChunk(nn.Module):
         self.action_dim = policy.config.output_features[ACTION].shape[0]
 
         # The constants Qwen3Backbone.forward would compute from these inputs on every frame.
-        names = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids")
-        model_input = {name: batch[name] for name in names if name in batch}
-        ids, attention_mask = model_input["input_ids"], model_input["attention_mask"]
-        mm_types = model_input.get("mm_token_type_ids", (ids == qwen.config.image_token_id).int())
+        ids, attention_mask = batch["input_ids"], batch["attention_mask"]
+        image_mask = ids == qwen.config.image_token_id
         position_ids, _ = qwen.get_rope_index(
             input_ids=ids,
-            mm_token_type_ids=mm_types,
-            image_grid_thw=model_input["image_grid_thw"],
+            mm_token_type_ids=batch.get("mm_token_type_ids", image_mask.int()),
+            image_grid_thw=batch["image_grid_thw"],
             attention_mask=attention_mask,
         )
         embodiment_id = batch["embodiment_id"]
         with torch.no_grad():
             text_embeds = backbone.language_model.get_input_embeddings()(ids)
             image_token_mask, _ = qwen.get_placeholder_mask(ids, inputs_embeds=text_embeds)
-            # The action head keeps weights for every embodiment it can be trained on; the program runs one.
-            for layer in self.action_head.modules():
-                if isinstance(layer, CategorySpecificLinear):
-                    layer.W = nn.Parameter(layer.W[embodiment_id], requires_grad=False)
-                    layer.b = nn.Parameter(layer.b[embodiment_id], requires_grad=False)
+            select_embodiment(self.action_head, embodiment_id)
         constants = {
             "text_embeds": text_embeds,
             "image_token_mask": image_token_mask,
             "attention_mask": attention_mask.long(),
             "position_ids": position_ids,
             "visual_pos_masks": image_token_mask[..., 0],
-            "image_mask": ids == backbone.model.config.image_token_id,
+            "image_mask": image_mask,
             "backbone_attention_mask": attention_mask == 1,
             "embodiment_id": torch.zeros_like(embodiment_id),
         }
         for name, value in constants.items():
             self.register_buffer(name, value, persistent=False)
-        self.vision = Qwen3VisionForExport(qwen.visual, model_input["image_grid_thw"])
+        self.vision = Qwen3VisionForExport(qwen.visual, batch["image_grid_thw"])
         self.llm = LLMForExport(backbone.language_model)
 
     def forward(self, *inputs: Tensor) -> Tensor:
@@ -575,7 +569,7 @@ class GrootChunk(nn.Module):
 
 
 class GrootExport:
-    """Loads a trained GR00T N1.7 checkpoint, and writes the exported folder around a compiled program."""
+    """Loads a trained GR00T N1.7 checkpoint, whole or one part at a time, and writes the exported folder."""
 
     def __init__(self, args: argparse.Namespace, *, split: bool = False):
         if split:
@@ -587,20 +581,13 @@ class GrootExport:
         self.policy = GrootPolicy.from_pretrained(self.policy_path).to("cuda").eval()
         self.config = self.policy.config
         preprocessor, postprocessor = gpu_processors(self.policy.config, self.policy_path)
-
-        metadata = LeRobotDatasetMetadata(args.dataset, root=args.dataset_root)
-        self.task = str(metadata.tasks.index[0])
-        self.frame = random_robot_frame(metadata.features)
-        self.input_features = {
-            name: feature
-            for name, feature in dataset_to_policy_features(metadata.features).items()
-            if name in self.frame
-        }
+        self.read_dataset(args)
         batch = preprocessor(self.observation())
         model = self.policy._groot_model
         self.noise = torch.randn(
             model.action_head.action_horizon, model.action_head.action_dim, device="cuda"
         )
+        # Before GrootChunk keeps only this robot's action head weights, which the policy shares.
         self.expected_actions = self.rollout_actions(preprocessor, postprocessor)
         observation = GrootObservation(preprocessor, self.frame, batch).cuda()
         self.image_resize = observation.image_resize
@@ -622,14 +609,7 @@ class GrootExport:
         self.model_config = model.config
         self.horizon = self.policy._action_queue_steps
         preprocessor, self.postprocessor = gpu_processors(self.config, self.policy_path)
-        metadata = LeRobotDatasetMetadata(args.dataset, root=args.dataset_root)
-        self.task = str(metadata.tasks.index[0])
-        self.frame = random_robot_frame(metadata.features)
-        self.input_features = {
-            name: feature
-            for name, feature in dataset_to_policy_features(metadata.features).items()
-            if name in self.frame
-        }
+        self.read_dataset(args)
         self.batch = preprocessor(self.observation())
         self.frame_processor = GrootObservation(preprocessor, self.frame, self.batch).cuda()
         self.image_resize = self.frame_processor.image_resize
@@ -662,15 +642,31 @@ class GrootExport:
         ]
         self.start = time.perf_counter()
 
+    def read_dataset(self, args: argparse.Namespace) -> None:
+        """The task, a random frame and the robot's input features, from the dataset the policy was trained on."""
+        metadata = LeRobotDatasetMetadata(args.dataset, root=args.dataset_root)
+        self.task = str(metadata.tasks.index[0])
+        self.frame = random_robot_frame(metadata.features)
+        # The folder takes the robot's cameras, so its config names them, not the checkpoint's placeholders.
+        self.input_features = {
+            name: feature
+            for name, feature in dataset_to_policy_features(metadata.features).items()
+            if name in self.frame
+        }
+
     def load_part(self, *modules: str) -> GrootPolicy:
-        """Load only this part, preserving the checkpoint's precision before autocast."""
+        """The policy with only `modules`' weights read from the checkpoint, in the checkpoint's own precision."""
         config = copy(self.config)
         # Casting norms, embeddings and category biases changes residual additions outside autocast.
         config.use_bf16 = False
         return GrootPolicy.load_checkpoint_modules(self.model_file, config, list(modules))
 
     def parts(self) -> Iterator[tuple[str, nn.Module, tuple, list[str], list[str]]]:
-        """Yield each program with example tensors, keeping only one weight group alive."""
+        """Yield the chunk's programs one at a time, each with only its own weights in memory.
+
+        Each program comes with its example inputs, input names and output names. Each part runs once in
+        PyTorch to make the next part's inputs, and the test case's actions are those parts chained.
+        """
         module = GrootVision(
             self.policy._groot_model.backbone.visual,
             self.frame_processor,
@@ -764,6 +760,7 @@ class GrootExport:
                     outputs = [f"step_hidden_{group}", "temb"]
                 else:
                     outputs = [f"step_hidden_{group}"]
+                # Every Euler step runs the same programs: yield them once, then only finish the test case.
                 if iteration == 0:
                     yield f"step_{group}", module, inputs, names, outputs
                 if module.last:
@@ -778,12 +775,13 @@ class GrootExport:
         yield "actions", module, (actions,), ["x_t"], [ACTION]
 
     def release_policy(self) -> None:
-        """Free the policy for the TensorRT step: the test case's actions are already computed."""
+        """Free the policy before the backend compiles; the test case's actions are already computed."""
         del self.policy, self.module
         gc.collect()
         torch.cuda.empty_cache()
 
     def observation(self) -> dict[str, Tensor]:
+        """The test frame and task as `lerobot-rollout` hands them to the policy's preprocessor."""
         return prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
 
     def rollout_actions(
@@ -798,26 +796,26 @@ class GrootExport:
             actions = postprocessor(actions[:, : self.policy._action_queue_steps])
         return actions[0].float().cpu().numpy()
 
-    def write(self, program_path: Path | dict, device_resident: bool = False) -> None:
-        """Save the raw test case, policy config and `export.json` beside the program."""
+    def write(self, program: Path | dict[str, dict], device_resident: bool = False) -> None:
+        """Save the raw test case, the policy config and `export.json` beside the program or chain of programs."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
+        if isinstance(program, dict):
+            files = {
+                "programs": program,
+                "device_resident": device_resident,
+                "num_steps": self.num_steps,
+                "timesteps": self.timesteps,
+                "dt": 1.0 / self.num_steps,
+            }
+        else:
+            files = {"file": program.name}
         info = {
             "backend": self.backend,
-            **(
-                {
-                    "programs": program_path,
-                    "device_resident": device_resident,
-                    "num_steps": self.num_steps,
-                    "timesteps": self.timesteps,
-                    "dt": 1.0 / self.num_steps,
-                }
-                if isinstance(program_path, dict)
-                else {"file": program_path.name}
-            ),
+            **files,
             "inputs": self.input_names,
             "raw_frame": True,
             "image_resize": self.image_resize,
@@ -860,20 +858,5 @@ def parse_args(description: str, backend: str) -> argparse.Namespace:
     parser.add_argument(
         "--part", help="Build only this program in an existing folder. The script sets it itself."
     )
-    if backend == "executorch_tensorrt":
-        parser.set_defaults(backend=backend)
-    else:
-        add_backend_args(parser, backend)
+    parser.set_defaults(backend=backend)
     return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args("Check the GR00T recipe module in eager against the PyTorch rollout chunk.", "eager")
-    export = GrootExport(args)
-    with torch.inference_mode():
-        actual = export.module(*export.inputs).float().cpu().numpy()
-    print("inputs", [(tuple(t.shape), str(t.dtype)) for t in export.inputs])
-    print(
-        f"EAGER_VS_ROLLOUT max_abs={np.abs(actual - export.expected_actions).max():.4g} "
-        f"ref_max={np.abs(export.expected_actions).max():.4g} shape={actual.shape}"
-    )
