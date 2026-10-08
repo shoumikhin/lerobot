@@ -246,13 +246,12 @@ class PI05Actions(nn.Module):
 
 
 class PI05Embed(nn.Module):
-    """The start of `PI05Prefix`: the cameras and the prompt in, the prefix embeddings and their mask out."""
+    """The start of the prefix: the raw frame in, the image and prompt embeddings and their mask out."""
 
-    def __init__(self, policy: PI05Policy, preprocessor: PI05Observation, input_names: list[str]):
+    def __init__(self, policy: PI05Policy, preprocessor: PI05Observation):
         super().__init__()
         self.policy = policy
         self.preprocessor = preprocessor
-        self.input_names = input_names
 
     def forward(self, *observation: Tensor) -> tuple[Tensor, Tensor]:
         batch = self.preprocessor(*observation)
@@ -264,7 +263,7 @@ class PI05Embed(nn.Module):
 
 
 class PI05LanguageModelLayers(nn.Module):
-    """Some of `PI05Prefix`'s language model layers: the hidden states in, the next hidden states and their KV cache out.
+    """Some of the prefix's language model layers: the hidden states in, the next hidden states and their KV cache out.
 
     pi0.5's prefix attends both ways inside the prompt, so the mask and positions come from the padding mask alone.
     """
@@ -360,7 +359,6 @@ class PI05Export:
         }
         self.input_features = {name: config.input_features[name] for name in self.frame}
         prompt = StatePrompt(tokenizer, self.task, self.frame[OBS_STATE].size).cuda()
-        names = [*self.frame, NOISE]
         self.noise = torch.randn(config.chunk_size, config.max_action_dim, device="cuda")
         # The whole policy never loads, so `parts` chains its parts' PyTorch outputs for the test case.
         self.expected_actions = None
@@ -369,7 +367,7 @@ class PI05Export:
         language_model.embed_tokens = CompactEmbedding(language_model.embed_tokens, token_ids)
         self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
         self.observation = PI05Observation(list(self.frame), tensor_steps, prompt)
-        self.input_names = names
+        self.input_names = [*self.frame, NOISE]
         self.start = time.perf_counter()
 
     def load_part(self, *modules: str) -> PI05Policy:
@@ -385,7 +383,7 @@ class PI05Export:
         those parts chained. Drop each module before taking the next, so only one part is ever loaded.
         """
         observation, names = self.inputs[:-1], self.input_names[:-1]
-        embed = PI05Embed(self.policy, self.observation, names)
+        embed = PI05Embed(self.policy, self.observation)
         del self.policy
         free_memory()
         with torch.no_grad():

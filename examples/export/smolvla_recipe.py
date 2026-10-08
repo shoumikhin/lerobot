@@ -51,7 +51,6 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 NOISE = "noise"
-TEXT_STEPS = "text_steps.json"
 
 
 class SmolVLAChunk(nn.Module):
@@ -114,8 +113,7 @@ class SmolVLAExport:
         prompt = self.text_steps(
             prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
         )
-        config = self.policy.config
-        self.noise = torch.randn(config.chunk_size, config.max_action_dim, device="cuda")
+        self.noise = torch.randn(self.config.chunk_size, self.config.max_action_dim, device="cuda")
         self.inputs = (*(torch.from_numpy(x).cuda() for x in self.frame.values()), self.noise)
         self.module = SmolVLAChunk(
             self.policy,
