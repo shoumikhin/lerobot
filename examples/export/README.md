@@ -156,6 +156,20 @@ Add `--robot.log_path=actions.npz` to save the actions and their times. Replay r
 
 Each policy runs five ways: the three TensorRT routes, `torch.compile` and plain PyTorch. Bold marks the best value in each row. Thor runs at MAXN power with locked clocks. The Orin Nano runs with a locked GPU clock.
 
+### The policies
+
+All four policies were trained on the same SO-101 dataset (225 episodes recorded at 30 Hz) with a wrist camera and a scene camera, both 640 by 480. Each run gets one observation and returns a chunk of actions:
+
+|                           |     ACT | SmolVLA |   pi0.5 | GR00T N1.7 |
+| ------------------------- | ------: | ------: | ------: | ---------: |
+| Parameters                |     52M |    450M |    4.1B |       3.1B |
+| Actions per chunk         |     100 |      50 |      50 |         40 |
+| Motion per chunk at 30 Hz |  3.33 s |  1.67 s |  1.67 s |     1.33 s |
+| Denoising steps per chunk |       0 |      10 |      10 |          4 |
+| Image size the model sees | 640x480 | 512x512 | 224x224 |    256x256 |
+
+`lerobot-rollout` plays every action of a chunk at 30 Hz, then runs the policy again while the arm holds still. So the latency below is a pause between chunks. For example, pi0.5 on the Orin Nano pauses about 0.63 s after every 1.67 s of motion.
+
 ### Accuracy
 
 How far the actions are from PyTorch's, on 50 dataset samples with the same random noise: largest / average, in degrees (gripper in %). Lower is better.
