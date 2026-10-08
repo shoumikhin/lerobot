@@ -104,7 +104,7 @@ class ACTExport:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def write(self, program_path: Path) -> None:
+    def write(self, program_path: Path, cuda_graphs: bool = False) -> None:
         """Save the test case, the policy config, and `export.json` beside the compiled program."""
         save_file({**self.frame, "expected_actions": self.expected_actions}, self.output_dir / TEST_CASE)
         self.config.save_pretrained(self.output_dir)
@@ -117,6 +117,9 @@ class ACTExport:
             "test_case": TEST_CASE,
             "tolerance": self.tolerance,
         }
+        if cuda_graphs:
+            # The ONNX-TensorRT and Torch-TensorRT runners then replay the engine from a CUDA graph.
+            info["cuda_graphs"] = True
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
         print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")
 

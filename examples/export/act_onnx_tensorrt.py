@@ -50,7 +50,7 @@ def main() -> None:
     export.release_policy()
     if not args.export_only:
         build_engine(onnx_path, engine_path)
-    export.write(engine_path)
+    export.write(engine_path, cuda_graphs=True)
 
 
 if __name__ == "__main__":
