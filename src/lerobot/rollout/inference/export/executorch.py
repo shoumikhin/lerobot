@@ -101,6 +101,7 @@ def to_torch(array: np.ndarray):
 
 
 def to_numpy(tensor) -> np.ndarray:
+    """A host copy of the tensor; NumPy reads bfloat16 through the ml_dtypes extension dtype."""
     import torch
 
     tensor = tensor.cpu()

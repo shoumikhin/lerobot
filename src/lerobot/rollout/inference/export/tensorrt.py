@@ -25,12 +25,14 @@ READ_CHUNK_BYTES = 64 << 20
 
 @functools.cache
 def cuda_runtime():
+    """The CUDA runtime bindings, imported on first use so the module loads without them."""
     from cuda.bindings import runtime
 
     return runtime
 
 
 def check_cuda(result):
+    """The value a CUDA runtime call returns, or an error if its status is not success."""
     status, *values = result
     if status != 0:
         raise RuntimeError(f"CUDA runtime call failed: {status}")

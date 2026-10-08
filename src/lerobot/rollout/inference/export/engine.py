@@ -24,8 +24,8 @@ flow-matching policy gets the starting noise as its last input, drawn here for e
 program compiled for one task holds that task in its weights, and `export.json` says so with
 `task_fixed`: the engine then refuses any other task.
 
-A policy too large for one program, like pi0.5, is exported as a chain of programs that `export.json`
-lists under `programs`; `ProgramChain` runs them in order with any backend.
+A policy too large for one program, like pi0.5 or GR00T, is exported as a chain of programs that
+`export.json` lists under `programs`; `ProgramChain` runs them in order with any backend.
 """
 
 from __future__ import annotations
@@ -172,6 +172,7 @@ class ProgramChain:
 
 
 def _call(program: Program, initialize: bool) -> Program:
+    """The program's `initialize`, which runs the startup check, or the program itself."""
     return getattr(program, "initialize", program) if initialize else program
 
 
@@ -249,8 +250,7 @@ class ExportInferenceEngine(InferenceEngine):
                 if noise is not None
                 else np.random.standard_normal(self._noise_shape).astype(np.float32)
             )
-        program = getattr(self._program, "initialize", self._program) if initialize else self._program
-        actions = program(*(observation[name] for name in self._input_names))
+        actions = _call(self._program, initialize)(*(observation[name] for name in self._input_names))
         return (actions if self._raw_frame else actions[0]).copy()
 
     def _check_task(self, task: str) -> None:
