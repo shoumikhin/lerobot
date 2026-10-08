@@ -36,13 +36,13 @@ from torch import nn
 
 def compile_part(
     module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
-):
+) -> None:
     onnx_path = path.with_suffix(".onnx")
     with torch.no_grad():
         torch.onnx.export(
             module, inputs, onnx_path, dynamo=True, input_names=input_names, output_names=output_names
         )
-    # CPU memory can swap during the build, GPU memory cannot.
+    # As offload_module_to_cpu does on the other routes: CPU memory can swap during the build; GPU memory cannot.
     module.cpu()
     free_memory()
     build_engine(

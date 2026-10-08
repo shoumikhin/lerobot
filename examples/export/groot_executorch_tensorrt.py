@@ -39,7 +39,7 @@ from torch import nn
 
 def compile_part(
     module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
-):
+) -> None:
     with torch.no_grad():
         program = torch.export.export(module, inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
@@ -54,6 +54,7 @@ def compile_part(
                 skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
             ),
             enable_non_cpu_memory_planning=True,
+            # Each program reads and writes CUDA tensors the rollout owns, so the chain never copies to the host.
             memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
         ),
     )

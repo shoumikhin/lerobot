@@ -23,7 +23,7 @@ model that built it:
         --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model
 
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
-Unlike the other two backends, the package runs only with PyTorch and Torch-TensorRT installed.
+Running it needs PyTorch and Torch-TensorRT.
 """
 
 import torch

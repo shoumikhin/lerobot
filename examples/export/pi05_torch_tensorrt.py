@@ -21,10 +21,10 @@ model that built it:
 
     python examples/export/pi05_torch_tensorrt.py \
         --policy.path=outputs/train/pi05_so101/checkpoints/last/pretrained_model \
-        --task="Pick up the block and place it in the cup"
+        --task="pick up the block and place it in the cup"
 
-Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
-Unlike the other backends, the packages run only with PyTorch and Torch-TensorRT installed.
+Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
+Running it needs PyTorch and Torch-TensorRT.
 """
 
 from pathlib import Path
@@ -37,7 +37,7 @@ from torch import nn
 
 def compile_part(
     module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
-):
+) -> None:
     with torch.no_grad():
         program = torch.export.export(module, inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)

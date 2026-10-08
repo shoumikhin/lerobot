@@ -21,12 +21,9 @@ model that built it:
 
     python examples/export/pi05_executorch_tensorrt.py \
         --policy.path=outputs/train/pi05_so101/checkpoints/last/pretrained_model \
-        --task="Pick up the block and place it in the cup"
+        --task="pick up the block and place it in the cup"
 
-Then run the exported folder with `lerobot-rollout --policy.path=<folder>`.
-
-Each program takes and returns CUDA tensors, so the rollout passes one program's outputs to the next
-without copying them to the host: only the frame goes in and the actions come out.
+Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
 """
 
 from pathlib import Path
@@ -42,7 +39,7 @@ from torch import nn
 
 def compile_part(
     module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
-):
+) -> None:
     with torch.no_grad():
         program = torch.export.export(module, inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
@@ -57,12 +54,13 @@ def compile_part(
                 skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
             ),
             enable_non_cpu_memory_planning=True,
-            # The caller owns the inputs and outputs, so the program neither allocates nor copies them.
+            # Each program reads and writes CUDA tensors the rollout owns, so the chain never copies to the host.
             memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
         ),
     )
 
 
 if __name__ == "__main__":
-    args = parse_args(__doc__, "executorch_tensorrt")
-    export_parts(args, __file__, "{name}.pte", compile_part, device_resident=True)
+    export_parts(
+        parse_args(__doc__, "executorch_tensorrt"), __file__, "{name}.pte", compile_part, device_resident=True
+    )

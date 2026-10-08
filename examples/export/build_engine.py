@@ -16,11 +16,10 @@
 
 """Build the TensorRT engine of a folder exported with `--export_only`, for this device's GPU.
 
-A TensorRT engine only runs on the GPU model that built it, and exporting a large policy needs more
-memory than a small device has. So export once on a big machine with `--export_only`, copy the folder
-to each device, and build its engine there:
+A TensorRT engine only runs on the GPU model that built it. So export once with `--export_only`, copy
+the folder to each device, and build its engine there:
 
-    python examples/export/build_engine.py outputs/export/pi05_onnx_tensorrt
+    python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 
 Then run the folder with `lerobot-rollout --policy.path=<folder>`.
 """

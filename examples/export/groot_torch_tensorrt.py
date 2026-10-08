@@ -24,7 +24,7 @@ model that built it:
         --dataset.repo_id=<user>/so101_dataset
 
 Then run the exported folder with `lerobot-rollout --policy.path=<folder>`, with the same task.
-Unlike the other backends, the packages run only with PyTorch and Torch-TensorRT installed.
+Running it needs PyTorch and Torch-TensorRT.
 """
 
 from pathlib import Path
@@ -37,7 +37,7 @@ from torch import nn
 
 def compile_part(
     module: nn.Module, inputs: tuple, input_names: list[str], output_names: list[str], path: Path
-):
+) -> None:
     with torch.no_grad():
         program = torch.export.export(module, inputs)
     engine = torch_tensorrt.dynamo.compile(program, arg_inputs=inputs, **TENSORRT_OPTIONS)
