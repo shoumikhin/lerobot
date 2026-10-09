@@ -31,7 +31,7 @@ takes the resized uint8 HWC cameras, float32 state and unbatched noise. Image no
 packing, state normalization and action unnormalization run inside the program. The folder records the
 task it was exported for; no tokenizer runs at inference.
 
-The split routes export a chain, one part per process: vision, groups of six language layers, groups of
+Every route exports a chain, one part per process: vision, groups of six language layers, groups of
 eight diffusion blocks, and the actions. Only one weight group is loaded at a time. The diffusion groups
 run once per Euler step, at the checkpoint's time buckets.
 """

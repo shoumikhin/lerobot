@@ -487,7 +487,15 @@ def test_actions_apply_the_postprocessor_after_slicing(recipe):
     torch.testing.assert_close(saved, part(values))
 
 
-@pytest.mark.parametrize("backend", ["onnx_tensorrt", "torch_tensorrt"])
+def mock_executorch(monkeypatch):
+    executorch = MagicMock()
+    for name in ("cuda.cuda_backend", "cuda.cuda_partitioner"):
+        monkeypatch.setitem(sys.modules, f"executorch.backends.{name}", executorch)
+    monkeypatch.setitem(sys.modules, "executorch.exir", executorch)
+    return executorch
+
+
+@pytest.mark.parametrize("backend", ["onnx_tensorrt", "torch_tensorrt", "executorch_cuda"])
 def test_split_script_launches_every_recipe_part(recipe, monkeypatch, tmp_path, backend):
     monkeypatch.setattr(
         recipe.PreTrainedConfig, "from_pretrained", lambda path: SimpleNamespace(base_model_path="base")
@@ -499,6 +507,7 @@ def test_split_script_launches_every_recipe_part(recipe, monkeypatch, tmp_path, 
     )
     monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=MagicMock()))
     monkeypatch.setitem(sys.modules, "torch_tensorrt", MagicMock())
+    mock_executorch(monkeypatch)
     load = MagicMock(side_effect=AssertionError("The parent must not load the whole policy"))
     monkeypatch.setattr(recipe, "GrootExport", load)
     calls = MagicMock()
@@ -521,8 +530,17 @@ def test_split_script_launches_every_recipe_part(recipe, monkeypatch, tmp_path, 
     load.assert_not_called()
 
 
-@pytest.mark.parametrize("backend,suffix", [("onnx_tensorrt", ".engine"), ("torch_tensorrt", ".pt2")])
-def test_split_script_compiles_named_parts_and_writes_chain(recipe, monkeypatch, tmp_path, backend, suffix):
+@pytest.mark.parametrize(
+    "backend,file_name",
+    [
+        ("onnx_tensorrt", "{name}.engine"),
+        ("torch_tensorrt", "{name}.pt2"),
+        ("executorch_cuda", "{name}/{name}.pte"),
+    ],
+)
+def test_split_script_compiles_named_parts_and_writes_chain(
+    recipe, monkeypatch, tmp_path, backend, file_name
+):
     class Part(torch.nn.Module):
         def forward(self, x):
             return x + 1, x * 2
@@ -563,6 +581,7 @@ def test_split_script_compiles_named_parts_and_writes_chain(recipe, monkeypatch,
     monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=build))
     trt = MagicMock()
     monkeypatch.setitem(sys.modules, "torch_tensorrt", trt)
+    executorch = mock_executorch(monkeypatch)
     script = Path(recipe.__file__).with_name(f"groot_{backend}.py")
     for name in names:
         monkeypatch.setattr(
@@ -588,7 +607,7 @@ def test_split_script_compiles_named_parts_and_writes_chain(recipe, monkeypatch,
         assert events == [
             event for i in range(len(names)) for event in [*(["free"] * i), "onnx", "cpu", "free", "build"]
         ]
-    else:
+    elif backend == "torch_tensorrt":
         assert trt.dynamo.compile.call_count == trt.save.call_count == len(names)
         for call in trt.dynamo.compile.call_args_list:
             assert call.kwargs == {"arg_inputs": inputs, **recipe.TENSORRT_OPTIONS}
@@ -596,11 +615,25 @@ def test_split_script_compiles_named_parts_and_writes_chain(recipe, monkeypatch,
         for name, call in zip(names, trt.save.call_args_list, strict=True):
             assert call.args == (trt.dynamo.compile.return_value, str(tmp_path / f"{name}.pt2"))
             assert call.kwargs == {"output_format": "aot_inductor", "arg_inputs": inputs}
+    else:
+        lower = executorch.to_edge_transform_and_lower
+        assert lower.call_count == len(names)
+        for call in lower.call_args_list:
+            torch.testing.assert_close(call.args[0].module()(*inputs), module(*inputs))
+            assert call.kwargs["partitioner"] == [executorch.CudaPartitioner.return_value]
+        executorch.CudaBackend.generate_method_name_compile_spec.assert_called_with("forward")
+        program = lower.return_value.to_executorch.return_value
+        assert program.save.call_args_list == [((str(tmp_path / name / f"{name}.pte"),),) for name in names]
+        assert program.write_tensor_data_to_file.call_args_list == [
+            ((str(tmp_path / name),),) for name in names
+        ]
+        assert all((tmp_path / name).is_dir() for name in names)
     info = json.loads((tmp_path / "export.json").read_text())
     assert info["backend"] == backend
     assert info["device_resident"] is (backend == "torch_tensorrt")
     assert info["programs"] == {
-        name: {"file": f"{name}{suffix}", "inputs": input_names, "outputs": output_names} for name in names
+        name: {"file": file_name.format(name=name), "inputs": input_names, "outputs": output_names}
+        for name in names
     }
     assert "file" not in info
     assert info["dt"] == 0.5 and info["timesteps"] == [0, 500]
