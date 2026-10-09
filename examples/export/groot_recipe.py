@@ -126,7 +126,7 @@ def export_parts(
         return
     if args.part not in names:
         raise ValueError(f"Unknown part {args.part!r}; choose from {names}.")
-    export = GrootExport(args, split=True)
+    export = GrootExport(args)
     programs = {}
     for name, module, inputs, input_names, output_names in export.parts():
         programs[name] = {"file": file_name.format(name=name), "inputs": input_names, "outputs": output_names}
@@ -495,7 +495,7 @@ class GrootActions(nn.Module):
 
 
 class GrootChunk(nn.Module):
-    """One action chunk in one program: the resized frame and the noise in, the actions to play out, in robot units."""
+    """One action chunk in PyTorch: the resized frame and the noise in, the actions to play out, in robot units."""
 
     def __init__(
         self,
@@ -569,36 +569,13 @@ class GrootChunk(nn.Module):
 
 
 class GrootExport:
-    """Loads a trained GR00T N1.7 checkpoint, whole or one part at a time, and writes the exported folder."""
+    """Reads a trained GR00T N1.7 checkpoint one part at a time, and writes the exported folder around its programs.
 
-    def __init__(self, args: argparse.Namespace, *, split: bool = False):
-        if split:
-            self.init_parts(args)
-            return
-        self.output_dir = make_output_dir(args.output_dir, args.job_name)
-        self.policy_path = args.policy_path
-        self.backend, self.tolerance = args.backend, args.tolerance
-        self.policy = GrootPolicy.from_pretrained(self.policy_path).to("cuda").eval()
-        self.config = self.policy.config
-        preprocessor, postprocessor = gpu_processors(self.policy.config, self.policy_path)
-        self.read_dataset(args)
-        batch = preprocessor(self.observation())
-        model = self.policy._groot_model
-        self.noise = torch.randn(
-            model.action_head.action_horizon, model.action_head.action_dim, device="cuda"
-        )
-        # Before GrootChunk keeps only this robot's action head weights, which the policy shares.
-        self.expected_actions = self.rollout_actions(preprocessor, postprocessor)
-        observation = GrootObservation(preprocessor, self.frame, batch).cuda()
-        self.image_resize = observation.image_resize
-        self.module = GrootChunk(self.policy, batch, postprocessor, observation).eval()
-        resized_frame = resize_images(self.frame, self.image_resize)
-        self.inputs = (*(torch.from_numpy(x).cuda() for x in resized_frame.values()), self.noise)
-        self.input_names = [*self.frame, NOISE]
-        self.start = time.perf_counter()
+    It prepares the fixed prompt and frame with only the vision weights loaded, and `parts` loads every later
+    part on its own.
+    """
 
-    def init_parts(self, args: argparse.Namespace) -> None:
-        """Prepare the fixed prompt and frame with only the vision weights loaded."""
+    def __init__(self, args: argparse.Namespace):
         self.output_dir, self.policy_path = args.output_dir, args.policy_path
         self.backend, self.tolerance = args.backend, args.tolerance
         self.config = PreTrainedConfig.from_pretrained(self.policy_path)
@@ -774,48 +751,24 @@ class GrootExport:
             self.expected_actions = module(actions).float().cpu().numpy()
         yield "actions", module, (actions,), ["x_t"], [ACTION]
 
-    def release_policy(self) -> None:
-        """Free the policy before the backend compiles; the test case's actions are already computed."""
-        del self.policy, self.module
-        gc.collect()
-        torch.cuda.empty_cache()
-
     def observation(self) -> dict[str, Tensor]:
         """The test frame and task as `lerobot-rollout` hands them to the policy's preprocessor."""
         return prepare_observation_for_inference(dict(self.frame), torch.device("cuda"), self.task)
 
-    def rollout_actions(
-        self, preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
-    ) -> np.ndarray:
-        """The chunk the PyTorch policy plays for the test frame, task and noise, as lerobot-rollout runs it."""
-        self.policy.reset()
-        with torch.inference_mode():
-            actions = self.policy.predict_action_chunk(
-                preprocessor(self.observation()), noise=self.noise[None]
-            )
-            actions = postprocessor(actions[:, : self.policy._action_queue_steps])
-        return actions[0].float().cpu().numpy()
-
-    def write(self, program: Path | dict[str, dict], device_resident: bool = False) -> None:
-        """Save the raw test case, the policy config and `export.json` beside the program or chain of programs."""
+    def write(self, programs: dict[str, dict], device_resident: bool = False) -> None:
+        """Save the raw test case, the policy config and `export.json`, which lists each program's file, inputs and outputs."""
         case = {**self.frame, NOISE: self.noise.cpu().numpy(), "expected_actions": self.expected_actions}
         save_file(case, self.output_dir / TEST_CASE)
         config = copy(self.config)
         config.input_features = self.input_features
         config.save_pretrained(self.output_dir)
-        if isinstance(program, dict):
-            files = {
-                "programs": program,
-                "device_resident": device_resident,
-                "num_steps": self.num_steps,
-                "timesteps": self.timesteps,
-                "dt": 1.0 / self.num_steps,
-            }
-        else:
-            files = {"file": program.name}
         info = {
             "backend": self.backend,
-            **files,
+            "programs": programs,
+            "device_resident": device_resident,
+            "num_steps": self.num_steps,
+            "timesteps": self.timesteps,
+            "dt": 1.0 / self.num_steps,
             "inputs": self.input_names,
             "raw_frame": True,
             "image_resize": self.image_resize,

@@ -60,7 +60,7 @@ def test_checkpoint_split_matches_chunk(monkeypatch, tmp_path):
         dataset=dataset,
         dataset_root=os.environ.get("GROOT_SPLIT_DATASET_ROOT"),
     )
-    export = GrootExport(args, split=True)
+    export = GrootExport(args)
     programs, metadata = {}, {}
     for name, module, inputs, input_names, output_names in export.parts():
         programs[name] = Program(module)
@@ -440,7 +440,7 @@ def test_export_parts_saves_the_device_contract(recipe, monkeypatch, tmp_path, d
         start=recipe.time.perf_counter(),
     )
     monkeypatch.setattr(recipe, "part_names", lambda path: ["actions"])
-    monkeypatch.setattr(recipe, "GrootExport", lambda args, split: export)
+    monkeypatch.setattr(recipe, "GrootExport", lambda args: export)
     monkeypatch.setattr(
         export,
         "parts",
@@ -590,7 +590,7 @@ def test_split_script_compiles_named_parts_and_writes_chain(
             [str(script), "--policy.path=checkpoint", "--dataset.repo_id=dataset", f"--part={name}"],
         )
         runpy.run_path(str(script), run_name="__main__")
-        assert load.call_args.kwargs == {"split": True}
+        assert load.call_args.args[0].part == name
         if name != "actions":
             assert not (tmp_path / "export.json").exists()
     if backend == "onnx_tensorrt":
