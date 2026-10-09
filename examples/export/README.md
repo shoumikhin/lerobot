@@ -174,8 +174,6 @@ All four policies were trained on the same SO-101 dataset (225 episodes recorded
 
 Bold compares the first number in each cell.
 
-The Orin Nano pi0.5 and GR00T ExecuTorch-TensorRT cells are older and read "estimate (measured)". The ExecuTorch build without PyTorch cannot run these chains on that board yet, because of a limitation in its Python bindings. The measured number loads PyTorch and gives each engine its own scratch area. The estimate subtracts a PyTorch overhead measured earlier on that board, rounded to 10 MiB. It is not a measurement.
-
 Thor:
 
 |         | ExecuTorch-TensorRT |    ONNX-TensorRT | Torch-TensorRT |      `torch.compile` |
@@ -224,29 +222,29 @@ The three TensorRT routes run ACT and SmolVLA with CUDA graphs on, within about 
 
 Memory the whole board uses while the policy runs, in MiB: the highest steady value across three valid runs, plus any memory the run pushed to swap. On a Jetson the CPU and GPU share memory, so the memory of the process alone misses some GPU use. Lower is better.
 
-ExecuTorch-TensorRT cells read "without PyTorch (with PyTorch)". Both numbers are measured, with the same exported folder. The first uses an ExecuTorch build that does not need PyTorch, so the rollout loads no PyTorch library. For pi0.5 and GR00T, ExecuTorch-TensorRT and ONNX-TensorRT run the chain with CUDA graphs off and one scratch area (memory for in-between results) shared by all its engines. The ONNX-TensorRT ACT and SmolVLA cells were measured with CUDA graphs off. Bold compares the first number in each cell.
+ExecuTorch-TensorRT numbers come from an ExecuTorch build that does not need PyTorch, so the rollout loads no PyTorch library. That torch-free pybindings work is still in progress, so treat these ExecuTorch-TensorRT memory numbers as early estimates that may still move. For pi0.5 and GR00T, ExecuTorch-TensorRT and ONNX-TensorRT run the chain with CUDA graphs off and one scratch area (memory for in-between results) shared by all its engines. The ONNX-TensorRT ACT and SmolVLA cells were measured with CUDA graphs off. Bold compares the two routes.
 
 Thor:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |     **538** (829) |           547 |           1510 |            2489 |    2327 |
-| SmolVLA |    **1263** (1539) |          1295 |           3233 |            4422 |    3940 |
-| pi0.5   |         6031 (6296) |      **5924** |           7072 |           12215 |   11610 |
-| GR00T   |     **5388** (5729) |          5409 |           6489 |           16138 |   15722 |
+| ACT     |     **538** |           547 |           1510 |            2489 |    2327 |
+| SmolVLA |    **1263** |          1295 |           3233 |            4422 |    3940 |
+| pi0.5   |         6031 |      **5924** |           7072 |           12215 |   11610 |
+| GR00T   |     **5388** |          5409 |           6489 |           16138 |   15722 |
 
 Orin Nano:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |     **207** (455) |           216 |            579 |            1651 |    1140 |
-| SmolVLA |     **346** (620) |           427 |           1708 |            2957 |    2034 |
-| pi0.5   |         5112 (5327) |      **4853** |            OOM |             OOM |     OOM |
-| GR00T   |         4434 (4739) |      **4417** |           7605 |             OOM |     OOM |
+| ACT     |     **207** |           216 |            579 |            1651 |    1140 |
+| SmolVLA |     **346** |           427 |           1708 |            2957 |    2034 |
+| pi0.5   |         5001 |      **4893** |            OOM |             OOM |     OOM |
+| GR00T   |     **4402** |          4422 |           7605 |             OOM |     OOM |
 
 ONNX-TensorRT uses the least memory on most rows, because it is the only route that does not load PyTorch. On the Orin Nano, pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT, and Torch-TensorRT runs out of memory while it loads. GR00T with Torch-TensorRT needs most of the board's 8 GB and pushes about 3 GB to swap.
 
-The Orin Nano pi0.5 and GR00T ExecuTorch-TensorRT cells use the host-handoff version of the chain (each program's outputs come back to the host and the next program reads them). The device-resident version, where programs pass CUDA tensors straight to each other, is a little lighter, but the ExecuTorch build without PyTorch cannot run it on the Orin yet: it stops with "Failed to copy a result off the device". So on the Orin these two cells are measured on the host-handoff chain, and the ONNX-TensorRT numbers beside them use the same chain, so the comparison is fair.
+On the Orin Nano, pi0.5 and GR00T run device-resident (each program passes its CUDA results straight to the next, with no copy back to the host), and the ONNX-TensorRT numbers beside them use the same chain, so the comparison is fair. GR00T with ExecuTorch-TensorRT uses a little less memory than ONNX-TensorRT here; pi0.5 still uses a bit more.
 
 ## Limits
 
