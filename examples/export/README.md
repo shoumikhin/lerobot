@@ -172,7 +172,9 @@ All four policies were trained on the same SO-101 dataset (225 episodes recorded
 
 ### Accuracy
 
-How far the actions are from PyTorch's, on 50 dataset samples with the same random noise: largest / average, in degrees (gripper in %). Lower is better.
+Bold compares the first number in each cell.
+
+The Orin Nano pi0.5 and GR00T ExecuTorch-TensorRT cells are older and read "estimate (measured)". The ExecuTorch build without PyTorch cannot run these chains on that board yet, because of a limitation in its Python bindings. The measured number loads PyTorch and gives each engine its own scratch area. The estimate subtracts a PyTorch overhead measured earlier on that board, rounded to 10 MiB. It is not a measurement.
 
 Thor:
 
@@ -222,23 +224,23 @@ The three TensorRT routes run ACT and SmolVLA with CUDA graphs on, within about 
 
 Memory the whole board uses while the policy runs, in MiB: the highest steady value across three valid runs, plus any memory the run pushed to swap. On a Jetson the CPU and GPU share memory, so the memory of the process alone misses some GPU use. Lower is better.
 
-ExecuTorch-TensorRT cells read "estimate (measured)". The measured number includes the PyTorch library, which these folders load to run. The estimate subtracts the PyTorch overhead measured earlier, rounded to 10 MiB. It is not a measurement. For GR00T on the Orin Nano it subtracts the smallest overhead measured on that board. Bold compares the first number in each cell.
+ExecuTorch-TensorRT cells read "without PyTorch (with PyTorch)". Both numbers are measured, with the same exported folder. The first uses an ExecuTorch build that does not need PyTorch, so the rollout loads no PyTorch library. For pi0.5 and GR00T, ExecuTorch-TensorRT and ONNX-TensorRT run the chain with CUDA graphs off and one scratch area (memory for in-between results) shared by all its engines. The ONNX-TensorRT ACT and SmolVLA cells were measured with CUDA graphs off. Bold compares the first number in each cell.
 
 Thor:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |           560 (873) |       **557** |           1510 |            2489 |    2327 |
-| SmolVLA |     **1190** (1534) |          1278 |           3233 |            4422 |    3940 |
-| pi0.5   |         6530 (6822) |      **5914** |           7072 |           12215 |   11610 |
-| GR00T   |         5470 (5775) |      **5426** |           6489 |           16138 |   15722 |
+| ACT     |     **538** (829) |           547 |           1510 |            2489 |    2327 |
+| SmolVLA |    **1263** (1539) |          1295 |           3233 |            4422 |    3940 |
+| pi0.5   |         6031 (6296) |      **5924** |           7072 |           12215 |   11610 |
+| GR00T   |     **5388** (5729) |          5409 |           6489 |           16138 |   15722 |
 
 Orin Nano:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |           330 (490) |       **223** |            579 |            1651 |    1140 |
-| SmolVLA |           520 (669) |       **370** |           1708 |            2957 |    2034 |
+| ACT     |     **207** (455) |           216 |            579 |            1651 |    1140 |
+| SmolVLA |     **346** (620) |           427 |           1708 |            2957 |    2034 |
 | pi0.5   |         5560 (5727) |      **4875** |            OOM |             OOM |     OOM |
 | GR00T   |         4510 (4658) |      **4411** |           7605 |             OOM |     OOM |
 
