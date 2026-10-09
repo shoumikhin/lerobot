@@ -241,10 +241,12 @@ Orin Nano:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |     **207** (455) |           216 |            579 |            1651 |    1140 |
 | SmolVLA |     **346** (620) |           427 |           1708 |            2957 |    2034 |
-| pi0.5   |         5560 (5727) |      **4875** |            OOM |             OOM |     OOM |
-| GR00T   |         4510 (4658) |      **4411** |           7605 |             OOM |     OOM |
+| pi0.5   |         5112 (5327) |      **4853** |            OOM |             OOM |     OOM |
+| GR00T   |         4434 (4739) |      **4417** |           7605 |             OOM |     OOM |
 
 ONNX-TensorRT uses the least memory on most rows, because it is the only route that does not load PyTorch. On the Orin Nano, pi0.5 runs with ExecuTorch-TensorRT and ONNX-TensorRT, and Torch-TensorRT runs out of memory while it loads. GR00T with Torch-TensorRT needs most of the board's 8 GB and pushes about 3 GB to swap.
+
+The Orin Nano pi0.5 and GR00T ExecuTorch-TensorRT cells use the host-handoff version of the chain (each program's outputs come back to the host and the next program reads them). The device-resident version, where programs pass CUDA tensors straight to each other, is a little lighter, but the ExecuTorch build without PyTorch cannot run it on the Orin yet: it stops with "Failed to copy a result off the device". So on the Orin these two cells are measured on the host-handoff chain, and the ONNX-TensorRT numbers beside them use the same chain, so the comparison is fair.
 
 ## Limits
 
