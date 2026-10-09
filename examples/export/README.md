@@ -204,8 +204,8 @@ Thor:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |                3.44 |      **3.39** |           3.63 |           12.80 |   15.91 |
 | SmolVLA |           **28.17** |         29.76 |          29.19 |           44.47 |   166.7 |
-| pi0.5   |               120.4 |     **116.0** |          119.2 |           129.9 |   244.2 |
-| GR00T   |               95.62 |         94.66 |      **93.28** |           205.8 |   211.1 |
+| pi0.5   |               118.6 |     **111.5** |          119.2 |           129.9 |   244.2 |
+| GR00T   |                93.4 |         95.1 |      **93.28** |           205.8 |   211.1 |
 
 Orin Nano:
 
@@ -213,10 +213,10 @@ Orin Nano:
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
 | ACT     |           **25.41** |         25.58 |          26.38 |           61.53 |   64.60 |
 | SmolVLA |               125.8 |     **121.0** |          135.4 |           172.3 |   762.0 |
-| pi0.5   |               630.7 |     **625.5** |            OOM |             OOM |     OOM |
-| GR00T   |           **272.9** |         275.0 |          276.4 |             OOM |     OOM |
+| pi0.5   |               631.4 |     **615.7** |            OOM |             OOM |     OOM |
+| GR00T   |               276.6 |     **276.1** |          276.4 |             OOM |     OOM |
 
-The three TensorRT routes run ACT and SmolVLA with CUDA graphs on, within about 1 ms of each other. ExecuTorch-TensorRT is the fastest for ACT on Thor and SmolVLA on Thor, and for GR00T on the Orin Nano. ONNX-TensorRT is the fastest for ACT on the Orin Nano, for SmolVLA on the Orin Nano, and for pi0.5 on both boards. Torch-TensorRT is the fastest for GR00T on Thor.
+All four TensorRT routes run with CUDA graphs on (the GPU records its work once and replays it). ExecuTorch-TensorRT is the fastest for ACT and SmolVLA on Thor. ONNX-TensorRT is the fastest for ACT and SmolVLA on the Orin Nano, and for pi0.5 on both boards. Torch-TensorRT is the fastest for GR00T on Thor, just ahead of ExecuTorch-TensorRT. For GR00T, ExecuTorch-TensorRT is the only route that can turn CUDA graphs on: ONNX-TensorRT runs out of memory while recording the graph, so it stays graphs off, and the two tie on the Orin Nano. On pi0.5, CUDA graphs make ExecuTorch-TensorRT about 1 ms slower, because its chain of small programs copies every input and output through private buffers on each replay, which costs more than the graph saves.
 
 ### Memory
 
