@@ -187,27 +187,27 @@ Every cell passed the 50-sample comparison, and every exported folder passed its
 
 ### Latency
 
-Time for one action chunk, in milliseconds: the median of three process medians, each over 100 chunks after 20 warmup chunks. The Thor `torch.compile` pi0.5 cell uses one process. Lower is better.
+Time for one action chunk, in milliseconds: the median of three process medians, each over 100 chunks after 20 warmup chunks. The Thor `torch.compile` pi0.5 cell uses one process. Repeated runs of the larger policies can differ by 1 ms or more, so values are rounded to whole milliseconds. A 1 ms gap between two routes does not show that one is faster. Lower is better.
 
 Thor:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |                3.44 |      **3.39** |           3.63 |           12.80 |   15.91 |
-| SmolVLA |           **28.17** |         29.76 |          29.19 |           44.47 |   166.7 |
-| pi0.5   |               118.6 |     **111.5** |          119.2 |           129.9 |   244.2 |
-| GR00T   |                93.4 |          95.1 |      **93.28** |           205.8 |   211.1 |
+| ACT     |               **3** |         **3** |              4 |              13 |      16 |
+| SmolVLA |              **28** |            30 |             29 |              44 |     167 |
+| pi0.5   |                 119 |       **111** |            119 |             130 |     244 |
+| GR00T   |              **93** |            95 |         **93** |             206 |     211 |
 
 Orin Nano:
 
 |         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
 | ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |           **25.41** |         25.58 |          26.38 |           61.53 |   64.60 |
-| SmolVLA |               125.8 |     **121.0** |          135.4 |           172.3 |   762.0 |
-| pi0.5   |               631.4 |     **615.7** |            OOM |             OOM |     OOM |
-| GR00T   |               276.6 |     **276.1** |          276.4 |             OOM |     OOM |
+| ACT     |              **25** |            26 |             26 |              62 |      65 |
+| SmolVLA |                 126 |       **121** |            135 |             172 |     762 |
+| pi0.5   |                 631 |       **616** |            OOM |             OOM |     OOM |
+| GR00T   |                 277 |       **276** |        **276** |             OOM |     OOM |
 
-The TensorRT routes use CUDA graphs wherever their scripts turn them on. On pi0.5 the graphs make ExecuTorch-TensorRT slightly slower, because its chain of small programs copies each input and output through private buffers on every replay.
+The TensorRT routes use CUDA graphs wherever their scripts turn them on. On pi0.5 the graphs do not make ExecuTorch-TensorRT faster, because its chain of small programs copies each input and output through private buffers on every replay.
 
 ### Memory
 
