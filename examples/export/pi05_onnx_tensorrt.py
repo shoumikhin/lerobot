@@ -54,4 +54,6 @@ def compile_part(
 
 
 if __name__ == "__main__":
-    export_parts(parse_args(__doc__, "onnx_tensorrt"), __file__, "{name}.engine", compile_part)
+    export_parts(
+        parse_args(__doc__, "onnx_tensorrt"), __file__, "{name}.engine", compile_part, cuda_graphs=True
+    )

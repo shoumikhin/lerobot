@@ -154,7 +154,7 @@ class SmolVLAExport:
             "tolerance": self.tolerance,
         }
         if cuda_graphs:
-            # The ONNX-TensorRT and Torch-TensorRT runners then replay the engine from a CUDA graph.
+            # The ONNX-TensorRT runner then replays the engine from a CUDA graph.
             info["cuda_graphs"] = True
         (self.output_dir / "export.json").write_text(json.dumps(info, indent=2) + "\n")
         print(f"Wrote {self.output_dir} in {time.perf_counter() - self.start:.0f} s")

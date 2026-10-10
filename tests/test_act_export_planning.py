@@ -107,3 +107,45 @@ def test_smolvla_direct_export_enables_cuda_graphs(tmp_path, monkeypatch):
     runpy.run_path(str(script), run_name="__main__")
     compile_spec.assert_called_once_with("use_cuda_graphs", b"1")
     assert tensorrt.save.call_args.kwargs["compile_specs"] == [compile_spec.return_value]
+
+
+@pytest.mark.parametrize("policy", ["pi05", "groot"])
+def test_chain_executorch_export_enables_cuda_graphs(tmp_path, monkeypatch, policy):
+    tensorrt = MagicMock()
+    compile_spec = MagicMock()
+    export_parts = MagicMock()
+    modules = {
+        "torch_tensorrt": tensorrt,
+        "executorch.exir": SimpleNamespace(ExecutorchBackendConfig=MagicMock()),
+        "executorch.exir.backend.compile_spec_schema": SimpleNamespace(CompileSpec=compile_spec),
+        "executorch.exir.passes.memory_planning_pass": SimpleNamespace(MemoryPlanningPass=MagicMock()),
+        "executorch.exir.passes.propagate_device_pass": SimpleNamespace(PropagateDeviceConfig=MagicMock()),
+        f"{policy}_recipe": SimpleNamespace(
+            TENSORRT_OPTIONS={}, export_parts=export_parts, parse_args=lambda *args: SimpleNamespace()
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    script = Path(__file__).resolve().parents[1] / "examples" / "export" / f"{policy}_executorch_tensorrt.py"
+    runpy.run_path(str(script), run_name="__main__")
+    compile_part = export_parts.call_args.args[3]
+    monkeypatch.setattr("torch.export.export", MagicMock())
+    compile_part(MagicMock(), (), [], [], tmp_path / "part.pte")
+    compile_spec.assert_called_once_with("use_cuda_graphs", b"1")
+    assert tensorrt.save.call_args.kwargs["compile_specs"] == [compile_spec.return_value]
+
+
+@pytest.mark.parametrize("policy,cuda_graphs", [("pi05", True), ("groot", False)])
+def test_chain_onnx_export_sets_cuda_graphs(monkeypatch, policy, cuda_graphs):
+    export_parts = MagicMock()
+    recipe = SimpleNamespace(
+        TENSORRT_OPTIONS={},
+        export_parts=export_parts,
+        free_memory=MagicMock(),
+        parse_args=lambda *args: SimpleNamespace(),
+    )
+    monkeypatch.setitem(sys.modules, f"{policy}_recipe", recipe)
+    monkeypatch.setitem(sys.modules, "build_engine", SimpleNamespace(build_engine=MagicMock()))
+    script = Path(__file__).resolve().parents[1] / "examples" / "export" / f"{policy}_onnx_tensorrt.py"
+    runpy.run_path(str(script), run_name="__main__")
+    assert export_parts.call_args.kwargs.get("cuda_graphs", False) is cuda_graphs

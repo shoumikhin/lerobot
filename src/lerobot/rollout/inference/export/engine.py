@@ -95,7 +95,7 @@ def load_one(
 
     A device-resident ExecuTorch program takes and returns CUDA tensors, so a chain keeps its values on the GPU.
     The ExecuTorch-TensorRT programs of a chain run one after another, so they share one activation scratch.
-    A lone program keeps its own scratch, because the delegate turns off CUDA graph replay on the shared one.
+    A lone program keeps its own scratch, because older delegates turn off CUDA graph replay on the shared one.
     """
     if backend == "torch_tensorrt":
         from .aoti import AOTInductorPackage
