@@ -87,6 +87,7 @@ print("POLICY_CLASS", get_policy_class("act").__name__)
 UNKNOWN_NAMES = """
 import json, sys, tempfile
 sys.modules["transformers"] = None  # pi_gemma, a helper module, fails to import without it
+sys.modules["peft"] = None  # peft imports transformers
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_policy_config
 
