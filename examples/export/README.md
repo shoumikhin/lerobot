@@ -124,7 +124,7 @@ Each value is the median of three runs of 100 chunks, measured with [benchmark.p
 
 ### Memory
 
-Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better.
+Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured with [benchmark_memory.py](benchmark_memory.py) around a `lerobot-rollout` run with the replay robot.
 
 Thor:
 

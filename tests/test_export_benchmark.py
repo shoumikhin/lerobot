@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The arithmetic behind the README's results: time per chunk and action error."""
+"""The arithmetic behind the README's results: time per chunk, action error and board memory."""
 
 import importlib
 from pathlib import Path
@@ -45,3 +45,13 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     mean, p95 = benchmark.action_error(actions, reference)
     assert mean == pytest.approx((19 * 0.5 + 10.0) / 20)
     assert p95 == pytest.approx(0.5 + 0.05 * (10.0 - 0.5))
+
+
+def test_memory_counts_swap_and_ignores_the_load_peak(examples):
+    memory = examples("benchmark_memory")
+    meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
+    assert memory.used_mib(meminfo) == 2048
+    assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
+    steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    run = [9000.0] * 10 + [3000.0] * steady  # loading peaks, then the loop holds steady
+    assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
