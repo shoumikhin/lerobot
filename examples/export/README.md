@@ -87,7 +87,7 @@ lerobot-rollout \
 
 ## Results
 
-The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the policy's own PyTorch code, as `lerobot-rollout` does.
+The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the same pieces of the policy that the export compiles, through the same inference engine, so only what runs those pieces differs. [benchmark.py](benchmark.py) measures time and accuracy, and [benchmark_memory.py](benchmark_memory.py) measures memory around the same run.
 
 - All four policies were trained on the same SO-101 dataset: 304 episodes, recorded at 30 frames per second.
 - Both boards ran at maximum power, with the GPU clock locked.
@@ -122,7 +122,7 @@ Each value is the median of three runs of 100 chunks. Differences of a few milli
 
 ### Memory
 
-Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured during a `lerobot-rollout` run with the replay robot.
+Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured over 60 s of chunks, after the same 20 warm-up chunks as the time per chunk.
 
 Thor:
 

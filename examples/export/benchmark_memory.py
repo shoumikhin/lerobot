@@ -12,31 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measure the memory a `lerobot-rollout` run takes on a Jetson.
+"""Measure the memory a policy takes on a Jetson while `benchmark.py --duration` runs it.
 
 A Jetson's CPU and GPU share one memory, and a process's own counters miss some GPU allocations, so this
 reads the whole board from /proc/meminfo: the drop in available memory plus the growth in swap, from the
-10 s before the command starts to the last 30 s of its run, in MiB. Keep the board otherwise idle.
+10 s before the command starts to the time the policy runs warm, in MiB. Keep the board otherwise idle.
 
 The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
-use is flat. The run's window ends 3 s before the command exits, since its teardown frees everything,
-and a run whose window is not flat by the same test is reported as invalid, not as a number.
+use is flat. The run's window opens when the benchmark says its warm-up chunks are done, so loading and
+compiling stay out of it, and closes when it says it stopped, before its teardown frees everything. A run
+whose window is not flat by the same test is reported as invalid, not as a number.
 
-    python examples/export/benchmark_memory.py -- lerobot-rollout --policy.path=outputs/export/act \\
-        --robot.type=replay --robot.frames_dir=outputs/replay_frames \\
-        --duration=60 --return_to_initial_position=false --play_sounds=false
+    python examples/export/benchmark_memory.py -- python examples/export/benchmark.py outputs/export/act \\
+        --frames=outputs/benchmark/frames.npz --duration=60
 """
 
 import statistics
 import subprocess
 import sys
+import threading
 import time
+
+from benchmark import STOPPED, WARM
 
 SAMPLE_SECONDS = 0.5
 BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
 FLAT_MIB_PER_SECOND = 2
-TEARDOWN_SECONDS = 3
 SETTLE_LIMIT_SECONDS = 300
 
 
@@ -45,19 +47,14 @@ def used_mib(meminfo: dict[str, int]) -> float:
     return (meminfo["MemTotal"] - meminfo["MemAvailable"] + meminfo["SwapTotal"] - meminfo["SwapFree"]) / 1024
 
 
-def steady_window(run: list[float]) -> list[float]:
-    """The last 30 s of the run before the command's teardown."""
-    return run[: -int(TEARDOWN_SECONDS / SAMPLE_SECONDS)][-int(STEADY_SECONDS / SAMPLE_SECONDS) :]
+def steady_window(run: list[tuple[float, float]], marks: dict[str, float]) -> list[float]:
+    """The use sampled between the benchmark's warm and stopped lines, from (time, use) samples."""
+    return [use for at, use in run if marks[WARM] <= at <= marks[STOPPED]]
 
 
-def extra_mib(baseline: list[float], run: list[float]) -> float:
+def extra_mib(baseline: list[float], window: list[float]) -> float:
     """The median use over the run's steady window minus the median use before it started."""
-    return statistics.median(steady_window(run)) - statistics.median(baseline)
-
-
-def long_enough(run: list[float]) -> bool:
-    """Whether the command ran for 60 s, as `--duration=60` does, so the window before teardown is loop."""
-    return len(run) * SAMPLE_SECONDS >= 2 * STEADY_SECONDS
+    return statistics.median(window) - statistics.median(baseline)
 
 
 def is_flat(samples: list[float]) -> bool:
@@ -76,14 +73,24 @@ def read_meminfo() -> dict[str, int]:
         return {line.split(":")[0]: int(line.split()[1]) for line in file}
 
 
-def sample(seconds: float | None = None, process: subprocess.Popen | None = None) -> list[float]:
-    """Memory use every half second, for `seconds` or until `process` exits."""
+def sample(
+    seconds: float | None = None, process: subprocess.Popen | None = None
+) -> list[tuple[float, float]]:
+    """(time, memory use) every half second, for `seconds` or until `process` exits."""
     samples = []
     end = time.monotonic() + (seconds or 0)
     while (process.poll() is None) if process else time.monotonic() < end:
-        samples.append(used_mib(read_meminfo()))
+        samples.append((time.monotonic(), used_mib(read_meminfo())))
         time.sleep(SAMPLE_SECONDS)
     return samples
+
+
+def watch(process: subprocess.Popen, marks: dict[str, float]) -> None:
+    """Pass the command's output through, and note when it prints the benchmark's warm and stopped lines."""
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        if line.strip() in (WARM, STOPPED):
+            marks[line.strip()] = time.monotonic()
 
 
 def main() -> None:
@@ -92,24 +99,31 @@ def main() -> None:
         return
     command = sys.argv[sys.argv.index("--") + 1 :]
     window = int(BASELINE_SECONDS / SAMPLE_SECONDS)
-    baseline = sample(BASELINE_SECONDS)
+    baseline = [use for _, use in sample(BASELINE_SECONDS)]
     settle_end = time.monotonic() + SETTLE_LIMIT_SECONDS
     while not is_flat(baseline[-window:]):
         if time.monotonic() > settle_end:
             raise SystemExit(f"Invalid: memory use was still changing after {SETTLE_LIMIT_SECONDS} s.")
-        baseline += sample(SAMPLE_SECONDS)
+        baseline += [use for _, use in sample(SAMPLE_SECONDS)]
     baseline = baseline[-window:]
-    process = subprocess.Popen(command)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    marks: dict[str, float] = {}
+    watcher = threading.Thread(target=watch, args=(process, marks))
+    watcher.start()
     run = sample(process=process)
+    watcher.join()
     if process.returncode != 0:
         raise SystemExit(f"{command[0]} exited with {process.returncode}")
-    if not long_enough(run):
+    if WARM not in marks or STOPPED not in marks:
         raise SystemExit(
-            f"Run for at least {2 * STEADY_SECONDS} s, so the last {STEADY_SECONDS} s are steady."
+            f"The command printed no {WARM!r} and {STOPPED!r} lines: run benchmark.py --duration."
         )
-    if not is_flat(steady_window(run)):
-        raise SystemExit(f"Invalid: memory use was still changing in the last {STEADY_SECONDS} s of the run.")
-    print(f"Extra memory: {extra_mib(baseline, run):.0f} MiB")
+    if marks[STOPPED] - marks[WARM] < STEADY_SECONDS:
+        raise SystemExit(f"Run for at least {STEADY_SECONDS} s after the warm-up, with --duration.")
+    steady = steady_window(run, marks)
+    if not is_flat(steady):
+        raise SystemExit("Invalid: memory use was still changing while the policy ran warm.")
+    print(f"Extra memory: {extra_mib(baseline, steady):.0f} MiB")
 
 
 if __name__ == "__main__":

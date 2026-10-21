@@ -50,19 +50,43 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     assert largest == 10.0
 
 
-def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples):
+def test_memory_counts_swap_and_only_the_warm_chunks(examples):
     memory = examples("benchmark_memory")
     meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
     assert memory.used_mib(meminfo) == 2048
     assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
-    steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
-    # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
-    run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
-    assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
-    assert memory.is_flat(memory.steady_window(run))
-    # Still returning its load-time memory, 7 MiB a second, is not flat, even with a teardown cliff at its end.
-    falling = [3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(120)] + [2000.0] * 6
-    assert not memory.is_flat(memory.steady_window(falling))
+    # Loading peaks, compiling holds a long flat plateau, the warm chunks hold steady, the teardown frees all.
+    use = [9000.0] * 10 + [7000.0] * 120 + [3000.0] * 80 + [2000.0] * 6
+    run = [(i * memory.SAMPLE_SECONDS, u) for i, u in enumerate(use)]
+    marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 209 * memory.SAMPLE_SECONDS}
+    window = memory.steady_window(run, marks)
+    assert window == [3000.0] * 80
+    assert memory.extra_mib([2000.0, 2010.0, 1990.0], window) == 1000.0
+
+
+def test_memory_measures_a_command_between_its_warm_and_stopped_lines(examples, monkeypatch, capsys):
+    import sys
+
+    memory = examples("benchmark_memory")
+    monkeypatch.setattr(memory, "SAMPLE_SECONDS", 0.02)
+    monkeypatch.setattr(memory, "BASELINE_SECONDS", 0.2)
+    monkeypatch.setattr(memory, "STEADY_SECONDS", 0.3)
+    start = __import__("time").monotonic()
+
+    def meminfo():
+        # 1000 MiB used before the command, 1500 MiB once it runs warm, 9000 MiB while it loads.
+        elapsed = __import__("time").monotonic() - start
+        used = 1000 if elapsed < 0.3 else 9000 if elapsed < 0.8 else 1500
+        return {"MemTotal": 10000 << 10, "MemAvailable": (10000 - used) << 10, "SwapTotal": 0, "SwapFree": 0}
+
+    monkeypatch.setattr(memory, "read_meminfo", meminfo)
+    command = (
+        "import time; time.sleep(0.4); print('loaded'); time.sleep(0.6);"
+        f"print({memory.WARM!r}, flush=True); time.sleep(0.5); print({memory.STOPPED!r}, flush=True)"
+    )
+    monkeypatch.setattr(sys, "argv", ["benchmark_memory.py", "--", sys.executable, "-c", command])
+    memory.main()
+    assert capsys.readouterr().out.splitlines()[-1] == "Extra memory: 500 MiB"
 
 
 def test_memory_is_flat_only_when_it_stops_changing(examples):
@@ -73,12 +97,6 @@ def test_memory_is_flat_only_when_it_stops_changing(examples):
     assert memory.is_flat(list(4000.0 + jitter))
     # The board still returning a previous job's memory: use falling 7 MiB a second.
     assert not memory.is_flat([3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(samples)])
-
-
-def test_memory_accepts_a_60_second_rollout(examples):
-    memory = examples("benchmark_memory")
-    assert memory.long_enough([3000.0] * int(60 / memory.SAMPLE_SECONDS))
-    assert not memory.long_enough([3000.0] * int(40 / memory.SAMPLE_SECONDS))
 
 
 def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tmp_path, monkeypatch):
