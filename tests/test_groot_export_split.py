@@ -24,6 +24,9 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
+pytest.importorskip("av", reason="the export examples require lerobot[dataset]")
+
 
 @pytest.fixture
 def recipe(monkeypatch):
