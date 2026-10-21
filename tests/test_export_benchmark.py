@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from tests.test_export_recipes import act_checkpoint
+
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 
 
@@ -77,3 +79,23 @@ def test_memory_accepts_a_60_second_rollout(examples):
     memory = examples("benchmark_memory")
     assert memory.long_enough([3000.0] * int(60 / memory.SAMPLE_SECONDS))
     assert not memory.long_enough([3000.0] * int(40 / memory.SAMPLE_SECONDS))
+
+
+def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tmp_path, monkeypatch):
+    import torch
+
+    benchmark = examples("benchmark")
+    compiled, generations = [], []
+    monkeypatch.setattr(torch, "compile", lambda module, **options: compiled.append(options) or module)
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: generations.append(1))
+    argv = [f"--policy.path={act_checkpoint(tmp_path / 'act')}", "--frames=unused", "--output=unused"]
+    engine, _ = benchmark.torch_engine("torch.compile", argv, tmp_path)
+    assert compiled == [{"mode": "reduce-overhead"}]
+    generations.clear()
+    frame = {
+        "observation.images.front": np.zeros((32, 32, 3), np.uint8),
+        "observation.state": np.zeros(3, np.float32),
+    }
+    for _ in range(4):  # two chunks of two actions
+        engine.get_action(frame)
+    assert len(generations) == 2
