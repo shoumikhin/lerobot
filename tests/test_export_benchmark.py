@@ -135,6 +135,14 @@ def test_memory_measures_a_command_between_its_warm_and_stopped_lines(examples, 
     assert capsys.readouterr().out.splitlines()[-1] == "Extra memory: 500 MiB"
 
 
+def test_frames_share_one_copy_of_the_file(examples, tmp_path):
+    benchmark = examples("benchmark")
+    np.savez(tmp_path / "frames.npz", image=np.zeros((benchmark.FRAMES, 4, 4, 3), np.uint8))
+    frames = benchmark.load_frames(tmp_path / "frames.npz")
+    # A frame per copy of all the frames would hold the file 50 times over in memory.
+    assert len({id(frame["image"].base) for frame in frames}) == 1
+
+
 def test_memory_is_flat_only_when_it_stops_changing(examples):
     memory = examples("benchmark_memory")
     samples = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)

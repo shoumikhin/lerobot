@@ -74,8 +74,9 @@ def action_error(actions: np.ndarray, reference: np.ndarray) -> tuple[float, flo
 
 def load_frames(path: Path) -> list[dict[str, np.ndarray]]:
     """The frames `benchmark.py frames` wrote, one dict per frame, as the robot gives them."""
-    data = np.load(path)
-    return [{name: np.ascontiguousarray(data[name][i]) for name in data.files} for i in range(FRAMES)]
+    # Each read of an .npz entry decompresses all its frames, and a frame is a view that keeps them alive.
+    data = dict(np.load(path))
+    return [{name: np.ascontiguousarray(data[name][i]) for name in data} for i in range(FRAMES)]
 
 
 def write_frames(argv: list[str]) -> None:
