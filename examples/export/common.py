@@ -310,13 +310,13 @@ class ChunkActions(nn.Module):
     program then takes as an input too.
     """
 
-    def __init__(self, horizon: int, action_dim: int, postprocessor: PolicyProcessorPipeline):
+    def __init__(self, n_action_steps: int, action_dim: int, postprocessor: PolicyProcessorPipeline):
         super().__init__()
-        self.horizon, self.action_dim = horizon, action_dim
+        self.n_action_steps, self.action_dim = n_action_steps, action_dim
         self.postprocessor, self.absolute_step = anchored_postprocessor(postprocessor)
 
     def forward(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
-        actions = self.postprocessor(actions[None, : self.horizon, : self.action_dim])
+        actions = self.postprocessor(actions[None, : self.n_action_steps, : self.action_dim])
         if self.absolute_step is not None:
             mask = self.absolute_step.relative_step._build_mask(actions.shape[-1])
             actions = to_absolute_actions(actions, state[None], mask)
