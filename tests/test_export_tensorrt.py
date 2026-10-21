@@ -461,3 +461,53 @@ def test_chained_engines_share_scratch_and_keep_the_cache_on_device(tmp_path, mo
     assert result.shape == noise_shape
     assert times == [1.0, 0.75, 0.5]
     np.testing.assert_allclose(result, 1.0 * 0.75 * 0.5)
+
+
+def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch):
+    from lerobot.inference.export.tensorrt import TensorRTProgram
+
+    engine = TensorRTProgram.__new__(TensorRTProgram)
+    engine._input_names = ["observation.images.wrist"]
+    engine._input_shapes = [(1, 3, 480, 640)]
+    engine._context = MagicMock()
+
+    with pytest.raises(ValueError, match=r"the engine was built for \(1, 3, 480, 640\)"):
+        engine(np.zeros((1, 3, 240, 320), np.float32))
+    engine._context.set_tensor_address.assert_not_called()
+
+
+def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch):
+    """TensorRT asks for the whole engine in one read; the reader answers with at most one piece per call."""
+    import sys
+    import types
+
+    from lerobot.inference.export import tensorrt as export_tensorrt
+
+    pieces = []
+
+    class Runtime:
+        def __init__(self, logger):
+            pass
+
+        def deserialize_cuda_engine(self, reader):
+            data, size = b"", 10
+            while len(data) < size:
+                pieces.append(reader.read(size - len(data), 0))
+                data += pieces[-1]
+            return data
+
+    fake_tensorrt = types.SimpleNamespace(
+        IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
+        IGpuAllocator=type("IGpuAllocator", (), {"__init__": lambda self: None}),
+        SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
+        Runtime=Runtime,
+        Logger=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
+    monkeypatch.setattr(export_tensorrt, "runtime", functools.cache(export_tensorrt.runtime.__wrapped__))
+    monkeypatch.setattr(export_tensorrt, "READ_CHUNK_BYTES", 4)
+    (tmp_path / "model.engine").write_bytes(b"0123456789")
+
+    assert export_tensorrt.load_engine(tmp_path / "model.engine") == b"0123456789"
+    assert [len(piece) for piece in pieces] == [4, 4, 2]
+    assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_tensorrt.IGpuAllocator)

@@ -18,12 +18,14 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 from lerobot.inference.export import engine as export_engine
 from lerobot.inference.export.engine import ExportInferenceEngine, ProgramChain, load_programs
+from tests.export_helpers import fake_program, write_export_folder
 
 # DLPack's device types.
 CPU, CUDA = 1, 2
@@ -373,3 +375,161 @@ def test_torch_tensorrt_package_takes_host_arrays_and_returns_host_actions(tmp_p
     assert isinstance(actions, np.ndarray)
     assert all(kind is torch.Tensor for _, kinds in received for kind in kinds), received
     assert cudagraphs and all(cudagraphs)
+
+
+@pytest.fixture
+def cpu_export_engine(monkeypatch):
+    """Builds an export engine around `fake_program`, on the CPU."""
+    from lerobot.inference.export import engine as export_engine
+
+    monkeypatch.setattr(export_engine, "load_programs", lambda folder, info: {"model": fake_program})
+    return lambda folder: export_engine.ExportInferenceEngine(folder, task="")
+
+
+def test_export_dir_tells_an_exported_folder_from_a_checkpoint(tmp_path):
+    from lerobot.inference.export import export_dir
+
+    assert export_dir(tmp_path) is None
+    assert export_dir(None) is None
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    assert export_dir(tmp_path) == tmp_path
+
+
+def test_export_engine_plays_one_chunk_one_action_per_call(tmp_path, cpu_export_engine):
+    import numpy as np
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    engine = cpu_export_engine(tmp_path)
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+
+    with patch.object(engine, "_run_chunk", wraps=engine._run_chunk) as run_chunk:
+        actions = [engine.get_action(frame) for _ in range(3)]
+
+    np.testing.assert_array_equal(actions[0], [1, 2, 3])
+    np.testing.assert_array_equal(actions[1], [2, 4, 6])
+    np.testing.assert_array_equal(actions[2], [1, 2, 3])
+    assert run_chunk.call_count == 2
+    assert len(engine.inference_times) == 2
+
+
+def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu_export_engine):
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        cpu_export_engine(tmp_path)
+
+
+@pytest.mark.parametrize("bad", ["nan", "shape"])
+def test_export_engine_refuses_nan_actions_and_a_wrong_shape(tmp_path, monkeypatch, bad):
+    import numpy as np
+
+    from lerobot.inference.export import engine as export_engine
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+
+    def program(state):
+        chunk = fake_program(state)
+        # One step more than the test case: comparing only the overlap would match.
+        return np.full_like(chunk, np.nan) if bad == "nan" else np.concatenate([chunk, chunk[:, :1]], axis=1)
+
+    monkeypatch.setattr(export_engine, "load_programs", lambda folder, info: {"model": program})
+    message = "does not reproduce its test case" if bad == "nan" else r"shaped \(2, 4\), but its test case"
+    with pytest.raises(RuntimeError, match=message):
+        export_engine.ExportInferenceEngine(tmp_path, task="")
+
+
+@pytest.mark.parametrize("event", ["task", "reset"])
+def test_export_engine_drops_the_queued_chunk_on_a_task_change_or_reset(tmp_path, cpu_export_engine, event):
+    import numpy as np
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    engine = cpu_export_engine(tmp_path)
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+    with patch.object(engine, "_run_chunk", wraps=engine._run_chunk) as run_chunk:
+        engine.get_action(frame)
+        if event == "task":
+            assert engine.set_task("place")
+        else:
+            engine.reset()
+        np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
+    assert run_chunk.call_count == 2
+
+
+def test_export_engine_applies_the_rename_map_to_the_robot_frame(tmp_path, monkeypatch):
+    import numpy as np
+
+    from lerobot.inference.export import engine as export_engine
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    monkeypatch.setattr(export_engine, "load_programs", lambda folder, info: {"model": fake_program})
+    engine = export_engine.ExportInferenceEngine(
+        tmp_path, task="", rename_map={"observation.joints": "observation.state"}
+    )
+
+    action = engine.get_action({"observation.joints": np.array([1, 2, 3], dtype=np.float32)})
+
+    np.testing.assert_array_equal(action, [1, 2, 3])
+
+
+def test_export_engine_refuses_another_task_before_loading_the_programs(tmp_path, monkeypatch):
+    """Loading a large chain takes long on a small board, so a wrong --task is refused first."""
+    import json
+
+    from lerobot.inference.export import engine as export_engine
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    info = json.loads((tmp_path / "export.json").read_text())
+    (tmp_path / "export.json").write_text(json.dumps({**info, "task": "pick"}))
+    monkeypatch.setattr(export_engine, "load_programs", lambda *args: pytest.fail("loaded the programs"))
+    with pytest.raises(ValueError, match="only runs the task it was exported for"):
+        export_engine.ExportInferenceEngine(tmp_path, task="place")
+
+
+def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, cpu_export_engine):
+    import json
+
+    import numpy as np
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    info = json.loads((tmp_path / "export.json").read_text())
+    (tmp_path / "export.json").write_text(json.dumps({**info, "task": "pick"}))
+
+    # Without --task, the rollout runs the task the folder was exported for.
+    assert cpu_export_engine(tmp_path).task == "pick"
+
+    from lerobot.inference.export import engine as export_engine
+
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="pick")
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+    np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
+    assert "only runs the task it was exported for" in engine.text_input_error("place", instruction=True)
+    assert engine.text_input_error("place") is None
+    assert not engine.set_task("place")
+    assert engine.task == "pick"
+
+    from lerobot.rollout.controller import RolloutController
+    from tests.interactive_helpers import _make_ctx
+
+    ctx, strategy, *_ = _make_ctx()
+    ctx.policy.inference = engine
+    assert not RolloutController(strategy, ctx).set_task("place")
+    assert engine.task == "pick"
+    np.testing.assert_array_equal(engine.get_action(frame), [2, 4, 6])
+    engine.reset()
+    engine.get_action(frame)
+    assert engine.task == engine.dispatched_task == "pick"
+
+
+def test_export_engine_holds_the_robot_until_the_planner_replies(tmp_path, cpu_export_engine):
+    import numpy as np
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    engine = cpu_export_engine(tmp_path)
+    engine.external_text = lambda obs, query, task: "pick up the cup"
+    assert engine.dispatch_allowed()
+    engine.start_autosteer("clear the table", interval_s=0.0)
+    assert engine.hold_for_planner()
+    assert not engine.dispatch_allowed()
+    engine.stop_autosteer()
+    assert engine.dispatch_allowed()
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+    np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
