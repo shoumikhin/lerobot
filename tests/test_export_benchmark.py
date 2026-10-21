@@ -99,3 +99,29 @@ def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tm
     for _ in range(4):  # two chunks of two actions
         engine.get_action(frame)
     assert len(generations) == 2
+
+
+def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, capsys):
+    from argparse import Namespace
+
+    from tests.export_helpers import write_export_folder
+
+    benchmark = examples("benchmark")
+    write_export_folder(tmp_path, np.zeros((2, 3)))
+    np.savez(tmp_path / "frames.npz", **{"observation.state": np.zeros((benchmark.FRAMES, 3), np.float32)})
+    chunks = []
+
+    class Program:
+        def reset(self):
+            pass
+
+        def get_action(self, frame):
+            chunks.append(capsys.readouterr().out)
+
+    args = Namespace(frames=tmp_path / "frames.npz", output=None, duration=0.2)
+    benchmark.measure_engine("folder", Program(), args, tmp_path)
+    # The warm line comes only after every warm-up chunk, the stopped line after the last chunk.
+    assert chunks[: benchmark.WARMUP_CHUNKS] == [""] * benchmark.WARMUP_CHUNKS
+    assert chunks[benchmark.WARMUP_CHUNKS] == benchmark.WARM + "\n"
+    assert len(chunks) > benchmark.WARMUP_CHUNKS + 1
+    assert capsys.readouterr().out == benchmark.STOPPED + "\n"

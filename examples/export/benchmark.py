@@ -35,6 +35,9 @@ what runs the parts differs. Run each step on the board that will run the policy
         --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/act_executorch.npz
     # the results, compared with the first file
     python examples/export/benchmark.py report outputs/benchmark/act_pytorch.npz outputs/benchmark/act_*.npz
+
+With `--duration=60` instead of `--output`, an executor runs chunks for 60 s after the warm-up and saves
+nothing, for `benchmark_memory.py` to measure. It prints a line when the warm-up is done and when it stops.
 """
 
 import argparse
@@ -50,6 +53,9 @@ FRAMES = 50
 WARMUP_CHUNKS = 20
 RUNS = 3
 CHUNKS_PER_RUN = 100
+# What `--duration` prints when the warm-up chunks are done, and when it stops running chunks.
+WARM = "benchmark: warm"
+STOPPED = "benchmark: stopped"
 
 
 def time_per_chunk(chunk_ms: np.ndarray) -> float:
@@ -150,7 +156,11 @@ def torch_engine(executor: str, argv: list[str], folder: Path):
 def benchmark_arguments() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--frames", type=Path, required=True, help="The file `benchmark.py frames` wrote.")
-    parser.add_argument("--output", type=Path, required=True, help="The .npz file to write.")
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--output", type=Path, help="The .npz file to write.")
+    output.add_argument(
+        "--duration", type=float, help="Instead, run chunks for this many seconds after the warm-up."
+    )
     return parser
 
 
@@ -168,7 +178,8 @@ def measure(executor: str, argv: list[str]) -> None:
 
 
 def measure_engine(executor: str, program, args: argparse.Namespace, folder: Path) -> None:
-    """Time `program` on the first frame, then save its actions for every frame."""
+    """Time `program` on the first frame, then save its actions for every frame, or with `--duration`, keep
+    running it."""
     from safetensors.numpy import load_file
 
     info = json.loads((folder / "export.json").read_text())
@@ -190,6 +201,13 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
 
     for _ in range(WARMUP_CHUNKS):
         chunk_ms()
+    if args.duration is not None:
+        print(WARM, flush=True)
+        end = time.monotonic() + args.duration
+        while time.monotonic() < end:
+            chunk_ms()
+        print(STOPPED, flush=True)
+        return
     times = np.array([[chunk_ms() for _ in range(CHUNKS_PER_RUN)] for _ in range(RUNS)])
     actions = np.stack([run_chunk(frame, seed) for seed, frame in enumerate(frames)])
     args.output.parent.mkdir(parents=True, exist_ok=True)
