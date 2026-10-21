@@ -32,7 +32,7 @@ from copy import copy
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from export import (
+from common import (
     ChunkActions,
     Part,
     add_dataset_arguments,
@@ -163,8 +163,8 @@ class GrootObservation(nn.Module):
         if encode.use_albumentations or pack.video_horizon not in (None, 1):
             raise ValueError("Raw-frame export requires tensor image processing and one observation frame.")
         self.frame_names = list(frame)
-        self.frame_processor = PolicyProcessorPipeline(steps=preprocessor.steps[:pack_index])
-        sample = self.frame_processor({n: to_policy_input(n, torch.from_numpy(x)) for n, x in frame.items()})
+        self.preprocessor = PolicyProcessorPipeline(steps=preprocessor.steps[:pack_index])
+        sample = self.preprocessor({n: to_policy_input(n, torch.from_numpy(x)) for n, x in frame.items()})
         # The cameras the policy feeds, in its order, as its own packing step picks them.
         self.cameras = pack._ordered_image_keys(sample)
         if not self.cameras:
@@ -183,7 +183,7 @@ class GrootObservation(nn.Module):
         # The engine resizes the frame before the rename step, so the geometry names the frame's cameras.
         renamed = {
             new: old
-            for step in self.frame_processor.steps
+            for step in self.preprocessor.steps
             if isinstance(step, RenameObservationsProcessorStep)
             for old, new in step.rename_map.items()
         }
@@ -217,7 +217,7 @@ class GrootObservation(nn.Module):
             self.register_buffer("state_span", torch.where(span != 0, span, torch.ones_like(span)))
 
     def forward(self, *frame: Tensor) -> tuple[Tensor, Tensor]:
-        obs = self.frame_processor(
+        obs = self.preprocessor(
             {n: to_policy_input(n, x) for n, x in zip(self.frame_names, frame, strict=True)}
         )
         images = torch.cat([obs[n] for n in self.cameras])
@@ -430,7 +430,7 @@ def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -
         )
 
 
-class Export:
+class Exporter:
     """Reads a trained GR00T N1.7 checkpoint one part at a time, and writes the folder around its programs."""
 
     def __init__(self, args: argparse.Namespace):
@@ -438,7 +438,7 @@ class Export:
         self.config = PreTrainedConfig.from_pretrained(args.policy_path)
         self.config.device = str(device())
         self.model_file = cached_file(args.policy_path, "model.safetensors")
-        self.policy = self.load_part(VISION)
+        self.policy = self.load_modules(VISION)
         model = self.policy._groot_model
         self.model_config = model.config
         self.horizon = self.policy._action_queue_steps
@@ -446,8 +446,8 @@ class Export:
         check_traceable_decode(self.postprocessor, args.route)
         self.task, self.frame, self.folder_config = dataset_frame(args, self.config)
         self.batch = preprocessor(prepare_observation_for_inference(dict(self.frame), device(), self.task))
-        self.frame_processor = GrootObservation(preprocessor, self.frame, self.batch).to(device())
-        self.image_resize = self.frame_processor.image_resize
+        self.observation = GrootObservation(preprocessor, self.frame, self.batch).to(device())
+        self.image_resize = self.observation.image_resize
         qwen = model.backbone.model.model
         ids, mask = self.batch["input_ids"], self.batch["attention_mask"]
         image_mask = ids == qwen.config.image_token_id
@@ -474,7 +474,7 @@ class Export:
         ]
         self.expected_actions = None
 
-    def load_part(self, *modules: str) -> GrootPolicy:
+    def load_modules(self, *modules: str) -> GrootPolicy:
         """The policy with only `modules`' weights read from the checkpoint, in the checkpoint's own precision."""
         config = copy(self.config)
         # Casting norms, embeddings and category biases changes residual additions outside autocast.
@@ -490,7 +490,7 @@ class Export:
         frame = tuple(torch.from_numpy(x).to(device()) for x in resized.values())
         module = GrootVision(
             self.policy._groot_model.backbone.visual,
-            self.frame_processor,
+            self.observation,
             self.batch["image_grid_thw"],
             self.config.use_bf16,
         ).eval()
@@ -501,7 +501,7 @@ class Export:
         yield Part("vision", module, frame, list(self.frame), ["image_embeds", *deepstack_names, "state"])
         del module
         free_memory()
-        policy = self.load_part(f"{LANGUAGE_MODEL}.embed_tokens")
+        policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
         with torch.no_grad():
             text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
         self.constants["text_embeds"] = text
@@ -514,7 +514,7 @@ class Export:
             if stop == depth:
                 modules += [f"{ACTION_HEAD}.{n}" for n in ("vlln", "vl_self_attention", "state_encoder")]
             free_memory()
-            policy = self.load_part(*modules)
+            policy = self.load_modules(*modules)
             module = GrootLanguageModel(
                 policy._groot_model.backbone.language_model,
                 policy._groot_model.action_head,
@@ -558,7 +558,7 @@ class Export:
                     modules.append(f"{ACTION_HEAD}.action_decoder")
                 free_memory()
                 module = GrootStep(
-                    self.load_part(*modules)._groot_model.action_head,
+                    self.load_modules(*modules)._groot_model.action_head,
                     self.constants,
                     first,
                     stop,

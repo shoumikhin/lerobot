@@ -29,7 +29,7 @@ def test_patch_packing_preserves_order_with_at_most_eight_dimensions(monkeypatch
     class Observation(GrootObservation):
         def __init__(self):
             torch.nn.Module.__init__(self)
-            self.frame_processor = torch.nn.Identity()
+            self.preprocessor = torch.nn.Identity()
             self.cameras = [f"observation.images.camera{i}" for i in range(cameras)]
             self.frame_names = [*self.cameras, "observation.state"]
             self.normalize = self.rescale = self.normalize_state = False
@@ -71,7 +71,7 @@ def test_patch_packing_normalizes_images_and_state(monkeypatch, mode):
     class Observation(GrootObservation):
         def __init__(self):
             torch.nn.Module.__init__(self)
-            self.frame_processor = torch.nn.Identity()
+            self.preprocessor = torch.nn.Identity()
             self.cameras = ["observation.images.camera"]
             self.frame_names = [*self.cameras, "observation.state"]
             self.normalize, self.rescale = mode == "normalize", mode == "rescale"

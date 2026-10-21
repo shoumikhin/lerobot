@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 from build_engine import build_engine
-from export import Part, export, free_memory, parse_args
+from common import Part, free_memory, parse_args, run_route
 
 
 def compile_part(part: Part, path: Path) -> None:
@@ -50,4 +50,4 @@ def compile_part(part: Part, path: Path) -> None:
 
 if __name__ == "__main__":
     args, recipe = parse_args(__doc__, "onnx_tensorrt")
-    export(__file__, args, recipe, compile_part, ".engine")
+    run_route(__file__, args, recipe, compile_part, ".engine")

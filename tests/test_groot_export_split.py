@@ -398,10 +398,10 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     head = tiny_head(num_layers=25)
     features, state, noise = torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4)
     text = SimpleNamespace(get_input_embeddings=lambda: torch.nn.Embedding(32, 32))
-    export = recipe.Export.__new__(recipe.Export)
-    export.__dict__.update(
+    exporter = recipe.Exporter.__new__(recipe.Exporter)
+    exporter.__dict__.update(
         policy=SimpleNamespace(_groot_model=SimpleNamespace(backbone=SimpleNamespace(visual=None))),
-        frame_processor=None,
+        observation=None,
         image_resize=None,
         batch={"image_grid_thw": None, "input_ids": torch.zeros(1, 5, dtype=torch.long)},
         config=SimpleNamespace(use_bf16=False, output_features={ACTION: SimpleNamespace(shape=(3,))}),
@@ -425,8 +425,8 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     monkeypatch.setattr(recipe, "GrootVision", lambda *args: Prefix())
     monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: Prefix())
     monkeypatch.setattr(
-        export,
-        "load_part",
+        exporter,
+        "load_modules",
         lambda *args: SimpleNamespace(
             _groot_model=SimpleNamespace(
                 backbone=SimpleNamespace(language_model=text), action_head=deepcopy(head)
@@ -461,7 +461,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         def upload(self, value):
             return value
 
-    for part in export.parts():
+    for part in exporter.parts():
         if not (part.name.startswith("step_") or part.name == "actions"):
             continue
         compile_part(part, tmp_path / f"{part.name}.engine")
@@ -481,27 +481,27 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         "inputs": ["vl_embeds", "state_features", "observation.state", "noise"],
         "programs": metadata,
         "steps": ["step_0", "step_1", "step_2", "step_3"],
-        "timesteps": export.timesteps,
+        "timesteps": exporter.timesteps,
     }
-    robot_state = export.frame["observation.state"]
+    robot_state = exporter.frame["observation.state"]
     actual = ProgramChain(programs, info)(features.numpy(), state.numpy(), robot_state, noise.numpy())
-    np.testing.assert_allclose(actual, export.expected_actions, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual, exporter.expected_actions, rtol=1e-5, atol=1e-5)
 
 
 def test_part_loader_preserves_precision_without_changing_policy_config(recipe, monkeypatch):
     calls = []
-    export = recipe.Export.__new__(recipe.Export)
-    export.config = SimpleNamespace(use_bf16=True, dtype=torch.float32)
-    export.model_file = "checkpoint"
+    exporter = recipe.Exporter.__new__(recipe.Exporter)
+    exporter.config = SimpleNamespace(use_bf16=True, dtype=torch.float32)
+    exporter.model_file = "checkpoint"
     monkeypatch.setattr(
         recipe.GrootPolicy,
         "load_checkpoint_modules",
         lambda path, config, modules: calls.append((path, config, modules)),
     )
-    export.load_part(recipe.VISION)
-    assert export.config.use_bf16
+    exporter.load_modules(recipe.VISION)
+    assert exporter.config.use_bf16
     path, config, modules = calls[0]
-    assert path == export.model_file and modules == [recipe.VISION]
+    assert path == exporter.model_file and modules == [recipe.VISION]
     assert not config.use_bf16 and config.dtype == torch.float32
 
 
@@ -578,13 +578,13 @@ def test_numpy_action_decoding_exports_to_onnx_and_follows_new_actions(recipe, t
     [((12, 16, 3), ["height", "width", "channels"]), ((3, 12, 16), ["channels", "height", "width"])],
 )
 def test_robot_frame_cameras_are_hwc_whatever_the_dataset_layout(recipe, shape, names):
-    smolvla = importlib.import_module("export")
+    common = importlib.import_module("common")
     features = {
         "observation.images.front": {"dtype": "video", "shape": shape, "names": names},
         "observation.state": {"dtype": "float32", "shape": (6,), "names": None},
         "action": {"dtype": "float32", "shape": (6,), "names": None},
     }
-    frame = smolvla.frame_from_dataset(features)
+    frame = common.frame_from_dataset(features)
     assert frame["observation.images.front"].shape == (12, 16, 3)
     assert frame["observation.images.front"].dtype == np.uint8
     assert frame["observation.state"].shape == (6,) and "action" not in frame
@@ -593,12 +593,12 @@ def test_robot_frame_cameras_are_hwc_whatever_the_dataset_layout(recipe, shape, 
 def test_task_must_be_one_of_the_dataset_tasks(recipe):
     import pandas as pd
 
-    smolvla = importlib.import_module("export")
+    common = importlib.import_module("common")
     metadata = SimpleNamespace(tasks=pd.DataFrame(index=["pick the cup", "open the drawer"]))
-    assert smolvla.dataset_task(metadata, None) == "pick the cup"
-    assert smolvla.dataset_task(metadata, "open the drawer") == "open the drawer"
+    assert common.dataset_task(metadata, None) == "pick the cup"
+    assert common.dataset_task(metadata, "open the drawer") == "open the drawer"
     with pytest.raises(ValueError, match="one of the dataset's tasks"):
-        smolvla.dataset_task(metadata, "close the drawer")
+        common.dataset_task(metadata, "close the drawer")
 
 
 def test_relative_actions_follow_the_robot_state_after_export(recipe):
@@ -651,15 +651,15 @@ def test_part_names_cover_remainders_and_reject_unknown_parts(recipe, monkeypatc
         "step_3",
         "actions",
     ]
-    export = importlib.import_module("export")
+    common = importlib.import_module("common")
     with pytest.raises(SystemExit, match="Unknown part"):
-        export.export("script", Namespace(part="bad", policy_path="checkpoint"), recipe, None, ".pte")
+        common.run_route("script", Namespace(part="bad", policy_path="checkpoint"), recipe, None, ".pte")
 
 
 def test_folder_turns_cuda_graphs_off(recipe, monkeypatch):
     written = {}
     monkeypatch.setattr(recipe, "write_folder", lambda *args, **info: written.update(info))
-    export = SimpleNamespace(
+    exporter = SimpleNamespace(
         folder_config=None,
         frame={},
         noise=None,
@@ -668,5 +668,5 @@ def test_folder_turns_cuda_graphs_off(recipe, monkeypatch):
         image_resize=None,
         task="task",
     )
-    recipe.Export.write(export, {"step_0": {}, "actions": {}}, Namespace())
+    recipe.Exporter.write(exporter, {"step_0": {}, "actions": {}}, Namespace())
     assert written["cuda_graphs"] is False
