@@ -43,7 +43,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 
@@ -118,7 +117,7 @@ def torch_engine(executor: str, argv: list[str], folder: Path):
     import torch
     from common import parse_args
 
-    from lerobot.inference.export import ExportInferenceEngine, engine
+    from lerobot.inference.export import ExportInferenceEngine
 
     args, recipe = parse_args(__doc__, executor, (benchmark_arguments(),), argv)
     # The compiled routes run float32 matrix multiplications in TensorFloat-32 too.
@@ -136,8 +135,7 @@ def torch_engine(executor: str, argv: list[str], folder: Path):
     args.output_dir = folder
     exporter.write(programs)
     loaded = {name: TorchProgram(module) for name, module in modules.items()}
-    with mock.patch.object(engine, "load_programs", lambda folder, info: loaded):
-        return ExportInferenceEngine(args.output_dir, task=""), args
+    return ExportInferenceEngine(args.output_dir, task="", programs=loaded), args
 
 
 def benchmark_arguments() -> argparse.ArgumentParser:

@@ -134,8 +134,14 @@ class ExportInferenceEngine(InferenceEngine):
     PyTorch.
     """
 
-    def __init__(self, folder: Path, task: str, rename_map: dict[str, str] | None = None) -> None:
-        """Load the folder's programs and check them against its test case."""
+    def __init__(
+        self,
+        folder: Path,
+        task: str,
+        rename_map: dict[str, str] | None = None,
+        programs: Mapping[str, Program] | None = None,
+    ) -> None:
+        """Load the folder's programs, or run `programs` instead, and check them against its test case."""
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._fixed_task: str | None = info.get("task")
         # Without --task, a folder exported for one task runs that task.
@@ -147,7 +153,7 @@ class ExportInferenceEngine(InferenceEngine):
         self._noise_shape = tuple(info["noise_shape"]) if "noise_shape" in info else None
         self._image_resize = info.get("image_resize")
         self._rename = rename_map or {}
-        self._chain = ProgramChain(load_programs(folder, info), info)
+        self._chain = ProgramChain(load_programs(folder, info) if programs is None else programs, info)
         self._actions: deque[np.ndarray] = deque()
         self._check(folder / info["test_case"], info["tolerance"])
         logger.info("Exported policy loaded from %s (%s)", folder, info["route"])

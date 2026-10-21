@@ -431,6 +431,23 @@ def test_export_engine_applies_the_rename_map_to_the_robot_frame(tmp_path, monke
     np.testing.assert_array_equal(action, [1, 2, 3])
 
 
+def test_export_engine_runs_the_programs_it_is_given(tmp_path, monkeypatch):
+    """The benchmark runs a recipe's parts in PyTorch through the same engine and the same startup check."""
+    import numpy as np
+
+    from lerobot.inference.export import engine as export_engine
+
+    write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    monkeypatch.setattr(
+        export_engine, "load_programs", lambda *args: pytest.fail("loaded the folder's programs")
+    )
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="", programs={"model": fake_program})
+
+    np.testing.assert_array_equal(
+        engine.get_action({"observation.state": np.array([1, 2, 3], np.float32)}), [1, 2, 3]
+    )
+
+
 def test_export_engine_refuses_another_task_before_loading_the_programs(tmp_path, monkeypatch):
     """Loading a large chain takes long on a small board, so a wrong --task is refused first."""
     import json
