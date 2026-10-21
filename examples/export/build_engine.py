@@ -30,8 +30,6 @@ from pathlib import Path
 from lerobot.inference.export import ExportInferenceEngine
 from lerobot.inference.export.engine import EXPORT_INFO
 
-# TensorRT's default. On the Orin Nano, level 5 built pi0.5's step program, but it did not load.
-OPTIMIZATION_LEVEL = 3
 # Small enough for the builds to fit an 8 GB Jetson Orin Nano beside the rest.
 WORKSPACE_BYTES = 1 << 30
 
@@ -58,7 +56,6 @@ def build_engine(onnx_path: Path, engine_path: Path) -> None:
         raise SystemExit("\n".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     config = builder.create_builder_config()
     config.set_memory_pool_limit(tensorrt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
-    config.builder_optimization_level = OPTIMIZATION_LEVEL
     start = time.perf_counter()
     with engine_path.open("wb") as file:
         if not builder.build_serialized_network_to_stream(network, config, FileWriter(file)):

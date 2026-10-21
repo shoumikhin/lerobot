@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from build_engine import OPTIMIZATION_LEVEL, WORKSPACE_BYTES, check_folder
+from build_engine import WORKSPACE_BYTES, check_folder
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
@@ -64,7 +64,6 @@ TENSORRT_OPTIONS = {
     "truncate_double": True,
     # On a Jetson the CPU and GPU share memory: CPU memory can swap during the build, GPU memory cannot.
     "offload_module_to_cpu": True,
-    "optimization_level": OPTIMIZATION_LEVEL,
     "workspace_size": WORKSPACE_BYTES,
     # Attention as plain matrix products, as the ONNX route writes it, so both TensorRT routes build alike.
     "decompose_attention": True,
