@@ -40,6 +40,7 @@ from common import (
     device,
     free_memory,
     processors,
+    renamed_inputs,
     to_policy_input,
     write_folder,
 )
@@ -57,7 +58,7 @@ from lerobot.policies.groot.processor_groot import (
     GrootN17VLMEncodeStep,
 )
 from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline, RenameObservationsProcessorStep
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 TOLERANCE = 5.0
@@ -162,7 +163,6 @@ class GrootObservation(nn.Module):
         ip = encode.proc.image_processor
         if encode.use_albumentations or pack.video_horizon not in (None, 1):
             raise ValueError("Raw-frame export requires tensor image processing and one observation frame.")
-        self.frame_names = list(frame)
         self.preprocessor = PolicyProcessorPipeline(steps=preprocessor.steps[:pack_index])
         sample = self.preprocessor({n: to_policy_input(n, torch.from_numpy(x)) for n, x in frame.items()})
         # The cameras the policy feeds, in its order, as its own packing step picks them.
@@ -181,20 +181,17 @@ class GrootObservation(nn.Module):
             raise ValueError("Raw-frame export requires equal, single-frame camera grids.")
         _, self.grid_h, self.grid_w = grids[0]
         # The engine resizes the frame before the rename step, so the geometry names the frame's cameras.
-        renamed = {
-            new: old
-            for step in self.preprocessor.steps
-            if isinstance(step, RenameObservationsProcessorStep)
-            for old, new in step.rename_map.items()
-        }
+        robot_names = {new: old for old, new in renamed_inputs(self.preprocessor).items()}
         self.image_resize = {
-            "cameras": [renamed.get(name, name) for name in self.cameras],
+            "cameras": [robot_names.get(name, name) for name in self.cameras],
             "target_size": target_size,
             "resize_edge": encode.shortest_image_edge or (target_size[0] if target_size else None),
             "crop_fraction": crop_fraction,
             "letterbox": encode.letter_box_transform,
             "image_size": [self.grid_h * ip.patch_size, self.grid_w * ip.patch_size],
         }
+        # A dataset camera the policy was not trained on stays out of the program, so the robot need not send it.
+        self.frame_names = [n for n in frame if n in self.image_resize["cameras"] or n == OBS_STATE]
         self.rescale, self.normalize = ip.do_rescale, ip.do_normalize
         self.rescale_factor = ip.rescale_factor
         scale = 1 / ip.rescale_factor if self.rescale else 1
@@ -448,6 +445,10 @@ class Exporter:
         self.batch = preprocessor(prepare_observation_for_inference(dict(self.frame), device(), self.task))
         self.observation = GrootObservation(preprocessor, self.frame, self.batch).to(device())
         self.image_resize = self.observation.image_resize
+        self.frame = {name: self.frame[name] for name in self.observation.frame_names}
+        self.folder_config.input_features = {
+            name: self.folder_config.input_features[name] for name in self.frame
+        }
         qwen = model.backbone.model.model
         ids, mask = self.batch["input_ids"], self.batch["attention_mask"]
         image_mask = ids == qwen.config.image_token_id

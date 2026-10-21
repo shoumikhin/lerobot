@@ -31,6 +31,7 @@ from common import (
     dataset_frame,
     device,
     processors,
+    renamed_inputs,
     to_policy_input,
     write_folder,
 )
@@ -89,7 +90,14 @@ class Exporter:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(device()).eval()
-        self.task, self.frame, self.folder_config = dataset_frame(args, self.policy.config)
+        self.task, frame, self.folder_config = dataset_frame(args, self.policy.config)
+        renamed = renamed_inputs(processors(self.policy.config, args.policy_path)[0])
+        # A dataset camera the policy was not trained on stays out of the program, so the robot need not send it.
+        inputs = self.policy.config.input_features
+        self.frame = {name: x for name, x in frame.items() if renamed.get(name, name) in inputs}
+        self.folder_config.input_features = {
+            name: self.folder_config.input_features[name] for name in self.frame
+        }
         self.noise = torch.randn(
             self.policy.config.chunk_size, self.policy.config.max_action_dim, device=device()
         )
