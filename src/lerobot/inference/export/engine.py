@@ -70,7 +70,7 @@ def load_programs(folder: Path, info: dict) -> Mapping[str, Program]:
     if route == "onnx_tensorrt":
         from .tensorrt import load_tensorrt_programs
 
-        return load_tensorrt_programs(folder, programs, info.get("cuda_graphs", True))
+        return load_tensorrt_programs(folder, programs)
     if route == "executorch_tensorrt":
         from .executorch import ExecuTorchProgram
 
