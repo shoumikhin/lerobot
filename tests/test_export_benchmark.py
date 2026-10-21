@@ -55,3 +55,11 @@ def test_memory_counts_swap_and_ignores_the_load_peak(examples):
     steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
     run = [9000.0] * 10 + [3000.0] * steady  # loading peaks, then the loop holds steady
     assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
+
+
+def test_memory_is_flat_only_when_it_stops_changing(examples):
+    memory = examples("benchmark_memory")
+    samples = int(memory.BASELINE_SECONDS / memory.SAMPLE_SECONDS)
+    assert memory.is_flat([2000.0 + (i % 2) * 8 for i in range(samples)])  # noise around a level
+    # The board still returning a previous job's memory: use falling 5 MiB a second.
+    assert not memory.is_flat([3000.0 - 5 * memory.SAMPLE_SECONDS * i for i in range(samples)])
