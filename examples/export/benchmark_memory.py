@@ -20,7 +20,7 @@ reads the whole board from /proc/meminfo: the drop in available memory plus the 
 
 The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
 use is flat. The run's window ends 3 s before the command exits, since its teardown frees everything,
-and a run whose window is not steady is reported as invalid, not as a number.
+and a run whose window is not flat by the same test is reported as invalid, not as a number.
 
     python examples/export/benchmark_memory.py -- lerobot-rollout --policy.path=outputs/export/act \\
         --robot.type=replay --robot.frames_dir=outputs/replay_frames \\
@@ -36,7 +36,6 @@ SAMPLE_SECONDS = 0.5
 BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
 FLAT_MIB_PER_SECOND = 2
-STEADY_MIB = 8
 TEARDOWN_SECONDS = 3
 SETTLE_LIMIT_SECONDS = 300
 
@@ -61,14 +60,12 @@ def long_enough(run: list[float]) -> bool:
     return len(run) * SAMPLE_SECONDS >= 2 * STEADY_SECONDS
 
 
-def is_steady(samples: list[float]) -> bool:
-    """Whether the medians of the first and second halves differ by less than 8 MiB, which one outlier cannot move."""
-    half = len(samples) // 2
-    return abs(statistics.median(samples[half:]) - statistics.median(samples[:half])) < STEADY_MIB
-
-
 def is_flat(samples: list[float]) -> bool:
-    """Whether memory use, sampled every half second, changes by less than 2 MiB/s on a fitted line."""
+    """Whether memory use, sampled every half second, changes by less than 2 MiB/s on a fitted line.
+
+    Allocator jitter of tens of MiB moves the fitted slope by a fraction of 1 MiB/s, while memory still being
+    returned after loading falls several MiB a second.
+    """
     times = [i * SAMPLE_SECONDS for i in range(len(samples))]
     return abs(statistics.linear_regression(times, samples).slope) < FLAT_MIB_PER_SECOND
 
@@ -110,7 +107,7 @@ def main() -> None:
         raise SystemExit(
             f"Run for at least {2 * STEADY_SECONDS} s, so the last {STEADY_SECONDS} s are steady."
         )
-    if not is_steady(steady_window(run)):
+    if not is_flat(steady_window(run)):
         raise SystemExit(f"Invalid: memory use was still changing in the last {STEADY_SECONDS} s of the run.")
     print(f"Extra memory: {extra_mib(baseline, run):.0f} MiB")
 

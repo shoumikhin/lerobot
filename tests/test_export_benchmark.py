@@ -56,18 +56,20 @@ def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples)
     # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
     run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
     assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
-    assert memory.is_steady(memory.steady_window(run))
-    # A steadily falling run is not steady, even with a teardown cliff at its end.
-    falling = [3000.0 - 0.5 * i for i in range(120)] + [2000.0] * 2
-    assert not memory.is_steady(memory.steady_window(falling))
+    assert memory.is_flat(memory.steady_window(run))
+    # Still returning its load-time memory, 7 MiB a second, is not flat, even with a teardown cliff at its end.
+    falling = [3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(120)] + [2000.0] * 6
+    assert not memory.is_flat(memory.steady_window(falling))
 
 
 def test_memory_is_flat_only_when_it_stops_changing(examples):
     memory = examples("benchmark_memory")
-    samples = int(memory.BASELINE_SECONDS / memory.SAMPLE_SECONDS)
-    assert memory.is_flat([2000.0 + (i % 2) * 8 for i in range(samples)])  # noise around a level
-    # The board still returning a previous job's memory: use falling 5 MiB a second.
-    assert not memory.is_flat([3000.0 - 5 * memory.SAMPLE_SECONDS * i for i in range(samples)])
+    samples = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    # A settled process whose allocator moves its use up and down by 30 MiB.
+    jitter = np.random.default_rng(0).uniform(-30, 30, samples)
+    assert memory.is_flat(list(4000.0 + jitter))
+    # The board still returning a previous job's memory: use falling 7 MiB a second.
+    assert not memory.is_flat([3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(samples)])
 
 
 def test_memory_accepts_a_60_second_rollout(examples):
