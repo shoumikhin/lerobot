@@ -90,6 +90,13 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     benchmark.measure_engine("pytorch", engine, args, folder)
     reference_file = tmp_path / "reference.npz"
     from lerobot.policies import utils
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+    def one_action_at_a_time(self, batch, **kwargs):
+        raise NotImplementedError
+
+    # As GR00T with relative actions refuses it: the reference asks for whole chunks.
+    monkeypatch.setattr(SmolVLAPolicy, "select_action", one_action_at_a_time)
 
     observed = []
     prepare = utils.prepare_observation_for_inference
@@ -107,7 +114,7 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     # Other noise or frames would move the actions as much as another frame does, by whole units here.
     assert np.abs(actions - reference).max() < 0.05
     assert np.abs(np.diff(reference, axis=0)).max() > 1
-    assert observed == [{"observation.images.front", "observation.state"}] * 6
+    assert observed == [{"observation.images.front", "observation.state"}] * 3
 
 
 def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):

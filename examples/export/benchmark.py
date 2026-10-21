@@ -292,14 +292,12 @@ def write_reference(argv: list[str]) -> None:
         if "noise_shape" in info:
             drawn = np.random.standard_normal(info["noise_shape"]).astype(np.float32)
             noise["noise"] = torch.from_numpy(drawn)[None].to(device())
-        chunk = []
+        observation = {name: frame[name] for name in names}
         with torch.inference_mode():
-            for _ in range(chunk_size):
-                observation = {name: frame[name] for name in names}
-                observation = prepare_observation_for_inference(observation, device(), info.get("task", ""))
-                action = postprocessor(policy.select_action(preprocessor(observation), **noise))
-                chunk.append(action.squeeze(0).float().cpu().numpy())
-        reference.append(np.stack(chunk))
+            observation = prepare_observation_for_inference(observation, device(), info.get("task", ""))
+            # The whole chunk at once, as the engine runs it: GR00T with relative actions refuses one at a time.
+            chunk = policy.predict_action_chunk(preprocessor(observation), **noise)[:, :chunk_size]
+            reference.append(postprocessor(chunk).squeeze(0).float().cpu().numpy())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.output, reference=np.stack(reference))
 
