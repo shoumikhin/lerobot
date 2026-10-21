@@ -219,28 +219,52 @@ def test_memory_counts_only_the_warm_chunks(examples):
     assert memory.steady_window(run, marks) == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
 
 
-def test_memory_measures_a_command_between_its_warm_and_stopped_lines(examples, monkeypatch, capsys):
+def run_benchmark_memory(memory, monkeypatch, process_mib, command: str) -> None:
+    """Run benchmark_memory.py on a Python `command`, with a 0.3 s window after 0.1 s to settle."""
     import sys
-    import time
 
-    memory = examples("benchmark_memory")
     monkeypatch.setattr(memory, "SAMPLE_SECONDS", 0.02)
     monkeypatch.setattr(memory, "STEADY_SECONDS", 0.3)
     monkeypatch.setattr(memory, "SETTLE_SECONDS", 0.1)
     monkeypatch.setattr(memory, "NVGPU", Path("/missing"))
     monkeypatch.setattr(memory, "nvidia_smi_gpu_mib", lambda: {})
-    start = time.monotonic()
-    # 9000 MiB while the command loads, then 1500 MiB once it runs warm.
-    monkeypatch.setattr(
-        memory, "process_mib", lambda pid, gpu: 9000 if time.monotonic() - start < 0.6 else 1500
-    )
-    command = (
-        "import time; time.sleep(0.2); print('loaded'); time.sleep(0.6);"
-        f"print({memory.WARM!r}, flush=True); time.sleep(0.5); print({memory.STOPPED!r}, flush=True)"
-    )
+    monkeypatch.setattr(memory, "process_mib", process_mib)
     monkeypatch.setattr(sys, "argv", ["benchmark_memory.py", "--", sys.executable, "-c", command])
     memory.main()
+
+
+def test_memory_measures_a_command_between_its_warm_and_stopped_lines(
+    examples, monkeypatch, capsys, tmp_path
+):
+    memory = examples("benchmark_memory")
+    warm = tmp_path / "warm"
+    # 9000 MiB while the command loads, then 1500 MiB once it runs warm, however long each step takes.
+    command = (
+        f"import pathlib, time; time.sleep(0.2); pathlib.Path({str(warm)!r}).touch();"
+        f"print({memory.WARM!r}, flush=True); time.sleep(1.0); print({memory.STOPPED!r}, flush=True)"
+    )
+    run_benchmark_memory(memory, monkeypatch, lambda pid, gpu: 1500 if warm.exists() else 9000, command)
     assert capsys.readouterr().out.splitlines()[-1] == "Memory: 1500 MiB"
+
+
+def test_memory_refuses_a_run_whose_memory_still_changes(examples, monkeypatch):
+    import itertools
+
+    memory = examples("benchmark_memory")
+    reads = itertools.count()
+    command = f"import time; print({memory.WARM!r}, flush=True); time.sleep(1.0); print({memory.STOPPED!r})"
+    with pytest.raises(SystemExit, match="Invalid"):
+        run_benchmark_memory(memory, monkeypatch, lambda pid, gpu: 1000 + 50 * next(reads), command)
+
+
+def test_memory_refuses_a_run_too_short_to_settle(examples, monkeypatch):
+    import sys
+
+    memory = examples("benchmark_memory")
+    monkeypatch.setattr(memory, "process_mib", lambda pid, gpu: 1500)
+    command = f"print({memory.WARM!r}); print({memory.STOPPED!r})"
+    with pytest.raises(SystemExit, match="Run for at least 90 s"):
+        memory.run([sys.executable, "-c", command], lambda: {})
 
 
 @pytest.mark.skipif(not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux's /proc")
@@ -262,6 +286,28 @@ def test_memory_counts_what_a_child_process_allocates(examples):
         process.stdin.close()
         process.wait()
     assert sizes[1] - sizes[0] == pytest.approx(200, abs=10)
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux's /proc")
+def test_memory_adds_the_gpu_memory_of_every_process_it_counts(examples):
+    import os
+    import subprocess
+    import sys
+
+    memory = examples("benchmark_memory")
+    child = "print(1, flush=True); input()"
+    parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+    process = subprocess.Popen(
+        [sys.executable, "-c", parent], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    process.stdout.readline()
+    root, child_pid = memory.process_tree(process.pid)
+    # This test's own process is not one the command started.
+    gpu = {root: 100.0, child_pid: 200.0, os.getpid(): 5000.0}
+    added = memory.process_mib(process.pid, gpu) - memory.process_mib(process.pid, {})
+    process.stdin.close()
+    process.wait()
+    assert added == pytest.approx(300, abs=1)
 
 
 def test_frames_share_one_copy_of_the_file(examples, tmp_path):
