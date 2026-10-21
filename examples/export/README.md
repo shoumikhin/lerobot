@@ -144,7 +144,7 @@ Orin Nano:
 
 ### Accuracy
 
-How far the compiled policy's actions are from PyTorch's, on 50 dataset samples with the same random noise: largest / average, in degrees (gripper in %). Lower is better. Every cell passed the export's own check.
+How far the compiled policy's actions are from PyTorch's, on 50 dataset samples with the same random noise. For each sample, take the largest difference over its actions and joints; each cell is the mean / 95th percentile / largest of that over the 50 samples, in degrees (gripper in %). Lower is better. Every cell passed the export's own check.
 
 Thor:
 
@@ -164,7 +164,7 @@ Orin Nano:
 | pi0.5   |     0.97 / **0.097** | **0.70** / 0.098 |                  OOM |                  OOM |
 | GR00T   | **1.79** / **0.085** |     2.14 / 0.091 | **1.79** / **0.085** |                  OOM |
 
-The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same.
+The largest error usually comes from one or two samples where the policy is close to a decision, so the mean is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same.
 
 ## Good to know
 
