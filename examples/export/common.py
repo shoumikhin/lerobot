@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from build_engine import OPTIMIZATION_LEVEL, WORKSPACE_BYTES
+from build_engine import OPTIMIZATION_LEVEL, WORKSPACE_BYTES, check_folder
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
@@ -122,26 +122,27 @@ def run_route(
     compile_part: Callable[[Part, Path], None],
     suffix: str,
 ) -> None:
-    """Compile each part of the checkpoint with `compile_part` into `<part><suffix>`, then write the folder.
+    """Compile each part of the checkpoint with `compile_part` into `<part><suffix>`, write the folder, and
+    check that the folder reproduces its test case, as `lerobot-rollout` does before the robot moves.
 
-    A chain runs `script` again once per part, because a process that built a part keeps some of its memory
-    until it exits. That process runs the parts before its own in PyTorch to make its example inputs.
+    Each part is built by running `script` again, because a process that built a part keeps some of its
+    memory until it exits. That process runs the parts before its own in PyTorch to make its example inputs.
+    The process that started the export then checks the folder with only the compiled programs in memory.
     """
     names = recipe.part_names(args)
     if args.part is None:
         args.output_dir = make_output_dir(args.output_dir, f"{recipe.__name__}_{args.route}")
-        if len(names) > 1:
-            for name in names:
-                command = [
-                    sys.executable,
-                    script,
-                    *sys.argv[1:],
-                    f"--output_dir={args.output_dir}",
-                    f"--part={name}",
-                ]
-                subprocess.run(command, check=True)
-            return
-        args.part = names[0]
+        for name in names:
+            command = [
+                sys.executable,
+                script,
+                *sys.argv[1:],
+                f"--output_dir={args.output_dir}",
+                f"--part={name}",
+            ]
+            subprocess.run(command, check=True)
+        check_folder(args.output_dir)
+        return
     if args.part not in names:
         raise SystemExit(f"Unknown part {args.part!r}; choose from {names}.")
     exporter = recipe.Exporter(args)

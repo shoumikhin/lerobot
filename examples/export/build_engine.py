@@ -78,9 +78,14 @@ def main() -> None:
     for program in info["programs"].values():
         engine = args.folder / program["file"]
         build_engine(engine.with_suffix(".onnx"), engine)
-    # The rollout's own startup check: the engines must reproduce the test case.
-    ExportInferenceEngine(args.folder, task=info.get("task", ""))
-    print(f"{args.folder} reproduces its test case")
+    check_folder(args.folder)
+
+
+def check_folder(folder: Path) -> None:
+    """Run the rollout's own startup check, which raises unless the programs reproduce the test case."""
+    info = json.loads((folder / EXPORT_INFO).read_text())
+    ExportInferenceEngine(folder, task=info.get("task", ""))
+    print(f"{folder} reproduces its test case")
 
 
 if __name__ == "__main__":
