@@ -260,14 +260,12 @@ def install_tensorrt():
     tensorrt.load_engine = load_engine
 """
 
-# ExecuTorch on the CPU. It records the output type the bindings would have chosen when they loaded, and
-# returns the actions in bfloat16, which NumPy can only read through ml_dtypes.
+# ExecuTorch on the CPU. It records the output type the bindings would have chosen when they loaded.
 FAKE_EXECUTORCH_RUNTIME = """
 import json
 import os
 
 import numpy as np
-from ml_dtypes import bfloat16
 
 from export_fakes import run
 
@@ -276,17 +274,14 @@ OUTPUT_AT_IMPORT = os.environ.get("EXECUTORCH_PYBINDINGS_TENSOR_OUTPUT")
 
 class ExecuTorchResult:
     def __init__(self, array):
-        self.array, self.shape, self.strides = array, array.shape, array.strides
-        self.dtype_name = array.dtype.name
+        self.array = array
 
     @classmethod
     def from_host(cls, array, device_index=0):
         return cls(np.array(array))
 
     def to_host(self):
-        copy = np.array(self.array)
-        # The bindings export a bfloat16 result's raw bytes, since the buffer protocol has no bfloat16.
-        return copy.view(np.uint8) if self.dtype_name == "bfloat16" else copy
+        return np.array(self.array)
 
     def __dlpack_device__(self):
         return (2, 0)
@@ -301,8 +296,6 @@ class Method:
     def execute(self, inputs):
         assert all(isinstance(value, ExecuTorchResult) for value in inputs), inputs
         outputs = run(self.name, {name: value.array for name, value in zip(self.inputs, inputs)})
-        if self.name == "actions":
-            outputs = {name: value.astype(bfloat16) for name, value in outputs.items()}
         return [ExecuTorchResult(value) for value in outputs.values()]
 
 
@@ -330,8 +323,6 @@ def write_fakes(tmp_path: Path) -> Path:
 
 
 def run_without_torch(code: str, tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
-    if "executorch_tensorrt" in args:
-        pytest.importorskip("ml_dtypes", reason="the ExecuTorch stand-in returns bfloat16 actions")
     env = {
         **os.environ,
         "PYTHONPATH": os.pathsep.join([str(write_fakes(tmp_path)), os.environ.get("PYTHONPATH", "")]),
