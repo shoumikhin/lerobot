@@ -37,7 +37,7 @@ what runs the parts differs. Run each step on the board that will run the policy
     # the results, compared with the reference in the PyTorch file, which comes first
     python examples/export/benchmark.py report outputs/benchmark/act_pytorch.npz outputs/benchmark/act_*.npz
 
-With `--duration=60` instead of `--output`, an executor runs chunks for 60 s after the warm-up and saves
+With `--duration=90` instead of `--output`, an executor runs chunks for 90 s after the warm-up and saves
 nothing, for `benchmark_memory.py` to measure. It prints a line when the warm-up is done and when it stops.
 """
 

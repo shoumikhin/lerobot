@@ -122,7 +122,7 @@ Each value is the median of three runs of 100 chunks. Differences of a few milli
 
 ### Memory
 
-Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured over 60 s of chunks, after the same 20 warm-up chunks as the time per chunk.
+Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured over the last 30 s of 90 s of chunks, after the same 20 warm-up chunks as the time per chunk.
 
 Thor:
 

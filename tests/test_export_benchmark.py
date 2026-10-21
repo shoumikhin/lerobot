@@ -101,12 +101,13 @@ def test_memory_counts_swap_and_only_the_warm_chunks(examples):
     meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
     assert memory.used_mib(meminfo) == 2048
     assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
-    # Loading peaks, compiling holds a long flat plateau, the warm chunks hold steady, the teardown frees all.
-    use = [9000.0] * 10 + [7000.0] * 120 + [3000.0] * 80 + [2000.0] * 6
+    # Loading peaks, compiling holds a long flat plateau, the warm chunks still give back some memory from
+    # loading, then hold steady, and the teardown frees everything.
+    use = [9000.0] * 10 + [7000.0] * 120 + [3100.0] * 80 + [3000.0] * 100 + [2000.0] * 6
     run = [(i * memory.SAMPLE_SECONDS, u) for i, u in enumerate(use)]
-    marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 209 * memory.SAMPLE_SECONDS}
+    marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 310 * memory.SAMPLE_SECONDS}
     window = memory.steady_window(run, marks)
-    assert window == [3000.0] * 80
+    assert window == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
     assert memory.extra_mib([2000.0, 2010.0, 1990.0], window) == 1000.0
 
 
@@ -117,6 +118,7 @@ def test_memory_measures_a_command_between_its_warm_and_stopped_lines(examples, 
     monkeypatch.setattr(memory, "SAMPLE_SECONDS", 0.02)
     monkeypatch.setattr(memory, "BASELINE_SECONDS", 0.2)
     monkeypatch.setattr(memory, "STEADY_SECONDS", 0.3)
+    monkeypatch.setattr(memory, "SETTLE_SECONDS", 0.1)
     start = __import__("time").monotonic()
 
     def meminfo():

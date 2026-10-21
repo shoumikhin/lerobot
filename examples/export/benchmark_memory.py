@@ -19,12 +19,13 @@ reads the whole board from /proc/meminfo: the drop in available memory plus the 
 10 s before the command starts to the time the policy runs warm, in MiB. Keep the board otherwise idle.
 
 The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
-use is flat. The run's window opens when the benchmark says its warm-up chunks are done, so loading and
-compiling stay out of it, and closes when it says it stopped, before its teardown frees everything. A run
-whose window is not flat by the same test is reported as invalid, not as a number.
+use is flat. The run's window is the last 30 s before the benchmark says it stopped, before its teardown
+frees everything, and at least 60 s after it says its warm-up chunks are done, so loading and compiling stay
+out of it: a process can still give back memory from loading well after its first warm chunks. A run whose
+window is not flat by the same test is reported as invalid, not as a number.
 
     python examples/export/benchmark_memory.py -- python examples/export/benchmark.py outputs/export/act \\
-        --frames=outputs/benchmark/frames.npz --duration=60
+        --frames=outputs/benchmark/frames.npz --duration=90
 """
 
 import statistics
@@ -38,6 +39,8 @@ from benchmark import STOPPED, WARM
 SAMPLE_SECONDS = 0.5
 BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
+# ACT in PyTorch gave back about 90 MiB from loading 40 s after its warm-up chunks, then stayed flat.
+SETTLE_SECONDS = 60
 FLAT_MIB_PER_SECOND = 2
 SETTLE_LIMIT_SECONDS = 300
 
@@ -48,8 +51,8 @@ def used_mib(meminfo: dict[str, int]) -> float:
 
 
 def steady_window(run: list[tuple[float, float]], marks: dict[str, float]) -> list[float]:
-    """The use sampled between the benchmark's warm and stopped lines, from (time, use) samples."""
-    return [use for at, use in run if marks[WARM] <= at <= marks[STOPPED]]
+    """The use sampled in the last 30 s before the benchmark's stopped line, from (time, use) samples."""
+    return [use for at, use in run if marks[STOPPED] - STEADY_SECONDS <= at < marks[STOPPED]]
 
 
 def extra_mib(baseline: list[float], window: list[float]) -> float:
@@ -118,8 +121,10 @@ def main() -> None:
         raise SystemExit(
             f"The command printed no {WARM!r} and {STOPPED!r} lines: run benchmark.py --duration."
         )
-    if marks[STOPPED] - marks[WARM] < STEADY_SECONDS:
-        raise SystemExit(f"Run for at least {STEADY_SECONDS} s after the warm-up, with --duration.")
+    if marks[STOPPED] - marks[WARM] < SETTLE_SECONDS + STEADY_SECONDS:
+        raise SystemExit(
+            f"Run for at least {SETTLE_SECONDS + STEADY_SECONDS} s after the warm-up, with --duration."
+        )
     steady = steady_window(run, marks)
     if not is_flat(steady):
         raise SystemExit("Invalid: memory use was still changing while the policy ran warm.")
