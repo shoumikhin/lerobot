@@ -263,8 +263,9 @@ def test_executorch_names_the_packages_it_needs(tmp_path, executorch, monkeypatc
 
 
 def test_unknown_routes_are_refused(tmp_path):
-    with pytest.raises(ValueError, match="Unknown export route"):
-        load_programs(tmp_path, {"route": "executorch_cuda", "programs": {}})
+    """A folder exported before the routes were renamed names an old route, and must be exported again."""
+    with pytest.raises(ValueError, match="Unknown export route 'onnx_trt'"):
+        load_programs(tmp_path, {"route": "onnx_trt", "programs": {}})
 
 
 @pytest.mark.parametrize("image_first", [False, True])
