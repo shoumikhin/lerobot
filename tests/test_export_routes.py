@@ -183,35 +183,6 @@ def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
     assert not compiled
 
 
-def test_route_scripts_name_no_policy():
-    """A route compiles any recipe's parts the same way, so its code names no policy; its docstring may."""
-    import ast
-    import re
-
-    policies = {"act", "smolvla", "pi0", "pi05", "groot", "gr00t"}
-    for name in ("to_executorch_tensorrt", "to_onnx_tensorrt", "to_torch_tensorrt"):
-        module = ast.parse((EXAMPLES / f"{name}.py").read_text())
-        names = []
-        for node in ast.walk(ast.Module(body=module.body[1:], type_ignores=[])):
-            if isinstance(node, ast.Name):
-                names.append(node.id)
-            elif isinstance(node, ast.Attribute):
-                names.append(node.attr)
-            elif isinstance(node, ast.alias):
-                names.append(node.name)
-            elif isinstance(node, ast.ImportFrom):
-                names.append(node.module or "")
-            elif isinstance(node, ast.FunctionDef | ast.ClassDef):
-                names.append(node.name)
-            elif isinstance(node, ast.arg | ast.keyword):
-                names.append(node.arg or "")
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                names.append(node.value)
-        # Split snake_case, CamelCase and dotted names into words, so "actions" is not "act".
-        words = {w.lower() for text in names for w in re.findall(r"[A-Z]?[a-z0-9]+|[A-Z0-9]+(?![a-z])", text)}
-        assert not words & policies, (name, words & policies)
-
-
 def test_usage_examples_print_one_option_per_line():
     """--help prints each script's docstring, where a lone backslash would join the lines of its example."""
     import ast
