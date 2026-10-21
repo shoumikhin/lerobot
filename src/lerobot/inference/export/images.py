@@ -12,46 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NumPy camera geometry for exports whose compiled programs cannot resize with antialiasing."""
+"""Camera geometry for exports whose compiled programs cannot resize with antialiasing."""
 
 import numpy as np
-
-
-def _axis_weights(length: int, output: int) -> tuple[np.ndarray, np.ndarray]:
-    scale = max(length / output, 1)
-    center = (np.arange(output, dtype=np.float32) + 0.5) * np.float32(length / output)
-    indices = np.floor(center - 2 * scale + 0.5).astype(np.int64)[:, None]
-    indices = indices + np.arange(int(np.ceil(4 * scale)) + 1)
-    distance = np.abs((indices.astype(np.float32) + 0.5 - center[:, None]) / np.float32(scale))
-    # Antialiased bicubic uses a=-0.5 and renormalizes the taps that overlap the image.
-    weights = np.where(
-        distance < 1,
-        ((1.5 * distance - 2.5) * distance) * distance + 1,
-        np.where(distance < 2, ((-0.5 * distance + 2.5) * distance - 4) * distance + 2, 0),
-    )
-    weights *= (indices >= 0) & (indices < length)
-    weights /= weights.sum(axis=1, keepdims=True)
-    return indices.clip(0, length - 1), weights
+from PIL import Image
 
 
 def resize_bicubic(image: np.ndarray, size: tuple[int, int] | list[int]) -> np.ndarray:
-    """Resize a uint8 HWC image with antialiased bicubic sampling and integer pixel rounding."""
+    """Resize a uint8 HWC image with antialiased bicubic sampling, as the policies' torchvision transforms do."""
     if image.dtype != np.uint8 or image.ndim != 3 or min(image.shape) == 0:
         raise ValueError("Expected a nonempty uint8 HWC image.")
     if len(size) != 2 or min(size) <= 0:
         raise ValueError("Expected a positive output height and width.")
     if image.shape[:2] == tuple(size):
         return image
-    columns, x_weights = _axis_weights(image.shape[1], size[1])
-    rows, y_weights = _axis_weights(image.shape[0], size[0])
-    # Reuse private workspaces to avoid a second allocation for each multiply.
-    horizontal = image[:, columns].astype(np.float32)
-    horizontal *= x_weights[None, :, :, None]
-    horizontal = horizontal.sum(axis=2)
-    resized = horizontal[rows]
-    resized *= y_weights[:, :, None, None]
-    resized = resized.sum(axis=1)
-    return np.ascontiguousarray(np.rint(resized.clip(0, 255)), dtype=np.uint8)
+    return np.asarray(Image.fromarray(image).resize((size[1], size[0]), Image.Resampling.BICUBIC))
 
 
 def resize_images(frame: dict[str, np.ndarray], geometry: dict) -> dict[str, np.ndarray]:
