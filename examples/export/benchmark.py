@@ -18,15 +18,19 @@ Time per chunk is the median of three runs of 100 chunks, after 20 warm-up chunk
 engine `lerobot-rollout` uses. Accuracy compares the actions with the original LeRobot policy's, on 50
 dataset frames, with the same random noise: the largest difference in each frame, then the mean, the 95th
 percentile and the largest over the frames, in robot units (degrees, and percent for the gripper). The
-PyTorch run also runs the original policy in full float32, as the reference.
+reference runs the original policy in full float32.
 
 The PyTorch and torch.compile runs execute the export recipe's own parts through the same engine, so only
-what runs the parts differs. Run each step on the board that will run the policy:
+what runs the parts differs. Run each step on the board that will run the policy, except the reference: it
+is the same on every board, so run it once wherever the policy fits in float32, and share its file:
 
     # 50 frames from the training dataset, named like the robot's (add --rename_map as for lerobot-rollout)
     python examples/export/benchmark.py frames --dataset.repo_id=<user>/so101_dataset \\
         --output=outputs/benchmark/frames.npz
-    # the reference, in PyTorch, then torch.compile; with the export script's arguments
+    # the reference, given an export folder of the policy for the inputs, task and noise it takes
+    python examples/export/benchmark.py reference outputs/export/act --policy.path=<checkpoint> \\
+        --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/reference_act.npz
+    # PyTorch, then torch.compile; with the export script's arguments
     python examples/export/benchmark.py pytorch --policy.path=<checkpoint> \\
         --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/act_pytorch.npz
     python examples/export/benchmark.py torch.compile --policy.path=<checkpoint> \\
@@ -34,8 +38,8 @@ what runs the parts differs. Run each step on the board that will run the policy
     # each compiled folder
     python examples/export/benchmark.py outputs/export/act \\
         --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/act_executorch.npz
-    # the results, compared with the reference in the PyTorch file, which comes first
-    python examples/export/benchmark.py report outputs/benchmark/act_pytorch.npz outputs/benchmark/act_*.npz
+    # the results, compared with the reference, which comes first
+    python examples/export/benchmark.py report outputs/benchmark/reference_act.npz outputs/benchmark/act_*.npz
 
 With `--duration=90` instead of `--output`, an executor runs chunks for 90 s after the warm-up and saves
 nothing, for `benchmark_memory.py` to measure. It prints a line when the warm-up is done and when it stops.
@@ -178,17 +182,13 @@ def benchmark_arguments() -> argparse.ArgumentParser:
 
 
 def measure(executor: str, argv: list[str]) -> None:
-    """Run one executor on the frames and save its times per chunk and its actions, and for PyTorch, the
-    reference actions."""
+    """Run one executor on the frames and save its times per chunk and its actions."""
     from lerobot.inference.export import ExportInferenceEngine
 
     if executor in ("pytorch", "torch.compile"):
         with tempfile.TemporaryDirectory() as folder:
             program, args = torch_engine(executor, argv, Path(folder))
             measure_engine(executor, program, args, Path(folder))
-            if executor == "pytorch" and args.output is not None:
-                del program
-                save_reference(args, Path(folder))
     else:
         args = benchmark_arguments().parse_args(argv)
         measure_engine(executor, ExportInferenceEngine(Path(executor), task=""), args, Path(executor))
@@ -242,23 +242,29 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
         )
 
 
-def save_reference(args: argparse.Namespace, folder: Path) -> None:
-    """Add the original LeRobot policy's actions for every frame to the PyTorch run's file, as the reference.
+def write_reference(argv: list[str]) -> None:
+    """Save the original LeRobot policy's actions for every frame, as the reference.
 
     The policy runs as `lerobot-rollout` runs it, but entirely in float32 with no TensorFloat-32, on the
-    engine's frames, task and noise, so the reference has neither the recipe's nor a compiler's rounding.
+    frames, with the export folder's task and the engine's noise, so the reference has neither the recipe's
+    nor a compiler's rounding.
     """
+    parser = argparse.ArgumentParser(description="Write the reference actions.")
+    parser.add_argument("folder", type=Path, help="An export folder of the policy.")
+    parser.add_argument("--policy.path", dest="policy_path", required=True, help="Trained policy checkpoint.")
+    parser.add_argument("--frames", type=Path, required=True, help="The file `benchmark.py frames` wrote.")
+    parser.add_argument("--output", type=Path, required=True, help="The .npz file to write.")
+    args = parser.parse_args(argv)
     import torch
-    from common import device, free_memory, processors
+    from common import device, processors
     from safetensors.numpy import load_file
 
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import get_policy_class
     from lerobot.policies.utils import prepare_observation_for_inference
 
-    free_memory()
-    info = json.loads((folder / "export.json").read_text())
-    chunk_size = len(load_file(folder / info["test_case"])["expected_actions"])
+    info = json.loads((args.folder / "export.json").read_text())
+    chunk_size = len(load_file(args.folder / info["test_case"])["expected_actions"])
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     config.device = str(device())
     config.use_amp = False
@@ -291,18 +297,20 @@ def save_reference(args: argparse.Namespace, folder: Path) -> None:
                 action = postprocessor(policy.select_action(preprocessor(observation), **noise))
                 chunk.append(action.squeeze(0).float().cpu().numpy())
         reference.append(np.stack(chunk))
-    result = dict(np.load(args.output))
-    np.savez(args.output, **result, reference=np.stack(reference))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(args.output, reference=np.stack(reference))
 
 
 def report(paths: list[str]) -> None:
-    """Print each file's time per chunk and its action error against the reference the first file holds."""
+    """Print each file's time per chunk and its action error against the reference file, which comes first."""
     first = np.load(paths[0])
     if "reference" not in first.files:
-        raise SystemExit(f"{paths[0]} holds no reference actions: give the PyTorch run's file first.")
+        raise SystemExit(
+            f"{paths[0]} holds no reference actions: give the file `benchmark.py reference` wrote first."
+        )
     reference = first["reference"]
     print(f"{'':40} {'ms per chunk':>12} {'mean error':>11} {'p95 error':>10} {'max error':>10}")
-    for path in paths:
+    for path in paths[1:]:
         result = np.load(path)
         mean, p95, largest = action_error(result["actions"], reference)
         print(
@@ -315,6 +323,8 @@ if __name__ == "__main__":
         print(__doc__)
     elif sys.argv[1] == "frames":
         write_frames(sys.argv[2:])
+    elif sys.argv[1] == "reference":
+        write_reference(sys.argv[2:])
     elif sys.argv[1] == "report":
         report(sys.argv[2:])
     else:

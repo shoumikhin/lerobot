@@ -57,7 +57,7 @@ def test_action_error_refuses_actions_of_another_shape(examples):
         benchmark.action_error(np.zeros((50, 1, 6)), np.zeros((50, 100, 6)))
 
 
-def test_pytorch_run_saves_the_original_policy_actions_with_the_engine_noise(examples, tmp_path, monkeypatch):
+def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_path, monkeypatch):
     pytest.importorskip("transformers")
     benchmark = examples("benchmark")
     for name, value in (("FRAMES", 3), ("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
@@ -80,20 +80,37 @@ def test_pytorch_run_saves_the_original_policy_actions_with_the_engine_noise(exa
         "observation.state": rng.uniform(-1, 1, (3, 3)).astype(np.float32),
     }
     np.savez(tmp_path / "frames.npz", **frames)
-    output = tmp_path / "pytorch.npz"
-    argv = [
-        f"--policy.path={checkpoint}",
-        "--dataset.repo_id=user/dataset",
-        f"--frames={tmp_path / 'frames.npz'}",
-        f"--output={output}",
-    ]
-    benchmark.measure("pytorch", argv)
-    result = np.load(output)
-    assert result["reference"].shape == result["actions"].shape == (3, 2, 3)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    frames, output = f"--frames={tmp_path / 'frames.npz'}", tmp_path / "pytorch.npz"
+    argv = [f"--policy.path={checkpoint}", "--dataset.repo_id=user/dataset", frames, f"--output={output}"]
+    engine, args = benchmark.torch_engine("pytorch", argv, folder)
+    benchmark.measure_engine("pytorch", engine, args, folder)
+    reference_file = tmp_path / "reference.npz"
+    benchmark.write_reference(
+        [str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference_file}"]
+    )
+    actions, reference = np.load(output)["actions"], np.load(reference_file)["reference"]
+    assert reference.shape == actions.shape == (3, 2, 3)
     # The recipe keeps the bfloat16 weights SmolVLA loads, the reference runs in float32: a small difference.
     # Other noise or frames would move the actions as much as another frame does, by whole units here.
-    assert np.abs(result["actions"] - result["reference"]).max() < 0.05
-    assert np.abs(np.diff(result["reference"], axis=0)).max() > 1
+    assert np.abs(actions - reference).max() < 0.05
+    assert np.abs(np.diff(reference, axis=0)).max() > 1
+
+
+def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):
+    benchmark = examples("benchmark")
+    reference = np.zeros((4, 2, 3))
+    actions = reference.copy()
+    actions[:, 0, 0] = 0.5
+    np.savez(tmp_path / "reference.npz", reference=reference)
+    np.savez(tmp_path / "pytorch.npz", chunk_ms=np.full((3, 5), 7.0), actions=actions)
+    benchmark.report([str(tmp_path / "reference.npz"), str(tmp_path / "pytorch.npz")])
+    assert capsys.readouterr().out.splitlines()[1:] == [
+        f"{'pytorch':40} {7.0:12.1f} {0.5:11.3f} {0.5:10.3f} {0.5:10.3f}"
+    ]
+    with pytest.raises(SystemExit, match="holds no reference actions"):
+        benchmark.report([str(tmp_path / "pytorch.npz"), str(tmp_path / "pytorch.npz")])
 
 
 def test_memory_counts_a_process_own_memory_and_swap_but_not_its_files(examples):
