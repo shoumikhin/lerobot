@@ -229,7 +229,7 @@ def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
     accept the flags. Fields of plain nested dataclasses count too, under their dotted names."""
     load_all = any(arg in ("--help", "-h") or re.match(r"--\w+\.[\w.]+\.type(=|$)", arg) for arg in cli_args)
     if _look_up_choices(config_class, cli_args) or load_all:
-        for registry in _lazy_registries(config_class):
+        for registry in _lazy_registries(config_class, cli_args):
             registry.load_all_choices()
 
 
@@ -260,16 +260,18 @@ def _look_up_choices(config_class: type, cli_args: Sequence[str], prefix: str = 
     return load_all
 
 
-def _lazy_registries(config_class: type) -> set[Any]:
-    """The on-demand registries of the config's choice fields, including those in nested dataclasses."""
+def _lazy_registries(config_class: type, cli_args: Sequence[str], prefix: str = "") -> set[Any]:
+    """The on-demand registries of the config's choice fields, including those in nested dataclasses, but
+    not of a field given a `.path`, whose config comes from that path."""
     registries = set()
-    for field_type in get_type_hints(config_class).values():
+    for field_name, field_type in get_type_hints(config_class).items():
+        name = prefix + field_name
         for candidate in get_args(field_type) or (field_type,):
             if draccus.utils.is_choice_type(candidate):
-                if hasattr(candidate, "load_all_choices"):
+                if hasattr(candidate, "load_all_choices") and not get_path_arg(name, cli_args):
                     registries.add(candidate)
             elif isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
-                registries |= _lazy_registries(candidate)
+                registries |= _lazy_registries(candidate, cli_args, f"{name}.")
     return registries
 
 

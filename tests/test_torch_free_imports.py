@@ -439,6 +439,37 @@ def test_rollout_runs_an_export_with_torch_unimportable(tmp_path, route, planner
     assert result.returncode == 0, result.stderr[-4000:]
 
 
+# Shows `lerobot-rollout --help` for an exported folder.
+ROLLOUT_HELP_WITHOUT_TORCH = (
+    BLOCK_TORCH
+    + """
+from pathlib import Path
+
+import export_fakes
+
+folder = Path(sys.argv[1])
+export_fakes.write_folder(folder, sys.argv[2], camera=False)
+
+from lerobot.scripts import lerobot_rollout
+
+sys.argv = ["lerobot-rollout", f"--policy.path={folder}", "--help"]
+try:
+    lerobot_rollout.main()
+except SystemExit as exit:
+    assert exit.code == 0, exit.code
+if attempts:
+    sys.exit(attempts[0])
+"""
+)
+
+
+@pytest.mark.skipif(not _datasets_available, reason="datasets not installed")
+def test_rollout_help_for_an_export_without_torch(tmp_path):
+    """The policy's config comes from the folder, so --help needs no PyTorch policy class either."""
+    result = run_without_torch(ROLLOUT_HELP_WITHOUT_TORCH, tmp_path, "onnx_tensorrt")
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 # Rebuilds an ONNX-TensorRT folder's engines, with TensorRT and the startup check replaced by stand-ins.
 REBUILD_WITHOUT_TORCH = (
     BLOCK_TORCH
