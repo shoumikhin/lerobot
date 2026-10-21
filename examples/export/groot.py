@@ -39,6 +39,7 @@ from common import (
     dataset_frame,
     device,
     free_memory,
+    hold_linear_weights_in_bfloat16,
     processors,
     renamed_inputs,
     to_policy_input,
@@ -495,11 +496,15 @@ class Exporter:
         self.expected_actions = None
 
     def load_modules(self, *modules: str) -> GrootPolicy:
-        """The policy with only `modules`' weights read from the checkpoint, in the config's `dtype`."""
+        """The policy with only `modules`' weights read from the checkpoint, in the config's `dtype`, and its
+        linear layers in bfloat16 when the parts run under bfloat16 autocast."""
         config = copy(self.config)
         # Casting norms, embeddings and category biases changes residual additions outside autocast.
         config.use_bf16 = False
-        return GrootPolicy.load_checkpoint_modules(self.model_file, config, list(modules))
+        policy = GrootPolicy.load_checkpoint_modules(self.model_file, config, list(modules))
+        if self.config.use_bf16:
+            hold_linear_weights_in_bfloat16(policy)
+        return policy
 
     def parts(self) -> Iterator[Part]:
         """The chain's parts, each run in PyTorch to make the next part's inputs, one in memory at a time.
