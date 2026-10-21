@@ -62,7 +62,17 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     benchmark = examples("benchmark")
     for name, value in (("FRAMES", 3), ("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
         monkeypatch.setattr(benchmark, name, value)
-    checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", tiny_smolvlm(tmp_path / "vlm"))
+    import json
+
+    import torch
+    from transformers import AutoConfig, SmolVLMForConditionalGeneration
+
+    vlm = tiny_smolvlm(tmp_path / "vlm")
+    checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", vlm)
+    # As a real checkpoint does: the policy loads its vision-language model's weights, in bfloat16.
+    SmolVLMForConditionalGeneration(AutoConfig.from_pretrained(vlm)).save_pretrained(vlm)
+    config = json.loads((checkpoint / "config.json").read_text())
+    (checkpoint / "config.json").write_text(json.dumps({**config, "load_vlm_weights": True}))
     features = {
         "observation.images.front": {
             "dtype": "video",
@@ -98,13 +108,22 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     # As GR00T with relative actions refuses it: the reference asks for whole chunks.
     monkeypatch.setattr(SmolVLAPolicy, "select_action", one_action_at_a_time)
 
-    observed = []
+    observed, ran = [], []
     prepare = utils.prepare_observation_for_inference
     monkeypatch.setattr(
         utils,
         "prepare_observation_for_inference",
-        lambda frame, *args: observed.append(set(frame)) or prepare(frame, *args),
+        lambda frame, device, task: observed.append((set(frame), task)) or prepare(frame, device, task),
     )
+    predict = SmolVLAPolicy.predict_action_chunk
+
+    def predict_in_float32(self, batch, **kwargs):
+        dtypes = {parameter.dtype for parameter in self.parameters()}
+        ran.append((dtypes, torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32))
+        return predict(self, batch, **kwargs)
+
+    monkeypatch.setattr(SmolVLAPolicy, "predict_action_chunk", predict_in_float32)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
     benchmark.write_reference(
         [str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference_file}"]
     )
@@ -114,7 +133,9 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     # Other noise or frames would move the actions as much as another frame does, by whole units here.
     assert np.abs(actions - reference).max() < 0.05
     assert np.abs(np.diff(reference, axis=0)).max() > 1
-    assert observed == [{"observation.images.front", "observation.state"}] * 3
+    assert observed == [({"observation.images.front", "observation.state"}, "pick the cup")] * 3
+    # Neither bfloat16 weights nor TensorFloat-32.
+    assert ran == [({torch.float32}, "highest", False)] * 3
 
 
 def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):
