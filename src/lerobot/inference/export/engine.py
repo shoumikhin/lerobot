@@ -197,6 +197,12 @@ class ExportInferenceEngine(InferenceEngine):
             return error
         return super().text_input_error(text, instruction=instruction)
 
+    def set_task(self, task: str) -> bool:
+        if error := self._task_error(task):
+            logger.warning("Instruction rejected: %s", error)
+            return False
+        return super().set_task(task)
+
     def dispatch_allowed(self) -> bool:
         # Inline inference has no worker to pause, so the planner hold is applied here.
         return not self.hold_for_planner()

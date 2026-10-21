@@ -2044,6 +2044,8 @@ def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, c
     np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
     assert "only runs the task it was exported for" in engine.text_input_error("place", instruction=True)
     assert engine.text_input_error("place") is None
+    assert not engine.set_task("place")
+    assert engine.task == "pick"
 
     from lerobot.rollout.controller import RolloutController
     from tests.interactive_helpers import _make_ctx
