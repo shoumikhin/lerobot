@@ -100,6 +100,23 @@ def tiny_head(alternate=True, interleave=True, num_layers=5):
     return GR00TN17ActionHead(config).eval()
 
 
+def tiny_text(num_layers=4):
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+
+    config = Qwen3VLTextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
+    )
+    return Qwen3VLTextModel(config).eval()
+
+
 def constants():
     image_mask = torch.tensor([[False, True, True, False, False]])
     return {
@@ -194,6 +211,17 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, hidden, rtol=0, atol=0)
     torch.testing.assert_close(hidden, (expected, expected_state), rtol=0, atol=0)
+
+
+def test_last_language_slice_encodes_a_float32_state_with_bfloat16_weights(recipe):
+    """A checkpoint loaded in bfloat16 with use_bf16 off has bfloat16 weights, but the robot's state is float32."""
+    text, head = tiny_text().to(torch.bfloat16), tiny_head().to(torch.bfloat16)
+    fixed = constants()
+    hidden, state = torch.randn(1, 5, 32, dtype=torch.bfloat16), torch.randn(1, 1, 6)
+    with torch.no_grad():
+        expected = head.state_encoder(state.to(torch.bfloat16), fixed["embodiment_id"])
+        _, state_features = recipe.GrootLanguageModel(text, head, fixed, 3, 4, False, 3).eval()(hidden, state)
+    torch.testing.assert_close(state_features, expected, rtol=0, atol=0)
 
 
 def test_vision_wrapper_matches_the_hugging_face_vision_model(recipe):
