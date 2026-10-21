@@ -37,6 +37,15 @@ from .configs import (
     RolloutStrategyConfig,
     SentryStrategyConfig,
 )
+from .context import (
+    DatasetContext,
+    HardwareContext,
+    PolicyContext,
+    ProcessorContext,
+    RolloutContext,
+    RuntimeContext,
+    build_rollout_context,
+)
 from .controller import (
     AskResult,
     LinkedEvent,
@@ -44,45 +53,19 @@ from .controller import (
     RolloutEvent,
 )
 from .interactive import InteractiveSession
+from .strategies import BaseStrategy, RolloutStrategy, create_strategy
 
-# These import torch, the dataset stack and the processors, so each is imported the first time it is used.
+# The recording strategies import torch and the dataset stack, so each is imported the first time it is used.
 if TYPE_CHECKING:
-    from .context import (
-        DatasetContext,
-        HardwareContext,
-        PolicyContext,
-        ProcessorContext,
-        RolloutContext,
-        RuntimeContext,
-        build_rollout_context,
-    )
-    from .strategies import (
-        BaseStrategy,
-        DAggerStrategy,
-        EpisodicStrategy,
-        HighlightStrategy,
-        RolloutStrategy,
-        SentryStrategy,
-        create_strategy,
-    )
+    from .strategies import DAggerStrategy, EpisodicStrategy, HighlightStrategy, SentryStrategy
 else:
     __getattr__, __dir__ = lazy_exports(
         __name__,
         {
-            "DatasetContext": ".context.DatasetContext",
-            "HardwareContext": ".context.HardwareContext",
-            "PolicyContext": ".context.PolicyContext",
-            "ProcessorContext": ".context.ProcessorContext",
-            "RolloutContext": ".context.RolloutContext",
-            "RuntimeContext": ".context.RuntimeContext",
-            "build_rollout_context": ".context.build_rollout_context",
-            "BaseStrategy": ".strategies.BaseStrategy",
             "DAggerStrategy": ".strategies.DAggerStrategy",
             "EpisodicStrategy": ".strategies.EpisodicStrategy",
             "HighlightStrategy": ".strategies.HighlightStrategy",
-            "RolloutStrategy": ".strategies.RolloutStrategy",
             "SentryStrategy": ".strategies.SentryStrategy",
-            "create_strategy": ".strategies.create_strategy",
         },
     )
 

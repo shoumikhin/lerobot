@@ -28,6 +28,7 @@ import draccus
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
+from lerobot.inference.export import export_dir
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
@@ -437,8 +438,6 @@ class RolloutConfig:
             pretrained_revision = parser.parse_arg("pretrained_revision", cli_overrides)
             if pretrained_revision is None:
                 pretrained_revision = parser.parse_arg("pretrained_revision", yaml_overrides)
-            from lerobot.inference.export import export_dir
-
             if export_dir(policy_path) is not None:
                 if policy_overrides:
                     raise ValueError("An exported policy has a fixed configuration; drop --policy overrides.")
