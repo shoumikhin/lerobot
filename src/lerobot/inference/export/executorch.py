@@ -45,9 +45,9 @@ class ExecuTorchProgram:
             from executorch.runtime import ExecuTorchResult, Runtime  # noqa: F401
         except ImportError as error:
             raise ImportError(
-                "An ExecuTorch-TensorRT export needs ExecuTorch 1.6.0.dev20261021 or newer and its TensorRT "
-                'runtime, which `pip install "torch-tensorrt[executorch]"` installs; see examples/export/README.md. '
-                f"({error})"
+                "An ExecuTorch-TensorRT export needs ExecuTorch 1.6.0.dev20261021 or newer and "
+                "torch-tensorrt-executorch-runtime built for it; see the Install section of "
+                f"examples/export/README.md. ({error})"
             ) from error
 
         runtime = Runtime.get()
