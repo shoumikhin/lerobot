@@ -20,7 +20,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.test_export_recipes import act_checkpoint
+from tests.export_helpers import action_pipeline
+from tests.test_export_recipes import (
+    act_checkpoint,
+    dataset_metadata,
+    pi05_checkpoint,
+    smolvla_checkpoint,
+    tiny_smolvlm,
+)
+from tests.utils import require_hf_token
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 
@@ -51,6 +59,240 @@ def test_action_error_takes_each_frames_largest_difference(examples):
 
 
 def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples):
+    memory = examples("benchmark_memory")
+    meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
+    assert memory.used_mib(meminfo) == 2048
+    assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
+    steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
+    run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
+    assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
+    assert memory.is_flat(memory.steady_window(run))
+    # Still returning its load-time memory, 7 MiB a second, is not flat, even with a teardown cliff at its end.
+    falling = [3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(120)] + [2000.0] * 6
+    assert not memory.is_flat(memory.steady_window(falling))
+
+
+def test_action_error_refuses_actions_of_another_shape(examples):
+    benchmark = examples("benchmark")
+    # NumPy would broadcast one action against a chunk of 100 and find no error at all.
+    with pytest.raises(ValueError, match="cannot be compared"):
+        benchmark.action_error(np.zeros((50, 1, 6)), np.zeros((50, 100, 6)))
+
+
+def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    benchmark = examples("benchmark")
+    for name, value in (("FRAMES", 3), ("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
+        monkeypatch.setattr(benchmark, name, value)
+    import json
+
+    import torch
+    from transformers import AutoConfig, SmolVLMForConditionalGeneration
+
+    vlm = tiny_smolvlm(tmp_path / "vlm")
+    checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", vlm)
+    # As a real checkpoint does: the policy loads its vision-language model's weights, in bfloat16.
+    SmolVLMForConditionalGeneration(AutoConfig.from_pretrained(vlm)).save_pretrained(vlm)
+    config = json.loads((checkpoint / "config.json").read_text())
+    (checkpoint / "config.json").write_text(json.dumps({**config, "load_vlm_weights": True}))
+    features = {
+        "observation.images.front": {
+            "dtype": "video",
+            "shape": (32, 32, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "observation.state": {"dtype": "float32", "shape": (3,), "names": None},
+        "action": {"dtype": "float32", "shape": (3,), "names": None},
+    }
+    metadata = dataset_metadata(features, ["pick the cup"])
+    monkeypatch.setattr(examples("common"), "LeRobotDatasetMetadata", lambda repo_id, root=None: metadata)
+    rng = np.random.default_rng(0)
+    frames = {
+        "observation.images.front": rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8),
+        "observation.state": rng.uniform(-1, 1, (3, 3)).astype(np.float32),
+        # A camera the dataset has and the export leaves out.
+        "observation.images.wrist": rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8),
+    }
+    np.savez(tmp_path / "frames.npz", **frames)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    frames, output = f"--frames={tmp_path / 'frames.npz'}", tmp_path / "pytorch.npz"
+    argv = [f"--policy.path={checkpoint}", "--dataset.repo_id=user/dataset", frames, f"--output={output}"]
+    engine, args = benchmark.torch_engine("pytorch", argv, folder)
+    benchmark.measure_engine("pytorch", engine, args, folder)
+    reference_file = tmp_path / "reference.npz"
+    from lerobot.policies import utils
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+    def one_action_at_a_time(self, batch, **kwargs):
+        raise NotImplementedError
+
+    # As GR00T with relative actions refuses it: the reference asks for whole chunks.
+    monkeypatch.setattr(SmolVLAPolicy, "select_action", one_action_at_a_time)
+
+    observed, ran = [], []
+    prepare = utils.prepare_observation_for_inference
+    monkeypatch.setattr(
+        utils,
+        "prepare_observation_for_inference",
+        lambda frame, device, task: observed.append((set(frame), task)) or prepare(frame, device, task),
+    )
+    predict = SmolVLAPolicy.predict_action_chunk
+
+    def predict_in_float32(self, batch, **kwargs):
+        dtypes = {parameter.dtype for parameter in self.parameters()}
+        ran.append((dtypes, torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32))
+        return predict(self, batch, **kwargs)
+
+    monkeypatch.setattr(SmolVLAPolicy, "predict_action_chunk", predict_in_float32)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    benchmark.write_reference(
+        [str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference_file}"]
+    )
+    actions, reference = np.load(output)["actions"], np.load(reference_file)["reference"]
+    assert reference.shape == actions.shape == (3, 2, 3)
+    # The recipe keeps the bfloat16 weights SmolVLA loads, the reference runs in float32: a small difference.
+    # Other noise or frames would move the actions as much as another frame does, by whole units here.
+    assert np.abs(actions - reference).max() < 0.05
+    assert np.abs(np.diff(reference, axis=0)).max() > 1
+    assert observed == [({"observation.images.front", "observation.state"}, "pick the cup")] * 3
+    # Neither bfloat16 weights nor TensorFloat-32.
+    assert ran == [({torch.float32}, "highest", False)] * 3
+
+
+@require_hf_token
+def test_reference_loads_the_checkpoint_in_float32_whatever_dtype_it_names(examples, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    import json
+
+    import torch
+    from safetensors.numpy import save_file
+
+    benchmark = examples("benchmark")
+    monkeypatch.setattr(benchmark, "FRAMES", 1)
+    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    camera = "observation.images.base_0_rgb"
+    info = {
+        "inputs": [camera, "observation.state", "noise"],
+        "noise_shape": [config.chunk_size, config.max_action_dim],
+        "task": "pick up the cube",
+        "test_case": "test_case.safetensors",
+    }
+    (folder / "export.json").write_text(json.dumps(info))
+    save_file(
+        {"expected_actions": np.zeros((config.n_action_steps, 3), np.float32)}, folder / info["test_case"]
+    )
+    frames = {
+        camera: np.full((1, 28, 28, 3), 127, np.uint8),
+        "observation.state": np.zeros((1, 3), np.float32),
+    }
+    np.savez(tmp_path / "frames.npz", **frames)
+    references = []
+    # The reference runs uncompiled even when the checkpoint saved compile_model.
+    monkeypatch.setattr(torch, "compile", lambda *args, **kwargs: pytest.fail("the reference compiled"))
+    config.compile_model = True
+    for dtype in (torch.float32, torch.bfloat16):
+        config.dtype = dtype
+        config.save_pretrained(checkpoint)
+        output = tmp_path / f"reference_{dtype}.npz"
+        argv = [str(folder), f"--policy.path={checkpoint}", f"--frames={tmp_path / 'frames.npz'}"]
+        benchmark.write_reference([*argv, f"--output={output}"])
+        references.append(np.load(output)["reference"])
+    # Float32 weights loaded into a bfloat16 policy are rounded, and casting it to float32 later cannot undo that.
+    np.testing.assert_array_equal(*references)
+
+
+def act_pytorch_run(benchmark, tmp_path, monkeypatch) -> tuple[Path, Path, str]:
+    """`benchmark.py pytorch` on a tiny ACT and 50 frames; its checkpoint, export folder and frames argument."""
+    for name, value in (("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
+        monkeypatch.setattr(benchmark, name, value)
+    checkpoint = act_checkpoint(tmp_path / "checkpoint")
+    rng = np.random.default_rng(0)
+    np.savez(
+        tmp_path / "frames.npz",
+        **{
+            "observation.images.front": rng.integers(0, 256, (benchmark.FRAMES, 32, 32, 3), dtype=np.uint8),
+            "observation.state": rng.uniform(-1, 1, (benchmark.FRAMES, 3)).astype(np.float32),
+        },
+    )
+    folder, frames = tmp_path / "folder", f"--frames={tmp_path / 'frames.npz'}"
+    folder.mkdir()
+    argv = [f"--policy.path={checkpoint}", frames, f"--output={tmp_path / 'pytorch.npz'}"]
+    engine, args = benchmark.torch_engine("pytorch", argv, folder)
+    benchmark.measure_engine("pytorch", engine, args, folder)
+    return checkpoint, folder, frames
+
+
+def test_reference_and_report_commands_compare_a_result_with_the_policy(examples, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    benchmark = examples("benchmark")
+    checkpoint, folder, frames = act_pytorch_run(benchmark, tmp_path, monkeypatch)
+    script = [sys.executable, str(EXAMPLES / "benchmark.py")]
+    reference = tmp_path / "reference.npz"
+    subprocess.run(
+        [*script, "reference", str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference}"],
+        check=True,
+    )
+    report = subprocess.run(
+        [*script, "report", str(reference), str(tmp_path / "pytorch.npz")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # On a GPU the PyTorch run uses TensorFloat-32, which moves ACT's actions by about 0.002 here.
+    assert max(float(error) for error in report.stdout.split()[-3:]) < 0.01
+
+
+def test_reference_slices_the_chunk_before_postprocessing_it(examples, tmp_path, monkeypatch):
+    from lerobot.processor import ProcessorStep, TransitionKey
+
+    class ScaleByHorizon(ProcessorStep):
+        """Depends on the chunk's length, so slicing after it gives a different answer than before it."""
+
+        def __call__(self, transition):
+            actions = transition[TransitionKey.ACTION]
+            return {**transition, TransitionKey.ACTION: actions * actions.shape[1] + 3}
+
+        def transform_features(self, features):
+            return features
+
+    benchmark, common = examples("benchmark"), examples("common")
+    monkeypatch.setattr(benchmark, "FRAMES", 3)
+    checkpoint, folder, frames = act_pytorch_run(benchmark, tmp_path, monkeypatch)
+    argv = [str(folder), f"--policy.path={checkpoint}", frames]
+    benchmark.write_reference([*argv, f"--output={tmp_path / 'plain.npz'}"])
+    processors = common.processors
+
+    def scaled_by_horizon(config, policy_path):
+        preprocessor, postprocessor = processors(config, policy_path)
+        return preprocessor, action_pipeline(*postprocessor.steps, ScaleByHorizon())
+
+    monkeypatch.setattr(common, "processors", scaled_by_horizon)
+    benchmark.write_reference([*argv, f"--output={tmp_path / 'scaled.npz'}"])
+    plain, scaled = (np.load(tmp_path / f"{name}.npz")["reference"] for name in ("plain", "scaled"))
+    # ACT predicts four actions and the robot plays two.
+    assert plain.shape == (3, 2, 3)
+    np.testing.assert_allclose(scaled, plain * 2 + 3, rtol=1e-6)
+
+
+def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):
+    benchmark = examples("benchmark")
+    reference = np.zeros((4, 2, 3))
+    actions = reference.copy()
+    actions[:, 0, 0] = 0.5
+    np.savez(tmp_path / "reference.npz", reference=reference)
+    np.savez(tmp_path / "pytorch.npz", chunk_ms=np.full((3, 5), 7.0), actions=actions)
+    benchmark.report([str(tmp_path / "reference.npz"), str(tmp_path / "pytorch.npz")])
+    assert capsys.readouterr().out.splitlines()[1:] == [
+        f"{'pytorch':40} {7.0:12.1f} {0.5:11.3f} {0.5:10.3f} {0.5:10.3f}"
+    ]
+    with pytest.raises(SystemExit, match="holds no reference actions"):
+        benchmark.report([str(tmp_path / "pytorch.npz"), str(tmp_path / "pytorch.npz")])
     memory = examples("benchmark_memory")
     meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
     assert memory.used_mib(meminfo) == 2048
