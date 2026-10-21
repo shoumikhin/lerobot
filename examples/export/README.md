@@ -89,7 +89,7 @@ lerobot-rollout \
 
 ## Results
 
-The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the same parts the export compiles, through the same engine, so only what runs them differs.
+The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the policy's own PyTorch code, as `lerobot-rollout` does.
 
 - All four policies were trained on the same SO-101 dataset: 304 episodes, recorded at 30 frames per second.
 - Both boards ran at maximum power, with the GPU clock locked.
@@ -100,7 +100,7 @@ Measured with PyTorch 2.15.0.dev20261005 and TensorRT 11.3.0.99.
 
 ### Time per chunk
 
-A policy returns a chunk of actions at a time (ACT 100, SmolVLA and pi0.5 50, GR00T 40). `lerobot-rollout` plays the whole chunk, then runs the policy again while the arm holds still, so this time is the pause between chunks. Milliseconds, lower is better.
+A policy returns a chunk of actions at a time (ACT 100, SmolVLA and pi0.5 50, GR00T 16). `lerobot-rollout` plays the whole chunk, then runs the policy again while the arm holds still, so this time is the pause between chunks. Milliseconds, lower is better.
 
 Thor:
 
@@ -120,11 +120,11 @@ Orin Nano:
 | pi0.5   |                 630 |       **612** |            OOM |             OOM |     OOM |
 | GR00T   |             **266** |           274 |            275 |             OOM |     OOM |
 
-Each value is the median of three runs of 100 chunks, measured with [benchmark.py](benchmark.py). Differences of a few milliseconds are within run-to-run noise. Every compiled policy replays its programs as CUDA graphs, except GR00T on ONNX-TensorRT, where TensorRT allocates GPU memory on every run of one of its engines.
+Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. The ExecuTorch-TensorRT and ONNX-TensorRT programs replayed as CUDA graphs, except GR00T on ONNX-TensorRT, where TensorRT allocates GPU memory on every run of one of its engines. The Torch-TensorRT programs ran without CUDA graphs.
 
 ### Memory
 
-Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured with [benchmark_memory.py](benchmark_memory.py) around a `lerobot-rollout` run with the replay robot.
+Extra memory the board needs while the policy runs: the drop in available memory plus any growth in swap, in MiB (the main processor, or CPU, and the GPU share it on a Jetson). Lower is better. Measured during a `lerobot-rollout` run with the replay robot.
 
 Thor:
 
@@ -166,7 +166,7 @@ Orin Nano:
 | pi0.5   |     0.97 / **0.097** | **0.70** / 0.098 |                  OOM |                  OOM |
 | GR00T   | **1.79** / **0.085** |     2.14 / 0.091 | **1.79** / **0.085** |                  OOM |
 
-The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is one measurement. Measured with [benchmark.py](benchmark.py).
+The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same.
 
 ## Good to know
 
