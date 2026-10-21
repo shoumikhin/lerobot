@@ -145,6 +145,9 @@ def torch_engine(executor: str, argv: list[str], folder: Path):
     args, recipe = parse_args(__doc__, executor, (benchmark_arguments(),), argv)
     # The compiled routes run float32 matrix multiplications in TensorFloat-32 too.
     torch.set_float32_matmul_precision("high")
+    if executor == "torch.compile":
+        # Inductor's compile worker processes outlive the compile, and the memory benchmark counts every process.
+        torch._inductor.config.compile_threads = 1
     exporter = recipe.Exporter(args)
     programs, modules = {}, {}
     for part in exporter.parts():

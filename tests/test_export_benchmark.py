@@ -215,6 +215,23 @@ def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tm
     assert len(generations) == 2
 
 
+def test_torch_compile_compiles_in_the_benchmark_process(examples, tmp_path, monkeypatch):
+    import torch
+
+    benchmark = examples("benchmark")
+    monkeypatch.setattr(torch._inductor.config, "compile_threads", 8)
+    threads = []
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda module, **options: threads.append(torch._inductor.config.compile_threads) or module,
+    )
+    argv = [f"--policy.path={act_checkpoint(tmp_path / 'act')}", "--frames=unused", "--output=unused"]
+    benchmark.torch_engine("torch.compile", argv, tmp_path)
+    # More than one thread starts worker processes that stay alive while the memory is measured.
+    assert threads == [1]
+
+
 def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, capsys):
     from argparse import Namespace
 
