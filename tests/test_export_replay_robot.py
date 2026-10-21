@@ -69,4 +69,15 @@ def test_replay_raises_instead_of_hanging_on_a_bad_frame(tmp_path, replay):
     with pytest.raises(RuntimeError, match="replay camera stopped") as caught:
         robot.connect()
     assert "not a valid JPEG" in str(caught.value.__cause__)
-    robot._stop.set()
+    # The rollout does not disconnect a robot that failed to connect, so nothing may be left running.
+    assert not robot.is_connected and not robot._threads and not robot._files
+
+
+def test_replay_reconnects(tmp_path, replay):
+    write_folder(tmp_path, {"front": (4, 6, 3)}, fps=15)
+    robot = replay.ReplayRobot(replay.ReplayRobotConfig(frames_dir=str(tmp_path)))
+    for _ in range(2):
+        robot.connect()
+        assert robot.get_observation()["front"].shape == (4, 6, 3)
+        assert all(thread.is_alive() for thread in robot._threads)
+        robot.disconnect()

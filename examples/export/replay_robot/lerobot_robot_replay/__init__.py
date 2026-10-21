@@ -57,10 +57,10 @@ class ReplayRobot(Robot):
         cameras = [str(cam) for cam in index["cameras"]]
         self._shapes = {cam: tuple(int(n) for n in index[f"{cam}_shape"]) for cam in cameras}
         self._fps = config.fps or int(index["fps"])
+        self._paths = {cam: folder / f"{cam}.jpg.bin" for cam in cameras}
+        self._offsets = {cam: index[f"{cam}_offsets"] for cam in cameras}
         # Read one JPEG at a time, so the recording never sits in memory.
-        self._jpegs = {
-            cam: (os.open(folder / f"{cam}.jpg.bin", os.O_RDONLY), index[f"{cam}_offsets"]) for cam in cameras
-        }
+        self._files: dict[str, int] = {}
         self._latest: dict[str, np.ndarray] = {}
         self._frame_lock = threading.Lock()
         self._stop = threading.Event()
@@ -103,7 +103,7 @@ class ReplayRobot(Robot):
 
     def _play(self, cam: str) -> None:
         # Decodes on its own thread at the camera rate, as an OpenCV camera's read thread does.
-        fd, offsets = self._jpegs[cam]
+        fd, offsets = self._files[cam], self._offsets[cam]
         period = 1.0 / self._fps
         next_time = time.perf_counter()
         while not self._stop.is_set():
@@ -123,16 +123,26 @@ class ReplayRobot(Robot):
                 next_time = time.perf_counter()
 
     def connect(self, calibrate: bool = True) -> None:
-        self._t0 = time.perf_counter()
-        for cam in self._jpegs:
-            thread = threading.Thread(
-                target=self._camera_loop, args=(cam,), name=f"replay-{cam}", daemon=True
-            )
-            thread.start()
-            self._threads.append(thread)
-        while len(self._latest) < len(self._jpegs):
-            self._raise_camera_error()
-            time.sleep(0.005)
+        self._stop.clear()
+        self._error = None
+        self._latest.clear()
+        try:
+            for cam, path in self._paths.items():
+                self._files[cam] = os.open(path, os.O_RDONLY)
+            self._t0 = time.perf_counter()
+            for cam in self._files:
+                thread = threading.Thread(
+                    target=self._camera_loop, args=(cam,), name=f"replay-{cam}", daemon=True
+                )
+                thread.start()
+                self._threads.append(thread)
+            while len(self._latest) < len(self._files):
+                self._raise_camera_error()
+                time.sleep(0.005)
+        except BaseException:
+            # The rollout only disconnects a connected robot, so a failed connect releases what it started.
+            self._release()
+            raise
         self._connected = True
 
     def _raise_camera_error(self) -> None:
@@ -151,9 +161,14 @@ class ReplayRobot(Robot):
         return dict(action)
 
     def disconnect(self) -> None:
+        self._release()
+        self._connected = False
+
+    def _release(self) -> None:
         self._stop.set()
         for thread in self._threads:
             thread.join(timeout=2.0)
-        for fd, _ in self._jpegs.values():
+        self._threads.clear()
+        for fd in self._files.values():
             os.close(fd)
-        self._connected = False
+        self._files.clear()
