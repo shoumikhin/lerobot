@@ -78,6 +78,8 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     frames = {
         "observation.images.front": rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8),
         "observation.state": rng.uniform(-1, 1, (3, 3)).astype(np.float32),
+        # A camera the dataset has and the export leaves out.
+        "observation.images.wrist": rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8),
     }
     np.savez(tmp_path / "frames.npz", **frames)
     folder = tmp_path / "folder"
@@ -87,6 +89,15 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     engine, args = benchmark.torch_engine("pytorch", argv, folder)
     benchmark.measure_engine("pytorch", engine, args, folder)
     reference_file = tmp_path / "reference.npz"
+    from lerobot.policies import utils
+
+    observed = []
+    prepare = utils.prepare_observation_for_inference
+    monkeypatch.setattr(
+        utils,
+        "prepare_observation_for_inference",
+        lambda frame, *args: observed.append(set(frame)) or prepare(frame, *args),
+    )
     benchmark.write_reference(
         [str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference_file}"]
     )
@@ -96,6 +107,7 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     # Other noise or frames would move the actions as much as another frame does, by whole units here.
     assert np.abs(actions - reference).max() < 0.05
     assert np.abs(np.diff(reference, axis=0)).max() > 1
+    assert observed == [{"observation.images.front", "observation.state"}] * 6
 
 
 def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):

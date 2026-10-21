@@ -256,7 +256,7 @@ def write_reference(argv: list[str]) -> None:
     parser.add_argument("--output", type=Path, required=True, help="The .npz file to write.")
     args = parser.parse_args(argv)
     import torch
-    from common import device, processors
+    from common import NOISE, device, processors
     from safetensors.numpy import load_file
 
     from lerobot.configs.policies import PreTrainedConfig
@@ -264,6 +264,8 @@ def write_reference(argv: list[str]) -> None:
     from lerobot.policies.utils import prepare_observation_for_inference
 
     info = json.loads((args.folder / "export.json").read_text())
+    # The engine gives the programs only these, so a camera the export left out stays out of the reference too.
+    names = [name for name in info["inputs"] if name != NOISE]
     chunk_size = len(load_file(args.folder / info["test_case"])["expected_actions"])
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     config.device = str(device())
@@ -293,7 +295,8 @@ def write_reference(argv: list[str]) -> None:
         chunk = []
         with torch.inference_mode():
             for _ in range(chunk_size):
-                observation = prepare_observation_for_inference(dict(frame), device(), info.get("task", ""))
+                observation = {name: frame[name] for name in names}
+                observation = prepare_observation_for_inference(observation, device(), info.get("task", ""))
                 action = postprocessor(policy.select_action(preprocessor(observation), **noise))
                 chunk.append(action.squeeze(0).float().cpu().numpy())
         reference.append(np.stack(chunk))
