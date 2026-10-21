@@ -135,8 +135,6 @@ class Evo1Model(nn.Module):
         inference_delay: int | None = None,
         prev_chunk_left_over: torch.Tensor | None = None,
         execution_horizon: int | None = None,
-        *,
-        noise: torch.Tensor | None = None,
     ):
         if actions_gt is None:
             return self.action_head.get_action(
@@ -149,7 +147,6 @@ class Evo1Model(nn.Module):
                 prev_chunk_left_over=prev_chunk_left_over,
                 execution_horizon=execution_horizon,
                 rtc_processor=self.rtc_processor,
-                noise=noise,
             )
         return self.action_head(
             fused_tokens,
@@ -171,8 +168,6 @@ class Evo1Model(nn.Module):
         inference_delay: int | None = None,
         prev_chunk_left_over: torch.Tensor | None = None,
         execution_horizon: int | None = None,
-        *,
-        noise: torch.Tensor | None = None,
     ):
         return self.predict_action(
             fused_tokens,
@@ -184,7 +179,6 @@ class Evo1Model(nn.Module):
             inference_delay,
             prev_chunk_left_over,
             execution_horizon,
-            noise=noise,
         )
 
     def _set_module_trainable(self, module: nn.Module, trainable: bool):

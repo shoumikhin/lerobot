@@ -129,17 +129,12 @@ class EO1Policy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions.
-
-        `noise` is the optional starting sample of the flow, shape `(batch_size, chunk_size, max_action_dim)`.
-        When it is None, standard normal noise is drawn.
-        """
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         self.eval()
 
         states = self.prepare_state(batch[OBS_STATE])
         model_inputs = self._get_model_inputs(batch, {OBS_STATE})
-        actions = self.model.sample_actions(states=states, noise=noise, **model_inputs).to(torch.float32)
+        actions = self.model.sample_actions(states=states, **model_inputs).to(torch.float32)
 
         return actions[:, :, : _original_action_dim(self.config)]
 
@@ -204,11 +199,11 @@ class EO1Policy(PreTrainedPolicy):
         return require_single_text_output(outputs, policy_name="EO-1")
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
@@ -591,7 +586,6 @@ class EO1VisionFlowMatchingModel(nn.Module):
         *,
         state_token_id: int,
         action_token_id: int,
-        noise: Tensor | None = None,
         **kwargs,
     ) -> Tensor:
         """Sample actions from the model."""
@@ -660,12 +654,10 @@ class EO1VisionFlowMatchingModel(nn.Module):
             return_dict=True,
         )
 
-        if noise is None:
-            noise = self.sample_noise(
-                (batch_size, chunk_size, self.config.max_action_dim),
-                device,
-            )
-        x_t = noise.to(device=device, dtype=self.action_in_proj.weight.dtype)
+        x_t = self.sample_noise(
+            (batch_size, chunk_size, self.config.max_action_dim),
+            device,
+        ).to(dtype=self.action_in_proj.weight.dtype)
         past_key_values = outputs.past_key_values
 
         # 3. Denoise only the action chunk while keeping the prefix cache invariant.
