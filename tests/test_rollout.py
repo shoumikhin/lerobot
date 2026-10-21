@@ -1665,6 +1665,7 @@ def test_status_line_hides_inference_times_that_are_too_old():
     assert "infer" not in line._format()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="PTYs are POSIX only")
 def test_status_line_measures_the_stream_it_draws_on():
     """With stdout redirected, the width must still come from the terminal the line is drawn on."""
     import fcntl
