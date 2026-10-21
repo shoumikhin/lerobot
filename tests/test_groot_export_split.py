@@ -92,6 +92,25 @@ def tiny_head(alternate=True, interleave=True, num_layers=5):
     return GR00TN17ActionHead(config).eval()
 
 
+def tiny_vision():
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    config = Qwen3VLVisionConfig(
+        depth=3,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        patch_size=2,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0, 1, 2],
+    )
+    return Qwen3VLVisionModel(config).eval()
+
+
 def tiny_text(num_layers=4):
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
@@ -123,23 +142,7 @@ def constants():
 
 
 def test_vision_part_preserves_deepstack_and_state(recipe):
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
-
-    vision = Qwen3VLVisionModel(
-        Qwen3VLVisionConfig(
-            depth=3,
-            hidden_size=32,
-            intermediate_size=64,
-            num_heads=4,
-            patch_size=2,
-            temporal_patch_size=2,
-            spatial_merge_size=2,
-            out_hidden_size=32,
-            num_position_embeddings=16,
-            deepstack_visual_indexes=[0, 1, 2],
-        )
-    ).eval()
+    vision = tiny_vision()
 
     class Observation(torch.nn.Module):
         def forward(self, pixels, state):
@@ -159,21 +162,7 @@ def test_vision_part_preserves_deepstack_and_state(recipe):
 
 
 def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(recipe):
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
-
-    text = Qwen3VLTextModel(
-        Qwen3VLTextConfig(
-            vocab_size=32,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=4,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
-        )
-    ).eval()
+    text = tiny_text()
     head, fixed = tiny_head(), constants()
     images, state = torch.randn(2, 32), torch.randn(1, 1, 6)
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
@@ -216,24 +205,8 @@ def test_last_language_slice_encodes_a_float32_state_with_bfloat16_weights(recip
 
 
 def test_vision_wrapper_matches_the_hugging_face_vision_model(recipe):
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
-
     torch.manual_seed(14)
-    vision = Qwen3VLVisionModel(
-        Qwen3VLVisionConfig(
-            depth=3,
-            hidden_size=32,
-            intermediate_size=64,
-            num_heads=4,
-            patch_size=2,
-            temporal_patch_size=2,
-            spatial_merge_size=2,
-            out_hidden_size=32,
-            num_position_embeddings=16,
-            deepstack_visual_indexes=[0, 1, 2],
-        )
-    ).eval()
+    vision = tiny_vision()
     grid, pixels = torch.tensor([[1, 4, 4], [1, 4, 4]]), torch.randn(32, 24)
     with torch.no_grad():
         expected = vision(pixels, grid)
@@ -243,22 +216,8 @@ def test_vision_wrapper_matches_the_hugging_face_vision_model(recipe):
 
 
 def test_language_model_layers_match_the_hugging_face_text_model(recipe):
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
-
     torch.manual_seed(14)
-    text = Qwen3VLTextModel(
-        Qwen3VLTextConfig(
-            vocab_size=32,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=4,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
-        )
-    ).eval()
+    text = tiny_text()
     fixed = constants()
     deepstack = [torch.randn(2, 32) for _ in range(3)]
     embeddings = fixed["text_embeds"].masked_scatter(fixed["image_token_mask"], torch.randn(2, 32))
@@ -288,21 +247,7 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
 
 
 def test_language_slices_take_only_the_inputs_their_layers_read(recipe):
-    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
-
-    text = Qwen3VLTextModel(
-        Qwen3VLTextConfig(
-            vocab_size=32,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=8,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
-        )
-    ).eval()
+    text = tiny_text(8)
     head, fixed = tiny_head(), constants()
     slices = {
         (start, stop): recipe.GrootLanguageModel(text, head, fixed, start, stop, False, 3)
