@@ -56,6 +56,11 @@ def extra_mib(baseline: list[float], run: list[float]) -> float:
     return statistics.median(steady_window(run)) - statistics.median(baseline)
 
 
+def long_enough(run: list[float]) -> bool:
+    """Whether the command ran for 60 s, as `--duration=60` does, so the window before teardown is loop."""
+    return len(run) * SAMPLE_SECONDS >= 2 * STEADY_SECONDS
+
+
 def is_steady(samples: list[float]) -> bool:
     """Whether the medians of the first and second halves differ by less than 8 MiB, which one outlier cannot move."""
     half = len(samples) // 2
@@ -101,7 +106,7 @@ def main() -> None:
     run = sample(process=process)
     if process.returncode != 0:
         raise SystemExit(f"{command[0]} exited with {process.returncode}")
-    if len(run) * SAMPLE_SECONDS < 2 * STEADY_SECONDS + TEARDOWN_SECONDS:
+    if not long_enough(run):
         raise SystemExit(
             f"Run for at least {2 * STEADY_SECONDS} s, so the last {STEADY_SECONDS} s are steady."
         )

@@ -68,3 +68,9 @@ def test_memory_is_flat_only_when_it_stops_changing(examples):
     assert memory.is_flat([2000.0 + (i % 2) * 8 for i in range(samples)])  # noise around a level
     # The board still returning a previous job's memory: use falling 5 MiB a second.
     assert not memory.is_flat([3000.0 - 5 * memory.SAMPLE_SECONDS * i for i in range(samples)])
+
+
+def test_memory_accepts_a_60_second_rollout(examples):
+    memory = examples("benchmark_memory")
+    assert memory.long_enough([3000.0] * int(60 / memory.SAMPLE_SECONDS))
+    assert not memory.long_enough([3000.0] * int(40 / memory.SAMPLE_SECONDS))
