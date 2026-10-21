@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.test_export_recipes import act_checkpoint
+from tests.test_export_recipes import act_checkpoint, dataset_metadata, smolvla_checkpoint, tiny_smolvlm
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 
@@ -48,6 +48,52 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     assert mean == pytest.approx((19 * 0.5 + 10.0) / 20)
     assert p95 == pytest.approx(0.5 + 0.05 * (10.0 - 0.5))
     assert largest == 10.0
+
+
+def test_action_error_refuses_actions_of_another_shape(examples):
+    benchmark = examples("benchmark")
+    # NumPy would broadcast one action against a chunk of 100 and find no error at all.
+    with pytest.raises(ValueError, match="cannot be compared"):
+        benchmark.action_error(np.zeros((50, 1, 6)), np.zeros((50, 100, 6)))
+
+
+def test_pytorch_run_saves_the_original_policy_actions_with_the_engine_noise(examples, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    benchmark = examples("benchmark")
+    for name, value in (("FRAMES", 3), ("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
+        monkeypatch.setattr(benchmark, name, value)
+    checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", tiny_smolvlm(tmp_path / "vlm"))
+    features = {
+        "observation.images.front": {
+            "dtype": "video",
+            "shape": (32, 32, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "observation.state": {"dtype": "float32", "shape": (3,), "names": None},
+        "action": {"dtype": "float32", "shape": (3,), "names": None},
+    }
+    metadata = dataset_metadata(features, ["pick the cup"])
+    monkeypatch.setattr(examples("common"), "LeRobotDatasetMetadata", lambda repo_id, root=None: metadata)
+    rng = np.random.default_rng(0)
+    frames = {
+        "observation.images.front": rng.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8),
+        "observation.state": rng.uniform(-1, 1, (3, 3)).astype(np.float32),
+    }
+    np.savez(tmp_path / "frames.npz", **frames)
+    output = tmp_path / "pytorch.npz"
+    argv = [
+        f"--policy.path={checkpoint}",
+        "--dataset.repo_id=user/dataset",
+        f"--frames={tmp_path / 'frames.npz'}",
+        f"--output={output}",
+    ]
+    benchmark.measure("pytorch", argv)
+    result = np.load(output)
+    assert result["reference"].shape == result["actions"].shape == (3, 2, 3)
+    # The recipe keeps the bfloat16 weights SmolVLA loads, the reference runs in float32: a small difference.
+    # Other noise or frames would move the actions as much as another frame does, by whole units here.
+    assert np.abs(result["actions"] - result["reference"]).max() < 0.05
+    assert np.abs(np.diff(result["reference"], axis=0)).max() > 1
 
 
 def test_memory_counts_swap_and_only_the_warm_chunks(examples):

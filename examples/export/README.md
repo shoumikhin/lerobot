@@ -144,7 +144,7 @@ Orin Nano:
 
 ### Accuracy
 
-How far the compiled policy's actions are from PyTorch's, on 50 dataset samples with the same random noise. For each sample, take the largest difference over its actions and joints; each cell is the mean / 95th percentile / largest of that over the 50 samples, in degrees (gripper in %). Lower is better. Every cell passed the export's own check.
+How far each column's actions are from the original LeRobot policy's, run in full float32 (no bfloat16 and no TensorFloat-32), on 50 dataset samples with the same random noise. For each sample, take the largest difference over its actions and joints; each cell is the mean / 95th percentile / largest of that over the 50 samples, in degrees (gripper in %). Lower is better. Every cell passed the export's own check.
 
 Thor:
 
