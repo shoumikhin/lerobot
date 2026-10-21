@@ -81,9 +81,13 @@ class Part:
 
 
 def parse_args(
-    description: str, route: str, parents: tuple[argparse.ArgumentParser, ...] = ()
+    description: str,
+    route: str,
+    parents: tuple[argparse.ArgumentParser, ...] = (),
+    argv: list[str] | None = None,
 ) -> tuple[argparse.Namespace, Any]:
-    """The route's command line with the arguments of the checkpoint's recipe and of `parents`, and that recipe."""
+    """The route's command line, or `argv`, with the arguments of the checkpoint's recipe and of `parents`,
+    and that recipe."""
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -98,7 +102,7 @@ def parse_args(
     # The checkpoint names the recipe, which adds its own arguments, so it is read before help is shown.
     checkpoint = argparse.ArgumentParser(add_help=False)
     checkpoint.add_argument("--policy.path", dest="policy_path")
-    policy_path = checkpoint.parse_known_args()[0].policy_path
+    policy_path = checkpoint.parse_known_args(argv)[0].policy_path
     recipe = None
     if policy_path is not None:
         policy_type = PreTrainedConfig.from_pretrained(policy_path).type
@@ -118,7 +122,7 @@ def parse_args(
         "-h", "--help", action="help", help="Show this help; with --policy.path, the recipe's too."
     )
     parser.set_defaults(route=route)
-    return parser.parse_args(), recipe
+    return parser.parse_args(argv), recipe
 
 
 def run_route(
