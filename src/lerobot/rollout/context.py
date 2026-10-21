@@ -450,6 +450,12 @@ def build_rollout_context(
     # Policy constructors and custom processors must use the resolved rollout device too.
     policy_config.device = cfg.device
 
+    policy_export_dir = export_dir(policy_config.pretrained_path)
+    if policy_export_dir is not None and (is_rtc or cfg.use_torch_compile):
+        raise ValueError(
+            "An exported policy runs with sync inference: drop --inference.type=rtc and --use_torch_compile."
+        )
+
     if is_rtc:
         _validate_trained_rtc_rollout_config(policy_config, cfg.inference)
 
@@ -460,12 +466,6 @@ def build_rollout_context(
         raise NotImplementedError(
             "Current implementation of VQBeT does not support `mps` backend. "
             "Please use `cpu` or `cuda` backend."
-        )
-
-    policy_export_dir = export_dir(policy_config.pretrained_path)
-    if policy_export_dir is not None and (is_rtc or cfg.use_torch_compile):
-        raise ValueError(
-            "An exported policy runs with the default inference: drop --inference.type and torch compile."
         )
 
     policy: PreTrainedPolicy | None = None
