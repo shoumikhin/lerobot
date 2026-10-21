@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -69,6 +70,16 @@ def nvidia_smi_gpu_mib() -> dict[int, float]:
         check=True,
     ).stdout
     return {int(pid): float(mib) for pid, mib in (line.split(",") for line in table.splitlines())}
+
+
+def jtop_gpu_mib(processes: list[list]) -> dict[int, float]:
+    """GPU memory per process ID from jtop's process rows, in MiB."""
+    gpu = defaultdict(float)
+    # A row lists its process ID first and its GPU memory, in KiB, ninth. A process gets a row per GPU memory
+    # client it opened.
+    for row in processes:
+        gpu[int(row[0])] += row[8] / 1024
+    return gpu
 
 
 def process_tree(root: int) -> list[int]:
@@ -158,8 +169,7 @@ def main() -> None:
         from jtop import jtop
 
         with jtop(interval=SAMPLE_SECONDS) as jetson:
-            # A process row lists its ID first and its GPU memory, in KiB, ninth.
-            steady = run(command, lambda: {int(row[0]): row[8] / 1024 for row in jetson.processes})
+            steady = run(command, lambda: jtop_gpu_mib(jetson.processes))
     else:
         steady = run(command, nvidia_smi_gpu_mib)
     if not is_flat(steady):

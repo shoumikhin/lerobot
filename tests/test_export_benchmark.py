@@ -122,6 +122,17 @@ def test_memory_reads_gpu_memory_per_process_from_nvidia_smi(examples, monkeypat
     assert memory.nvidia_smi_gpu_mib() == {4242: 1140.0, 4343: 12.0}
 
 
+def test_memory_sums_each_process_gpu_memory_over_its_jtop_rows(examples):
+    memory = examples("benchmark_memory")
+    # jtop rows: process ID, user, GPU, type, priority, state, CPU %, memory and GPU memory in KiB, name.
+    rows = [
+        [4242, "user", "I", "G", 0, "S", 10.0, 900000, 102400, "python3"],
+        [4242, "user", "I", "G", 0, "S", 10.0, 900000, 51200, "python3"],
+        [4343, "user", "I", "G", 0, "S", 1.0, 20000, 1024, "nvargus"],
+    ]
+    assert memory.jtop_gpu_mib(rows) == {4242: 150.0, 4343: 1.0}
+
+
 def test_memory_counts_only_the_warm_chunks(examples):
     memory = examples("benchmark_memory")
     # Loading peaks, compiling holds a long flat plateau, the warm chunks still give back some memory from
