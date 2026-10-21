@@ -524,12 +524,15 @@ def n17_decoder(relative=False):
     )
 
 
-@pytest.mark.parametrize("route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt"])
+@pytest.mark.parametrize(
+    "route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt", "pytorch", "torch.compile"]
+)
 def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, route):
     from lerobot.policies.groot.processor_groot import GrootActionUnpackUnnormalizeStep
 
     recipe.check_traceable_decode(action_pipeline(GrootActionUnpackUnnormalizeStep()), route)
-    if route == "onnx_tensorrt":
+    # The benchmark's plain PyTorch run of the recipe decodes in NumPy as it is, with no tracing.
+    if route in ("onnx_tensorrt", "pytorch"):
         recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
     else:
         with pytest.raises(ValueError, match="only the ONNX-TensorRT route"):

@@ -426,7 +426,8 @@ def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -
     GR00T N1.7 checkpoints with statistics for their embodiment decode actions in NumPy. The other routes
     trace with torch.export's default non-strict mode, which cannot run NumPy on traced tensors, so the
     export would otherwise fail at its last part after hours. The ONNX exporter traces it into the program,
-    except relative actions, which add a state the decoder caches between calls. It is the only recipe check
+    and the benchmark's plain PyTorch run needs no tracing at all, except relative actions, which add a state
+    the decoder caches between calls. It is the only recipe check
     that names a route, because the route decides how a program is traced. torch.export's strict mode also
     traces the decoding, but a TensorRT build of that graph is untested, so the routes keep their default.
     """
@@ -438,7 +439,7 @@ def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -
             "This checkpoint decodes relative actions with GrootN17ActionDecodeStep, which adds the state "
             "it cached from the last observation and cannot be exported."
         )
-    if route != "onnx_tensorrt":
+    if route not in ("onnx_tensorrt", "pytorch"):
         raise ValueError(
             "This checkpoint decodes its actions with GrootN17ActionDecodeStep, which runs in NumPy and "
             "only the ONNX-TensorRT route can export: use to_onnx_tensorrt.py."
