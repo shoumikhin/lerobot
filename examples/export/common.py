@@ -370,6 +370,18 @@ class ChunkActions(nn.Module):
         return Part("actions", self, (actions, state), ["x_t", OBS_STATE], [ACTION])
 
 
+def hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
+    """Store the linear layers of `module`, which runs them only under bfloat16 autocast, in bfloat16.
+
+    Autocast casts a float32 linear layer's weight and bias to bfloat16 on every call, so this is the same
+    arithmetic without copying the weights every chunk: what a TensorRT build does once, when it folds the
+    cast into the weights.
+    """
+    for layer in module.modules():
+        if isinstance(layer, nn.Linear):
+            layer.to(torch.bfloat16)
+
+
 def free_memory() -> None:
     """Return freed GPU memory to the next part or the build."""
     gc.collect()
