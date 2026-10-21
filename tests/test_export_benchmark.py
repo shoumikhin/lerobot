@@ -169,6 +169,25 @@ def test_memory_sums_each_process_gpu_memory_over_its_jtop_rows(examples):
     assert memory.jtop_gpu_mib(rows) == {4242: 150.0, 4343: 1.0}
 
 
+def test_memory_times_a_sample_when_its_read_ends(examples, monkeypatch):
+    from types import SimpleNamespace
+
+    memory = examples("benchmark_memory")
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        memory, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda seconds: None)
+    )
+
+    def slow_read(pid, gpu):
+        clock.now += 1.0
+        return 3000.0
+
+    monkeypatch.setattr(memory, "process_mib", slow_read)
+    process = SimpleNamespace(pid=1, poll=iter([None, None, 0]).__next__)
+    # Timed when it starts, a read that ends after the stopped line would be counted as before it.
+    assert memory.sample(process, lambda: {}) == [(1.0, 3000.0), (2.0, 3000.0)]
+
+
 def test_memory_counts_only_the_warm_chunks(examples):
     memory = examples("benchmark_memory")
     # Loading peaks, compiling holds a long flat plateau, the warm chunks still give back some memory from

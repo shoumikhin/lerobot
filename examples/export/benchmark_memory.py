@@ -126,7 +126,9 @@ def sample(process: subprocess.Popen, gpu_mib: Callable[[], dict[int, float]]) -
     """(time, memory of `process` and the processes it started) every half second until it exits."""
     samples = []
     while process.poll() is None:
-        samples.append((time.monotonic(), process_mib(process.pid, gpu_mib())))
+        mib = process_mib(process.pid, gpu_mib())
+        # Timed after the read, so a read that ends in the teardown falls outside the window.
+        samples.append((time.monotonic(), mib))
         time.sleep(SAMPLE_SECONDS)
     return samples
 
