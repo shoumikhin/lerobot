@@ -286,7 +286,7 @@ class GrootLanguageModel(nn.Module):
         self.layers = nn.ModuleList(text_model.layers[start:stop])
         self.rotary_emb = text_model.rotary_emb
         self.use_bf16 = use_bf16
-        for name in ("attention_mask", "position_ids", "visual_pos_masks"):
+        for name in ("attention_mask", "position_ids", "image_mask"):
             self.register_buffer(name, constants[name])
         if start == 0:
             self.register_buffer("text_embeds", constants["text_embeds"])
@@ -318,7 +318,7 @@ class GrootLanguageModel(nn.Module):
                     position_embeddings=positions,
                 )
                 if index in deepstack:
-                    hidden = deepstack_add(hidden, self.visual_pos_masks, deepstack[index].to(hidden.dtype))
+                    hidden = deepstack_add(hidden, self.image_mask, deepstack[index].to(hidden.dtype))
             if self.last:
                 (state,) = inputs[added:]
                 # GR00T consumes the decoder output before Qwen's final norm.
@@ -464,7 +464,6 @@ class Exporter:
         self.constants = {
             "attention_mask": mask.long(),
             "position_ids": positions,
-            "visual_pos_masks": image_mask,
             "image_mask": image_mask,
             "backbone_attention_mask": mask == 1,
             "embodiment_id": self.batch["embodiment_id"],
@@ -479,7 +478,7 @@ class Exporter:
         self.expected_actions = None
 
     def load_modules(self, *modules: str) -> GrootPolicy:
-        """The policy with only `modules`' weights read from the checkpoint, in the checkpoint's own precision."""
+        """The policy with only `modules`' weights read from the checkpoint, in the config's `dtype`."""
         config = copy(self.config)
         # Casting norms, embeddings and category biases changes residual additions outside autocast.
         config.use_bf16 = False
