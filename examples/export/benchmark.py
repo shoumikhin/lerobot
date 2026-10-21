@@ -262,8 +262,7 @@ def save_reference(args: argparse.Namespace, folder: Path) -> None:
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     config.device = str(device())
     config.use_amp = False
-    if hasattr(config, "dtype"):  # pi0.5 and GR00T
-        config.dtype = torch.float32
+    config.dtype = torch.float32
     if hasattr(config, "use_bf16"):  # GR00T
         config.use_bf16 = False
     if hasattr(config, "compile_model"):  # SmolVLA and pi0.5
