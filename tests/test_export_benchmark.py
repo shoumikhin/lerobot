@@ -239,3 +239,28 @@ def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, cap
     assert chunks[benchmark.WARMUP_CHUNKS] == benchmark.WARM + "\n"
     assert len(chunks) > benchmark.WARMUP_CHUNKS + 1
     assert capsys.readouterr().out == benchmark.STOPPED + "\n"
+
+
+def test_duration_keeps_only_a_copy_of_the_first_frame(examples, tmp_path):
+    from argparse import Namespace
+
+    from tests.export_helpers import write_export_folder
+
+    benchmark = examples("benchmark")
+    write_export_folder(tmp_path, np.zeros((2, 3)))
+    states = np.arange(benchmark.FRAMES * 3, dtype=np.float32).reshape(benchmark.FRAMES, 3)
+    np.savez(tmp_path / "frames.npz", **{"observation.state": states})
+    seen = []
+
+    class Program:
+        def reset(self):
+            pass
+
+        def get_action(self, frame):
+            seen.append(frame["observation.state"])
+
+    args = Namespace(frames=tmp_path / "frames.npz", output=None, duration=0.0)
+    benchmark.measure_engine("folder", Program(), args, tmp_path)
+    # A view of the first frame would keep every frame in memory while the run is measured.
+    assert all(state.base is None for state in seen)
+    np.testing.assert_array_equal(seen[-1], states[0])

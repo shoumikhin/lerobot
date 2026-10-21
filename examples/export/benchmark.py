@@ -199,6 +199,9 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
     info = json.loads((folder / "export.json").read_text())
     chunk_size = len(load_file(folder / info["test_case"])["expected_actions"])
     frames = load_frames(args.frames)
+    if args.duration is not None:
+        # A frame is a view of every frame, so only a copy lets the others go before memory is measured.
+        frames = [{name: value.copy() for name, value in frames[0].items()}]
 
     def run_chunk(frame: dict, seed: int) -> np.ndarray:
         program.reset()
