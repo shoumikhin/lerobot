@@ -89,7 +89,7 @@ lerobot-rollout \
 
 ## Results
 
-The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch.
+The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the same parts the export compiles, through the same engine, so only what runs them differs.
 
 - All four policies were trained on the same SO-101 dataset: 304 episodes, recorded at 30 frames per second.
 - Both boards ran at maximum power, with the GPU clock locked.
@@ -120,7 +120,7 @@ Orin Nano:
 | pi0.5   |                 630 |       **612** |            OOM |             OOM |     OOM |
 | GR00T   |             **266** |           274 |            275 |             OOM |     OOM |
 
-Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise.
+Each value is the median of three runs of 100 chunks, measured with [benchmark.py](benchmark.py). Differences of a few milliseconds are within run-to-run noise.
 
 ### Memory
 
@@ -166,7 +166,7 @@ Orin Nano:
 | pi0.5   |     0.97 / **0.097** | **0.70** / 0.098 |                  OOM |                  OOM |
 | GR00T   | **1.79** / **0.085** |     2.14 / 0.091 | **1.79** / **0.085** |                  OOM |
 
-The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number.
+The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is one measurement. Measured with [benchmark.py](benchmark.py).
 
 ## Good to know
 
