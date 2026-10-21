@@ -440,6 +440,7 @@ class Exporter:
         self.policy = self.load_modules(VISION)
         model = self.policy._groot_model
         self.model_config = model.config
+        # How many actions the policy plays per chunk, which it resolves from the checkpoint and keeps private.
         self.n_action_steps = self.policy._action_queue_steps
         preprocessor, self.postprocessor = processors(self.config, args.policy_path)
         check_traceable_decode(self.postprocessor, args.route)

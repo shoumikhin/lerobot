@@ -186,6 +186,7 @@ class PI05Embed(nn.Module):
 
     def forward(self, *frame: Tensor) -> tuple[Tensor, Tensor]:
         batch = self.observation(*frame)
+        # The policy's own image resize and padding, which it exposes under no public name.
         images, img_masks = self.policy._preprocess_images(batch)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
             images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
@@ -202,7 +203,7 @@ class PI05LanguageModelLayers(nn.Module):
     def __init__(self, model: PI05Pytorch, layers: range):
         super().__init__()
         language_model = model.paligemma_with_expert.paligemma.model.language_model
-        language_model.config._attn_implementation = "eager"
+        language_model.set_attn_implementation("eager")
         self.layers = nn.ModuleList(language_model.layers[i] for i in layers)
         self.rotary_emb = language_model.rotary_emb
         self.last = layers.stop == len(language_model.layers)
