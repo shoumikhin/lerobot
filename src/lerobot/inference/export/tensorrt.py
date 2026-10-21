@@ -94,11 +94,11 @@ class CudaBuffer:
 @functools.cache
 def runtime():
     """Use plain allocations so large engines fit without a stream-ordered memory pool."""
-    import tensorrt as trt
+    import tensorrt
 
-    class CudaAllocator(trt.IGpuAllocator):
+    class CudaAllocator(tensorrt.IGpuAllocator):
         def __init__(self):
-            trt.IGpuAllocator.__init__(self)
+            tensorrt.IGpuAllocator.__init__(self)
 
         def allocate(self, size: int, alignment: int, flags: int) -> int:
             status, pointer = cuda_runtime().cudaMalloc(size)
@@ -112,25 +112,29 @@ def runtime():
         def deallocate(self, memory: int) -> bool:
             return cuda_runtime().cudaFree(memory)[0] == 0
 
-    result = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    result = tensorrt.Runtime(tensorrt.Logger(tensorrt.Logger.WARNING))
     result.gpu_allocator = CudaAllocator()
     return result
 
 
 def load_engine(path: Path):
     """Deserialize an engine without holding another complete copy on the host."""
-    import tensorrt as trt
+    import tensorrt
 
-    class FileReader(trt.IStreamReaderV2):
+    class FileReader(tensorrt.IStreamReaderV2):
         def __init__(self, file):
-            trt.IStreamReaderV2.__init__(self)
+            tensorrt.IStreamReaderV2.__init__(self)
             self._file = file
 
         def read(self, num_bytes: int, stream: int) -> bytes:
             return self._file.read(min(num_bytes, READ_CHUNK_BYTES))
 
-        def seek(self, offset: int, where: trt.SeekPosition) -> bool:
-            whence = {trt.SeekPosition.SET: 0, trt.SeekPosition.CUR: 1, trt.SeekPosition.END: 2}[where]
+        def seek(self, offset: int, where: tensorrt.SeekPosition) -> bool:
+            whence = {
+                tensorrt.SeekPosition.SET: 0,
+                tensorrt.SeekPosition.CUR: 1,
+                tensorrt.SeekPosition.END: 2,
+            }[where]
             self._file.seek(offset, whence)
             return True
 
@@ -143,14 +147,14 @@ def load_engine(path: Path):
 
 def numpy_dtype(dtype):
     """NumPy needs an extension dtype for TensorRT's bfloat16 bindings."""
-    import tensorrt as trt
+    import tensorrt
 
-    if dtype == trt.bfloat16:
+    if dtype == tensorrt.bfloat16:
         require_package("ml-dtypes", extra="export", import_name="ml_dtypes")
         from ml_dtypes import bfloat16
 
         return np.dtype(bfloat16)
-    return np.dtype(trt.nptype(dtype))
+    return np.dtype(tensorrt.nptype(dtype))
 
 
 class TensorRTEngine:
@@ -170,11 +174,11 @@ class TensorRTEngine:
         stream: CudaStream,
         cuda_graphs: bool = True,
     ):
-        import tensorrt as trt
+        import tensorrt
 
         self._engine = load_engine(path)
         self._context = self._engine.create_execution_context(
-            trt.ExecutionContextAllocationStrategy.USER_MANAGED
+            tensorrt.ExecutionContextAllocationStrategy.USER_MANAGED
         )
         if self._context is None:
             raise RuntimeError(f"TensorRT could not create an execution context for {path}")
