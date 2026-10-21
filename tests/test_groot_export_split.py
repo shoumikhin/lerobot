@@ -514,6 +514,8 @@ def test_bfloat16_linear_weights_compute_what_autocast_computes(recipe):
     autocast, held = (recipe.GrootStep(tiny_head(), fixed, 0, 5, True, 1 / 3).eval() for _ in range(2))
     held.load_state_dict(autocast.state_dict())
     recipe.hold_linear_weights_in_bfloat16(held)
+    linears = [layer for layer in held.modules() if isinstance(layer, torch.nn.Linear)]
+    assert linears and all(layer.weight.dtype == torch.bfloat16 for layer in linears)
     with torch.no_grad():
         torch.testing.assert_close(held(*inputs), autocast(*inputs), rtol=0, atol=0)
 
