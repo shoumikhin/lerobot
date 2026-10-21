@@ -14,10 +14,10 @@
 
 """Rebuild the TensorRT engines of an ONNX-TensorRT folder for this board's GPU.
 
-A TensorRT engine only runs on the GPU model that built it. A folder `onnx_trt.py` wrote keeps its
+A TensorRT engine only runs on the GPU model that built it. A folder `to_onnx_tensorrt.py` wrote keeps its
 ONNX files, so copy it to another board and rebuild its engines there:
 
-    python examples/export/build_engine.py outputs/export/act_onnx_trt
+    python examples/export/build_engine.py outputs/export/act_onnx_tensorrt
 
 Then run the folder with `lerobot-rollout --policy.path=<folder>`.
 """
@@ -70,10 +70,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("folder", type=Path, help="A folder onnx_trt.py wrote.")
+    parser.add_argument("folder", type=Path, help="A folder to_onnx_tensorrt.py wrote.")
     args = parser.parse_args()
     info = json.loads((args.folder / EXPORT_INFO).read_text())
-    if info["backend"] != "onnx_trt":
+    if info["backend"] != "onnx_tensorrt":
         raise SystemExit("Only an ONNX-TensorRT folder keeps the ONNX files to rebuild its engines from.")
     for program in info["programs"].values():
         engine = args.folder / program["file"]

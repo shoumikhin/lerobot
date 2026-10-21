@@ -31,18 +31,18 @@ The ExecuTorch-TensorRT route also needs `torch-tensorrt-executorch-runtime` bui
 Export on the kind of board that will run the policy: a compiled folder runs only on the kind of GPU (graphics processor) that built it.
 
 ```bash
-python examples/export/executorch_trt.py \
+python examples/export/to_executorch_tensorrt.py \
     --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
     --output_dir=outputs/export/act
 ```
 
 Each script compiles any supported policy one way. All use [TensorRT](https://developer.nvidia.com/tensorrt), NVIDIA's compiler for its GPUs. If you are not sure, start with ExecuTorch-TensorRT: it is fast and small, and it runs without PyTorch.
 
-| script              | writes                      | needs PyTorch to run |
-| ------------------- | --------------------------- | -------------------- |
-| `executorch_trt.py` | ExecuTorch `.pte` programs  | no                   |
-| `onnx_trt.py`       | TensorRT `.engine` files    | no                   |
-| `torch_trt.py`      | AOTInductor `.pt2` packages | yes                  |
+| script                      | writes                      | needs PyTorch to run |
+| --------------------------- | --------------------------- | -------------------- |
+| `to_executorch_tensorrt.py` | ExecuTorch `.pte` programs  | no                   |
+| `to_onnx_tensorrt.py`       | TensorRT `.engine` files    | no                   |
+| `to_torch_tensorrt.py`      | AOTInductor `.pt2` packages | yes                  |
 
 Some policies need more arguments:
 

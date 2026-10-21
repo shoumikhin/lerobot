@@ -423,10 +423,10 @@ def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -
             "This checkpoint decodes relative actions with GrootN17ActionDecodeStep, which adds the state "
             "it cached from the last observation and cannot be exported."
         )
-    if route != "onnx_trt":
+    if route != "onnx_tensorrt":
         raise ValueError(
             "This checkpoint decodes its actions with GrootN17ActionDecodeStep, which runs in NumPy and "
-            "only the ONNX-TensorRT route can export: use onnx_trt.py."
+            "only the ONNX-TensorRT route can export: use to_onnx_tensorrt.py."
         )
 
 

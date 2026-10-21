@@ -355,7 +355,7 @@ import export_fakes
 
 folder, backend = Path(sys.argv[1]), sys.argv[2]
 frame = export_fakes.write_folder(folder, backend, camera=True)
-if backend == "onnx_trt":
+if backend == "onnx_tensorrt":
     export_fakes.install_tensorrt()
 
 from lerobot.inference.export import ExportInferenceEngine
@@ -370,7 +370,7 @@ assert "torch" not in sys.modules
 )
 
 
-@pytest.mark.parametrize("backend", ["executorch_trt", "onnx_trt"])
+@pytest.mark.parametrize("backend", ["executorch_tensorrt", "onnx_tensorrt"])
 def test_export_engine_runs_a_denoising_chain_without_torch(tmp_path, backend):
     """With torch installed but refusing to load, the engine runs a flow-matching chain with a camera."""
     result = run_without_torch(ENGINE_WITHOUT_TORCH, tmp_path, backend)
@@ -389,7 +389,7 @@ import export_fakes
 folder, backend, planner = Path(sys.argv[1]), sys.argv[2], sys.argv[4] == "planner"
 sys.path.insert(0, sys.argv[3])
 export_fakes.write_folder(folder, backend, camera=False)
-if backend == "onnx_trt":
+if backend == "onnx_tensorrt":
     export_fakes.install_tensorrt()
 
 from tests.mocks.mock_robot import MockRobot
@@ -418,7 +418,7 @@ assert "torch" not in sys.modules
 # The first actions the robot gets are the chunk the programs computed from its state, one per tick.
 names = ["motor_1.pos", "motor_2.pos", "motor_3.pos"]
 assert sent[:2] == [dict(zip(names, row.tolist())) for row in export_fakes.ACTIONS], sent[:2]
-if backend == "executorch_trt":
+if backend == "executorch_tensorrt":
     import executorch.runtime
 
     assert executorch.runtime.OUTPUT_AT_IMPORT == "executorch", executorch.runtime.OUTPUT_AT_IMPORT
@@ -428,7 +428,7 @@ if backend == "executorch_trt":
 
 @pytest.mark.skipif(not _datasets_available, reason="datasets not installed")
 @pytest.mark.parametrize("planner", ["", "planner"], ids=["no_planner", "planner"])
-@pytest.mark.parametrize("backend", ["executorch_trt", "onnx_trt"])
+@pytest.mark.parametrize("backend", ["executorch_tensorrt", "onnx_tensorrt"])
 def test_rollout_runs_an_export_with_torch_unimportable(tmp_path, backend, planner):
     """`lerobot-rollout` loads an ExecuTorch-TensorRT or ONNX-TensorRT folder and drives a robot without torch.
 
@@ -449,7 +449,7 @@ from pathlib import Path
 folder = Path(sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 (folder / "export.json").write_text(json.dumps({
-    "backend": "onnx_trt", "programs": {"model": {"file": "model.engine", "inputs": [], "outputs": []}}
+    "backend": "onnx_tensorrt", "programs": {"model": {"file": "model.engine", "inputs": [], "outputs": []}}
 }))
 import build_engine
 
