@@ -1782,7 +1782,7 @@ def _write_export_folder(folder: Path, expected_actions) -> None:
         {**frame, "expected_actions": np.asarray(expected_actions, np.float32)}, folder / "case.safetensors"
     )
     info = {
-        "backend": "fake",
+        "route": "fake",
         "programs": {"model": {"file": "model.bin", "inputs": ["observation.state"], "outputs": ["action"]}},
         "inputs": ["observation.state"],
         "test_case": "case.safetensors",

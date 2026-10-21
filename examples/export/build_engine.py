@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument("folder", type=Path, help="A folder to_onnx_tensorrt.py wrote.")
     args = parser.parse_args()
     info = json.loads((args.folder / EXPORT_INFO).read_text())
-    if info["backend"] != "onnx_tensorrt":
+    if info["route"] != "onnx_tensorrt":
         raise SystemExit("Only an ONNX-TensorRT folder keeps the ONNX files to rebuild its engines from.")
     for program in info["programs"].values():
         engine = args.folder / program["file"]

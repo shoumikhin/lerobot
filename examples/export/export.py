@@ -179,7 +179,7 @@ def write_folder(
     save_file(case, args.output_dir / TEST_CASE)
     config.save_pretrained(args.output_dir)
     info = {
-        "backend": args.route,
+        "route": args.route,
         "programs": programs,
         "inputs": [*frame, *([NOISE] if noise is not None else [])],
         "test_case": TEST_CASE,

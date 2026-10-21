@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NumPy camera geometry for exports whose backends cannot resize with antialiasing."""
+"""NumPy camera geometry for exports whose compiled programs cannot resize with antialiasing."""
 
 import numpy as np
 

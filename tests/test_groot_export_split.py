@@ -539,19 +539,19 @@ def n17_decoder(relative=False):
 
 
 @pytest.mark.parametrize(
-    "backend", ["executorch_tensorrt", "torch_tensorrt", "executorch_cuda", "onnx_tensorrt"]
+    "route", ["executorch_tensorrt", "torch_tensorrt", "executorch_cuda", "onnx_tensorrt"]
 )
-def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, backend):
+def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, route):
     from lerobot.policies.groot.processor_groot import GrootActionUnpackUnnormalizeStep
 
-    recipe.check_traceable_decode(action_pipeline(GrootActionUnpackUnnormalizeStep()), backend)
-    if backend == "onnx_tensorrt":
-        recipe.check_traceable_decode(action_pipeline(n17_decoder()), backend)
+    recipe.check_traceable_decode(action_pipeline(GrootActionUnpackUnnormalizeStep()), route)
+    if route == "onnx_tensorrt":
+        recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
     else:
         with pytest.raises(ValueError, match="only the ONNX-TensorRT route"):
-            recipe.check_traceable_decode(action_pipeline(n17_decoder()), backend)
+            recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
     with pytest.raises(ValueError, match="relative actions"):
-        recipe.check_traceable_decode(action_pipeline(n17_decoder(relative=True)), backend)
+        recipe.check_traceable_decode(action_pipeline(n17_decoder(relative=True)), route)
 
 
 def test_numpy_action_decoding_exports_to_onnx_and_follows_new_actions(recipe, tmp_path):

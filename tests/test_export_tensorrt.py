@@ -352,7 +352,7 @@ def test_a_folder_can_turn_cuda_graphs_off(tmp_path, fake_cuda, fake_engine, mon
         "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
     info = {
-        "backend": "onnx_tensorrt",
+        "route": "onnx_tensorrt",
         "inputs": ["noise"],
         "programs": programs,
         "steps": ["step_0", "step_1"],
