@@ -144,6 +144,27 @@ def test_act_exports_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch
     assert all(action.shape == (3,) for action in actions)
 
 
+def test_test_case_images_change_smoothly_like_a_camera_image(recipes):
+    """Random pixels make a vision-language policy's bfloat16 actions swing, so the test case avoids them."""
+    from types import SimpleNamespace
+
+    from common import IMAGE_CELLS, frame_from_policy
+
+    camera = "observation.images.front"
+    config = SimpleNamespace(
+        input_features={
+            camera: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 48, 64)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+        },
+        image_features={camera},
+    )
+    image = frame_from_policy(config)[camera].astype(int)
+    assert image.shape == (48, 64, 3) and image.std() > 0
+    # Bilinear blending across cells of 8 pixels moves each pixel at most 1/8 of the range from its neighbor.
+    for axis, cells in ((0, IMAGE_CELLS[0]), (1, IMAGE_CELLS[1])):
+        assert np.abs(np.diff(image, axis=axis)).max() <= 255 * cells / image.shape[axis] + 1
+
+
 def test_act_with_temporal_ensembling_is_refused(recipes, monkeypatch):
     from types import SimpleNamespace
 

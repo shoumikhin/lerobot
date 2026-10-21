@@ -59,7 +59,7 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
-# TensorRT reorders bfloat16 math, so actions drift by up to about 4; wrong noise gives 15 or more.
+# TensorRT rounds bfloat16 differently, so actions differ by up to about 1.5; wrong noise gives 14 or more.
 TOLERANCE = 5.0
 LANGUAGE_MODEL = "model.paligemma_with_expert.paligemma.model.language_model"
 # The vision encoder, its projector and the token embeddings; the language model's lm_head is never needed.
