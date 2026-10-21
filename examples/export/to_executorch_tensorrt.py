@@ -42,8 +42,6 @@ def compile_part(part: Part, path: Path) -> None:
         engine,
         str(path),
         output_format="executorch",
-        arg_inputs=part.inputs,
-        retrace=False,
         use_cuda_graphs=True,
         backend_config=ExecutorchBackendConfig(
             # The rollout hands each program its inputs, and takes its outputs, on the GPU.
