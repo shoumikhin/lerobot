@@ -193,6 +193,16 @@ def test_route_scripts_name_no_policy():
         assert not words & policies, (name, words & policies)
 
 
+def test_usage_examples_print_one_option_per_line():
+    """--help prints each script's docstring, where a lone backslash would join the lines of its example."""
+    import ast
+    import re
+
+    for script in [*EXAMPLES.glob("*.py"), EXAMPLES / "replay_robot" / "write_frames.py"]:
+        docstring = ast.get_docstring(ast.parse(script.read_text()), clean=False) or ""
+        assert not re.search(r"\S {2,}--", docstring), script.name
+
+
 def test_no_export_script_shadows_a_package_it_imports():
     """A script named like a package it imports hides that package, because its own folder is first on
     sys.path when it runs, as a script named torch_tensorrt.py importing torch_tensorrt would. The check is
