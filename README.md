@@ -39,7 +39,7 @@ lerobot-info
 
 ## Compiled Policies on Jetson
 
-![An SO-101 arm handing over a candy](https://raw.githubusercontent.com/shoumikhin/lerobot/assets/candy.gif)
+https://github.com/user-attachments/assets/3a8f30f8-4856-449b-b2a7-661c72f1eac6
 
 _An SO-101 arm hands over a candy, driven by a policy exported with ExecuTorch-TensorRT on a Jetson Orin Nano._
 
