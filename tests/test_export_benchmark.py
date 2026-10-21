@@ -47,14 +47,19 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     assert p95 == pytest.approx(0.5 + 0.05 * (10.0 - 0.5))
 
 
-def test_memory_counts_swap_and_ignores_the_load_peak(examples):
+def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples):
     memory = examples("benchmark_memory")
     meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
     assert memory.used_mib(meminfo) == 2048
     assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
     steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
-    run = [9000.0] * 10 + [3000.0] * steady  # loading peaks, then the loop holds steady
+    # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
+    run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
     assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
+    assert memory.is_steady(memory.steady_window(run))
+    # A steadily falling run is not steady, even with a teardown cliff at its end.
+    falling = [3000.0 - 0.5 * i for i in range(120)] + [2000.0] * 2
+    assert not memory.is_steady(memory.steady_window(falling))
 
 
 def test_memory_is_flat_only_when_it_stops_changing(examples):
