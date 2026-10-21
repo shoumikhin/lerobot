@@ -19,12 +19,10 @@ git clone --branch export https://github.com/shoumikhin/lerobot.git
 cd lerobot
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -e ".[smolvla,pi,groot,feetech,export]" torch-tensorrt "executorch>=1.6.0.dev20261020" \
+uv pip install -e ".[smolvla,pi,groot,feetech,export]" "torch-tensorrt[executorch]" "executorch>=1.6.0.dev20261021" \
     --index-url https://download.pytorch.org/whl/nightly/cu132 --extra-index-url https://pypi.org/simple \
     --index-strategy unsafe-best-match --prerelease allow
 ```
-
-The ExecuTorch-TensorRT route also needs `torch-tensorrt-executorch-runtime` built for ExecuTorch 1.6.0.dev20261020 or newer. Until a matching nightly is published, [build it from source](https://github.com/pytorch/TensorRT/blob/main/py/torch-tensorrt-executorch-runtime/README.md#build).
 
 ## Export
 

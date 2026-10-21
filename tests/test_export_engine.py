@@ -258,7 +258,7 @@ def test_executorch_names_the_packages_it_needs(tmp_path, executorch, monkeypatc
     else:
         monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", None)
     info = chain_info({"model": (["observation.state"], ["action"])}, inputs=["observation.state"])
-    with pytest.raises(ImportError, match="1.6.0.dev20261020 or newer"):
+    with pytest.raises(ImportError, match="1.6.0.dev20261021 or newer"):
         load_programs(tmp_path, info)
 
 
