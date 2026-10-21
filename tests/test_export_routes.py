@@ -200,8 +200,9 @@ def test_no_export_script_shadows_a_package_it_imports():
 
     scripts = sorted(EXAMPLES.glob("*.py"))
     filenames = {s.name for s in scripts}
-    # The modules a sibling is meant to import locally: the shared driver, the engine rebuilder, the recipes.
-    local = {"common", "build_engine", "act", "smolvla", "pi05", "groot"}
+    # The modules a sibling is meant to import locally: the shared driver, the engine rebuilder, the recipes,
+    # and the benchmark, whose output lines the memory benchmark reads.
+    local = {"common", "build_engine", "act", "smolvla", "pi05", "groot", "benchmark"}
     imported = set()
     for script in scripts:
         for node in ast.walk(ast.parse(script.read_text())):
