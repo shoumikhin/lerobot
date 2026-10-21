@@ -120,7 +120,7 @@ Orin Nano:
 | pi0.5   |                 630 |       **612** |            OOM |             OOM |     OOM |
 | GR00T   |             **266** |           274 |            275 |             OOM |     OOM |
 
-Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. The ExecuTorch-TensorRT and ONNX-TensorRT programs replayed as CUDA graphs, except GR00T on ONNX-TensorRT, where TensorRT allocates GPU memory on every run of one of its engines. The Torch-TensorRT programs ran without CUDA graphs.
+Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. The ExecuTorch-TensorRT and ONNX-TensorRT programs replayed as CUDA graphs, except GR00T on ONNX-TensorRT, where TensorRT allocates GPU memory on every run of one of its engines. The Torch-TensorRT programs run without CUDA graphs, because Torch-TensorRT's runtime crashes when it destroys recorded graphs as Python exits.
 
 ### Memory
 
