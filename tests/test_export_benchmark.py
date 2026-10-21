@@ -281,6 +281,64 @@ def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tm
     assert len(generations) == 2
 
 
+def test_torch_compile_starts_one_cuda_graph_generation_per_chunk_of_a_chain(examples, tmp_path, monkeypatch):
+    import json
+    from argparse import Namespace
+    from types import SimpleNamespace
+
+    import torch
+    from safetensors.numpy import save_file
+
+    benchmark = examples("benchmark")
+    state = np.arange(3, dtype=np.float32)
+
+    class AddOne(torch.nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    class Chunk(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.stack([hidden, 2 * hidden])
+
+    class Exporter:
+        """A recipe of two parts, the second reading the first's output."""
+
+        def __init__(self, args):
+            self.args = args
+
+        def parts(self):
+            example = (torch.from_numpy(state),)
+            yield SimpleNamespace(
+                name="first", module=AddOne(), inputs=example, input_names=["state"], output_names=["hidden"]
+            )
+            yield SimpleNamespace(
+                name="second", module=Chunk(), inputs=example, input_names=["hidden"], output_names=["action"]
+            )
+
+        def write(self, programs):
+            case = {"state": state, "expected_actions": np.stack([state + 1, 2 * state + 2])}
+            save_file(case, self.args.output_dir / "case.safetensors")
+            info = {
+                "route": "fake",
+                "programs": programs,
+                "inputs": ["state"],
+                "test_case": "case.safetensors",
+            }
+            (self.args.output_dir / "export.json").write_text(json.dumps({**info, "tolerance": 1e-6}))
+
+    recipe = SimpleNamespace(Exporter=Exporter)
+    monkeypatch.setattr(examples("common"), "parse_args", lambda *args: (Namespace(), recipe))
+    monkeypatch.setattr(torch, "compile", lambda module, **options: module)
+    generations = []
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: generations.append(1))
+    engine, _ = benchmark.torch_engine("torch.compile", [], tmp_path)
+    generations.clear()
+    for _ in range(4):  # two chunks of two actions
+        engine.get_action({"state": state})
+    # A generation per part would let the first part's output, which the second part reads, be overwritten.
+    assert len(generations) == 2
+
+
 def test_torch_compile_compiles_in_the_benchmark_process(examples, tmp_path, monkeypatch):
     import torch
 
