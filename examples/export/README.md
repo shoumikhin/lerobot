@@ -1,6 +1,10 @@
 # Compiled LeRobot policies on an NVIDIA Jetson
 
-Train a policy as usual, export it into a compiled folder, and run that folder with `lerobot-rollout`, the same command you use for a PyTorch checkpoint. In the results below, a compiled policy runs 2 to 6 times faster than in PyTorch and needs a sixth to a half of its memory, so the larger policies also fit on a small board.
+![An SO-101 arm handing over a candy](https://raw.githubusercontent.com/shoumikhin/lerobot/assets/candy.gif)
+
+_An SO-101 arm hands over a candy, driven by a policy exported with ExecuTorch-TensorRT on a Jetson Orin Nano._
+
+Train a policy as usual, export it into a compiled folder, and run that folder with `lerobot-rollout`, the same command you use for a PyTorch checkpoint. In the results below, a compiled policy runs 2 to 6 times faster than in PyTorch and needs about half of its memory or less, so the larger policies also fit on a small board.
 
 Supported policies: ACT, SmolVLA, pi0.5 and GR00T N1.7.
 
@@ -31,7 +35,7 @@ Export on the kind of board that will run the policy: a compiled folder runs onl
 ```bash
 python examples/export/to_executorch_tensorrt.py \
     --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
-    --output_dir=outputs/export/act
+    --output_dir=outputs/export/act_executorch_tensorrt
 ```
 
 Each script compiles any supported policy one way. All use [TensorRT](https://developer.nvidia.com/tensorrt), NVIDIA's compiler for its GPUs. If you are not sure, start with ExecuTorch-TensorRT: it is fast and small, and it runs without PyTorch.
@@ -49,8 +53,6 @@ Some policies need more arguments:
 
 A few checkpoints cannot be exported: ACT with temporal ensembling, and pi0.5 with visual or proprioceptive memory. A GR00T checkpoint that decodes its actions with its embodiment statistics exports only with `to_onnx_tensorrt.py`.
 
-pi0.5 and GR00T are too large to compile in one piece on a small board, so the scripts build them as a chain of smaller programs, one at a time.
-
 To run an ONNX-TensorRT export on another board, copy the folder there and rebuild its engines with `python examples/export/build_engine.py <folder>`.
 
 ## Run
@@ -59,7 +61,7 @@ Use the same calibrated robot and camera settings as when you recorded the train
 
 ```bash
 lerobot-rollout \
-    --policy.path=outputs/export/act \
+    --policy.path=outputs/export/act_executorch_tensorrt \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
     --robot.id=my_follower \
@@ -80,21 +82,22 @@ uv pip install -e examples/export/replay_robot
 python examples/export/replay_robot/write_frames.py \
     --dataset.repo_id=<user>/so101_dataset --episodes 0 1 2 3 --output_dir=outputs/replay_frames
 lerobot-rollout \
-    --policy.path=outputs/export/act \
+    --policy.path=outputs/export/act_executorch_tensorrt \
     --robot.type=replay --robot.frames_dir=outputs/replay_frames \
     --duration=60 --return_to_initial_position=false --play_sounds=false
 ```
 
 ## Results
 
-The tables compare each policy, on each board, compiled each way, with `torch.compile` and plain PyTorch. The `torch.compile` and PyTorch columns run the policy's own PyTorch code, as `lerobot-rollout` does.
+The tables compare each policy, on each board, compiled each way and in plain PyTorch. For time and accuracy, the PyTorch column runs the same parts the export compiles, in PyTorch, through the same engine as the compiled folders. For memory, it runs the policy's own PyTorch checkpoint with `lerobot-rollout`.
 
-- All four policies were trained on the same SO-101 dataset: 304 episodes, recorded at 30 frames per second.
+There is no `torch.compile` column: its default mode runs without CUDA graphs, while every TensorRT route uses them, so it is not a like-for-like comparison.
+
 - Both boards ran at maximum power, with the GPU clock locked.
-- **Bold** marks the best value in a row.
+- **Bold** marks the best time or memory in a row.
 - OOM (out of memory) means the policy did not fit on the 8 GB Orin Nano.
 
-Measured with PyTorch 2.15.0.dev20261005 and TensorRT 11.3.0.99.
+Measured with PyTorch 2.15.0.dev20261005, TensorRT 11.3.0.99, and this fork's scripts at commit [f6951b7c9](https://github.com/shoumikhin/lerobot/commit/f6951b7c9).
 
 ### Time per chunk
 
@@ -102,21 +105,21 @@ A policy returns a chunk of actions at a time (ACT 100, SmolVLA and pi0.5 50, GR
 
 Thor:
 
-|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
-| ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |               **3** |         **3** |              4 |              13 |      16 |
-| SmolVLA |              **29** |            30 |             30 |              44 |     164 |
-| pi0.5   |                 125 |       **115** |            121 |             124 |     237 |
-| GR00T   |              **94** |            96 |         **94** |             206 |     211 |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | PyTorch |
+| ------- | ------------------: | ------------: | -------------: | ------: |
+| ACT     |                   4 |         **3** |              4 |      10 |
+| SmolVLA |              **30** |        **30** |             31 |     168 |
+| pi0.5   |                 118 |       **113** |            114 |     240 |
+| GR00T   |              **92** |            93 |             94 |     215 |
 
 Orin Nano:
 
-|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
-| ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |              **25** |        **25** |             26 |              61 |      64 |
-| SmolVLA |                 125 |       **121** |            137 |             170 |     749 |
-| pi0.5   |                 630 |       **612** |            OOM |             OOM |     OOM |
-| GR00T   |             **266** |           274 |            275 |             OOM |     OOM |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | PyTorch |
+| ------- | ------------------: | ------------: | -------------: | ------: |
+| ACT     |              **26** |        **26** |             27 |      53 |
+| SmolVLA |             **124** |       **124** |            138 |     757 |
+| pi0.5   |                 672 |       **655** |            OOM |     OOM |
+| GR00T   |             **268** |           276 |            276 |     OOM |
 
 Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. Every compiled policy replays its programs as CUDA graphs.
 
@@ -126,45 +129,71 @@ Extra memory the board needs while the policy runs: the drop in available memory
 
 Thor:
 
-|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
-| ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |             **545** |           551 |           1523 |            2404 |    2039 |
-| SmolVLA |            **1247** |          1310 |           2836 |            4706 |    4568 |
-| pi0.5   |                6050 |      **5932** |           7600 |           13186 |   11618 |
-| GR00T   |            **5405** |          5420 |           6068 |           16361 |   15708 |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT |      PyTorch |
+| ------- | ------------------: | ------------: | -------------: | -----------: |
+| ACT     |             **538** |           552 |           1163 |         2047 |
+| SmolVLA |            **1225** |          1316 |           2681 |         3782 |
+| pi0.5   |                5996 |      **5922** |           7059 |        11507 |
+| GR00T   |            **5310** |          5412 |           6007 | not measured |
 
 Orin Nano:
 
-|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | `torch.compile` | PyTorch |
-| ------- | ------------------: | ------------: | -------------: | --------------: | ------: |
-| ACT     |             **207** |           222 |            841 |            1677 |    1136 |
-| SmolVLA |             **373** |           475 |           1764 |            2493 |    2447 |
-| pi0.5   |                4983 |      **4882** |            OOM |             OOM |     OOM |
-| GR00T   |            **4402** |          4408 |           7534 |             OOM |     OOM |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT | PyTorch |
+| ------- | ------------------: | ------------: | -------------: | ------: |
+| ACT     |             **206** |           224 |            846 |    1126 |
+| SmolVLA |             **346** |           354 |           1716 |    2300 |
+| pi0.5   |                4974 |      **4871** |            OOM |     OOM |
+| GR00T   |            **4421** |          4422 |           4980 |     OOM |
+
+On the Orin Nano these values can be up to about 0.9 GiB too low: the GPU driver reuses memory it already holds, and the board does not count that memory as newly used. On Thor the values are exact.
 
 ### Accuracy
 
-How far the compiled policy's actions are from PyTorch's, on 50 dataset samples with the same random noise: largest / average, in degrees (gripper in %). Lower is better. Every cell passed the export's own check.
+Mean / p95 of each frame's largest action error, in degrees, against PyTorch, over 50 frames (p95: 95% of the frames have a smaller error). The frames are spread evenly over an SO-101 dataset, and every run uses the same random noise. Lower is better. Every compiled folder passed the export's own check.
 
 Thor:
 
-|         | ExecuTorch-TensorRT | ONNX-TensorRT |   Torch-TensorRT |      `torch.compile` |
-| ------- | ------------------: | ------------: | ---------------: | -------------------: |
-| ACT     |        0.14 / 0.004 |  0.14 / 0.004 |     0.14 / 0.004 | **0.05** / **0.001** |
-| SmolVLA |        1.72 / 0.048 |  2.00 / 0.049 |     1.72 / 0.048 | **1.68** / **0.045** |
-| pi0.5   |    **0.66** / 0.088 |  1.33 / 0.090 | **0.66** / 0.088 |     0.71 / **0.078** |
-| GR00T   |    **1.62** / 0.089 |  1.76 / 0.087 | **1.62** / 0.089 |     3.06 / **0.064** |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT |
+| ------- | ------------------: | ------------: | -------------: |
+| ACT     |         0.04 / 0.11 |   0.03 / 0.10 |    0.04 / 0.11 |
+| SmolVLA |         0.46 / 1.55 |   0.50 / 1.49 |    0.46 / 1.55 |
+| pi0.5   |         0.57 / 0.81 |   0.57 / 0.83 |    0.57 / 0.81 |
+| GR00T   |         0.58 / 1.31 |   0.60 / 1.36 |    0.58 / 1.31 |
 
 Orin Nano:
 
-|         |  ExecuTorch-TensorRT |    ONNX-TensorRT |       Torch-TensorRT |      `torch.compile` |
-| ------- | -------------------: | ---------------: | -------------------: | -------------------: |
-| ACT     |     **0.13** / 0.004 |     0.15 / 0.004 |     **0.13** / 0.004 |     0.20 / **0.002** |
-| SmolVLA |         4.03 / 0.058 | 2.76 / **0.044** |         4.03 / 0.058 | **1.42** / **0.044** |
-| pi0.5   |     0.97 / **0.097** | **0.70** / 0.098 |                  OOM |                  OOM |
-| GR00T   | **1.79** / **0.085** |     2.14 / 0.091 | **1.79** / **0.085** |                  OOM |
+|         | ExecuTorch-TensorRT | ONNX-TensorRT | Torch-TensorRT |
+| ------- | ------------------: | ------------: | -------------: |
+| ACT     |         0.04 / 0.13 |   0.04 / 0.12 |    0.04 / 0.13 |
+| SmolVLA |         0.39 / 1.36 |   0.40 / 1.22 |    0.39 / 1.36 |
+| pi0.5   |         0.57 / 0.85 |   0.56 / 0.77 |            OOM |
+| GR00T   |         0.61 / 1.51 |   0.63 / 1.59 |    0.61 / 1.51 |
 
-The largest error usually comes from one or two samples where the policy is close to a decision, so the average is the steadier number. ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same.
+ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same.
+
+### Reproduce
+
+Run each step on the board you measure. For SmolVLA, pi0.5 and GR00T, give `benchmark.py pytorch` the same extra arguments as the export script.
+
+```bash
+# 50 frames from the dataset
+python examples/export/benchmark.py frames --dataset.repo_id=<user>/so101_dataset \
+    --output=outputs/benchmark/frames.npz
+# the reference, in PyTorch
+python examples/export/benchmark.py pytorch --policy.path=<checkpoint> \
+    --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/act_pytorch.npz
+# each compiled folder
+python examples/export/benchmark.py outputs/export/act_executorch_tensorrt \
+    --frames=outputs/benchmark/frames.npz --output=outputs/benchmark/act_executorch_tensorrt.npz
+# time per chunk and accuracy against PyTorch
+python examples/export/benchmark.py report outputs/benchmark/act_pytorch.npz outputs/benchmark/act_*.npz
+# memory, with the replay robot from above; pass --policy.path=<checkpoint> for PyTorch
+python examples/export/benchmark_memory.py -- lerobot-rollout --policy.path=outputs/export/act_executorch_tensorrt \
+    --robot.type=replay --robot.frames_dir=outputs/replay_frames \
+    --duration=60 --return_to_initial_position=false --play_sounds=false
+```
+
+Torch-TensorRT, and PyTorch on Thor, keep freeing memory for a minute or two after loading, so their memory was measured with `--duration=180`.
 
 ## Good to know
 
