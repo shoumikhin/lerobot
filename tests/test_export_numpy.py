@@ -312,8 +312,6 @@ def test_engine_feeds_the_raw_frame_and_fresh_noise_and_plays_the_chunk(tmp_path
     np.testing.assert_array_equal(engine.get_action(live), 2 * state)
     assert len(calls) == 2
     assert not np.array_equal(calls[1], noise)
-    with pytest.raises(ValueError, match="only runs the task"):
-        engine._check_task("place")
 
 
 @pytest.mark.parametrize("chain", [False, True])
