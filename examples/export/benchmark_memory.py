@@ -14,15 +14,22 @@
 
 """Measure the memory a policy takes on a Jetson while `benchmark.py --duration` runs it.
 
-A Jetson's CPU and GPU share one memory, and a process's own counters miss some GPU allocations, so this
-reads the whole board from /proc/meminfo: the drop in available memory plus the growth in swap, from the
-10 s before the command starts to the time the policy runs warm, in MiB. Keep the board otherwise idle.
+The run's memory is what its processes hold that the board cannot take back without swapping: their own
+memory and what they have swapped out, from /proc/<pid>/smaps_rollup, plus their GPU memory. Each process
+counts its proportional share of a page it shares with others. Library and model files they read stay in the
+page cache, which the kernel can drop, so they are not counted. The result is the median over the window,
+in MiB.
 
-The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
-use is flat. The run's window is the last 30 s before the benchmark says it stopped, before its teardown
-frees everything, and at least 60 s after it says its warm-up chunks are done, so loading and compiling stay
-out of it: a process can still give back memory from loading well after its first warm chunks. A run whose
-window is not flat by the same test is reported as invalid, not as a number.
+A Jetson's CPU and GPU share one memory, but a process's own counters miss its GPU memory, so that comes
+from the GPU driver: from `nvidia-smi` on Thor, and on an Orin from jtop (`pip install jetson-stats`), whose
+service reads the driver's per-process counts, which only root can read. The board's free memory cannot stand
+in for it on an Orin: the driver keeps the memory a finished GPU job freed, up to an eighth of the board, for
+the next one, so a run that reuses it would look smaller by an amount that depends on what ran before.
+
+The window is the last 30 s before the benchmark says it stopped, before its teardown frees everything, and
+at least 60 s after it says its warm-up chunks are done, so loading and compiling stay out of it: a process
+can still give back memory from loading well after its first warm chunks. A run whose window is still
+changing is reported as invalid, not as a number.
 
     python examples/export/benchmark_memory.py -- python examples/export/benchmark.py outputs/export/act \\
         --frames=outputs/benchmark/frames.npz --duration=90
@@ -33,31 +40,65 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 from benchmark import STOPPED, WARM
 
 SAMPLE_SECONDS = 0.5
-BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
 # ACT in PyTorch gave back about 90 MiB from loading 40 s after its warm-up chunks, then stayed flat.
 SETTLE_SECONDS = 60
 FLAT_MIB_PER_SECOND = 2
-SETTLE_LIMIT_SECONDS = 300
+# Orin and older Jetsons run their GPU on the nvgpu driver, whose memory `nvidia-smi` does not report.
+NVGPU = Path("/sys/module/nvgpu")
 
 
-def used_mib(meminfo: dict[str, int]) -> float:
-    """Memory in use as the measure counts it: what is not available, plus what is swapped out, in MiB."""
-    return (meminfo["MemTotal"] - meminfo["MemAvailable"] + meminfo["SwapTotal"] - meminfo["SwapFree"]) / 1024
+def own_mib(smaps_rollup: str) -> float:
+    """A process's anonymous and shared memory plus what it swapped out, from its smaps_rollup, in MiB."""
+    fields = {line.split(":")[0]: int(line.split()[1]) for line in smaps_rollup.splitlines()[1:]}
+    return (fields["Pss_Anon"] + fields["Pss_Shmem"] + fields["SwapPss"]) / 1024
+
+
+def nvidia_smi_gpu_mib() -> dict[int, float]:
+    """GPU memory per process ID as `nvidia-smi` reports it, in MiB."""
+    table = subprocess.run(  # nosec B607
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return {int(pid): float(mib) for pid, mib in (line.split(",") for line in table.splitlines())}
+
+
+def process_tree(root: int) -> list[int]:
+    """`root` and every process it started, directly or through others."""
+    parents = {}
+    for entry in Path("/proc").iterdir():
+        try:
+            parents[int(entry.name)] = int((entry / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (ValueError, OSError):
+            continue
+    tree = [root]
+    for pid in tree:
+        tree += [child for child, parent in parents.items() if parent == pid]
+    return tree
+
+
+def process_mib(root: int, gpu: dict[int, float]) -> float:
+    """The memory of `root` and the processes it started, with their GPU memory from `gpu`, in MiB."""
+    total = 0.0
+    for pid in process_tree(root):
+        try:
+            total += own_mib(Path(f"/proc/{pid}/smaps_rollup").read_text()) + gpu.get(pid, 0.0)
+        except OSError:
+            continue
+    return total
 
 
 def steady_window(run: list[tuple[float, float]], marks: dict[str, float]) -> list[float]:
-    """The use sampled in the last 30 s before the benchmark's stopped line, from (time, use) samples."""
-    return [use for at, use in run if marks[STOPPED] - STEADY_SECONDS <= at < marks[STOPPED]]
-
-
-def extra_mib(baseline: list[float], window: list[float]) -> float:
-    """The median use over the run's steady window minus the median use before it started."""
-    return statistics.median(window) - statistics.median(baseline)
+    """The memory sampled in the last 30 s before the benchmark's stopped line, from (time, memory) samples."""
+    return [mib for at, mib in run if marks[STOPPED] - STEADY_SECONDS <= at < marks[STOPPED]]
 
 
 def is_flat(samples: list[float]) -> bool:
@@ -70,20 +111,11 @@ def is_flat(samples: list[float]) -> bool:
     return abs(statistics.linear_regression(times, samples).slope) < FLAT_MIB_PER_SECOND
 
 
-def read_meminfo() -> dict[str, int]:
-    """/proc/meminfo's values, in KiB."""
-    with open("/proc/meminfo") as file:
-        return {line.split(":")[0]: int(line.split()[1]) for line in file}
-
-
-def sample(
-    seconds: float | None = None, process: subprocess.Popen | None = None
-) -> list[tuple[float, float]]:
-    """(time, memory use) every half second, for `seconds` or until `process` exits."""
+def sample(process: subprocess.Popen, gpu_mib: Callable[[], dict[int, float]]) -> list[tuple[float, float]]:
+    """(time, memory of `process` and the processes it started) every half second until it exits."""
     samples = []
-    end = time.monotonic() + (seconds or 0)
-    while (process.poll() is None) if process else time.monotonic() < end:
-        samples.append((time.monotonic(), used_mib(read_meminfo())))
+    while process.poll() is None:
+        samples.append((time.monotonic(), process_mib(process.pid, gpu_mib())))
         time.sleep(SAMPLE_SECONDS)
     return samples
 
@@ -96,24 +128,13 @@ def watch(process: subprocess.Popen, marks: dict[str, float]) -> None:
             marks[line.strip()] = time.monotonic()
 
 
-def main() -> None:
-    if "--" not in sys.argv:
-        print(__doc__)
-        return
-    command = sys.argv[sys.argv.index("--") + 1 :]
-    window = int(BASELINE_SECONDS / SAMPLE_SECONDS)
-    baseline = [use for _, use in sample(BASELINE_SECONDS)]
-    settle_end = time.monotonic() + SETTLE_LIMIT_SECONDS
-    while not is_flat(baseline[-window:]):
-        if time.monotonic() > settle_end:
-            raise SystemExit(f"Invalid: memory use was still changing after {SETTLE_LIMIT_SECONDS} s.")
-        baseline += [use for _, use in sample(SAMPLE_SECONDS)]
-    baseline = baseline[-window:]
+def run(command: list[str], gpu_mib: Callable[[], dict[int, float]]) -> list[float]:
+    """Run `command` and return its memory over the window."""
     process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
     marks: dict[str, float] = {}
     watcher = threading.Thread(target=watch, args=(process, marks))
     watcher.start()
-    run = sample(process=process)
+    samples = sample(process, gpu_mib)
     watcher.join()
     if process.returncode != 0:
         raise SystemExit(f"{command[0]} exited with {process.returncode}")
@@ -125,10 +146,25 @@ def main() -> None:
         raise SystemExit(
             f"Run for at least {SETTLE_SECONDS + STEADY_SECONDS} s after the warm-up, with --duration."
         )
-    steady = steady_window(run, marks)
+    return steady_window(samples, marks)
+
+
+def main() -> None:
+    if "--" not in sys.argv:
+        print(__doc__)
+        return
+    command = sys.argv[sys.argv.index("--") + 1 :]
+    if NVGPU.is_dir():
+        from jtop import jtop
+
+        with jtop(interval=SAMPLE_SECONDS) as jetson:
+            # A process row lists its ID first and its GPU memory, in KiB, ninth.
+            steady = run(command, lambda: {int(row[0]): row[8] / 1024 for row in jetson.processes})
+    else:
+        steady = run(command, nvidia_smi_gpu_mib)
     if not is_flat(steady):
         raise SystemExit("Invalid: memory use was still changing while the policy ran warm.")
-    print(f"Extra memory: {extra_mib(baseline, steady):.0f} MiB")
+    print(f"Memory: {statistics.median(steady):.0f} MiB")
 
 
 if __name__ == "__main__":

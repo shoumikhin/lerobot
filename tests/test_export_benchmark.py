@@ -96,45 +96,85 @@ def test_pytorch_run_saves_the_original_policy_actions_with_the_engine_noise(exa
     assert np.abs(np.diff(result["reference"], axis=0)).max() > 1
 
 
-def test_memory_counts_swap_and_only_the_warm_chunks(examples):
+def test_memory_counts_a_process_own_memory_and_swap_but_not_its_files(examples):
     memory = examples("benchmark_memory")
-    meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
-    assert memory.used_mib(meminfo) == 2048
-    assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
+    rollup = "\n".join(
+        [
+            "00400000-ffffd0a1c000 ---p 00000000 00:00 0                  [rollup]",
+            "Rss:              457620 kB",
+            "Pss:              445068 kB",
+            "Pss_Anon:         323340 kB",
+            "Pss_File:         121728 kB",
+            "Pss_Shmem:          1024 kB",
+            "Swap:               4096 kB",
+            "SwapPss:            2048 kB",
+        ]
+    )
+    assert memory.own_mib(rollup) == (323340 + 1024 + 2048) / 1024
+
+
+def test_memory_reads_gpu_memory_per_process_from_nvidia_smi(examples, monkeypatch):
+    from types import SimpleNamespace
+
+    memory = examples("benchmark_memory")
+    table = "4242, 1140\n4343, 12\n"
+    monkeypatch.setattr(memory.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=table))
+    assert memory.nvidia_smi_gpu_mib() == {4242: 1140.0, 4343: 12.0}
+
+
+def test_memory_counts_only_the_warm_chunks(examples):
+    memory = examples("benchmark_memory")
     # Loading peaks, compiling holds a long flat plateau, the warm chunks still give back some memory from
     # loading, then hold steady, and the teardown frees everything.
-    use = [9000.0] * 10 + [7000.0] * 120 + [3100.0] * 80 + [3000.0] * 100 + [2000.0] * 6
+    use = [9000.0] * 10 + [7000.0] * 120 + [3100.0] * 80 + [3000.0] * 100 + [500.0] * 6
     run = [(i * memory.SAMPLE_SECONDS, u) for i, u in enumerate(use)]
     marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 310 * memory.SAMPLE_SECONDS}
-    window = memory.steady_window(run, marks)
-    assert window == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
-    assert memory.extra_mib([2000.0, 2010.0, 1990.0], window) == 1000.0
+    assert memory.steady_window(run, marks) == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
 
 
 def test_memory_measures_a_command_between_its_warm_and_stopped_lines(examples, monkeypatch, capsys):
     import sys
+    import time
 
     memory = examples("benchmark_memory")
     monkeypatch.setattr(memory, "SAMPLE_SECONDS", 0.02)
-    monkeypatch.setattr(memory, "BASELINE_SECONDS", 0.2)
     monkeypatch.setattr(memory, "STEADY_SECONDS", 0.3)
     monkeypatch.setattr(memory, "SETTLE_SECONDS", 0.1)
-    start = __import__("time").monotonic()
-
-    def meminfo():
-        # 1000 MiB used before the command, 1500 MiB once it runs warm, 9000 MiB while it loads.
-        elapsed = __import__("time").monotonic() - start
-        used = 1000 if elapsed < 0.3 else 9000 if elapsed < 0.8 else 1500
-        return {"MemTotal": 10000 << 10, "MemAvailable": (10000 - used) << 10, "SwapTotal": 0, "SwapFree": 0}
-
-    monkeypatch.setattr(memory, "read_meminfo", meminfo)
+    monkeypatch.setattr(memory, "NVGPU", Path("/missing"))
+    monkeypatch.setattr(memory, "nvidia_smi_gpu_mib", lambda: {})
+    start = time.monotonic()
+    # 9000 MiB while the command loads, then 1500 MiB once it runs warm.
+    monkeypatch.setattr(
+        memory, "process_mib", lambda pid, gpu: 9000 if time.monotonic() - start < 0.6 else 1500
+    )
     command = (
-        "import time; time.sleep(0.4); print('loaded'); time.sleep(0.6);"
+        "import time; time.sleep(0.2); print('loaded'); time.sleep(0.6);"
         f"print({memory.WARM!r}, flush=True); time.sleep(0.5); print({memory.STOPPED!r}, flush=True)"
     )
     monkeypatch.setattr(sys, "argv", ["benchmark_memory.py", "--", sys.executable, "-c", command])
     memory.main()
-    assert capsys.readouterr().out.splitlines()[-1] == "Extra memory: 500 MiB"
+    assert capsys.readouterr().out.splitlines()[-1] == "Memory: 1500 MiB"
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux's /proc")
+def test_memory_counts_what_a_child_process_allocates(examples):
+    import subprocess
+    import sys
+
+    memory = examples("benchmark_memory")
+    sizes = []
+    for mib in (10, 210):
+        # A parent that starts a child, which touches every page of `mib` MiB and waits for its input to close.
+        child = f"data = bytearray({mib << 20}); data[::4096] = b'1' * {(mib << 20) // 4096}; print(1, flush=True); input()"
+        parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+        process = subprocess.Popen(
+            [sys.executable, "-c", parent], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+        )
+        process.stdout.readline()
+        sizes.append(memory.process_mib(process.pid, {}))
+        process.stdin.close()
+        process.wait()
+    assert sizes[1] - sizes[0] == pytest.approx(200, abs=10)
 
 
 def test_frames_share_one_copy_of_the_file(examples, tmp_path):
