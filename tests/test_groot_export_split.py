@@ -54,7 +54,8 @@ def whole_language_model(
             position_embeddings=positions,
         )
         if index < len(deepstack):
-            hidden = recipe.deepstack_add(hidden, visual_pos_masks, deepstack[index].to(hidden.dtype))
+            rows = recipe.image_rows(visual_pos_masks)
+            hidden = recipe.deepstack_add(hidden, visual_pos_masks, rows, deepstack[index].to(hidden.dtype))
     return hidden
 
 
@@ -136,9 +137,13 @@ def constants():
         "embodiment_id": torch.tensor([2]),
         "attention_mask": torch.tensor([[1, 1, 1, 1, 0]]),
         "position_ids": torch.arange(5)[None, None].expand(3, 1, -1),
-        "image_token_mask": image_mask[..., None].expand(1, 5, 32),
         "text_embeds": torch.randn(1, 5, 32),
     }
+
+
+def image_embeddings(fixed, images):
+    """The text embeddings with the image features at the image tokens, as Qwen3-VL places them."""
+    return fixed["text_embeds"].masked_scatter(fixed["image_mask"][..., None].expand(1, 5, 32), images)
 
 
 def test_vision_part_preserves_deepstack_and_state(recipe):
@@ -167,7 +172,7 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
     images, state = torch.randn(2, 32), torch.randn(1, 1, 6)
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
     with torch.no_grad():
-        embeddings = fixed["text_embeds"].masked_scatter(fixed["image_token_mask"], images)
+        embeddings = image_embeddings(fixed, images)
         expected = whole_language_model(
             recipe,
             text,
@@ -191,6 +196,23 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, hidden, rtol=0, atol=0)
     torch.testing.assert_close(hidden, (expected, expected_state), rtol=0, atol=0)
+
+
+def test_language_slices_have_no_data_dependent_shapes(recipe):
+    """TensorRT allocates GPU memory on every run for a data-dependent shape, which a CUDA graph cannot record."""
+    text = tiny_text()
+    head, fixed = tiny_head(), constants()
+    deepstack = tuple(torch.randn(2, 32) for _ in range(3))
+    part = recipe.GrootLanguageModel(text, head, fixed, 0, 4, False, len(deepstack)).eval()
+    inputs = (torch.randn(2, 32), *deepstack, torch.randn(1, 1, 6))
+    with torch.no_grad():
+        program = torch.export.export(part, inputs)
+    # Autocast regions are submodules of the exported graph.
+    graphs = [
+        module.graph for module in program.graph_module.modules() if isinstance(module, torch.fx.GraphModule)
+    ]
+    targets = {str(node.target) for graph in graphs for node in graph.nodes if node.op == "call_function"}
+    assert not {"aten.masked_scatter.default", "aten.nonzero.default"} & targets
 
 
 def test_last_language_slice_encodes_a_float32_state_with_bfloat16_weights(recipe):
@@ -220,7 +242,7 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
     text = tiny_text()
     fixed = constants()
     deepstack = [torch.randn(2, 32) for _ in range(3)]
-    embeddings = fixed["text_embeds"].masked_scatter(fixed["image_token_mask"], torch.randn(2, 32))
+    embeddings = image_embeddings(fixed, torch.randn(2, 32))
     last = []
     # GR00T reads the last layer's output, before the model's final norm.
     text.layers[-1].register_forward_hook(lambda module, args, output: last.append(output))
