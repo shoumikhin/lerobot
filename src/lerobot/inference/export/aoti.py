@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 
-class AOTInductorPackage:
+class AOTInductorProgram:
     """Runs a `.pt2` package on GPU tensors, with PyTorch and Torch-TensorRT installed.
 
     `run_device` keeps the outputs on the GPU, so the next package in a chain reads them without a copy.
