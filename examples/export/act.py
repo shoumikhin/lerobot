@@ -97,9 +97,9 @@ class Exporter:
         steps = self.policy.config.n_action_steps
         return np.stack([engine.get_action(dict(self.frame)).numpy() for _ in range(steps)])
 
-    def write(self, programs: dict[str, dict], args: argparse.Namespace) -> None:
+    def write(self, programs: dict[str, dict]) -> None:
         write_folder(
-            args,
+            self.args,
             self.policy.config,
             self.frame,
             None,

@@ -129,9 +129,9 @@ class Exporter:
             actions = postprocessor(actions[:, : self.policy.config.n_action_steps])
         return actions[0].cpu().numpy()
 
-    def write(self, programs: dict[str, dict], args: argparse.Namespace) -> None:
+    def write(self, programs: dict[str, dict]) -> None:
         write_folder(
-            args,
+            self.args,
             self.folder_config,
             self.frame,
             self.noise,

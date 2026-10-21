@@ -689,6 +689,7 @@ def test_folder_turns_cuda_graphs_off(recipe, monkeypatch):
     written = {}
     monkeypatch.setattr(recipe, "write_folder", lambda *args, **info: written.update(info))
     exporter = SimpleNamespace(
+        args=Namespace(),
         folder_config=None,
         frame={},
         noise=None,
@@ -697,5 +698,5 @@ def test_folder_turns_cuda_graphs_off(recipe, monkeypatch):
         image_resize=None,
         task="task",
     )
-    recipe.Exporter.write(exporter, {"step_0": {}, "actions": {}}, Namespace())
+    recipe.Exporter.write(exporter, {"step_0": {}, "actions": {}})
     assert written["cuda_graphs"] is False

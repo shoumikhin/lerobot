@@ -597,9 +597,9 @@ class Exporter:
             self.expected_actions = module(actions, state).float().cpu().numpy()
         yield module.part(actions, state)
 
-    def write(self, programs: dict[str, dict], args: argparse.Namespace) -> None:
+    def write(self, programs: dict[str, dict]) -> None:
         write_folder(
-            args,
+            self.args,
             self.folder_config,
             self.frame,
             self.noise,

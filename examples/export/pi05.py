@@ -346,9 +346,9 @@ class Exporter:
             self.expected_actions = actions(x_t, state).cpu().numpy()
         yield actions.part(self.noise, state)
 
-    def write(self, programs: dict[str, dict], args: argparse.Namespace) -> None:
+    def write(self, programs: dict[str, dict]) -> None:
         write_folder(
-            args,
+            self.args,
             self.folder_config,
             self.frame,
             self.noise,
@@ -357,5 +357,5 @@ class Exporter:
             steps=["step"],
             timesteps=self.timesteps,
             # The program holds the task's prompt tokens, so the folder runs only this task.
-            task=args.task,
+            task=self.args.task,
         )

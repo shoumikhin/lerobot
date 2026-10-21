@@ -173,7 +173,7 @@ def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
                 for name in ("a", "b_misnamed"):
                     yield common.Part(name, torch.nn.Identity(), (torch.zeros(1),), ["x"], ["y"])
 
-            def write(self, programs, args):
+            def write(self, programs):
                 raise AssertionError("nothing was compiled")
 
     compiled = []
