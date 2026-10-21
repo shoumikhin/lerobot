@@ -39,6 +39,7 @@ class ExecuTorchProgram:
     """
 
     def __init__(self, path: Path):
+        """Load the `forward` method of the program at `path`."""
         try:
             import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
 
@@ -56,13 +57,16 @@ class ExecuTorchProgram:
         self._method = runtime.load_program(path).load_method("forward")
 
     def run_device(self, *inputs: np.ndarray | Any) -> tuple[Any, ...]:
+        """Run the program; its outputs stay on the GPU for the next program to read."""
         return tuple(self._method.execute([on_device(value) for value in inputs]))
 
     def __call__(self, *inputs: np.ndarray | Any) -> np.ndarray:
+        """Run the program and return its one output, the actions, as a host array."""
         (output,) = self.run_device(*inputs)
         return to_host(output)
 
     def upload(self, value: np.ndarray) -> Any:
+        """`value` in GPU memory, for many runs to read without another copy."""
         return on_device(value)
 
 

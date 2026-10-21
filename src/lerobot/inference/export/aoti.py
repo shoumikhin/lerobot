@@ -27,6 +27,7 @@ class AOTInductorProgram:
     """
 
     def __init__(self, path: Path):
+        """Load the package at `path`."""
         import torch_tensorrt  # registers the TensorRT engine op the package calls
 
         # Replay each engine's work as a CUDA graph, as the other routes do.
@@ -34,14 +35,17 @@ class AOTInductorProgram:
         self._model = torch._inductor.aoti_load_package(str(path))
 
     def run_device(self, *inputs: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Run the package; its outputs stay on the GPU for the next package to read."""
         with torch.inference_mode():
             tensors = [torch.from_numpy(v).to("cuda") if isinstance(v, np.ndarray) else v for v in inputs]
             outputs = self._model(*tensors)
         return tuple(outputs) if isinstance(outputs, list | tuple) else (outputs,)
 
     def __call__(self, *inputs: np.ndarray | torch.Tensor) -> np.ndarray:
+        """Run the package and return its one output, the actions, as a host array."""
         (output,) = self.run_device(*inputs)
         return output.cpu().numpy()
 
     def upload(self, value: np.ndarray) -> torch.Tensor:
+        """`value` on the GPU, for many runs to read without another copy."""
         return torch.from_numpy(value).to("cuda")

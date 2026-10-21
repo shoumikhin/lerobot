@@ -507,7 +507,6 @@ ignore = [
 "src/lerobot/datasets/**" = ["D"]
 "src/lerobot/distributed/**" = ["D"]
 "src/lerobot/envs/**" = ["D"]
-"src/lerobot/inference/export/**" = ["D"]
 "src/lerobot/jobs/**" = ["D"]
 "src/lerobot/model/**" = ["D"]
 "src/lerobot/motors/**" = ["D"]

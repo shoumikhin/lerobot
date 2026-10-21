@@ -44,6 +44,8 @@ ROUTES = ("executorch_tensorrt", "onnx_tensorrt", "torch_tensorrt")
 
 
 class Program(Protocol):
+    """One compiled program of a chain, as a route's runtime loads it."""
+
     def run_device(self, *inputs: Any) -> tuple[Any, ...]:
         """The outputs where the program left them, for the next program to read without a copy."""
 
@@ -90,6 +92,7 @@ class ProgramChain:
     """
 
     def __init__(self, programs: Mapping[str, Program], info: dict):
+        """Take the loaded programs and the `export.json` that lists them."""
         self._programs = programs
         self._names: list[str] = info["inputs"]
         self._inputs = {name: program["inputs"] for name, program in info["programs"].items()}
@@ -102,6 +105,7 @@ class ProgramChain:
         ]
 
     def __call__(self, *inputs: np.ndarray) -> np.ndarray:
+        """Run the chain on the frame, and the noise if it takes one, and return the actions on the host."""
         values: dict[str, Any] = dict(zip(self._names, inputs, strict=True))
         *names, last = self._programs
         for name in names:
@@ -131,6 +135,7 @@ class ExportInferenceEngine(InferenceEngine):
     """
 
     def __init__(self, folder: Path, task: str, rename_map: dict[str, str] | None = None) -> None:
+        """Load the folder's programs and check them against its test case."""
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._fixed_task: str | None = info.get("task")
         # Without --task, a folder exported for one task runs that task.
@@ -189,21 +194,24 @@ class ExportInferenceEngine(InferenceEngine):
 
     @property
     def control_thread_owns_policy(self) -> bool:
+        """The control thread runs the programs itself."""
         return True
 
     def text_input_error(self, text: str, *, instruction: bool = False) -> str | None:
+        """Refuse an instruction other than the task the folder was exported for."""
         if instruction and (error := self._task_error(text)):
             return error
         return super().text_input_error(text, instruction=instruction)
 
     def set_task(self, task: str) -> bool:
+        """Change the task, unless the folder was exported for another one."""
         if error := self._task_error(task):
             logger.warning("Instruction rejected: %s", error)
             return False
         return super().set_task(task)
 
     def dispatch_allowed(self) -> bool:
-        # Inline inference has no worker to pause, so the planner hold is applied here.
+        """Hold the robot while the planner answers; inline inference has no worker to pause."""
         return not self.hold_for_planner()
 
     def start(self) -> None:
@@ -213,10 +221,12 @@ class ExportInferenceEngine(InferenceEngine):
         """No background resources to stop."""
 
     def reset(self) -> None:
+        """Drop the queued actions and any pending task change."""
         self._actions.clear()
         self._discard_task_change()
 
     def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
+        """The next action of the chunk, running the programs when the chunk is used up."""
         if obs_frame is None:
             return None
         task, task_changed = self._take_task()
