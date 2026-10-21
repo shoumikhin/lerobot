@@ -22,6 +22,7 @@ import importlib
 import sys
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.inference.export import ExportInferenceEngine, engine as export_engine
+from tests.export_helpers import action_pipeline
 from tests.utils import require_hf_token
 
 pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
@@ -149,7 +151,6 @@ def test_act_exports_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch
 
 def test_test_case_images_change_smoothly_like_a_camera_image(recipes):
     """Random pixels make a vision-language policy's bfloat16 actions swing, so the test case avoids them."""
-    from types import SimpleNamespace
 
     from common import IMAGE_CELLS, frame_from_policy
 
@@ -169,8 +170,6 @@ def test_test_case_images_change_smoothly_like_a_camera_image(recipes):
 
 
 def test_act_with_temporal_ensembling_is_refused(recipes, monkeypatch):
-    from types import SimpleNamespace
-
     act = importlib.import_module("act")
     policy = SimpleNamespace(config=SimpleNamespace(temporal_ensemble_coeff=0.01))
     policy.to = lambda device: policy
@@ -218,8 +217,6 @@ def tiny_smolvlm(path):
 
 
 def dataset_metadata(features, tasks):
-    from types import SimpleNamespace
-
     import pandas as pd
 
     return SimpleNamespace(features=features, tasks=pd.DataFrame(index=tasks))
@@ -422,3 +419,63 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
     expected = tokenizer(transition)[TransitionKey.OBSERVATION]
     torch.testing.assert_close(tokens, expected["observation.language.tokens"])
     torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+
+
+@pytest.mark.parametrize(
+    "shape,names",
+    [((12, 16, 3), ["height", "width", "channels"]), ((3, 12, 16), ["channels", "height", "width"])],
+)
+def test_robot_frame_cameras_are_hwc_whatever_the_dataset_layout(recipes, shape, names):
+    common = importlib.import_module("common")
+    features = {
+        "observation.images.front": {"dtype": "video", "shape": shape, "names": names},
+        "observation.state": {"dtype": "float32", "shape": (6,), "names": None},
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+    }
+    frame = common.frame_from_dataset(features)
+    assert frame["observation.images.front"].shape == (12, 16, 3)
+    assert frame["observation.images.front"].dtype == np.uint8
+    assert frame["observation.state"].shape == (6,) and "action" not in frame
+
+
+def test_task_must_be_one_of_the_dataset_tasks(recipes):
+    import pandas as pd
+
+    common = importlib.import_module("common")
+    metadata = SimpleNamespace(tasks=pd.DataFrame(index=["pick the cup", "open the drawer"]))
+    assert common.dataset_task(metadata, None) == "pick the cup"
+    assert common.dataset_task(metadata, "open the drawer") == "open the drawer"
+    with pytest.raises(ValueError, match="one of the dataset's tasks"):
+        common.dataset_task(metadata, "close the drawer")
+
+
+def test_relative_actions_follow_the_robot_state_after_export(recipes):
+    common = importlib.import_module("common")
+    from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep, TransitionKey
+
+    relative = RelativeActionsProcessorStep(enabled=True)
+    relative({TransitionKey.OBSERVATION: {"observation.state": torch.full((1, 3), 50.0)}})
+    postprocessor = action_pipeline(AbsoluteActionsProcessorStep(enabled=True, relative_step=relative))
+    part = common.ChunkActions(2, 3, postprocessor)
+    offsets = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    program = torch.export.export(part, (offsets, torch.full((3,), 50.0))).module()
+    moved = torch.tensor([-5.0, 0.0, 5.0])
+    torch.testing.assert_close(program(offsets, moved), offsets[:2] + moved)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_actions_program_takes_the_state_only_when_it_reads_it(recipes, relative):
+    """An input the program never reads stays on the host, where the rollout cannot hand it one."""
+    common = importlib.import_module("common")
+    from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+
+    relative_step = RelativeActionsProcessorStep(enabled=True)
+    absolute_step = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)
+    postprocessor = action_pipeline(absolute_step) if relative else action_pipeline()
+    part = common.ChunkActions(2, 3, postprocessor).part(torch.zeros(3, 3), torch.zeros(3))
+    inputs, names = part.inputs, part.input_names
+    program = torch.export.export(part.module, inputs)
+    user_inputs = set(program.graph_signature.user_inputs)
+    unread = [n.name for n in program.graph.nodes if n.name in user_inputs and not n.users]
+    assert unread == []
+    assert names == (["x_t", "observation.state"] if relative else ["x_t"])

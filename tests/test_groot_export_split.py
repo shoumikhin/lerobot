@@ -24,6 +24,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.export_helpers import action_pipeline
+
 pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
 pytest.importorskip("av", reason="the export examples require lerobot[dataset]")
 
@@ -54,19 +56,6 @@ def whole_language_model(
         if index < len(deepstack):
             hidden = recipe.deepstack_add(hidden, visual_pos_masks, deepstack[index].to(hidden.dtype))
     return hidden
-
-
-def action_pipeline(*steps):
-    """A postprocessor that takes and returns an action tensor, as the policies' own do."""
-    from lerobot.processor import (
-        PolicyProcessorPipeline,
-        policy_action_to_transition,
-        transition_to_policy_action,
-    )
-
-    return PolicyProcessorPipeline(
-        steps=list(steps), to_transition=policy_action_to_transition, to_output=transition_to_policy_action
-    )
 
 
 def tiny_head(alternate=True, interleave=True, num_layers=5):
@@ -599,64 +588,6 @@ def test_numpy_action_decoding_exports_to_onnx_and_follows_new_actions(recipe, t
     np.testing.assert_allclose(
         session.run(None, {"x": moved.numpy(), "state": state.numpy()})[0], expected, atol=1e-6
     )
-
-
-@pytest.mark.parametrize(
-    "shape,names",
-    [((12, 16, 3), ["height", "width", "channels"]), ((3, 12, 16), ["channels", "height", "width"])],
-)
-def test_robot_frame_cameras_are_hwc_whatever_the_dataset_layout(recipe, shape, names):
-    common = importlib.import_module("common")
-    features = {
-        "observation.images.front": {"dtype": "video", "shape": shape, "names": names},
-        "observation.state": {"dtype": "float32", "shape": (6,), "names": None},
-        "action": {"dtype": "float32", "shape": (6,), "names": None},
-    }
-    frame = common.frame_from_dataset(features)
-    assert frame["observation.images.front"].shape == (12, 16, 3)
-    assert frame["observation.images.front"].dtype == np.uint8
-    assert frame["observation.state"].shape == (6,) and "action" not in frame
-
-
-def test_task_must_be_one_of_the_dataset_tasks(recipe):
-    import pandas as pd
-
-    common = importlib.import_module("common")
-    metadata = SimpleNamespace(tasks=pd.DataFrame(index=["pick the cup", "open the drawer"]))
-    assert common.dataset_task(metadata, None) == "pick the cup"
-    assert common.dataset_task(metadata, "open the drawer") == "open the drawer"
-    with pytest.raises(ValueError, match="one of the dataset's tasks"):
-        common.dataset_task(metadata, "close the drawer")
-
-
-def test_relative_actions_follow_the_robot_state_after_export(recipe):
-    from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep, TransitionKey
-
-    relative = RelativeActionsProcessorStep(enabled=True)
-    relative({TransitionKey.OBSERVATION: {"observation.state": torch.full((1, 3), 50.0)}})
-    postprocessor = action_pipeline(AbsoluteActionsProcessorStep(enabled=True, relative_step=relative))
-    part = recipe.ChunkActions(2, 3, postprocessor)
-    offsets = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
-    program = torch.export.export(part, (offsets, torch.full((3,), 50.0))).module()
-    moved = torch.tensor([-5.0, 0.0, 5.0])
-    torch.testing.assert_close(program(offsets, moved), offsets[:2] + moved)
-
-
-@pytest.mark.parametrize("relative", [False, True])
-def test_actions_program_takes_the_state_only_when_it_reads_it(recipe, relative):
-    """An input the program never reads stays on the host, where the rollout cannot hand it one."""
-    from lerobot.processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
-
-    relative_step = RelativeActionsProcessorStep(enabled=True)
-    absolute_step = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)
-    postprocessor = action_pipeline(absolute_step) if relative else action_pipeline()
-    part = recipe.ChunkActions(2, 3, postprocessor).part(torch.zeros(3, 3), torch.zeros(3))
-    inputs, names = part.inputs, part.input_names
-    program = torch.export.export(part.module, inputs)
-    user_inputs = set(program.graph_signature.user_inputs)
-    unread = [n.name for n in program.graph.nodes if n.name in user_inputs and not n.users]
-    assert unread == []
-    assert names == (["x_t", "observation.state"] if relative else ["x_t"])
 
 
 def test_part_names_cover_remainders_and_reject_unknown_parts(recipe, monkeypatch):
