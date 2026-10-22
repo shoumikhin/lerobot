@@ -69,7 +69,7 @@ lerobot-rollout \
 
 pi0.5 and GR00T run any task: pass it with `--task`, or change it while the robot runs. Their folders keep the policy's own tokenizer and its whole word table, and the rollout reads only the rows of the task's words. A GR00T folder takes tasks up to 32 tokens (about 25 words); export with `--max_task_tokens` for longer ones, at a small cost in time. SmolVLA runs only the task it was exported for, so leave out `--task` or pass the same one. Without `--task`, a folder runs the task it was exported with.
 
-pi0.5 also runs with any of the cameras it was trained with: it fills in a camera the robot does not send, as the PyTorch policy does. If your robot never has some of them, export with `--cameras` and the slots it can fill. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
+pi0.5 also runs with any of the cameras it was trained with: it fills in a camera the robot does not send, as the PyTorch policy does. If your robot never has some of them, export with `--cameras` and the slots it can fill: the program then leaves the others out, which saves time. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
 
 Before the robot moves, the rollout checks that the compiled policy reproduces the actions PyTorch computed at export time, and stops if it does not.
 
