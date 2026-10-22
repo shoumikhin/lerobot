@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from tests.export_helpers import action_pipeline
 from tests.test_export_recipes import (
     act_checkpoint,
     dataset_metadata,
@@ -227,6 +228,38 @@ def test_reference_and_report_commands_compare_a_result_with_the_policy(examples
     )
     # On a GPU the PyTorch run uses TensorFloat-32, which moves ACT's actions by about 0.002 here.
     assert max(float(error) for error in report.stdout.split()[-3:]) < 0.01
+
+
+def test_reference_slices_the_chunk_before_postprocessing_it(examples, tmp_path, monkeypatch):
+    from lerobot.processor import ProcessorStep, TransitionKey
+
+    class ScaleByHorizon(ProcessorStep):
+        """Depends on the chunk's length, so slicing after it gives a different answer than before it."""
+
+        def __call__(self, transition):
+            actions = transition[TransitionKey.ACTION]
+            return {**transition, TransitionKey.ACTION: actions * actions.shape[1] + 3}
+
+        def transform_features(self, features):
+            return features
+
+    benchmark, common = examples("benchmark"), examples("common")
+    monkeypatch.setattr(benchmark, "FRAMES", 3)
+    checkpoint, folder, frames = act_pytorch_run(benchmark, tmp_path, monkeypatch)
+    argv = [str(folder), f"--policy.path={checkpoint}", frames]
+    benchmark.write_reference([*argv, f"--output={tmp_path / 'plain.npz'}"])
+    processors = common.processors
+
+    def scaled_by_horizon(config, policy_path):
+        preprocessor, postprocessor = processors(config, policy_path)
+        return preprocessor, action_pipeline(*postprocessor.steps, ScaleByHorizon())
+
+    monkeypatch.setattr(common, "processors", scaled_by_horizon)
+    benchmark.write_reference([*argv, f"--output={tmp_path / 'scaled.npz'}"])
+    plain, scaled = (np.load(tmp_path / f"{name}.npz")["reference"] for name in ("plain", "scaled"))
+    # ACT predicts four actions and the robot plays two.
+    assert plain.shape == (3, 2, 3)
+    np.testing.assert_allclose(scaled, plain * 2 + 3, rtol=1e-6)
 
 
 def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):
