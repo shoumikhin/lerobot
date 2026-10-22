@@ -78,6 +78,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Build the whole chunk as one program, which needs the memory to compile all of it at once.",
     )
+    parser.add_argument(
+        "--one_denoise_program",
+        action="store_true",
+        help="Build every denoising step and the actions as one program, after the prefix programs.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -86,12 +91,8 @@ def part_names(args: argparse.Namespace) -> list[str]:
     model = GR00TN17Config.from_pretrained(PreTrainedConfig.from_pretrained(args.policy_path).base_model_path)
     language_groups = math.ceil(model.select_layer / LANGUAGE_LAYERS_PER_PROGRAM)
     step_groups = math.ceil(model.diffusion_model_cfg["num_layers"] / DIT_BLOCKS_PER_PROGRAM)
-    return [
-        "vision",
-        *(f"language_model_{i}" for i in range(language_groups)),
-        *(f"step_{i}" for i in range(step_groups)),
-        "actions",
-    ]
+    tail = ["denoise"] if args.one_denoise_program else [*(f"step_{i}" for i in range(step_groups)), "actions"]
+    return ["vision", *(f"language_model_{i}" for i in range(language_groups)), *tail]
 
 
 # Fix the image sequence lengths at export time instead of reading cu_seqlens inside the graph.
@@ -429,6 +430,21 @@ class GrootStep(nn.Module):
             return (hidden, temb) if self.start == 0 else hidden
 
 
+class GrootDenoise(nn.Module):
+    """Every denoising step and the actions in one module: the language model's features and the noise in."""
+
+    def __init__(self, step: GrootStep, actions: ChunkActions, timesteps: list[int]):
+        super().__init__()
+        self.step = step
+        self.actions = actions
+        self.timesteps = timesteps
+
+    def forward(self, vl_embeds: Tensor, state_features: Tensor, x_t: Tensor, *state: Tensor) -> Tensor:
+        for bucket in self.timesteps:
+            x_t = self.step(vl_embeds, state_features, x_t, torch.full((1,), float(bucket), device=x_t.device))
+        return self.actions(x_t, *state)
+
+
 class GrootChunk(nn.Module):
     """The whole chunk in one module: the chain's parts in order, the denoising step once per step."""
 
@@ -606,6 +622,9 @@ class Exporter:
                 hidden = result
             hidden_name = outputs[0]
             del module
+        if self.args.one_denoise_program:
+            yield self.denoise(vl_embeds, state_features)
+            return
         actions = self.noise
         depth = self.model_config.diffusion_model_cfg["num_layers"]
         for iteration, bucket in enumerate(self.timesteps):
@@ -661,6 +680,30 @@ class Exporter:
         with torch.no_grad():
             self.expected_actions = module(actions, state).float().cpu().numpy()
         yield module.part(actions, state)
+
+    def denoise(self, vl_embeds: Tensor, state_features: Tensor) -> Part:
+        """Every denoising step and the actions as one part."""
+        free_memory()
+        blocks = self.model_config.diffusion_model_cfg["num_layers"]
+        modules = [f"{ACTION_HEAD}.model.transformer_blocks.{i}" for i in range(blocks)]
+        modules += [f"{ACTION_HEAD}.action_encoder", f"{ACTION_HEAD}.model.timestep_encoder"]
+        if self.model_config.add_pos_embed:
+            modules.append(f"{ACTION_HEAD}.position_embedding")
+        modules += [f"{ACTION_HEAD}.model.{n}" for n in ("norm_out", "proj_out_1", "proj_out_2")]
+        modules.append(f"{ACTION_HEAD}.action_decoder")
+        head = self.load_modules(*modules)._groot_model.action_head
+        step = GrootStep(head, self.constants, 0, blocks, self.config.use_bf16, 1.0 / self.num_steps).eval()
+        actions = ChunkActions(
+            self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        )
+        module = GrootDenoise(step, actions, self.timesteps)
+        state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
+        reads_state = actions.absolute_step is not None
+        inputs = (vl_embeds, state_features, self.noise, *((state,) if reads_state else ()))
+        with torch.no_grad():
+            self.expected_actions = module(*inputs).float().cpu().numpy()
+        names = ["vl_embeds", "state_features", NOISE, *([OBS_STATE] if reads_state else [])]
+        return Part("denoise", module, inputs, names, [ACTION])
 
     def whole(self, frame: tuple[Tensor, ...]) -> Part:
         """The chunk as one part, with every weight it reads in memory at once."""
@@ -723,7 +766,7 @@ class Exporter:
             programs,
             **(
                 {}
-                if self.args.one_piece
+                if self.args.one_piece or self.args.one_denoise_program
                 else {"steps": [n for n in programs if n.startswith("step_")], "timesteps": self.timesteps}
             ),
             image_resize=self.image_resize,
