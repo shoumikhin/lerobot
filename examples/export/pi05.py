@@ -47,6 +47,7 @@ from transformers import DynamicCache
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
+from lerobot.inference.export.engine import NOISE
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch, get_gemma_config
@@ -84,9 +85,16 @@ LANGUAGE_LAYERS_PER_PROGRAM = 3
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task", required=True, help="The task the policy was trained on, as a sentence.")
     parser.add_argument("--cameras", nargs="+", help="The camera slots the robot fills; pi0.5 pads the rest.")
+    parser.add_argument(
+        "--one_piece",
+        action="store_true",
+        help="Build the whole chunk as one program, which needs the memory to compile all of it at once.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
+    if args.one_piece:
+        return ["policy"]
     depth = get_gemma_config(PreTrainedConfig.from_pretrained(args.policy_path).paligemma_variant).depth
     groups = range(math.ceil(depth / LANGUAGE_LAYERS_PER_PROGRAM))
     return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
@@ -235,6 +243,36 @@ class PI05LanguageModelLayers(nn.Module):
         return keys_values if self.last else (hidden_states, *keys_values)
 
 
+class PI05Chunk(nn.Module):
+    """The whole chunk in one module: the chain's parts in order, the denoising step once per step."""
+
+    def __init__(
+        self,
+        embed: PI05Embed,
+        language_model: PI05LanguageModelLayers,
+        step: PI05Step,
+        actions: ChunkActions,
+        timesteps: list[float],
+    ):
+        super().__init__()
+        self.embed = embed
+        self.language_model = language_model
+        self.step = step
+        self.actions = actions
+        self.timesteps = timesteps
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        *frame, noise = inputs
+        hidden, prefix_pad_masks = self.embed(*frame)
+        cache = self.language_model(hidden, prefix_pad_masks)
+        x_t = noise
+        for timestep in self.timesteps:
+            x_t = self.step(prefix_pad_masks, *cache, x_t, torch.full((1,), timestep, device=noise.device))
+        if self.actions.absolute_step is None:
+            return self.actions(x_t)
+        return self.actions(x_t, frame[list(self.embed.observation.frame_names).index(OBS_STATE)])
+
+
 class CompactEmbedding(nn.Module):
     """An embedding that keeps only the rows of `token_ids`, and finds them with a constant table."""
 
@@ -310,6 +348,9 @@ class Exporter:
         The test case's actions are these parts chained, the denoising step once per step.
         """
         frame = tuple(torch.from_numpy(x).to(device()) for x in self.frame.values())
+        if self.args.one_piece:
+            yield self.whole(frame)
+            return
         embed = PI05Embed(self.policy, self.observation)
         del self.policy
         with torch.no_grad():
@@ -355,6 +396,27 @@ class Exporter:
             self.expected_actions = actions(x_t, state).cpu().numpy()
         yield actions.part(self.noise, state)
 
+    def whole(self, frame: tuple[Tensor, ...]) -> Part:
+        """The chunk as one part, with every weight it reads in memory at once."""
+        depth = get_gemma_config(self.config.paligemma_variant).depth
+        layers = [f"{LANGUAGE_MODEL}.layers.{i}" for i in range(depth)]
+        model = self.load_modules(*layers, *STEP_MODULES).model
+        free_memory()
+        module = PI05Chunk(
+            PI05Embed(self.policy, self.observation),
+            PI05LanguageModelLayers(model, range(depth)),
+            PI05Step(model, self.dt),
+            ChunkActions(
+                self.config.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+            ),
+            self.timesteps,
+        )
+        del self.policy, model
+        inputs = (*frame, self.noise)
+        with torch.no_grad():
+            self.expected_actions = module(*inputs).cpu().numpy()
+        return Part("policy", module, inputs, [*self.frame, NOISE], [ACTION])
+
     def write(self, programs: dict[str, dict]) -> None:
         write_folder(
             self.args,
@@ -363,8 +425,7 @@ class Exporter:
             self.noise,
             self.expected_actions,
             programs,
-            steps=["step"],
-            timesteps=self.timesteps,
+            **({} if self.args.one_piece else {"steps": ["step"], "timesteps": self.timesteps}),
             # The program holds the task's prompt tokens, so the folder runs only this task.
             task=self.args.task,
         )

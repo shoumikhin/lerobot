@@ -50,6 +50,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
+from lerobot.inference.export.engine import NOISE
 from lerobot.inference.export.images import resize_images
 from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -72,9 +73,16 @@ DIT_BLOCKS_PER_PROGRAM = 8
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     add_dataset_arguments(parser)
+    parser.add_argument(
+        "--one_piece",
+        action="store_true",
+        help="Build the whole chunk as one program, which needs the memory to compile all of it at once.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
+    if args.one_piece:
+        return ["policy"]
     model = GR00TN17Config.from_pretrained(PreTrainedConfig.from_pretrained(args.policy_path).base_model_path)
     language_groups = math.ceil(model.select_layer / LANGUAGE_LAYERS_PER_PROGRAM)
     step_groups = math.ceil(model.diffusion_model_cfg["num_layers"] / DIT_BLOCKS_PER_PROGRAM)
@@ -421,6 +429,39 @@ class GrootStep(nn.Module):
             return (hidden, temb) if self.start == 0 else hidden
 
 
+class GrootChunk(nn.Module):
+    """The whole chunk in one module: the chain's parts in order, the denoising step once per step."""
+
+    def __init__(
+        self,
+        vision: GrootVision,
+        language_model: GrootLanguageModel,
+        step: GrootStep,
+        actions: ChunkActions,
+        timesteps: list[int],
+        state_index: int,
+    ):
+        super().__init__()
+        self.vision = vision
+        self.language_model = language_model
+        self.step = step
+        self.actions = actions
+        self.timesteps = timesteps
+        self.state_index = state_index
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        *frame, noise = inputs
+        hidden, *deepstack, state = self.vision(*frame)
+        used = [deepstack[i] for i in self.language_model.deepstack_layers]
+        vl_embeds, state_features = self.language_model(hidden, *used, state)
+        x_t = noise
+        for bucket in self.timesteps:
+            x_t = self.step(vl_embeds, state_features, x_t, torch.full((1,), float(bucket), device=noise.device))
+        if self.actions.absolute_step is None:
+            return self.actions(x_t)
+        return self.actions(x_t, frame[self.state_index])
+
+
 def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -> None:
     """Refuse at the start a checkpoint whose action decoding this route cannot compile.
 
@@ -513,6 +554,9 @@ class Exporter:
         """
         resized = resize_images(self.frame, self.image_resize)
         frame = tuple(torch.from_numpy(x).to(device()) for x in resized.values())
+        if self.args.one_piece:
+            yield self.whole(frame)
+            return
         module = GrootVision(
             self.policy._groot_model.backbone.visual,
             self.observation,
@@ -618,6 +662,57 @@ class Exporter:
             self.expected_actions = module(actions, state).float().cpu().numpy()
         yield module.part(actions, state)
 
+    def whole(self, frame: tuple[Tensor, ...]) -> Part:
+        """The chunk as one part, with every weight it reads in memory at once."""
+        vision = GrootVision(
+            self.policy._groot_model.backbone.visual,
+            self.observation,
+            self.batch["image_grid_thw"],
+            self.config.use_bf16,
+        ).eval()
+        del self.policy
+        policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
+        with torch.no_grad():
+            text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
+        self.constants["text_embeds"] = text
+        del policy
+        free_memory()
+        depth = self.model_config.select_layer
+        blocks = self.model_config.diffusion_model_cfg["num_layers"]
+        modules = [f"{LANGUAGE_MODEL}.layers.{i}" for i in range(depth)]
+        modules += [f"{ACTION_HEAD}.{n}" for n in ("vlln", "vl_self_attention", "state_encoder")]
+        modules += [f"{ACTION_HEAD}.model.transformer_blocks.{i}" for i in range(blocks)]
+        modules += [f"{ACTION_HEAD}.action_encoder", f"{ACTION_HEAD}.model.timestep_encoder"]
+        if self.model_config.add_pos_embed:
+            modules.append(f"{ACTION_HEAD}.position_embedding")
+        modules += [f"{ACTION_HEAD}.model.{n}" for n in ("norm_out", "proj_out_1", "proj_out_2")]
+        modules.append(f"{ACTION_HEAD}.action_decoder")
+        policy = self.load_modules(*modules)
+        head = policy._groot_model.action_head
+        with torch.no_grad():
+            deepstack_count = len(vision(*frame)) - 2
+        language_model = GrootLanguageModel(
+            policy._groot_model.backbone.language_model,
+            head,
+            self.constants,
+            0,
+            depth,
+            self.config.use_bf16,
+            deepstack_count,
+        ).eval()
+        step = GrootStep(head, self.constants, 0, blocks, self.config.use_bf16, 1.0 / self.num_steps).eval()
+        del policy, head
+        actions = ChunkActions(
+            self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        )
+        module = GrootChunk(
+            vision, language_model, step, actions, self.timesteps, list(self.frame).index(OBS_STATE)
+        )
+        inputs = (*frame, self.noise)
+        with torch.no_grad():
+            self.expected_actions = module(*inputs).float().cpu().numpy()
+        return Part("policy", module, inputs, [*self.frame, NOISE], [ACTION])
+
     def write(self, programs: dict[str, dict]) -> None:
         write_folder(
             self.args,
@@ -626,8 +721,11 @@ class Exporter:
             self.noise,
             self.expected_actions,
             programs,
-            steps=[name for name in programs if name.startswith("step_")],
-            timesteps=self.timesteps,
+            **(
+                {}
+                if self.args.one_piece
+                else {"steps": [n for n in programs if n.startswith("step_")], "timesteps": self.timesteps}
+            ),
             image_resize=self.image_resize,
             # The task's token ids and rope positions are constants inside the programs.
             task=self.task,
