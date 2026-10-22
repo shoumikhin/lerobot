@@ -129,21 +129,29 @@ def tiny_text(num_layers=4):
     return Qwen3VLTextModel(config).eval()
 
 
+# A prompt of a text token, two image tokens, then a task of one token padded to two.
+REAL = 4
+
+
 def constants():
-    image_mask = torch.tensor([[False, True, True, False, False]])
     return {
-        "image_mask": image_mask,
-        "backbone_attention_mask": torch.tensor([[True, True, True, True, False]]),
+        "image_mask": torch.tensor([[False, True, True, False, False]]),
         "embodiment_id": torch.tensor([2]),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]]),
+        "attention_mask": torch.ones(1, 5, dtype=torch.long),
         "position_ids": torch.arange(5)[None, None].expand(3, 1, -1),
-        "text_embeds": torch.randn(1, 5, 32),
+        "task_positions": torch.arange(2),
+        "head": 3,
+        "head_embeds": torch.randn(1, 3, 32),
+        # Not a recipe constant: what the rollout gives the programs for the task.
+        "task_embeddings": torch.cat((torch.randn(1, 32), torch.zeros(1, 32))),
+        "task_length": torch.tensor([REAL - 3]),
     }
 
 
 def image_embeddings(fixed, images):
     """The text embeddings with the image features at the image tokens, as Qwen3-VL places them."""
-    return fixed["text_embeds"].masked_scatter(fixed["image_mask"][..., None].expand(1, 5, 32), images)
+    text = torch.cat((fixed["head_embeds"], fixed["task_embeddings"][None]), dim=1)
+    return text.masked_scatter(fixed["image_mask"][..., None].expand(1, 5, 32), images)
 
 
 def test_vision_part_preserves_deepstack_and_state(recipe):
@@ -172,14 +180,15 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
     images, state = torch.randn(2, 32), torch.randn(1, 1, 6)
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
     with torch.no_grad():
-        embeddings = image_embeddings(fixed, images)
+        # The policy runs the prompt without the task's padding.
+        embeddings = image_embeddings(fixed, images)[:, :REAL]
         expected = whole_language_model(
             recipe,
             text,
             embeddings,
-            fixed["attention_mask"],
-            fixed["position_ids"],
-            fixed["image_mask"],
+            torch.ones(1, REAL, dtype=torch.long),
+            fixed["position_ids"][..., :REAL],
+            fixed["image_mask"][:, :REAL],
             *deepstack,
         )
         expected = head.vl_self_attention(head.vlln(expected))
@@ -190,12 +199,15 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
             inputs = (
                 hidden,
                 *(deepstack[i] for i in part.deepstack_layers),
-                *((state,) if part.last else ()),
+                *((fixed["task_embeddings"],) if start == 0 else ()),
+                *((state, fixed["task_length"]) if part.last else ()),
             )
             hidden = part(*inputs)
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, hidden, rtol=0, atol=0)
-    torch.testing.assert_close(hidden, (expected, expected_state), rtol=0, atol=0)
+    features, state_features = hidden
+    torch.testing.assert_close(features[:, :REAL], expected, rtol=0, atol=1e-6)
+    torch.testing.assert_close(state_features, expected_state, rtol=0, atol=0)
 
 
 def test_language_slices_have_no_data_dependent_shapes(recipe):
@@ -204,7 +216,13 @@ def test_language_slices_have_no_data_dependent_shapes(recipe):
     head, fixed = tiny_head(), constants()
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
     part = recipe.GrootLanguageModel(text, head, fixed, 0, 4, False, len(deepstack)).eval()
-    inputs = (torch.randn(2, 32), *deepstack, torch.randn(1, 1, 6))
+    inputs = (
+        torch.randn(2, 32),
+        *deepstack,
+        fixed["task_embeddings"],
+        torch.randn(1, 1, 6),
+        fixed["task_length"],
+    )
     with torch.no_grad():
         program = torch.export.export(part, inputs)
     # Autocast regions are submodules of the exported graph.
@@ -222,7 +240,8 @@ def test_last_language_slice_encodes_a_float32_state_with_bfloat16_weights(recip
     hidden, state = torch.randn(1, 5, 32, dtype=torch.bfloat16), torch.randn(1, 1, 6)
     with torch.no_grad():
         expected = head.state_encoder(state.to(torch.bfloat16), fixed["embodiment_id"])
-        _, state_features = recipe.GrootLanguageModel(text, head, fixed, 3, 4, False, 3).eval()(hidden, state)
+        part = recipe.GrootLanguageModel(text, head, fixed, 3, 4, False, 3).eval()
+        _, state_features = part(hidden, state, fixed["task_length"])
     torch.testing.assert_close(state_features, expected, rtol=0, atol=0)
 
 
@@ -246,25 +265,20 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
     last = []
     # GR00T reads the last layer's output, before the model's final norm.
     text.layers[-1].register_forward_hook(lambda module, args, output: last.append(output))
+    padding = torch.tensor([[1, 1, 1, 1, 0]])
     with torch.no_grad():
         text(
             inputs_embeds=embeddings,
-            attention_mask=fixed["attention_mask"],
+            attention_mask=padding,
             position_ids=fixed["position_ids"],
             visual_pos_masks=fixed["image_mask"],
             deepstack_visual_embeds=deepstack,
         )
         actual = whole_language_model(
-            recipe,
-            text,
-            embeddings,
-            fixed["attention_mask"],
-            fixed["position_ids"],
-            fixed["image_mask"],
-            *deepstack,
+            recipe, text, embeddings, padding, fixed["position_ids"], fixed["image_mask"], *deepstack
         )
     expected = last[0][0] if isinstance(last[0], tuple) else last[0]
-    valid = fixed["attention_mask"][0].bool()
+    valid = padding[0].bool()
     torch.testing.assert_close(actual[:, valid], expected[:, valid], rtol=0, atol=1e-5)
 
 
@@ -289,14 +303,15 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
     head, fixed = tiny_head(alternate, interleave), constants()
     features, state, noise = torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4)
     with torch.no_grad():
+        # The policy runs the prompt without the task's padding.
         expected = head.get_action_with_features(
-            features,
+            features[:, :REAL],
             state,
             fixed["embodiment_id"],
             BatchFeature(
                 {
-                    "image_mask": fixed["image_mask"],
-                    "backbone_attention_mask": fixed["backbone_attention_mask"],
+                    "image_mask": fixed["image_mask"][:, :REAL],
+                    "backbone_attention_mask": torch.ones(1, REAL, dtype=torch.bool),
                 }
             ),
             BatchFeature({}),
@@ -333,9 +348,9 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
     programs = {f"step_{i}": Program(part, f"step_{i}") for i, part in enumerate(parts)}
     programs["actions"] = Program(recipe.ChunkActions(2, 3, action_pipeline()), "actions")
     names = {
-        "step_0": (["vl", "state", "x_t", "timestep"], ["hidden", "temb"]),
-        "step_1": (["vl", "hidden", "temb"], ["hidden"]),
-        "step_2": (["vl", "hidden", "temb", "x_t"], ["x_next"]),
+        "step_0": (["vl", "state", "x_t", "timestep", "task_length"], ["hidden", "temb"]),
+        "step_1": (["vl", "hidden", "temb", "task_length"], ["hidden"]),
+        "step_2": (["vl", "hidden", "temb", "x_t", "task_length"], ["x_next"]),
         "actions": (["x_t", "robot_state"], ["actions"]),
     }
     info = {
@@ -347,21 +362,23 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         },
     }
     chain = ProgramChain(programs, info)
+    chain.hold({"task_length": fixed["task_length"].numpy()})
     actual = chain(features.numpy(), state.numpy(), np.zeros(6, np.float32), noise.numpy())
     np.testing.assert_allclose(actual, expected[:2, :3].numpy(), rtol=0, atol=1e-6)
     assert calls == ["step_0", "step_1", "step_2"] * 3 + ["actions"]
-    inputs = (features, state, noise, torch.tensor([333.0]))
+    length = fixed["task_length"]
+    inputs = (features, state, noise, torch.tensor([333.0]), length)
     with torch.no_grad():
         for part in parts:
             result = part(*inputs)
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, result, rtol=0, atol=0)
             if not part.last:
-                hidden, temb = result if part.start == 0 else (result, inputs[-1])
+                hidden, temb = result if part.start == 0 else (result, inputs[-2])
                 inputs = (
-                    (features, hidden, temb)
+                    (features, hidden, temb, length)
                     if not parts[parts.index(part) + 1].last
-                    else (features, hidden, temb, noise)
+                    else (features, hidden, temb, noise, length)
                 )
 
 
@@ -373,11 +390,15 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     from lerobot.inference.export.engine import ProgramChain
     from lerobot.utils.constants import ACTION
 
-    class Prefix(torch.nn.Module):
+    class Vision(torch.nn.Module):
+        def forward(self, features, state, robot_state):
+            return features, state
+
+    class LanguageModel(torch.nn.Module):
         last = True
         deepstack_layers = []
 
-        def forward(self, features, state, robot_state=None):
+        def forward(self, features, task_embeddings, state, task_length):
             return features, state
 
     torch.manual_seed(14)
@@ -395,10 +416,12 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
             select_layer=1, diffusion_model_cfg={"num_layers": 25}, add_pos_embed=False
         ),
         constants=constants(),
+        prompt={"max_tokens": 2},
         noise=noise,
         timesteps=[0, 333, 666],
         num_steps=3,
         n_action_steps=2,
+        preprocessor=action_pipeline(),
         postprocessor=action_pipeline(),
         frame={
             "features": features.numpy(),
@@ -408,8 +431,8 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     )
     monkeypatch.setattr(recipe, "resize_images", lambda frame, geometry: frame)
     # Keep the prefix tiny while exercising the real recipe's diffusion modules and names.
-    monkeypatch.setattr(recipe, "GrootVision", lambda *args: Prefix())
-    monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: Prefix())
+    monkeypatch.setattr(recipe, "GrootVision", lambda *args: Vision())
+    monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: LanguageModel())
     monkeypatch.setattr(
         exporter,
         "load_modules",
@@ -470,7 +493,9 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         "timesteps": exporter.timesteps,
     }
     robot_state = exporter.frame["observation.state"]
-    actual = ProgramChain(programs, info)(features.numpy(), state.numpy(), robot_state, noise.numpy())
+    chain = ProgramChain(programs, info)
+    chain.hold({"task_length": np.array([2])})
+    actual = chain(features.numpy(), state.numpy(), robot_state, noise.numpy())
     np.testing.assert_allclose(actual, exporter.expected_actions, rtol=1e-5, atol=1e-5)
 
 
@@ -510,7 +535,13 @@ def test_part_loader_holds_only_linear_weights_in_bfloat16_under_autocast(recipe
 def test_bfloat16_linear_weights_compute_what_autocast_computes(recipe):
     torch.manual_seed(15)
     fixed = constants()
-    inputs = (torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4), torch.tensor([333.0]))
+    inputs = (
+        torch.randn(1, 5, 32),
+        torch.randn(1, 1, 32),
+        torch.randn(3, 4),
+        torch.tensor([333.0]),
+        fixed["task_length"],
+    )
     autocast, held = (recipe.GrootStep(tiny_head(), fixed, 0, 5, True, 1 / 3).eval() for _ in range(2))
     held.load_state_dict(autocast.state_dict())
     recipe.hold_linear_weights_in_bfloat16(held)

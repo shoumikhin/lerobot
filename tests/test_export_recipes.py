@@ -389,8 +389,9 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
 
 
 @require_hf_token
-def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
-    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise."""
+def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkeypatch):
+    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise,
+    for the task of the export and for another one given at run time."""
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
@@ -419,12 +420,24 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
     policy = PI05Policy.from_pretrained(checkpoint, config=config).eval()
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
     frame = {name: case[name] for name in ("observation.images.base_0_rgb", "observation.state")}
-    with torch.no_grad():
-        batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), task))
-        actions = policy.predict_action_chunk(batch, noise=torch.from_numpy(case["noise"])[None])
-        expected = postprocessor(actions[:, : config.n_action_steps])[0].numpy()
-    np.testing.assert_allclose(case["expected_actions"], expected, rtol=0, atol=1e-4)
-    assert engine.get_action(frame).shape == (3,)
+
+    def policy_actions(task, noise):
+        with torch.no_grad():
+            batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), task))
+            actions = policy.predict_action_chunk(batch, noise=torch.from_numpy(noise)[None])
+            return postprocessor(actions[:, : config.n_action_steps])[0].numpy()
+
+    np.testing.assert_allclose(
+        case["expected_actions"], policy_actions(task, case["noise"]), rtol=0, atol=1e-4
+    )
+    other = "open_the drawer\n"
+    assert engine.set_task(other)
+    np.random.seed(0)
+    actions = np.stack([engine.get_action(frame) for _ in range(config.n_action_steps)])
+    noise = np.random.RandomState(0).standard_normal(case["noise"].shape).astype(np.float32)
+    np.testing.assert_allclose(actions, policy_actions(other, noise), rtol=0, atol=1e-4)
+    # The task changes the actions, so the comparison above would catch a program that ignores it.
+    assert not np.allclose(policy_actions(task, noise), policy_actions(other, noise), atol=1e-3)
 
 
 @require_cuda
@@ -467,16 +480,39 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
         tokenizer_name="google/paligemma-3b-pt-224", max_length=64, padding_side="right", padding="max_length"
     )
     state = torch.tensor([[-1.0, -1.0 + 1 / 128, 0.0, 0.5 - 1e-6, 1.0, 0.3]])
-    prompt = pi05.StatePrompt(tokenizer, "pick up the cube", state.shape[1])
-    tokens, mask = prompt(state)
-    transition = {
-        TransitionKey.OBSERVATION: {"observation.state": state},
-        TransitionKey.COMPLEMENTARY_DATA: {"task": ["pick up the cube"]},
-    }
-    transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
-    expected = tokenizer(transition)[TransitionKey.OBSERVATION]
-    torch.testing.assert_close(tokens, expected["observation.language.tokens"])
-    torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+    # Row i holds i, so the rows the prompt picks spell out its token ids.
+    embedding = torch.nn.Embedding(len(tokenizer.input_tokenizer), 1)
+    embedding.weight.data = torch.arange(len(tokenizer.input_tokenizer), dtype=torch.float32)[:, None]
+    prompt = pi05.StatePrompt(tokenizer, embedding, state.shape[1])
+    for task in ("pick up the cube", " stack_the\nblocks "):
+        clean = task.strip().replace("_", " ").replace("\n", " ")
+        ids = tokenizer.input_tokenizer.encode(pi05.TASK_TEXT.replace("{task}", clean))
+        task_embeddings = torch.zeros(prompt.max_task_tokens, 1)
+        task_embeddings[: len(ids), 0] = torch.tensor(ids, dtype=torch.float32)
+        rows, mask = prompt(state, task_embeddings, torch.tensor([len(ids)]))
+        transition = {
+            TransitionKey.OBSERVATION: {"observation.state": state},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": [task]},
+        }
+        transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
+        expected = tokenizer(transition)[TransitionKey.OBSERVATION]
+        torch.testing.assert_close(rows[..., 0].long(), expected["observation.language.tokens"])
+        torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+
+
+def test_embedding_tables_are_saved_in_bfloat16_only_when_that_is_exact(recipes, tmp_path):
+    from lerobot.inference.export.prompt import read_table
+
+    common = importlib.import_module("common")
+    exact = torch.randn(5, 4).to(torch.bfloat16).float()
+    inexact = exact + 1e-4
+    for table, raw_dtype in ((exact, np.uint16), (inexact, np.float32)):
+        common.save_embedding_table(table, tmp_path / "table.safetensors")
+        saved = read_table(tmp_path / "table.safetensors")
+        assert saved.dtype == raw_dtype
+        if raw_dtype == np.uint16:
+            saved = (saved.astype(np.uint32) << 16).view(np.float32)
+        np.testing.assert_array_equal(saved, table.numpy())
 
 
 @pytest.mark.parametrize(

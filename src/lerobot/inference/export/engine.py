@@ -17,8 +17,9 @@
 An exported folder holds the compiled programs, the policy's `config.json`, and an `export.json` that
 lists the programs with their inputs and outputs, and a test case. A whole policy is one program; a
 policy too large to compile at once is a chain. The engine feeds the chain the robot's frame (and, for a
-flow-matching policy, fresh noise each chunk) and returns actions in robot units. A folder that names a
-`task` was compiled for it and refuses any other.
+flow-matching policy, fresh noise each chunk) and returns actions in robot units. A folder with a `prompt`
+takes any task, as token embeddings the engine makes when the task changes; a folder that names a `task`
+was compiled for it and refuses any other.
 """
 
 from __future__ import annotations
@@ -103,10 +104,17 @@ class ProgramChain:
             programs[self._steps[0]].upload(np.array([t], dtype=np.float32))
             for t in info.get("timesteps", [])
         ]
+        self._held: dict[str, Any] = {}
+
+    def hold(self, values: Mapping[str, np.ndarray]) -> None:
+        """Give every later run `values`, placed once where the first program that reads each one reads it."""
+        for name, value in values.items():
+            reader = next(p for p in self._programs if name in self._inputs[p])
+            self._held[name] = self._programs[reader].upload(value)
 
     def __call__(self, *inputs: np.ndarray) -> np.ndarray:
         """Run the chain on the frame, and the noise if it takes one, and return the actions on the host."""
-        values: dict[str, Any] = dict(zip(self._names, inputs, strict=True))
+        values: dict[str, Any] = {**self._held, **dict(zip(self._names, inputs, strict=True))}
         *names, last = self._programs
         for name in names:
             if name not in self._steps:
@@ -144,8 +152,13 @@ class ExportInferenceEngine(InferenceEngine):
         """Load the folder's programs, or run `programs` instead, and check them against its test case."""
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._fixed_task: str | None = info.get("task")
-        # Without --task, a folder exported for one task runs that task.
-        task = task or self._fixed_task or ""
+        self._prompt = None
+        if "prompt" in info:
+            from .prompt import TaskPrompt
+
+            self._prompt = TaskPrompt(folder, info["prompt"])
+        # Without --task, a folder runs the task it was exported with.
+        task = task or self._fixed_task or (self._prompt.task if self._prompt is not None else "")
         if error := self._task_error(task):
             raise ValueError(error)
         super().__init__(task=task)
@@ -155,7 +168,11 @@ class ExportInferenceEngine(InferenceEngine):
         self._rename = rename_map or {}
         self._chain = ProgramChain(load_programs(folder, info) if programs is None else programs, info)
         self._actions: deque[np.ndarray] = deque()
+        self._prompt_task: str | None = None
+        # The test case was computed for the task the folder was exported with.
+        self._use_task(self._prompt.task if self._prompt is not None else task)
         self._check(folder / info["test_case"], info["tolerance"])
+        self._use_task(task)
         logger.info("Exported policy loaded from %s (%s)", folder, info["route"])
 
     def _run_chunk(self, frame: dict[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
@@ -172,7 +189,21 @@ class ExportInferenceEngine(InferenceEngine):
             )
         return self._chain(*inputs)
 
+    def _use_task(self, task: str) -> None:
+        """Give the programs the task's embeddings, if they take the task as an input and it changed."""
+        if self._prompt is not None and task != self._prompt_task:
+            from .prompt import TASK_EMBEDDINGS, TASK_LENGTH
+
+            embeddings, length = self._prompt(task)
+            self._chain.hold({TASK_EMBEDDINGS: embeddings, TASK_LENGTH: length})
+            self._prompt_task = task
+
     def _task_error(self, task: str) -> str | None:
+        if self._prompt is not None:
+            try:
+                self._prompt.check(task)
+            except ValueError as error:
+                return str(error)
         if self._fixed_task is not None and task != self._fixed_task:
             return (
                 f"This exported policy only runs the task it was exported for, {self._fixed_task!r}, "
@@ -238,6 +269,7 @@ class ExportInferenceEngine(InferenceEngine):
         task, task_changed = self._take_task()
         if task_changed:
             self._actions.clear()
+        self._use_task(task)
         if not self._actions:
             start = time.perf_counter()
             frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
