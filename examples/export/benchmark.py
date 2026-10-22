@@ -61,6 +61,7 @@ CHUNKS_PER_RUN = 100
 # What `--duration` prints when the warm-up chunks are done, and when it stops running chunks.
 WARM = "benchmark: warm"
 STOPPED = "benchmark: stopped"
+TASK_HELP = "For a folder that takes any task, the task to run. Default: the task it was exported with."
 
 
 def time_per_chunk(chunk_ms: np.ndarray) -> float:
@@ -196,8 +197,10 @@ def measure(executor: str, argv: list[str]) -> None:
             program, args = torch_engine(executor, argv, Path(folder))
             measure_engine(executor, program, args, Path(folder))
     else:
-        args = benchmark_arguments().parse_args(argv)
-        measure_engine(executor, ExportInferenceEngine(Path(executor), task=""), args, Path(executor))
+        parser = argparse.ArgumentParser(parents=[benchmark_arguments()])
+        parser.add_argument("--task", default="", help=TASK_HELP)
+        args = parser.parse_args(argv)
+        measure_engine(executor, ExportInferenceEngine(Path(executor), task=args.task), args, Path(executor))
 
 
 def measure_engine(executor: str, program, args: argparse.Namespace, folder: Path) -> None:
@@ -260,6 +263,7 @@ def write_reference(argv: list[str]) -> None:
     parser.add_argument("--policy.path", dest="policy_path", required=True, help="Trained policy checkpoint.")
     parser.add_argument("--frames", type=Path, required=True, help="The file `benchmark.py frames` wrote.")
     parser.add_argument("--output", type=Path, required=True, help="The .npz file to write.")
+    parser.add_argument("--task", default="", help=TASK_HELP)
     args = parser.parse_args(argv)
     import torch
     from common import NOISE, device, processors
@@ -300,7 +304,8 @@ def write_reference(argv: list[str]) -> None:
             noise["noise"] = torch.from_numpy(drawn)[None].to(device())
         observation = {name: frame[name] for name in names}
         with torch.inference_mode():
-            observation = prepare_observation_for_inference(observation, device(), info.get("task", ""))
+            task = args.task or info.get("task") or info.get("prompt", {}).get("task", "")
+            observation = prepare_observation_for_inference(observation, device(), task)
             # The whole chunk at once, as the engine runs it: GR00T with relative actions refuses one at a time.
             chunk = policy.predict_action_chunk(preprocessor(observation), **noise)[:, :chunk_size]
             reference.append(postprocessor(chunk).squeeze(0).float().cpu().numpy())

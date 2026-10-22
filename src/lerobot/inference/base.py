@@ -701,6 +701,12 @@ class InferenceEngine(abc.ABC):
             logger.exception("External text query failed (%s) for %r", query.kind.value, query.text)
             answer = QueryAnswer(question=query.text, error=f"{type(e).__name__}: {e}", kind=query.kind)
         answer = replace(answer, latency_s=round(time.perf_counter() - started, 3))
+        subtask = None
+        if query.kind is QueryKind.NEXT_SUBTASK and answer.ok and not answer.completed:
+            subtask = answer.answer
+        # Checking a subtask can take a second (an exported policy tokenizes it), and the control loop
+        # takes the query lock every tick, so the check runs before the lock.
+        subtask_error = self.text_input_error(subtask, instruction=True) if subtask is not None else None
         with self._query_lock:
             if generation != self._external_generation:
                 self._finish_external_query(None)  # the run ended; its VQA notice was queued then
@@ -716,9 +722,8 @@ class InferenceEngine(abc.ABC):
                 )
                 self._finish_external_query(None)
                 return
-            subtask = answer.answer if answer.ok and not answer.completed else None
-            if subtask is not None and (error := self.text_input_error(subtask, instruction=True)):
-                answer = replace(answer, answer=None, error=f"ValueError: unusable subtask: {error}")
+            if subtask_error:
+                answer = replace(answer, answer=None, error=f"ValueError: unusable subtask: {subtask_error}")
                 subtask = None
             if not answer.ok:
                 self._autosteer_goal = None

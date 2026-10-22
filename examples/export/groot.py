@@ -15,9 +15,12 @@
 """The GR00T N1.7 recipe: one action chunk of LeRobot's own GR00T, as a chain of programs.
 
 The chunk goes from resized uint8 HWC cameras, float32 state and noise to actions in robot units. Qwen3-VL
-computes its rope positions and image grid with Python loops no exporter can follow; for one task and one
-camera size they never change, so they are computed once here and held as constants, as in NVIDIA's own
-GR00T deployment code. The rollout resizes the cameras with NumPy; no tokenizer runs at inference.
+computes its rope positions and image grid with Python loops no exporter can follow; for one camera size
+they never change up to the task's text, which follows the images, so they are computed once here and held
+as constants, as in NVIDIA's own GR00T deployment code. The rollout resizes the cameras with NumPy, and turns
+the task into token embeddings with the policy's own tokenizer and embedding table, which the folder keeps
+as a file, so the folder runs any task up to `--max_task_tokens` long. The programs pad the task to that
+length and leave the padding out of every attention, so the actions are those of the unpadded prompt.
 
 The chain is the vision encoder, the language model in groups of six layers, the diffusion model in groups
 of eight blocks, and the actions. Each part is built in its own process with only its own weights in
@@ -42,6 +45,7 @@ from common import (
     hold_linear_weights_in_bfloat16,
     processors,
     renamed_inputs,
+    save_embedding_table,
     to_policy_input,
     write_folder,
 )
@@ -51,6 +55,7 @@ from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.inference.export.images import resize_images
+from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
 from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
@@ -66,12 +71,20 @@ TOLERANCE = 5.0
 VISION = "_groot_model.backbone.model.model.visual"
 LANGUAGE_MODEL = "_groot_model.backbone.model.model.language_model"
 ACTION_HEAD = "_groot_model.action_head"
+# The text after the images in GR00T's chat prompt; the rollout tokenizes it.
+TASK_TEXT = "{task}<|im_end|>\n"
 LANGUAGE_LAYERS_PER_PROGRAM = 6
 DIT_BLOCKS_PER_PROGRAM = 8
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     add_dataset_arguments(parser)
+    parser.add_argument(
+        "--max_task_tokens",
+        type=int,
+        default=32,
+        help="The longest task, in tokens, the folder runs. Each token adds to every chunk's time.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -156,6 +169,12 @@ def place_image_features(hidden: Tensor, features: Tensor, image_mask: Tensor, r
     GPU memory for on every run, and a CUDA graph cannot record that.
     """
     return torch.where(image_mask[..., None], features[rows], hidden)
+
+
+def prompt_mask(head: int, task_positions: Tensor, task_length: Tensor) -> Tensor:
+    """Which tokens of the padded prompt are real: the `head` tokens before the task, then the task's own."""
+    head_mask = torch.ones(head, dtype=torch.bool, device=task_positions.device)
+    return torch.cat((head_mask, task_positions < task_length))[None]
 
 
 def deepstack_add(hidden_states: Tensor, image_mask: Tensor, rows: Tensor, visual_embeds: Tensor) -> Tensor:
@@ -279,8 +298,12 @@ class GrootLanguageModel(nn.Module):
     """Some language model layers; the first group inserts the image features, the last runs the action head's encoders.
 
     The program takes only what its layers read: the hidden states, the deepstack features added in its layer range,
-    and, in the last group, the robot state. An input a program never reads would still be a program input the GPU
-    cannot own, since an ExecuTorch export places an input on the device only when the device's backend reads it.
+    in the first group the task's embeddings, and in the last the robot state and the task's length. An input a
+    program never reads would still be a program input the GPU cannot own, since an ExecuTorch export places an
+    input on the device only when the device's backend reads it.
+
+    The task's padding follows every real token, so the causal mask already keeps it out of the real tokens'
+    attention; the action head's self-attention, which attends both ways, leaves it out with the prompt mask.
     """
 
     def __init__(
@@ -301,12 +324,13 @@ class GrootLanguageModel(nn.Module):
         self.layers = nn.ModuleList(text_model.layers[start:stop])
         self.rotary_emb = text_model.rotary_emb
         self.use_bf16 = use_bf16
-        for name in ("attention_mask", "position_ids", "image_mask"):
+        for name in ("attention_mask", "position_ids", "image_mask", "task_positions"):
             self.register_buffer(name, constants[name])
         self.register_buffer("image_rows", image_rows(constants["image_mask"]))
         if start == 0:
-            self.register_buffer("text_embeds", constants["text_embeds"])
+            self.register_buffer("head_embeds", constants["head_embeds"])
         if self.last:
+            self.head = constants["head"]
             self.vlln = action_head.vlln
             self.vl_self_attention = action_head.vl_self_attention
             self.state_encoder = action_head.state_encoder
@@ -314,13 +338,17 @@ class GrootLanguageModel(nn.Module):
             select_embodiment(self.state_encoder, constants["embodiment_id"])
 
     def forward(self, hidden: Tensor, *inputs: Tensor):
-        """`inputs` holds the deepstack features this layer range adds, in layer order, then the state in the last group."""
+        """`inputs` holds the deepstack features this layer range adds, in layer order, then the task's embeddings
+        in the first group, then the state and the task's length in the last."""
         added = len(self.deepstack_layers)
         deepstack = dict(zip(self.deepstack_layers, inputs[:added], strict=True))
+        inputs = inputs[added:]
         with torch.autocast(hidden.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
+                task_embeddings, *inputs = inputs
+                text_embeds = torch.cat((self.head_embeds, task_embeddings[None]), dim=1)
                 hidden = place_image_features(
-                    self.text_embeds, hidden.to(self.text_embeds.dtype), self.image_mask, self.image_rows
+                    text_embeds, hidden.to(text_embeds.dtype), self.image_mask, self.image_rows
                 )
             mask = causal_mask(hidden.dtype, hidden.device, *hidden.shape[:2], self.attention_mask)
             positions = self.rotary_emb(hidden, self.position_ids)
@@ -337,9 +365,13 @@ class GrootLanguageModel(nn.Module):
                         hidden, self.image_mask, self.image_rows, deepstack[index].to(hidden.dtype)
                     )
             if self.last:
-                (state,) = inputs[added:]
+                state, task_length = inputs
                 # GR00T consumes the decoder output before Qwen's final norm.
-                features = self.vl_self_attention(self.vlln(hidden))
+                features = self.vlln(hidden).contiguous()
+                mask = prompt_mask(self.head, self.task_positions, task_length)
+                # The self-attention transformer's own loop, with the mask its forward takes no argument for.
+                for block in getattr(self.vl_self_attention, "transformer_blocks", ()):
+                    features = block(features, attention_mask=mask)
                 # As GR00T's own input step does, since autocast is off when use_bf16 is false.
                 state = state.reshape(state.shape[0], 1, -1).to(self.state_encoder.layer1.W.dtype)
                 state_features = self.state_encoder(state, self.embodiment_id)
@@ -369,8 +401,9 @@ class GrootStep(nn.Module):
             raise ValueError("AlternateVLDiT requires interleaved self attention.")
         self.use_bf16 = use_bf16
         self.horizon = action_head.action_horizon
-        self.register_buffer("image_mask", constants["image_mask"] & constants["backbone_attention_mask"])
-        self.register_buffer("text_mask", ~constants["image_mask"] & constants["backbone_attention_mask"])
+        self.head = constants["head"]
+        self.register_buffer("image_mask", constants["image_mask"])
+        self.register_buffer("task_positions", constants["task_positions"])
         self.register_buffer("embodiment_id", torch.zeros_like(constants["embodiment_id"]))
         if start == 0:
             self.action_encoder = action_head.action_encoder
@@ -387,6 +420,10 @@ class GrootStep(nn.Module):
             select_embodiment(self.action_decoder, constants["embodiment_id"])
 
     def forward(self, vl_embeds: Tensor, *inputs: Tensor):
+        """`inputs` holds what the previous group passes on, then the task's length."""
+        *inputs, task_length = inputs
+        # The policy attends to every token of its unpadded prompt; the padding stays out of every cross-attention.
+        prompt = prompt_mask(self.head, self.task_positions, task_length)
         with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
                 state_features, x_t, time = inputs
@@ -404,9 +441,10 @@ class GrootStep(nn.Module):
             hidden, vl_embeds = hidden.contiguous(), vl_embeds.contiguous()
             for index, block in enumerate(self.blocks, self.start):
                 self_attention = self.interleave and index % 2 == 1
-                mask = None
+                mask = None if self_attention else prompt
                 if self.alternate and not self_attention:
-                    mask = self.text_mask if index % (2 * self.attend_text_every) == 0 else self.image_mask
+                    text = index % (2 * self.attend_text_every) == 0
+                    mask = prompt & (~self.image_mask if text else self.image_mask)
                 hidden = block(
                     hidden,
                     encoder_hidden_states=None if self_attention else vl_embeds,
@@ -470,20 +508,51 @@ class Exporter:
             name: self.folder_config.input_features[name] for name in self.frame
         }
         qwen = model.backbone.model.model
-        ids, mask = self.batch["input_ids"], self.batch["attention_mask"]
+        ids = self.batch["input_ids"]
         image_mask = ids == qwen.config.image_token_id
         positions, _ = qwen.get_rope_index(
             input_ids=ids,
             mm_token_type_ids=self.batch.get("mm_token_type_ids", image_mask.int()),
             image_grid_thw=self.batch["image_grid_thw"],
-            attention_mask=mask,
+            attention_mask=self.batch["attention_mask"],
         )
+        encode = next(s for s in preprocessor.steps if isinstance(s, GrootN17VLMEncodeStep))
+        pack = next(s for s in preprocessor.steps if isinstance(s, GrootN17PackInputsStep))
+        self.tokenizer = encode.proc.tokenizer
+        # The prompt is a head that ends with the last image, then the task's text.
+        vision_end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        head = int(torch.nonzero(ids[0] == vision_end).max()) + 1
+        task_text = TASK_TEXT.replace("{task}", self.batch["language"][0])
+        if ids[0, head:].tolist() != self.tokenizer.encode(task_text):
+            raise ValueError("The task's text does not follow the images in the prompt as expected.")
+        max_tokens = args.max_task_tokens
+        if ids.shape[1] - head > max_tokens:
+            raise SystemExit(f"The task is {ids.shape[1] - head} tokens long; raise --max_task_tokens.")
+        # Qwen3-VL numbers the text after the images on from the largest image position, in all three axes.
+        task_positions = torch.arange(max_tokens, device=ids.device)
+        text_positions = positions[:, :, :head].max() + 1 + task_positions
+        if not torch.equal(positions[:, :, head:], text_positions[: ids.shape[1] - head].expand(3, 1, -1)):
+            raise ValueError("Qwen3-VL's rope positions of the task's text are not consecutive.")
+        padded = head + max_tokens
         self.constants = {
-            "attention_mask": mask.long(),
-            "position_ids": positions,
-            "image_mask": image_mask,
-            "backbone_attention_mask": mask == 1,
+            # The policy's prompt has no padding; the programs keep the task's out of attention themselves.
+            "attention_mask": torch.ones(1, padded, dtype=torch.long, device=ids.device),
+            "position_ids": torch.cat((positions[:, :, :head], text_positions.expand(3, 1, -1)), dim=2),
+            "image_mask": F.pad(image_mask[:, :head], (0, max_tokens)),
+            "task_positions": task_positions,
+            "head": head,
             "embodiment_id": self.batch["embodiment_id"],
+        }
+        self.prompt = {
+            "tokenizer": "tokenizer.json",
+            "embeddings": "token_embeddings.safetensors",
+            "text": TASK_TEXT,
+            # What GR00T's processor runs for an empty task, and how it cleans a task.
+            "default_task": "Perform the task.",
+            "formalize": pack.formalize_language,
+            "max_tokens": max_tokens,
+            "task": self.task,
+            "task_ids": ids[0, head:].tolist(),
         }
         self.noise = torch.randn(
             self.model_config.action_horizon, self.model_config.max_action_dim, device=device()
@@ -528,8 +597,11 @@ class Exporter:
         policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
         with torch.no_grad():
             text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
-        self.constants["text_embeds"] = text
         del policy
+        head = self.constants["head"]
+        self.constants["head_embeds"] = text[:, :head]
+        task_embeddings = F.pad(text[0, head:], (0, 0, 0, self.prompt["max_tokens"] - (text.shape[1] - head)))
+        task_length = torch.tensor([text.shape[1] - head], device=device())
         depth, hidden_name = self.model_config.select_layer, "image_embeds"
         for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
             stop = min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth)
@@ -548,9 +620,20 @@ class Exporter:
                 len(deepstack),
             ).eval()
             del policy
-            state_input = ((state,), ["state"]) if module.last else ((), [])
-            inputs = (hidden, *(deepstack[i] for i in module.deepstack_layers), *state_input[0])
-            names = [hidden_name, *(deepstack_names[i] for i in module.deepstack_layers), *state_input[1]]
+            task_input = ((task_embeddings,), [TASK_EMBEDDINGS]) if first == 0 else ((), [])
+            state_input = ((state, task_length), ["state", TASK_LENGTH]) if module.last else ((), [])
+            inputs = (
+                hidden,
+                *(deepstack[i] for i in module.deepstack_layers),
+                *task_input[0],
+                *state_input[0],
+            )
+            names = [
+                hidden_name,
+                *(deepstack_names[i] for i in module.deepstack_layers),
+                *task_input[1],
+                *state_input[1],
+            ]
             with torch.no_grad():
                 result = module(*inputs)
             outputs = ["vl_embeds", "state_features"] if module.last else [f"language_hidden_{group}"]
@@ -591,6 +674,7 @@ class Exporter:
                 inputs = (vl_embeds, *carried)
                 if module.last and first != 0:
                     inputs, names = (*inputs, actions), [*names, "x_t"]
+                inputs, step_names = (*inputs, task_length), [*names, TASK_LENGTH]
                 with torch.no_grad():
                     result = module(*inputs)
                 if module.last:
@@ -601,7 +685,7 @@ class Exporter:
                     outputs = [f"step_hidden_{group}"]
                 # Every denoising step runs the same programs: yield them once, then only finish the test case.
                 if iteration == 0:
-                    yield Part(f"step_{group}", module, inputs, names, outputs)
+                    yield Part(f"step_{group}", module, inputs, step_names, outputs)
                 if module.last:
                     actions = result
                 else:
@@ -618,6 +702,11 @@ class Exporter:
         yield module.part(actions, state)
 
     def write(self, programs: dict[str, dict]) -> None:
+        self.tokenizer.backend_tokenizer.save(str(self.args.output_dir / self.prompt["tokenizer"]))
+        policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
+        table = policy._groot_model.backbone.language_model.get_input_embeddings().weight
+        save_embedding_table(table, self.args.output_dir / self.prompt["embeddings"])
+        del policy, table
         write_folder(
             self.args,
             self.folder_config,
@@ -628,6 +717,5 @@ class Exporter:
             steps=[name for name in programs if name.startswith("step_")],
             timesteps=self.timesteps,
             image_resize=self.image_resize,
-            # The task's token ids and rope positions are constants inside the programs.
-            task=self.task,
+            prompt=self.prompt,
         )
