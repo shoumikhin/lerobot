@@ -644,6 +644,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     use_typed_attention_masks = False
     use_on_device_suffix_mask = False
     precompute_denoise_times = False
+    # The action expert's attention in `denoise_step`: a name transformers' AttentionInterface knows.
+    denoise_attn_implementation = "eager"
 
     def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
         super().__init__()
@@ -1045,7 +1047,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (  # noqa: SLF001
+            self.denoise_attn_implementation
+        )
 
         past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(

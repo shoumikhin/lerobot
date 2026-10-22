@@ -535,6 +535,62 @@ def test_pi05_language_model_hands_torch_tensorrt_sdpa_attention(recipes, tmp_pa
     assert checked == 2
 
 
+def test_pi05_shared_kv_attention_computes_gemma_eager_attention(recipes):
+    """Folding the query heads over the one key/value head gives Gemma's eager attention, mask included."""
+    pytest.importorskip("transformers")
+    from transformers.models.gemma.modeling_gemma import eager_attention_forward
+
+    pi05 = importlib.import_module("pi05")
+    torch.manual_seed(0)
+    module = SimpleNamespace(num_key_value_groups=4, training=False)
+    query, key, value = torch.randn(2, 4, 5, 8), torch.randn(2, 1, 7, 8), torch.randn(2, 1, 7, 8)
+    mask = torch.where(torch.rand(2, 1, 5, 7) > 0.3, 0.0, -1e9)
+    expected, _ = eager_attention_forward(module, query, key, value, mask, scaling=8**-0.5)
+    output, _ = pi05.shared_kv_attention(module, query, key, value, mask, scaling=8**-0.5)
+    torch.testing.assert_close(output, expected)
+
+
+@require_hf_token
+@pytest.mark.parametrize(
+    "route, capability, folded",
+    [
+        ("executorch_tensorrt", (11, 0), True),
+        ("torch_tensorrt", (8, 0), True),
+        ("executorch_tensorrt", (8, 7), False),
+        ("onnx_tensorrt", (11, 0), False),
+        ("torch.compile", (11, 0), False),
+    ],
+)
+def test_pi05_step_reads_the_shared_kv_head_unrepeated_where_tensorrt_is_faster(
+    recipes, tmp_path, monkeypatch, route, capability, folded
+):
+    """For the Torch-TensorRT routes, on the GPUs where it is faster, the step never repeats the key/value head."""
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    monkeypatch.setattr(pi05, "gpu_capability", lambda: capability)
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None, route=route)
+    )
+    from transformers import AttentionInterface
+
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return pi05.shared_kv_attention(*args, **kwargs)
+
+    monkeypatch.setitem(AttentionInterface._global_mapping, "pi05_shared_kv", spy)
+    step = next(part for part in exporter.parts() if part.name == "step")
+    calls.clear()
+    with torch.no_grad():
+        step.module(*step.inputs)
+    # One attention per expert layer when folded.
+    assert len(calls) == (4 if folded else 0)
+
+
 @require_cuda
 @require_hf_token
 def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_computes(

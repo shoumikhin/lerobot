@@ -44,7 +44,7 @@ from common import (
     write_folder,
 )
 from torch import Tensor, nn
-from transformers import DynamicCache
+from transformers import AttentionInterface, DynamicCache
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
@@ -84,6 +84,10 @@ STEP_MODULES = (
 LANGUAGE_LAYERS_PER_PROGRAM = 3
 # The routes that compile with Torch-TensorRT, which share its engines.
 TORCH_TENSORRT_ROUTES = ("executorch_tensorrt", "torch_tensorrt")
+# The GPUs (compute capabilities) on which TensorRT runs the step faster with shared_kv_attention: an A100 and
+# a Jetson Thor. A Jetson Orin (8.7) runs it slower: its slow memory favors the fused kernel that keeps the
+# attention scores on chip.
+SHARED_KV_ATTENTION_GPUS = ((8, 0), (11, 0))
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -212,6 +216,33 @@ class PI05Observation(nn.Module):
             batch[OBS_STATE], task_embeddings, task_length
         )
         return batch
+
+
+def gpu_capability() -> tuple[int, int] | None:
+    return torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+
+
+def shared_kv_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    """Gemma's eager attention for one key/value head, read by every query head without repeating it.
+
+    The query heads are folded into the rows of two matrix products. On some GPUs TensorRT runs that about
+    three times faster at Gemma's head size of 256 than the repeated form, which it fuses into a slow kernel.
+    """
+    if key.shape[1] != 1:
+        raise ValueError(f"shared_kv_attention takes one key/value head, not {key.shape[1]}.")
+    batch, heads, length, dim = query.shape
+    keys = key.shape[2]
+    weights = torch.matmul(query.reshape(batch, 1, heads * length, dim), key.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        weights = (weights.view(batch, heads, length, keys) + attention_mask).view(
+            batch, 1, heads * length, keys
+        )
+    weights = nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    output = torch.matmul(weights, value).view(batch, heads, length, dim)
+    return output.transpose(1, 2).contiguous(), None
+
+
+AttentionInterface.register("pi05_shared_kv", shared_kv_attention)
 
 
 class PI05Step(nn.Module):
@@ -413,7 +444,9 @@ class Exporter:
         depth = get_gemma_config(self.config.paligemma_variant).depth
         # TensorRT turns SDPA into its attention layer, which runs Gemma's 256-wide heads several times faster
         # on Jetson Thor (0.12 against 0.61 ms per layer) than the kernel it fuses from the eager matmuls;
-        # PyTorch and Inductor run the eager matmuls faster, so the other routes keep them.
+        # PyTorch and Inductor run the eager matmuls faster, so the other routes keep them. The step's attention
+        # reads the prefix's cache with fewer queries, where the same layer stays slow; on the GPUs where it
+        # helps, it is folded instead.
         torch_tensorrt = getattr(self.args, "route", None) in TORCH_TENSORRT_ROUTES
         for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
             layers = range(first, min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth))
@@ -443,7 +476,10 @@ class Exporter:
             del module
             hidden_name = outputs[0]
         free_memory()
-        step = PI05Step(self.load_modules(*STEP_MODULES).model, self.dt)
+        step_model = self.load_modules(*STEP_MODULES).model
+        if torch_tensorrt and gpu_capability() in SHARED_KV_ATTENTION_GPUS:
+            step_model.denoise_attn_implementation = "pi05_shared_kv"
+        step = PI05Step(step_model, self.dt)
         cache_inputs = (prefix_pad_masks, *cache.values())
         x_t = self.noise
         with torch.no_grad():
