@@ -216,7 +216,8 @@ def test_memory_counts_only_the_warm_chunks(examples):
     use = [9000.0] * 10 + [7000.0] * 120 + [3100.0] * 80 + [3000.0] * 100 + [500.0] * 6
     run = [(i * memory.SAMPLE_SECONDS, u) for i, u in enumerate(use)]
     marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 310 * memory.SAMPLE_SECONDS}
-    assert memory.steady_window(run, marks) == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    steady = [mib for _, mib in memory.steady_window(run, marks)]
+    assert steady == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
 
 
 def run_benchmark_memory(memory, monkeypatch, process_mib, command: str) -> None:
@@ -320,12 +321,21 @@ def test_frames_share_one_copy_of_the_file(examples, tmp_path):
 
 def test_memory_is_flat_only_when_it_stops_changing(examples):
     memory = examples("benchmark_memory")
-    samples = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    times = [i * memory.SAMPLE_SECONDS for i in range(int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS))]
     # A settled process whose allocator moves its use up and down by 30 MiB.
-    jitter = np.random.default_rng(0).uniform(-30, 30, samples)
-    assert memory.is_flat(list(4000.0 + jitter))
+    jitter = np.random.default_rng(0).uniform(-30, 30, len(times))
+    assert memory.is_flat(list(zip(times, 4000.0 + jitter, strict=True)))
     # The board still returning a previous job's memory: use falling 7 MiB a second.
-    assert not memory.is_flat([3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(samples)])
+    assert not memory.is_flat([(t, 3000.0 - 7 * t) for t in times])
+
+
+def test_memory_is_flat_measures_its_slope_on_the_samples_real_times(examples):
+    memory = examples("benchmark_memory")
+    # Each read takes time, so the samples are further apart than the time slept between them.
+    reads = np.random.default_rng(0).uniform(0.1, 0.5, 60)
+    times = np.cumsum(memory.SAMPLE_SECONDS + reads).tolist()
+    assert memory.is_flat([(t, 4000.0 - 1.5 * t) for t in times])
+    assert not memory.is_flat([(t, 4000.0 - 3 * t) for t in times])
 
 
 def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tmp_path, monkeypatch):

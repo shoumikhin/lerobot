@@ -107,19 +107,19 @@ def process_mib(root: int, gpu: dict[int, float]) -> float:
     return total
 
 
-def steady_window(run: list[tuple[float, float]], marks: dict[str, float]) -> list[float]:
-    """The memory sampled in the last 30 s before the benchmark's stopped line, from (time, memory) samples."""
-    return [mib for at, mib in run if marks[STOPPED] - STEADY_SECONDS <= at < marks[STOPPED]]
+def steady_window(run: list[tuple[float, float]], marks: dict[str, float]) -> list[tuple[float, float]]:
+    """The (time, memory) samples of the last 30 s before the benchmark's stopped line."""
+    return [(at, mib) for at, mib in run if marks[STOPPED] - STEADY_SECONDS <= at < marks[STOPPED]]
 
 
-def is_flat(samples: list[float]) -> bool:
-    """Whether memory use, sampled every half second, changes by less than 2 MiB/s on a fitted line.
+def is_flat(samples: list[tuple[float, float]]) -> bool:
+    """Whether memory use changes by less than 2 MiB/s on a line fitted to its (time, memory) samples.
 
     Allocator jitter of tens of MiB moves the fitted slope by a fraction of 1 MiB/s, while memory still being
     returned after loading falls several MiB a second.
     """
-    times = [i * SAMPLE_SECONDS for i in range(len(samples))]
-    return abs(statistics.linear_regression(times, samples).slope) < FLAT_MIB_PER_SECOND
+    times, mib = zip(*samples, strict=True)
+    return abs(statistics.linear_regression(times, mib).slope) < FLAT_MIB_PER_SECOND
 
 
 def sample(process: subprocess.Popen, gpu_mib: Callable[[], dict[int, float]]) -> list[tuple[float, float]]:
@@ -141,8 +141,8 @@ def watch(process: subprocess.Popen, marks: dict[str, float]) -> None:
             marks[line.strip()] = time.monotonic()
 
 
-def run(command: list[str], gpu_mib: Callable[[], dict[int, float]]) -> list[float]:
-    """Run `command` and return its memory over the window."""
+def run(command: list[str], gpu_mib: Callable[[], dict[int, float]]) -> list[tuple[float, float]]:
+    """Run `command` and return its (time, memory) samples over the window."""
     process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
     marks: dict[str, float] = {}
     watcher = threading.Thread(target=watch, args=(process, marks))
@@ -176,7 +176,7 @@ def main() -> None:
         steady = run(command, nvidia_smi_gpu_mib)
     if not is_flat(steady):
         raise SystemExit("Invalid: memory use was still changing while the policy ran warm.")
-    print(f"Memory: {statistics.median(steady):.0f} MiB")
+    print(f"Memory: {statistics.median(mib for _, mib in steady):.0f} MiB")
 
 
 if __name__ == "__main__":
