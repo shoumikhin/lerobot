@@ -421,8 +421,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         timesteps=[0, 333, 666],
         num_steps=3,
         n_action_steps=2,
-        preprocessor=action_pipeline(),
-        postprocessor=action_pipeline(),
+        chunk_actions=recipe.chunk_actions(2, 3, action_pipeline(), action_pipeline()),
         frame={
             "features": features.numpy(),
             "state": state.numpy(),
@@ -572,48 +571,99 @@ def test_actions_apply_the_postprocessor_after_slicing(recipe):
     torch.testing.assert_close(saved, part(values, state))
 
 
-def n17_decoder(relative=False):
+def n17_decoder(relative=False, percentiles=False, per_step=False, transform=None):
+    """An N1.7 decode step for a two-group arm, a one-number gripper and an end effector pose."""
     from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep
 
-    rep = {"rep": "relative", "state_key": "arm"} if relative else {"rep": "absolute"}
+    rng = np.random.default_rng(0)
+
+    def stats(dim):
+        low = rng.uniform(-3, 0, (4, dim) if per_step else dim)
+        return {"min": low, "max": low + rng.uniform(1, 3, low.shape), "q01": low + 0.1, "q99": low + 0.9}
+
+    groups = {"arm": 3, "gripper": 1, "eef": 9}
+    raw_stats = {
+        "action": {k: {n: v.tolist() for n, v in stats(d).items()} for k, d in groups.items()},
+        "relative_action": {k: {n: v.tolist() for n, v in stats(d).items()} for k, d in groups.items()},
+    }
+    configs = [
+        {"rep": "relative" if relative else "absolute", "type": "non_eef", "state_key": "joints"},
+        {"rep": "absolute"},
+        {"rep": "relative" if relative else "absolute", "type": "eef", "format": "xyz_rot6d"},
+    ]
     return GrootN17ActionDecodeStep(
-        env_action_dim=3,
-        raw_stats={"action": {"arm": {"min": [-2.0, -1.0, 0.0], "max": [2.0, 1.0, 10.0]}}},
-        modality_config={"action": {"modality_keys": ["arm"], "action_configs": [rep]}},
+        env_action_dim=12,
+        raw_stats=raw_stats,
+        modality_config={
+            "action": {"modality_keys": list(groups), "action_configs": configs, "delta_indices": [0, 1, 2]}
+        },
+        use_percentiles=percentiles,
         use_relative_action=relative,
+        action_decode_transform=transform,
     )
 
 
-@pytest.mark.parametrize("route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt"])
-def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, route):
-    from lerobot.policies.groot.processor_groot import GrootActionUnpackUnnormalizeStep
-
-    recipe.check_traceable_decode(action_pipeline(GrootActionUnpackUnnormalizeStep()), route)
-    if route == "onnx_tensorrt":
-        recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
-    else:
-        with pytest.raises(ValueError, match="only the ONNX-TensorRT route"):
-            recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
-    with pytest.raises(ValueError, match="relative actions"):
-        recipe.check_traceable_decode(action_pipeline(n17_decoder(relative=True)), route)
+def n17_pack():
+    """What the decoding reads from the packing step: the state's groups, the joints then the end effector."""
+    state = {"joints": {"min": [0.0] * 3}, "eef": {"min": [0.0] * 9}}
+    return SimpleNamespace(
+        raw_stats={"state": state}, modality_config={"state": {"modality_keys": list(state)}}
+    )
 
 
-def test_numpy_action_decoding_exports_to_onnx_and_follows_new_actions(recipe, tmp_path):
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"percentiles": True}, {"per_step": True}, {"relative": True}, {"transform": "libero"}],
+)
+def test_n17_decoding_in_tensors_matches_the_policy_step(recipe, options):
+    """The program's decoding computes what GR00T N1.7's own NumPy step computes, for every kind of group."""
+    torch.manual_seed(0)
+    step = n17_decoder(**options)
+    module = recipe.N17ChunkActions(4, recipe.N17ActionDecode(step, n17_pack(), 4))
+    actions = torch.rand(6, 16) * 2.4 - 1.2
+    pose = torch.cat((torch.randn(3), torch.randn(6)))
+    state = torch.cat((torch.randn(3), pose))
+    groups = {"joints": state[None, :3].numpy(), "eef": state[None, 3:].numpy()}
+    step.pack_step = SimpleNamespace(get_cached_raw_state=lambda: groups)
+    expected = action_pipeline(step)(actions[None, :4])[0]
+    torch.testing.assert_close(module(actions, state), expected, rtol=1e-5, atol=1e-5)
+    saved = torch.export.export(module, (actions, state)).module()
+    moved = torch.rand(6, 16) * 2 - 1
+    torch.testing.assert_close(saved(moved, state), module(moved, state))
+
+
+def test_n17_decoding_refuses_what_the_policy_step_refuses(recipe):
+    step = n17_decoder(transform="unknown")
+    with pytest.raises(ValueError, match="Unsupported N1.7 action decode transform"):
+        recipe.N17ActionDecode(step, n17_pack(), 4)
+
+
+def test_n17_decoding_takes_the_state_only_for_relative_actions(recipe):
+    for relative in (False, True):
+        step = n17_decoder(relative=relative)
+        module = recipe.N17ChunkActions(4, recipe.N17ActionDecode(step, n17_pack(), 4))
+        part = module.part(torch.zeros(6, 16), torch.zeros(12))
+        assert part.input_names == (["x_t", "observation.state"] if relative else ["x_t"])
+
+
+def test_n17_decoding_exports_to_onnx_and_follows_new_actions(recipe, tmp_path):
     onnxruntime = pytest.importorskip("onnxruntime")
     pytest.importorskip("onnxscript")
 
-    module = recipe.ChunkActions(2, 3, action_pipeline(n17_decoder())).eval()
-    actions, state = torch.rand(4, 3) * 2 - 1, torch.zeros(3)
+    module = recipe.N17ChunkActions(
+        4, recipe.N17ActionDecode(n17_decoder(relative=True), n17_pack(), 4)
+    ).eval()
+    actions, state = torch.rand(6, 16) * 2 - 1, torch.randn(12)
     path = tmp_path / "actions.onnx"
     torch.onnx.export(
         module, (actions, state), path, dynamo=True, input_names=["x", "state"], output_names=["a"]
     )
     session = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    moved = torch.rand(4, 3) * 2 - 1
+    moved = torch.rand(6, 16) * 2 - 1
     with torch.no_grad():
         expected = module(moved, state).numpy()
     np.testing.assert_allclose(
-        session.run(None, {"x": moved.numpy(), "state": state.numpy()})[0], expected, atol=1e-6
+        session.run(None, {"x": moved.numpy(), "state": state.numpy()})[0], expected, atol=1e-5
     )
 
 

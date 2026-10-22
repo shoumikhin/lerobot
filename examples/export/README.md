@@ -53,7 +53,7 @@ Some policies need more arguments:
 - **SmolVLA and GR00T** take their camera names and task from the dataset they were trained on: add `--dataset.repo_id=<user>/so101_dataset`, and `--task="<one of its tasks>"` to pick a task other than its first.
 - **pi0.5** takes a task it was trained on: add `--task="pick up the block and place it in the cup"`.
 
-A few checkpoints cannot be exported: ACT with temporal ensembling, and pi0.5 with visual or proprioceptive memory. A GR00T checkpoint that decodes its actions with its embodiment statistics exports only with `to_onnx_tensorrt.py`.
+A few checkpoints cannot be exported: ACT with temporal ensembling, and pi0.5 with visual or proprioceptive memory.
 
 To run an ONNX-TensorRT export on another board, copy the folder there and rebuild its engines with `python examples/export/build_engine.py <folder>`.
 
