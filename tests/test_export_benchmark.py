@@ -20,7 +20,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.test_export_recipes import act_checkpoint, dataset_metadata, smolvla_checkpoint, tiny_smolvlm
+from tests.test_export_recipes import (
+    act_checkpoint,
+    dataset_metadata,
+    pi05_checkpoint,
+    smolvla_checkpoint,
+    tiny_smolvlm,
+)
+from tests.utils import require_hf_token
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 
@@ -136,6 +143,47 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     assert observed == [({"observation.images.front", "observation.state"}, "pick the cup")] * 3
     # Neither bfloat16 weights nor TensorFloat-32.
     assert ran == [({torch.float32}, "highest", False)] * 3
+
+
+@require_hf_token
+def test_reference_loads_the_checkpoint_in_float32_whatever_dtype_it_names(examples, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    import json
+
+    import torch
+    from safetensors.numpy import save_file
+
+    benchmark = examples("benchmark")
+    monkeypatch.setattr(benchmark, "FRAMES", 1)
+    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    camera = "observation.images.base_0_rgb"
+    info = {
+        "inputs": [camera, "observation.state", "noise"],
+        "noise_shape": [config.chunk_size, config.max_action_dim],
+        "task": "pick up the cube",
+        "test_case": "test_case.safetensors",
+    }
+    (folder / "export.json").write_text(json.dumps(info))
+    save_file(
+        {"expected_actions": np.zeros((config.n_action_steps, 3), np.float32)}, folder / info["test_case"]
+    )
+    frames = {
+        camera: np.full((1, 28, 28, 3), 127, np.uint8),
+        "observation.state": np.zeros((1, 3), np.float32),
+    }
+    np.savez(tmp_path / "frames.npz", **frames)
+    references = []
+    for dtype in (torch.float32, torch.bfloat16):
+        config.dtype = dtype
+        config.save_pretrained(checkpoint)
+        output = tmp_path / f"reference_{dtype}.npz"
+        argv = [str(folder), f"--policy.path={checkpoint}", f"--frames={tmp_path / 'frames.npz'}"]
+        benchmark.write_reference([*argv, f"--output={output}"])
+        references.append(np.load(output)["reference"])
+    # Float32 weights loaded into a bfloat16 policy are rounded, and casting it to float32 later cannot undo that.
+    np.testing.assert_array_equal(*references)
 
 
 def act_pytorch_run(benchmark, tmp_path, monkeypatch) -> tuple[Path, Path, str]:
