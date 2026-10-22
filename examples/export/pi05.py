@@ -90,6 +90,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Build the whole chunk as one program, which needs the memory to compile all of it at once.",
     )
+    parser.add_argument(
+        "--one_denoise_program",
+        action="store_true",
+        help="Build every denoising step and the actions as one program, after the prefix programs.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -97,7 +102,8 @@ def part_names(args: argparse.Namespace) -> list[str]:
         return ["policy"]
     depth = get_gemma_config(PreTrainedConfig.from_pretrained(args.policy_path).paligemma_variant).depth
     groups = range(math.ceil(depth / LANGUAGE_LAYERS_PER_PROGRAM))
-    return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
+    tail = ["denoise"] if args.one_denoise_program else ["step", "actions"]
+    return ["embed", *(f"language_model_{group}" for group in groups), *tail]
 
 
 class StatePrompt(nn.Module):
@@ -243,6 +249,23 @@ class PI05LanguageModelLayers(nn.Module):
         return keys_values if self.last else (hidden_states, *keys_values)
 
 
+class PI05Denoise(nn.Module):
+    """Every denoising step and the actions in one module: the prefix's mask and KV cache and the noise in."""
+
+    def __init__(self, step: PI05Step, actions: ChunkActions, timesteps: list[float], cache_size: int):
+        super().__init__()
+        self.step = step
+        self.actions = actions
+        self.timesteps = timesteps
+        self.cache_size = cache_size
+
+    def forward(self, prefix_pad_masks: Tensor, *inputs: Tensor) -> Tensor:
+        cache, (x_t, *state) = inputs[: self.cache_size], inputs[self.cache_size :]
+        for timestep in self.timesteps:
+            x_t = self.step(prefix_pad_masks, *cache, x_t, torch.full((1,), timestep, device=x_t.device))
+        return self.actions(x_t, *state)
+
+
 class PI05Chunk(nn.Module):
     """The whole chunk in one module: the chain's parts in order, the denoising step once per step."""
 
@@ -380,6 +403,9 @@ class Exporter:
         free_memory()
         step = PI05Step(self.load_modules(*STEP_MODULES).model, self.dt)
         cache_inputs = (prefix_pad_masks, *cache.values())
+        if self.args.one_denoise_program:
+            yield self.denoise(step, cache_inputs, list(cache))
+            return
         x_t = self.noise
         with torch.no_grad():
             for timestep in self.timesteps:
@@ -395,6 +421,20 @@ class Exporter:
         with torch.no_grad():
             self.expected_actions = actions(x_t, state).cpu().numpy()
         yield actions.part(self.noise, state)
+
+    def denoise(self, step: PI05Step, cache_inputs: tuple[Tensor, ...], cache_names: list[str]) -> Part:
+        """Every denoising step and the actions as one part."""
+        actions = ChunkActions(
+            self.config.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        )
+        module = PI05Denoise(step, actions, self.timesteps, len(cache_names))
+        state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
+        reads_state = actions.absolute_step is not None
+        inputs = (*cache_inputs, self.noise, *((state,) if reads_state else ()))
+        with torch.no_grad():
+            self.expected_actions = module(*inputs).cpu().numpy()
+        names = ["prefix_pad_masks", *cache_names, NOISE, *([OBS_STATE] if reads_state else [])]
+        return Part("denoise", module, inputs, names, [ACTION])
 
     def whole(self, frame: tuple[Tensor, ...]) -> Part:
         """The chunk as one part, with every weight it reads in memory at once."""
@@ -425,7 +465,11 @@ class Exporter:
             self.noise,
             self.expected_actions,
             programs,
-            **({} if self.args.one_piece else {"steps": ["step"], "timesteps": self.timesteps}),
+            **(
+                {}
+                if self.args.one_piece or self.args.one_denoise_program
+                else {"steps": ["step"], "timesteps": self.timesteps}
+            ),
             # The program holds the task's prompt tokens, so the folder runs only this task.
             task=self.args.task,
         )
