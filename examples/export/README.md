@@ -45,7 +45,7 @@ Each script compiles any supported policy one way. All use [TensorRT](https://de
 Some policies need more arguments:
 
 - **SmolVLA and GR00T** take their camera names and task from the dataset they were trained on: add `--dataset.repo_id=<user>/so101_dataset`, and `--task="<one of its tasks>"` to pick a task other than its first.
-- **pi0.5** takes the task it was trained on, and the camera slots your robot fills: add `--task="pick up the block and place it in the cup" --cameras observation.images.base_0_rgb observation.images.left_wrist_0_rgb`.
+- **pi0.5** takes a task it was trained on, and the camera slots your robot fills: add `--task="pick up the block and place it in the cup" --cameras observation.images.base_0_rgb observation.images.left_wrist_0_rgb`.
 
 A few checkpoints cannot be exported: ACT with temporal ensembling, and pi0.5 with visual or proprioceptive memory. A GR00T checkpoint that decodes its actions with its embodiment statistics exports only with `to_onnx_tensorrt.py`.
 
@@ -67,7 +67,7 @@ lerobot-rollout \
     --duration=30
 ```
 
-SmolVLA, pi0.5 and GR00T run only the task they were exported for, so leave out `--task` or pass the same one. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
+pi0.5 and GR00T run any task: pass it with `--task`, or change it while the robot runs. Their folders keep the policy's own tokenizer and its whole word table, and the rollout reads only the rows of the task's words. A GR00T folder takes tasks up to 32 tokens (about 25 words); export with `--max_task_tokens` for longer ones, at a small cost in time. SmolVLA runs only the task it was exported for, so leave out `--task` or pass the same one. Without `--task`, a folder runs the task it was exported with. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
 
 Before the robot moves, the rollout checks that the compiled policy reproduces the actions PyTorch computed at export time, and stops if it does not.
 
