@@ -31,7 +31,7 @@ import torch
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.inference.export import ExportInferenceEngine, engine as export_engine
 from tests.export_helpers import action_pipeline
-from tests.utils import require_hf_token
+from tests.utils import require_cuda, require_hf_token
 
 pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
 pytest.importorskip("av", reason="the export examples require lerobot[dataset]")
@@ -334,7 +334,7 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
-def pi05_checkpoint(path, monkeypatch):
+def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
@@ -354,7 +354,7 @@ def pi05_checkpoint(path, monkeypatch):
     monkeypatch.setattr(modeling_pi05, "PaliGemmaForConditionalGenerationWithPiGemma", small_projector)
     config = PI05Config(
         device="cpu",
-        dtype=torch.float32,
+        dtype=dtype,
         image_resolution=(28, 28),
         chunk_size=4,
         n_action_steps=2,
@@ -423,6 +423,34 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
         expected = postprocessor(actions[:, : config.n_action_steps])[0].numpy()
     np.testing.assert_allclose(case["expected_actions"], expected, rtol=0, atol=1e-4)
     assert engine.get_action(frame).shape == (3,)
+
+
+@require_cuda
+@require_hf_token
+def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_computes(
+    recipes, tmp_path, monkeypatch
+):
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, dtype=torch.bfloat16)
+    pi05 = importlib.import_module("pi05")
+    exporter = pi05.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube", cameras=None))
+    with monkeypatch.context() as patch:
+        patch.setattr(pi05, "hold_linear_weights_in_bfloat16", lambda module: None)
+        stock_step = pi05.PI05Step(exporter.load_modules(*pi05.STEP_MODULES).model, exporter.dt)
+    stock = {
+        "embed": pi05.PI05Embed(exporter.load_modules(*pi05.EMBED_MODULES), exporter.observation),
+        "step": stock_step,
+    }
+    for part in exporter.parts():
+        if part.name in stock:
+            linears = [layer for layer in part.module.modules() if isinstance(layer, torch.nn.Linear)]
+            assert linears and all(layer.weight.dtype == torch.bfloat16 for layer in linears), part.name
+            with torch.no_grad():
+                torch.testing.assert_close(
+                    part.module(*part.inputs), stock.pop(part.name)(*part.inputs), rtol=0, atol=0
+                )
+    assert not stock
 
 
 @require_hf_token
