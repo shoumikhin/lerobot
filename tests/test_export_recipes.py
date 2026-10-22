@@ -336,7 +336,7 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
-def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
+def pi05_checkpoint(path, monkeypatch, dtype=torch.float32, empty_cameras=0):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
@@ -364,6 +364,7 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
         max_action_dim=8,
         num_inference_steps=2,
         tokenizer_max_length=48,
+        empty_cameras=empty_cameras,
         input_features={
             "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
             "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
@@ -390,15 +391,19 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
 
 @require_hf_token
 @pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
-def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route):
-    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise."""
+@pytest.mark.parametrize("empty_cameras", [0, 1])
+def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route, empty_cameras):
+    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise.
+
+    With an empty camera slot, the policy attends past a blank image that the chain leaves out.
+    """
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
     from lerobot.policies.utils import prepare_observation_for_inference
 
     torch.manual_seed(0)
-    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, empty_cameras=empty_cameras)
     task = "pick up the cube"
     args = Namespace(
         policy_path=str(checkpoint),
@@ -426,6 +431,29 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route)
         expected = postprocessor(actions[:, : config.n_action_steps])[0].numpy()
     np.testing.assert_allclose(case["expected_actions"], expected, rtol=0, atol=1e-4)
     assert engine.get_action(frame).shape == (3,)
+
+
+@require_hf_token
+def test_pi05_prefix_leaves_out_empty_camera_slots(recipes, tmp_path, monkeypatch):
+    """A camera slot the frame leaves empty adds no tokens to the prefix the language model reads."""
+    pytest.importorskip("transformers")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    lengths = []
+    for empty_cameras in (0, 1):
+        torch.manual_seed(0)
+        checkpoint, _ = pi05_checkpoint(
+            tmp_path / f"checkpoint{empty_cameras}", monkeypatch, empty_cameras=empty_cameras
+        )
+        pi05 = importlib.import_module("pi05")
+        exporter = pi05.Exporter(
+            Namespace(policy_path=str(checkpoint), task="pick up the cube", cameras=None)
+        )
+        embed = next(exporter.parts())
+        with torch.no_grad():
+            prefix_embs, prefix_pad_masks = embed.module(*embed.inputs)
+        lengths.append(prefix_embs.shape[1])
+        sys.modules.pop("pi05", None)
+    assert lengths[0] == lengths[1]
 
 
 @require_hf_token

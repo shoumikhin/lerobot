@@ -224,6 +224,11 @@ class PI05Embed(nn.Module):
         batch = self.observation(*frame)
         # The policy's own image resize and padding, which it exposes under no public name.
         images, img_masks = self.policy._preprocess_images(batch)
+        # It lists the frame's cameras first, then a blank image for each camera slot the frame leaves empty.
+        # Every token of a blank image is masked out of attention, so leaving it out changes no result and
+        # saves its vision pass and its tokens in every language model layer.
+        cameras = sum(name in batch for name in self.policy.config.image_features)
+        images, img_masks = images[:cameras], img_masks[:cameras]
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
             images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
         )
