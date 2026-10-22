@@ -392,9 +392,10 @@ def pi05_checkpoint(
 
 
 @require_hf_token
-def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkeypatch):
+@pytest.mark.parametrize("max_task_tokens", [None, 12])
+def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkeypatch, max_task_tokens):
     """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise,
-    for the task of the export and for another one given at run time."""
+    for the task of the export and for another one given at run time, with the policy's prompt length or less."""
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
@@ -409,6 +410,7 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkey
         tolerance=1e-4,
         route="executorch_tensorrt",
         task=task,
+        max_task_tokens=max_task_tokens,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
@@ -463,6 +465,7 @@ def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(recipes, tmp_p
         tolerance=1e-4,
         route="executorch_tensorrt",
         task="pick up the cube",
+        max_task_tokens=None,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
@@ -494,7 +497,11 @@ def test_pi05_empty_camera_slots_add_no_prefix_tokens(recipes, tmp_path, monkeyp
     for empty in (0, 2):
         torch.manual_seed(0)
         checkpoint, _ = pi05_checkpoint(tmp_path / f"checkpoint_{empty}", monkeypatch, empty_cameras=empty)
-        part = next(pi05.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube")).parts())
+        part = next(
+            pi05.Exporter(
+                Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None)
+            ).parts()
+        )
         with torch.no_grad():
             lengths.append(part.module(*part.inputs)[1].shape[1])
     assert lengths[0] == lengths[1]
@@ -509,7 +516,9 @@ def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_co
     torch.manual_seed(0)
     checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, dtype=torch.bfloat16)
     pi05 = importlib.import_module("pi05")
-    exporter = pi05.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube"))
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None)
+    )
     with monkeypatch.context() as patch:
         patch.setattr(pi05, "hold_linear_weights_in_bfloat16", lambda module: None)
         stock_step = pi05.PI05Step(exporter.load_modules(*pi05.STEP_MODULES).model, exporter.dt)
@@ -543,8 +552,8 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
     # Row i holds i, so the rows the prompt picks spell out its token ids.
     embedding = torch.nn.Embedding(len(tokenizer.input_tokenizer), 1)
     embedding.weight.data = torch.arange(len(tokenizer.input_tokenizer), dtype=torch.float32)[:, None]
-    prompt = pi05.StatePrompt(tokenizer, embedding, state.shape[1])
-    for task in ("pick up the cube", " stack_the\nblocks "):
+    for task, max_task_tokens in (("pick up the cube", None), (" stack_the\nblocks ", None), ("pick", 9)):
+        prompt = pi05.StatePrompt(tokenizer, embedding, state.shape[1], max_task_tokens)
         clean = task.strip().replace("_", " ").replace("\n", " ")
         ids = tokenizer.input_tokenizer.encode(pi05.TASK_TEXT.replace("{task}", clean))
         task_embeddings = torch.zeros(prompt.max_task_tokens, 1)
@@ -556,8 +565,11 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
         }
         transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
         expected = tokenizer(transition)[TransitionKey.OBSERVATION]
-        torch.testing.assert_close(rows[..., 0].long(), expected["observation.language.tokens"])
-        torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+        # A shorter prompt ends where only the policy's padding would follow.
+        length = mask.shape[1]
+        assert not expected["observation.language.attention_mask"][:, length:].any()
+        torch.testing.assert_close(rows[..., 0].long(), expected["observation.language.tokens"][:, :length])
+        torch.testing.assert_close(mask, expected["observation.language.attention_mask"][:, :length].bool())
 
 
 def test_embedding_tables_are_saved_in_bfloat16_only_when_that_is_exact(recipes, tmp_path):
