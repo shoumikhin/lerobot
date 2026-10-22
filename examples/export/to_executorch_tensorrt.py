@@ -36,7 +36,9 @@ from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
 def compile_part(part: Part, path: Path) -> None:
     with torch.no_grad():
         program = torch.export.export(part.module, part.inputs)
-    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=part.inputs, **TENSORRT_OPTIONS)
+    engine = torch_tensorrt.dynamo.compile(
+        program, arg_inputs=part.inputs, **{**TENSORRT_OPTIONS, **part.tensorrt_options}
+    )
     del program
     torch_tensorrt.save(
         engine,
