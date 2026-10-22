@@ -99,7 +99,7 @@ def part_names(args: argparse.Namespace) -> list[str]:
 
 
 class StatePrompt(nn.Module):
-    """The fixed task and normalized state as a padded Gemma prompt."""
+    """The fixed task and normalized state as a padded Gemma prompt, as long as the longest one it can be."""
 
     def __init__(self, tokenizer: TokenizerProcessorStep, task: str, state_dim: int):
         super().__init__()
@@ -109,10 +109,10 @@ class StatePrompt(nn.Module):
         pieces = [tok.encode(f" {value}", add_special_tokens=False) for value in range(-1, 256)]
         suffix = tok.encode(";\nAction: ", add_special_tokens=False)
         width = max(map(len, pieces))
-        if (
-            tokenizer.padding_side != "right"
-            or len(prefix) + state_dim * width + len(suffix) > tokenizer.max_length
-        ):
+        # The longest prompt this task can produce. The tokenizer pads to its whole window, but every token past
+        # this one would be masked padding, which every language model layer would still process.
+        length = len(prefix) + state_dim * width + len(suffix)
+        if tokenizer.padding_side != "right" or length > tokenizer.max_length:
             raise ValueError("The state prompt must fit in a right-padded tokenizer window.")
         self.pad_id = tok.pad_token_id
         self.register_buffer("edges", -1 + torch.arange(256, dtype=torch.float32) / 128)
@@ -121,7 +121,7 @@ class StatePrompt(nn.Module):
         self.register_buffer("pieces", torch.tensor([p + [self.pad_id] * (width - len(p)) for p in pieces]))
         self.register_buffer("lengths", torch.tensor(list(map(len, pieces))))
         self.register_buffer("piece_positions", torch.arange(width))
-        self.register_buffer("positions", torch.arange(tokenizer.max_length))
+        self.register_buffer("positions", torch.arange(length))
 
     def forward(self, state: Tensor) -> tuple[Tensor, Tensor]:
         bins = (state.flatten()[..., None] >= self.edges).sum(-1) - 1

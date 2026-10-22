@@ -585,8 +585,14 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
     }
     transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
     expected = tokenizer(transition)[TransitionKey.OBSERVATION]
-    torch.testing.assert_close(tokens, expected["observation.language.tokens"])
-    torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+    expected_tokens = expected["observation.language.tokens"]
+    expected_mask = expected["observation.language.attention_mask"].bool()
+    # The program's prompt stops where the longest prompt for this task would; the policy pads further.
+    length = tokens.shape[1]
+    assert length < tokenizer.max_length
+    torch.testing.assert_close(tokens, expected_tokens[:, :length])
+    torch.testing.assert_close(mask, expected_mask[:, :length])
+    assert not expected_mask[:, length:].any()
 
 
 @pytest.mark.parametrize(
