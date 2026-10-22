@@ -336,7 +336,9 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
-def pi05_checkpoint(path, monkeypatch, dtype=torch.float32, cameras=("observation.images.base_0_rgb",)):
+def pi05_checkpoint(
+    path, monkeypatch, dtype=torch.float32, cameras=("observation.images.base_0_rgb",), empty_cameras=0
+):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
@@ -364,6 +366,7 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32, cameras=("observatio
         max_action_dim=8,
         num_inference_steps=2,
         tokenizer_max_length=48,
+        empty_cameras=empty_cameras,
         input_features={
             **{name: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)) for name in cameras},
             "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
@@ -450,7 +453,10 @@ def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(recipes, tmp_p
 
     torch.manual_seed(0)
     cameras = ("observation.images.base_0_rgb", "observation.images.wrist")
-    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, cameras=cameras)
+    # With an empty camera slot too, which the export leaves out.
+    checkpoint, config = pi05_checkpoint(
+        tmp_path / "checkpoint", monkeypatch, cameras=cameras, empty_cameras=1
+    )
     args = Namespace(
         policy_path=str(checkpoint),
         output_dir=tmp_path / "folder",
@@ -476,6 +482,22 @@ def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(recipes, tmp_p
     np.testing.assert_allclose(actions, expected, rtol=0, atol=1e-4)
     with pytest.raises(ValueError, match="none of the policy's cameras"):
         engine.get_action({"observation.state": case["observation.state"]})
+
+
+@require_hf_token
+def test_pi05_empty_camera_slots_add_no_prefix_tokens(recipes, tmp_path, monkeypatch):
+    """The policy leaves its empty camera slots out of attention, so the export leaves them out entirely."""
+    pytest.importorskip("transformers")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    lengths = []
+    for empty in (0, 2):
+        torch.manual_seed(0)
+        checkpoint, _ = pi05_checkpoint(tmp_path / f"checkpoint_{empty}", monkeypatch, empty_cameras=empty)
+        part = next(pi05.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube")).parts())
+        with torch.no_grad():
+            lengths.append(part.module(*part.inputs)[1].shape[1])
+    assert lengths[0] == lengths[1]
 
 
 @require_cuda

@@ -245,8 +245,14 @@ class PI05Embed(nn.Module):
             images[i] = torch.where(present, images[i], -1.0)
             # Not `&`: TensorRT does not convert a bitwise and of booleans.
             img_masks[i] = torch.logical_and(img_masks[i], present)
+        # The policy's empty camera slots come last and are always left out of attention, so leaving them out
+        # of the program gives the same actions without their vision tower run and prefix tokens.
+        cameras = len(cameras_present)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
-            images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+            images[:cameras],
+            img_masks[:cameras],
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
         )
         return prefix_embs, prefix_pad_masks
 
