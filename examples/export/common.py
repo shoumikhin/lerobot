@@ -26,6 +26,7 @@ import datetime as dt
 import gc
 import importlib
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -68,6 +69,8 @@ TENSORRT_OPTIONS = {
     # Attention as plain matrix products, as the ONNX route writes it, so both TensorRT routes build alike.
     "decompose_attention": True,
 }
+# Experiment hook (not for landing): extra Torch-TensorRT settings as JSON.
+TENSORRT_OPTIONS.update(json.loads(os.environ.get("LEROBOT_TENSORRT_OPTIONS", "{}")))
 
 
 @dataclasses.dataclass
