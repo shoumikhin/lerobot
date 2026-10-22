@@ -260,7 +260,7 @@ def write_reference(argv: list[str]) -> None:
     parser.add_argument("--task", default="", help=TASK_HELP)
     args = parser.parse_args(argv)
     import torch
-    from common import NOISE, device, processors
+    from common import CAMERAS_PRESENT, NOISE, device, processors
     from safetensors.numpy import load_file
 
     from lerobot.configs.policies import PreTrainedConfig
@@ -269,7 +269,7 @@ def write_reference(argv: list[str]) -> None:
 
     info = json.loads((args.folder / "export.json").read_text())
     # The engine gives the programs only these, so a camera the export left out stays out of the reference too.
-    names = [name for name in info["inputs"] if name != NOISE]
+    names = [name for name in info["inputs"] if name not in (NOISE, CAMERAS_PRESENT)]
     chunk_size = len(load_file(args.folder / info["test_case"])["expected_actions"])
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     config.device = str(device())
@@ -296,7 +296,8 @@ def write_reference(argv: list[str]) -> None:
         if "noise_shape" in info:
             drawn = np.random.standard_normal(info["noise_shape"]).astype(np.float32)
             noise["noise"] = torch.from_numpy(drawn)[None].to(device())
-        observation = {name: frame[name] for name in names}
+        # A camera the frames lack is one the robot did not send, which a policy may fill in itself.
+        observation = {name: frame[name] for name in names if name in frame}
         with torch.inference_mode():
             task = args.task or info.get("task") or info.get("prompt", {}).get("task", "")
             observation = prepare_observation_for_inference(observation, device(), task)
