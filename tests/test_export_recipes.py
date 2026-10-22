@@ -336,7 +336,7 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
-def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
+def pi05_checkpoint(path, monkeypatch, dtype=torch.float32, cameras=("observation.images.base_0_rgb",)):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
@@ -365,7 +365,7 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
         num_inference_steps=2,
         tokenizer_max_length=48,
         input_features={
-            "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
+            **{name: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)) for name in cameras},
             "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
         },
         output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
@@ -438,6 +438,56 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkey
     np.testing.assert_allclose(actions, policy_actions(other, noise), rtol=0, atol=1e-4)
     # The task changes the actions, so the comparison above would catch a program that ignores it.
     assert not np.allclose(policy_actions(task, noise), policy_actions(other, noise), atol=1e-3)
+
+
+@require_hf_token
+@pytest.mark.parametrize(
+    "exported,sent",
+    [
+        (None, ["observation.images.wrist"]),
+        (None, ["observation.images.base_0_rgb"]),
+        (["observation.images.wrist"], ["observation.images.wrist"]),
+    ],
+)
+def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(
+    recipes, tmp_path, monkeypatch, exported, sent
+):
+    """A camera the robot does not send, or one the export leaves out with --cameras, is filled in as the policy
+    fills in a camera missing from its batch."""
+    pytest.importorskip("transformers")
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.pi05 import PI05Policy
+    from lerobot.policies.utils import prepare_observation_for_inference
+
+    torch.manual_seed(0)
+    cameras = ("observation.images.base_0_rgb", "observation.images.wrist")
+    checkpoint, config = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, cameras=cameras)
+    args = Namespace(
+        policy_path=str(checkpoint),
+        output_dir=tmp_path / "folder",
+        tolerance=1e-4,
+        route="executorch_tensorrt",
+        task="pick up the cube",
+        cameras=exported,
+    )
+    args.output_dir.mkdir()
+    engine = export_with_replay("pi05", args, monkeypatch)
+    case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
+        args.output_dir / "test_case.safetensors"
+    )
+    frame = {name: case[name] for name in (*sent, "observation.state")}
+    np.random.seed(0)
+    actions = np.stack([engine.get_action(frame) for _ in range(config.n_action_steps)])
+    noise = np.random.RandomState(0).standard_normal(case["noise"].shape).astype(np.float32)
+    policy = PI05Policy.from_pretrained(checkpoint, config=config).eval()
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
+    with torch.no_grad():
+        batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), args.task))
+        expected = policy.predict_action_chunk(batch, noise=torch.from_numpy(noise)[None])
+        expected = postprocessor(expected[:, : config.n_action_steps])[0].numpy()
+    np.testing.assert_allclose(actions, expected, rtol=0, atol=1e-4)
+    with pytest.raises(ValueError, match="none of the policy's cameras"):
+        engine.get_action({"observation.state": case["observation.state"]})
 
 
 @require_cuda

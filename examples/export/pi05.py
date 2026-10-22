@@ -48,6 +48,7 @@ from transformers import DynamicCache
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
+from lerobot.inference.export.engine import CAMERAS_PRESENT
 from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
@@ -87,7 +88,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--task", required=True, help="A task the policy was trained on, as a sentence, for the test case."
     )
-    parser.add_argument("--cameras", nargs="+", help="The camera slots the robot fills; pi0.5 pads the rest.")
+    parser.add_argument(
+        "--cameras",
+        nargs="+",
+        help="The camera slots the robot can fill, if not all of them; pi0.5 pads the rest. Default: all.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -221,7 +226,14 @@ class PI05Step(nn.Module):
 
 
 class PI05Embed(nn.Module):
-    """The start of the prefix: the raw frame and the task's embeddings in, the prefix's embeddings and mask out."""
+    """The start of the prefix: the raw frame, which cameras it holds and the task's embeddings in, the prefix's
+    embeddings and mask out.
+
+    The rollout gives every camera the export takes; for one the robot did not send, a blank image and False.
+    The policy then fills that camera in itself, as for a camera missing from its batch: an image of -1 left out
+    of attention. It puts such cameras after the others, but a camera left out of attention adds nothing and
+    shifts no position, so keeping its place gives the same actions.
+    """
 
     def __init__(self, policy: PI05Policy, observation: PI05Observation):
         super().__init__()
@@ -229,9 +241,15 @@ class PI05Embed(nn.Module):
         self.observation = observation
 
     def forward(self, *inputs: Tensor) -> tuple[Tensor, Tensor]:
+        *inputs, cameras_present = inputs
         batch = self.observation(*inputs)
         # The policy's own image resize and padding, which it exposes under no public name.
         images, img_masks = self.policy._preprocess_images(batch)
+        # The frame's cameras come first, in the policy's order, which `cameras_present` follows.
+        for i, present in enumerate(cameras_present.unbind(0)):
+            images[i] = torch.where(present, images[i], -1.0)
+            # Not `&`: TensorRT does not convert a bitwise and of booleans.
+            img_masks[i] = torch.logical_and(img_masks[i], present)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
             images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
         )
@@ -303,14 +321,14 @@ class Exporter:
         )
         # pi0.5 fills in its empty cameras itself, so the robot does not send them.
         empty_cameras = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(config.empty_cameras)}
-        available = set(config.image_features) - empty_cameras
-        cameras = available if args.cameras is None else set(args.cameras)
-        if not cameras or not cameras <= available:
-            raise SystemExit(f"Choose --cameras from {sorted(available)}.")
+        available = [name for name in config.image_features if name not in empty_cameras]
+        if args.cameras is not None and not set(args.cameras) <= set(available):
+            raise SystemExit(f"Choose --cameras from {available}.")
+        self.cameras = [name for name in available if args.cameras is None or name in args.cameras]
         self.frame = {
             name: value
             for name, value in frame_from_policy(config).items()
-            if name not in config.image_features or name in cameras
+            if name not in config.image_features or name in self.cameras
         }
         self.folder_config = copy(config)
         self.folder_config.input_features = {name: config.input_features[name] for name in self.frame}
@@ -358,12 +376,13 @@ class Exporter:
         The test case's actions are these parts chained, the denoising step once per step.
         """
         frame = tuple(torch.from_numpy(x).to(device()) for x in self.frame.values())
-        inputs = (*frame, *self.task_inputs)
+        present = torch.ones(len(self.cameras), dtype=torch.bool, device=device())
+        inputs = (*frame, *self.task_inputs, present)
         embed = PI05Embed(self.policy, self.observation)
         del self.policy
         with torch.no_grad():
             hidden, prefix_pad_masks = embed(*inputs)
-        names = [*self.frame, TASK_EMBEDDINGS, TASK_LENGTH]
+        names = [*self.frame, TASK_EMBEDDINGS, TASK_LENGTH, CAMERAS_PRESENT]
         yield Part("embed", embed, inputs, names, ["prefix_embs", "prefix_pad_masks"])
         del embed
         hidden_name, cache = "prefix_embs", {}
@@ -421,4 +440,5 @@ class Exporter:
             steps=["step"],
             timesteps=self.timesteps,
             prompt=self.prompt,
+            optional_cameras=self.cameras,
         )
