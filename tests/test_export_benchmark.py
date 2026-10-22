@@ -138,6 +138,49 @@ def test_reference_runs_the_original_policy_with_the_engine_noise(examples, tmp_
     assert ran == [({torch.float32}, "highest", False)] * 3
 
 
+def act_pytorch_run(benchmark, tmp_path, monkeypatch) -> tuple[Path, Path, str]:
+    """`benchmark.py pytorch` on a tiny ACT and 50 frames; its checkpoint, export folder and frames argument."""
+    for name, value in (("WARMUP_CHUNKS", 1), ("RUNS", 1), ("CHUNKS_PER_RUN", 1)):
+        monkeypatch.setattr(benchmark, name, value)
+    checkpoint = act_checkpoint(tmp_path / "checkpoint")
+    rng = np.random.default_rng(0)
+    np.savez(
+        tmp_path / "frames.npz",
+        **{
+            "observation.images.front": rng.integers(0, 256, (benchmark.FRAMES, 32, 32, 3), dtype=np.uint8),
+            "observation.state": rng.uniform(-1, 1, (benchmark.FRAMES, 3)).astype(np.float32),
+        },
+    )
+    folder, frames = tmp_path / "folder", f"--frames={tmp_path / 'frames.npz'}"
+    folder.mkdir()
+    argv = [f"--policy.path={checkpoint}", frames, f"--output={tmp_path / 'pytorch.npz'}"]
+    engine, args = benchmark.torch_engine("pytorch", argv, folder)
+    benchmark.measure_engine("pytorch", engine, args, folder)
+    return checkpoint, folder, frames
+
+
+def test_reference_and_report_commands_compare_a_result_with_the_policy(examples, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    benchmark = examples("benchmark")
+    checkpoint, folder, frames = act_pytorch_run(benchmark, tmp_path, monkeypatch)
+    script = [sys.executable, str(EXAMPLES / "benchmark.py")]
+    reference = tmp_path / "reference.npz"
+    subprocess.run(
+        [*script, "reference", str(folder), f"--policy.path={checkpoint}", frames, f"--output={reference}"],
+        check=True,
+    )
+    report = subprocess.run(
+        [*script, "report", str(reference), str(tmp_path / "pytorch.npz")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # On a GPU the PyTorch run uses TensorFloat-32, which moves ACT's actions by about 0.002 here.
+    assert max(float(error) for error in report.stdout.split()[-3:]) < 0.01
+
+
 def test_report_compares_each_result_with_the_reference_file(examples, tmp_path, capsys):
     benchmark = examples("benchmark")
     reference = np.zeros((4, 2, 3))
