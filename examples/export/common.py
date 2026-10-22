@@ -79,6 +79,8 @@ class Part:
     inputs: tuple[Tensor, ...]
     input_names: list[str]
     output_names: list[str]
+    # Torch-TensorRT options this part needs on top of TENSORRT_OPTIONS.
+    tensorrt_options: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 def parse_args(

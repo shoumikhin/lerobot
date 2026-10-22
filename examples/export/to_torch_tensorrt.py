@@ -33,7 +33,9 @@ from common import TENSORRT_OPTIONS, Part, parse_args, run_route
 def compile_part(part: Part, path: Path) -> None:
     with torch.no_grad():
         program = torch.export.export(part.module, part.inputs)
-    engine = torch_tensorrt.dynamo.compile(program, arg_inputs=part.inputs, **TENSORRT_OPTIONS)
+    engine = torch_tensorrt.dynamo.compile(
+        program, arg_inputs=part.inputs, **{**TENSORRT_OPTIONS, **part.tensorrt_options}
+    )
     del program
     torch_tensorrt.save(engine, str(path), output_format="aot_inductor", arg_inputs=part.inputs)
 
