@@ -88,6 +88,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--task", required=True, help="A task the policy was trained on, as a sentence, for the test case."
     )
+    parser.add_argument(
+        "--max_task_tokens",
+        type=int,
+        help="The longest task, in tokens, the folder runs; a shorter prompt is faster. Default: what fits in "
+        "the policy's prompt.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -104,19 +110,31 @@ class StatePrompt(nn.Module):
     """The task and the normalized state as a padded Gemma prompt, given as the embedding rows of its tokens.
 
     The task's rows come in, looked up by the rollout. Those of the state's bin numbers and of the end of the
-    prompt are the only others a prompt can hold, so the module keeps just them.
+    prompt are the only others a prompt can hold, so the module keeps just them. The policy pads its prompt
+    to the tokenizer's length and leaves the padding out of attention; a prompt for `max_task_tokens` is
+    padded only to the longest prompt with that many, which gives the same actions in less time.
     """
 
-    def __init__(self, tokenizer: TokenizerProcessorStep, embedding: nn.Embedding, state_dim: int):
+    def __init__(
+        self,
+        tokenizer: TokenizerProcessorStep,
+        embedding: nn.Embedding,
+        state_dim: int,
+        max_task_tokens: int | None = None,
+    ):
         super().__init__()
         tok = tokenizer.input_tokenizer
         pieces = [tok.encode(f" {value}", add_special_tokens=False) for value in range(-1, 256)]
         suffix = tok.encode(";\nAction: ", add_special_tokens=False)
         width = max(map(len, pieces))
         # The longest task prompt that leaves room for the widest state and the end of the prompt.
-        self.max_task_tokens = tokenizer.max_length - state_dim * width - len(suffix)
-        if tokenizer.padding_side != "right" or self.max_task_tokens < 1:
-            raise ValueError("The state prompt must fit in a right-padded tokenizer window.")
+        longest = tokenizer.max_length - state_dim * width - len(suffix)
+        self.max_task_tokens = longest if max_task_tokens is None else max_task_tokens
+        if tokenizer.padding_side != "right" or not 0 < self.max_task_tokens <= longest:
+            raise ValueError(
+                f"The task prompt must fit in a right-padded tokenizer window: at most {longest}."
+            )
+        length = self.max_task_tokens + state_dim * width + len(suffix)
         pad_id = tok.pad_token_id
         ids = sorted({pad_id, *suffix, *(i for p in pieces for i in p)})
         local = {token: index for index, token in enumerate(ids)}
@@ -133,7 +151,7 @@ class StatePrompt(nn.Module):
         self.register_buffer("lengths", torch.tensor(list(map(len, pieces))))
         self.register_buffer("piece_positions", torch.arange(width))
         self.register_buffer("task_positions", torch.arange(self.max_task_tokens))
-        self.register_buffer("positions", torch.arange(tokenizer.max_length))
+        self.register_buffer("positions", torch.arange(length))
 
     def forward(self, state: Tensor, task_embeddings: Tensor, task_length: Tensor) -> tuple[Tensor, Tensor]:
         bins = (state.flatten()[..., None] >= self.edges).sum(-1) - 1
@@ -332,7 +350,9 @@ class Exporter:
         self.folder_config.input_features = {name: config.input_features[name] for name in self.frame}
         language_model = self.policy.model.paligemma_with_expert.paligemma.model.language_model
         embedding = language_model.embed_tokens
-        prompt = StatePrompt(tokenizer, embedding, self.frame[OBS_STATE].size).to(device())
+        prompt = StatePrompt(tokenizer, embedding, self.frame[OBS_STATE].size, args.max_task_tokens).to(
+            device()
+        )
         self.prompt = {
             "tokenizer": "tokenizer.json",
             "embeddings": "token_embeddings.safetensors",
