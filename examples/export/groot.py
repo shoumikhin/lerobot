@@ -56,15 +56,19 @@ from transformers.utils import cached_file
 from lerobot.configs import PreTrainedConfig
 from lerobot.inference.export.images import resize_images
 from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
+from lerobot.policies.groot.configuration_groot import GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
     GrootN17ActionDecodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
+    _n1_7_decode_stats_for_action,
+    _n1_7_decode_valid_horizon,
 )
+from lerobot.policies.groot.utils import config_value, stat_dim_from_entry
 from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 TOLERANCE = 5.0
@@ -459,30 +463,156 @@ class GrootStep(nn.Module):
             return (hidden, temb) if self.start == 0 else hidden
 
 
-def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -> None:
-    """Refuse at the start a checkpoint whose action decoding this route cannot compile.
+def rot6d_to_matrix(rot6d: Tensor) -> Tensor:
+    """GR00T's `rot6d_to_matrix` on a batch: the rotation whose first two rows the six numbers give.
 
-    GR00T N1.7 checkpoints with statistics for their embodiment decode actions in NumPy. The other routes
-    trace with torch.export's default non-strict mode, which cannot run NumPy on traced tensors, so the
-    export would otherwise fail at its last part after hours. The ONNX exporter traces it into the program,
-    and the benchmark's plain PyTorch run needs no tracing at all, except relative actions, which add a state
-    the decoder caches between calls. It is the only recipe check
-    that names a route, because the route decides how a program is traced. torch.export's strict mode also
-    traces the decoding, but a TensorRT build of that graph is untested, so the routes keep their default.
+    In float32 where GR00T computes in float64, which TensorRT does not support.
     """
+    row1, row2 = rot6d.unflatten(-1, (2, 3)).unbind(-2)
+    row1 = row1 / row1.norm(dim=-1, keepdim=True)
+    row2 = row2 - (row1 * row2).sum(-1, keepdim=True) * row1
+    row2 = row2 / row2.norm(dim=-1, keepdim=True)
+    return torch.stack((row1, row2, torch.linalg.cross(row1, row2)), dim=-2)
+
+
+def relative_eef_to_absolute(action: Tensor, reference: Tensor) -> Tensor:
+    """GR00T's `relative_eef_to_absolute`: xyz+rot6d poses relative to `reference`, made absolute."""
+    turn = rot6d_to_matrix(reference[:, None, 3:])
+    rotation = turn @ rot6d_to_matrix(action[..., 3:])
+    xyz = (turn @ action[..., :3, None])[..., 0] + reference[:, None, :3]
+    return torch.cat((xyz, rotation[..., :2, :].flatten(-2)), dim=-1)
+
+
+class N17ActionDecode(nn.Module):
+    """`GrootN17ActionDecodeStep`, GR00T N1.7's decoding with its embodiment statistics, as tensor operations.
+
+    The step decodes in NumPy after a copy to the host, which no program can hold, and reads the reference
+    state of relative actions from its packing step's cache; here the robot state is an input, split into the
+    packing step's state groups. Each action group is unnormalized with its statistics, relative groups are
+    then added to, or composed with, their state group, and the groups are joined and cut to the robot's
+    actions, as the step does.
+    """
+
+    def __init__(self, decode: GrootN17ActionDecodeStep, pack: GrootN17PackInputsStep, horizon: int):
+        super().__init__()
+        action = decode.modality_config["action"]
+        keys, configs = action.get("modality_keys", []), action.get("action_configs", [])
+        steps = np.zeros((1, horizon))
+        self.horizon = _n1_7_decode_valid_horizon(action, steps[..., None]) or horizon
+        self.env_action_dim = decode.env_action_dim
+        self.groups, self.relative = [], []
+        start = 0
+        for index, key in enumerate(keys):
+            entry = decode.raw_stats.get("action", {}).get(key) if isinstance(key, str) else None
+            dim = stat_dim_from_entry(entry) if isinstance(entry, dict) else 0
+            if dim <= 0:
+                continue
+            config = configs[index] if index < len(configs) and isinstance(configs[index], dict) else {}
+            low, high = _n1_7_decode_stats_for_action(
+                decode.raw_stats,
+                key,
+                config,
+                use_relative_action=decode.use_relative_action,
+                use_percentiles=decode.use_percentiles,
+            )
+            # Per-step statistics hold a row per chunk step, and a chunk starts at step 0.
+            if low.ndim == 2:
+                low, high = low[: self.horizon], high[: self.horizon]
+            self.register_buffer(f"low_{key}", torch.from_numpy(low))
+            self.register_buffer(f"high_{key}", torch.from_numpy(high))
+            self.groups.append((key, start, dim))
+            start += dim
+            if decode.use_relative_action and config_value(config.get("rep")) == "relative":
+                kind = config_value(config.get("type")), config_value(config.get("format"))
+                if kind[0] != "non_eef" and kind != ("eef", "xyz+rot6d"):
+                    raise ValueError(f"Unsupported relative N1.7 action config for {key!r}: {config}")
+                self.relative.append((key, config.get("state_key") or key, kind[0]))
+        self.state_groups = {}
+        state_start = 0
+        for key in pack.modality_config.get("state", {}).get("modality_keys", []):
+            stats = pack.raw_stats.get("state", {}).get(key, {}) if isinstance(key, str) else {}
+            dim = len(stats.get("mean") or stats.get("min") or stats.get("q01") or [])
+            if dim > 0:
+                self.state_groups[key] = (state_start, dim)
+                state_start += dim
+        self.gripper = None
+        if decode.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO:
+            gripper = [start for key, start, dim in self.groups if key == "gripper" and dim == 1]
+            if not gripper or (self.env_action_dim and gripper[0] >= self.env_action_dim):
+                raise ValueError("The LIBERO action decode transform needs a scalar gripper action group.")
+            self.gripper = gripper[0]
+        elif decode.action_decode_transform is not None:
+            raise ValueError(f"Unsupported N1.7 action decode transform {decode.action_decode_transform!r}.")
+
+    def forward(self, actions: Tensor, state: Tensor) -> Tensor:
+        """`actions` (batch, steps, model width) to robot actions, about `state` (batch, state width)."""
+        actions = actions[:, : self.horizon].float()
+        decoded = {}
+        for key, start, dim in self.groups:
+            low, high = getattr(self, f"low_{key}"), getattr(self, f"high_{key}")
+            group = actions[..., start : start + dim].clamp(-1.0, 1.0)
+            decoded[key] = (group + 1.0) * 0.5 * (high - low) + low
+        for key, state_key, kind in self.relative:
+            start, dim = self.state_groups[state_key]
+            reference = state[:, start : start + dim].float()
+            if kind == "non_eef":
+                decoded[key] = decoded[key] + reference[:, None]
+            else:
+                decoded[key] = relative_eef_to_absolute(decoded[key], reference)
+        result = torch.cat([decoded[key] for key, _, _ in self.groups], dim=-1)
+        if self.env_action_dim:
+            result = result[..., : self.env_action_dim]
+        if self.gripper is not None:
+            gripper = result[..., self.gripper : self.gripper + 1]
+            result = torch.cat(
+                (
+                    result[..., : self.gripper],
+                    -torch.sign(2.0 * gripper - 1.0),
+                    result[..., self.gripper + 1 :],
+                ),
+                dim=-1,
+            )
+        return result
+
+
+class N17ChunkActions(nn.Module):
+    """The end of the chain for a checkpoint that decodes with `GrootN17ActionDecodeStep`."""
+
+    def __init__(self, n_action_steps: int, decode: N17ActionDecode):
+        super().__init__()
+        self.n_action_steps = n_action_steps
+        self.decode = decode
+
+    def forward(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
+        return self.decode(actions[None, : self.n_action_steps], state[None] if state is not None else None)[
+            0
+        ]
+
+    def part(self, actions: Tensor, state: Tensor) -> Part:
+        """The last part, which takes the state only if a relative group reads it."""
+        if not self.decode.relative:
+            return Part("actions", self, (actions,), ["x_t"], [ACTION])
+        return Part("actions", self, (actions, state), ["x_t", OBS_STATE], [ACTION])
+
+
+def chunk_actions(
+    n_action_steps: int,
+    action_dim: int,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> nn.Module:
+    """The end of the chain: `N17ChunkActions` for a checkpoint whose postprocessor decodes with GR00T N1.7's
+    own step, otherwise the shared `ChunkActions`."""
     decode = next((s for s in postprocessor.steps if isinstance(s, GrootN17ActionDecodeStep)), None)
     if decode is None:
-        return
-    if decode.use_relative_action:
+        return ChunkActions(n_action_steps, action_dim, postprocessor)
+    rest = [s for s in postprocessor.steps if s is not decode]
+    if not all(isinstance(s, DeviceProcessorStep) for s in rest):
         raise ValueError(
-            "This checkpoint decodes relative actions with GrootN17ActionDecodeStep, which adds the state "
-            "it cached from the last observation and cannot be exported."
+            "GrootN17ActionDecodeStep must be the postprocessor's only step besides the device's."
         )
-    if route not in ("onnx_tensorrt", "pytorch"):
-        raise ValueError(
-            "This checkpoint decodes its actions with GrootN17ActionDecodeStep, which runs in NumPy and "
-            "only the ONNX-TensorRT route can export: use to_onnx_tensorrt.py."
-        )
+    pack = next(s for s in preprocessor.steps if isinstance(s, GrootN17PackInputsStep))
+    return N17ChunkActions(n_action_steps, N17ActionDecode(decode, pack, n_action_steps))
 
 
 class Exporter:
@@ -499,7 +629,7 @@ class Exporter:
         # How many actions the policy plays per chunk, which it resolves from the checkpoint and keeps private.
         self.n_action_steps = self.policy._action_queue_steps
         preprocessor, self.postprocessor = processors(self.config, args.policy_path)
-        check_traceable_decode(self.postprocessor, args.route)
+        self.preprocessor = preprocessor
         self.task, self.frame, self.folder_config = dataset_frame(args, self.config)
         self.batch = preprocessor(prepare_observation_for_inference(dict(self.frame), device(), self.task))
         self.observation = GrootObservation(preprocessor, self.frame, self.batch).to(device())
@@ -694,8 +824,11 @@ class Exporter:
                     names = ["vl_embeds", f"step_hidden_{group}", "temb"]
                 del module
         free_memory()
-        module = ChunkActions(
-            self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        module = chunk_actions(
+            self.n_action_steps,
+            self.config.output_features[ACTION].shape[0],
+            self.preprocessor,
+            self.postprocessor,
         )
         state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
         with torch.no_grad():
