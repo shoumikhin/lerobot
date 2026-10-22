@@ -111,6 +111,18 @@ def test_routes_compile_with_the_shared_tensorrt_options(route, tmp_path, name):
         assert {key: options[key] for key in TENSORRT_OPTIONS} == TENSORRT_OPTIONS
 
 
+@pytest.mark.parametrize("name", ["to_executorch_tensorrt", "to_torch_tensorrt"])
+def test_a_part_overrides_the_shared_tensorrt_options(route, tmp_path, name):
+    compile_part, stubs = route(name)
+    from common import TENSORRT_OPTIONS
+
+    overriding = part()
+    overriding.tensorrt_options = {"decompose_attention": not TENSORRT_OPTIONS["decompose_attention"]}
+    compile_part(overriding, tmp_path / "step.bin")
+    options = stubs["torch_tensorrt"].dynamo.compile.call_args.kwargs
+    assert options == {"arg_inputs": overriding.inputs, **TENSORRT_OPTIONS, **overriding.tensorrt_options}
+
+
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["alone", "with_checkpoint"])
 def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys, checkpoint):
     monkeypatch.syspath_prepend(str(EXAMPLES))
