@@ -389,7 +389,8 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
 
 
 @require_hf_token
-def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
+def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route):
     """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise."""
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
@@ -403,7 +404,7 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
         policy_path=str(checkpoint),
         output_dir=tmp_path / "folder",
         tolerance=1e-4,
-        route="executorch_tensorrt",
+        route=route,
         task=task,
         cameras=None,
     )
@@ -425,6 +426,31 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
         expected = postprocessor(actions[:, : config.n_action_steps])[0].numpy()
     np.testing.assert_allclose(case["expected_actions"], expected, rtol=0, atol=1e-4)
     assert engine.get_action(frame).shape == (3,)
+
+
+@require_hf_token
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt", "torch.compile"])
+def test_pi05_language_model_hands_torch_tensorrt_sdpa_attention(recipes, tmp_path, monkeypatch, route):
+    """For the Torch-TensorRT routes the language model parts carry SDPA, which TensorRT must not decompose."""
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", cameras=None, route=route)
+    )
+    torch_tensorrt = route in ("executorch_tensorrt", "torch_tensorrt")
+    sdpa = torch.ops.aten.scaled_dot_product_attention.default
+    checked = 0
+    for part in exporter.parts():
+        if not part.name.startswith("language_model"):
+            continue
+        graph = torch.export.export(part.module, part.inputs).graph
+        assert any(node.target == sdpa for node in graph.nodes) == torch_tensorrt, part.name
+        assert part.tensorrt_options == ({"decompose_attention": False} if torch_tensorrt else {}), part.name
+        checked += 1
+    assert checked == 2
 
 
 @require_cuda

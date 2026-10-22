@@ -79,6 +79,8 @@ STEP_MODULES = (
 )
 # The most language model layers whose TensorRT build fits an 8 GB Jetson Orin Nano beside the rest.
 LANGUAGE_LAYERS_PER_PROGRAM = 3
+# The routes that compile with Torch-TensorRT, which share its engines.
+TORCH_TENSORRT_ROUTES = ("executorch_tensorrt", "torch_tensorrt")
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -203,20 +205,24 @@ class PI05LanguageModelLayers(nn.Module):
     pi0.5's prefix attends both ways inside the prompt, so the mask and positions come from the padding mask alone.
     """
 
-    def __init__(self, model: PI05Pytorch, layers: range):
+    def __init__(self, model: PI05Pytorch, layers: range, attn_implementation: str = "eager"):
         super().__init__()
         language_model = model.paligemma_with_expert.paligemma.model.language_model
-        language_model.set_attn_implementation("eager")
+        language_model.set_attn_implementation(attn_implementation)
         self.layers = nn.ModuleList(language_model.layers[i] for i in layers)
         self.rotary_emb = language_model.rotary_emb
         self.last = layers.stop == len(language_model.layers)
+        # SDPA takes an additive mask only in the attention's own dtype.
+        self.sdpa = attn_implementation == "sdpa"
 
     def forward(self, hidden_states: Tensor, prefix_pad_masks: Tensor) -> tuple[Tensor, ...]:
-        att_masks = torch.zeros_like(prefix_pad_masks)
-        attention_mask = prepare_attention_masks_4d(make_att_2d_masks(prefix_pad_masks, att_masks))
-        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         if self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
+        att_masks = torch.zeros_like(prefix_pad_masks)
+        attention_mask = prepare_attention_masks_4d(
+            make_att_2d_masks(prefix_pad_masks, att_masks), dtype=hidden_states.dtype if self.sdpa else None
+        )
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         cache = DynamicCache()
         for layer in self.layers:
@@ -318,11 +324,17 @@ class Exporter:
         del embed
         hidden_name, cache = "prefix_embs", {}
         depth = get_gemma_config(self.config.paligemma_variant).depth
+        # TensorRT turns SDPA into its attention layer, which runs Gemma's 256-wide heads several times faster
+        # on Jetson Thor (0.12 against 0.61 ms per layer) than the kernel it fuses from the eager matmuls;
+        # PyTorch and Inductor run the eager matmuls faster, so the other routes keep them.
+        torch_tensorrt = getattr(self.args, "route", None) in TORCH_TENSORRT_ROUTES
         for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
             layers = range(first, min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth))
             free_memory()
             module = PI05LanguageModelLayers(
-                self.load_modules(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
+                self.load_modules(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model,
+                layers,
+                "sdpa" if torch_tensorrt else "eager",
             )
             inputs = (hidden, prefix_pad_masks)
             with torch.no_grad():
@@ -333,7 +345,14 @@ class Exporter:
                 outputs = [f"hidden_{group}", *cache_names]
                 hidden, *keys_values = keys_values
             cache.update(zip(cache_names, keys_values, strict=True))
-            yield Part(f"language_model_{group}", module, inputs, [hidden_name, "prefix_pad_masks"], outputs)
+            yield Part(
+                f"language_model_{group}",
+                module,
+                inputs,
+                [hidden_name, "prefix_pad_masks"],
+                outputs,
+                tensorrt_options={"decompose_attention": False} if torch_tensorrt else {},
+            )
             del module
             hidden_name = outputs[0]
         free_memory()
