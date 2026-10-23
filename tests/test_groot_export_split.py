@@ -318,6 +318,7 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
             noise=noise[None],
         )["action_pred"][0]
     split_head = deepcopy(head)
+    keys_values = recipe.GrootKeysValues(split_head, False).eval()
     parts = [
         recipe.GrootStep(split_head, fixed, start, stop, False, 1 / 3).eval()
         for start, stop in ((0, 2), (2, 3), (3, 5))
@@ -326,6 +327,8 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         for layer in part.modules():
             if isinstance(layer, recipe.CategorySpecificLinear):
                 assert layer.W.shape[0] == layer.b.shape[0] == 1
+        # The steps take the keys and values, so they hold no projections that make them.
+        assert all(part.blocks[i - part.start].attn1.to_k is None for i in part.cross)
     calls = []
 
     class Program:
@@ -345,12 +348,18 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         def upload(self, value):
             return value
 
-    programs = {f"step_{i}": Program(part, f"step_{i}") for i, part in enumerate(parts)}
+    programs = {"keys_values": Program(keys_values, "keys_values")}
+    programs.update({f"step_{i}": Program(part, f"step_{i}") for i, part in enumerate(parts)})
     programs["actions"] = Program(recipe.ChunkActions(2, 3, action_pipeline()), "actions")
+
+    def given(part):
+        return [f"{kind}_{i}" for i in part.cross for kind in ("key", "value")]
+
     names = {
-        "step_0": (["vl", "state", "x_t", "timestep", "task_length"], ["hidden", "temb"]),
-        "step_1": (["vl", "hidden", "temb", "task_length"], ["hidden"]),
-        "step_2": (["vl", "hidden", "temb", "x_t", "task_length"], ["x_next"]),
+        "keys_values": (["vl"], given(keys_values)),
+        "step_0": ([*given(parts[0]), "state", "x_t", "timestep", "task_length"], ["hidden", "temb"]),
+        "step_1": ([*given(parts[1]), "hidden", "temb", "task_length"], ["hidden"]),
+        "step_2": ([*given(parts[2]), "hidden", "temb", "x_t", "task_length"], ["x_next"]),
         "actions": (["x_t", "robot_state"], ["actions"]),
     }
     info = {
@@ -365,21 +374,19 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
     chain.hold({"task_length": fixed["task_length"].numpy()})
     actual = chain(features.numpy(), state.numpy(), np.zeros(6, np.float32), noise.numpy())
     np.testing.assert_allclose(actual, expected[:2, :3].numpy(), rtol=0, atol=1e-6)
-    assert calls == ["step_0", "step_1", "step_2"] * 3 + ["actions"]
+    assert calls == ["keys_values"] + ["step_0", "step_1", "step_2"] * 3 + ["actions"]
     length = fixed["task_length"]
-    inputs = (features, state, noise, torch.tensor([333.0]), length)
     with torch.no_grad():
+        computed = dict(zip(given(keys_values), keys_values(features), strict=True))
+        carried = (state, noise, torch.tensor([333.0]))
         for part in parts:
+            inputs = (*(computed[n] for n in given(part)), *carried, length)
             result = part(*inputs)
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, result, rtol=0, atol=0)
             if not part.last:
-                hidden, temb = result if part.start == 0 else (result, inputs[-2])
-                inputs = (
-                    (features, hidden, temb, length)
-                    if not parts[parts.index(part) + 1].last
-                    else (features, hidden, temb, noise, length)
-                )
+                hidden, temb = result if part.start == 0 else (result, carried[1])
+                carried = (hidden, temb, noise) if parts[parts.index(part) + 1].last else (hidden, temb)
 
 
 def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tmp_path):
@@ -413,7 +420,9 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         batch={"image_grid_thw": None, "input_ids": torch.zeros(1, 5, dtype=torch.long)},
         config=SimpleNamespace(use_bf16=False, output_features={ACTION: SimpleNamespace(shape=(3,))}),
         model_config=SimpleNamespace(
-            select_layer=1, diffusion_model_cfg={"num_layers": 25}, add_pos_embed=False
+            select_layer=1,
+            diffusion_model_cfg={"num_layers": 25, "interleave_self_attention": True},
+            add_pos_embed=False,
         ),
         constants=constants(),
         prompt={"max_tokens": 2},
@@ -470,7 +479,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
             return value
 
     for part in exporter.parts():
-        if not (part.name.startswith("step_") or part.name == "actions"):
+        if not (part.name.startswith("step_") or part.name in ("keys_values", "actions")):
             continue
         compile_part(part, tmp_path / f"{part.name}.engine")
         session = sessions[part.name]
@@ -484,7 +493,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         actual = session.run(None, dict(zip(part.input_names, [x.numpy() for x in part.inputs], strict=True)))
         for got, want in zip(actual, expected, strict=True):
             np.testing.assert_allclose(got, want.numpy(), rtol=1e-5, atol=1e-5)
-    assert list(programs) == ["step_0", "step_1", "step_2", "step_3", "actions"]
+    assert list(programs) == ["keys_values", "step_0", "step_1", "step_2", "step_3", "actions"]
     info = {
         "inputs": ["vl_embeds", "state_features", "observation.state", "noise"],
         "programs": metadata,
@@ -534,15 +543,20 @@ def test_part_loader_holds_only_linear_weights_in_bfloat16_under_autocast(recipe
 def test_bfloat16_linear_weights_compute_what_autocast_computes(recipe):
     torch.manual_seed(15)
     fixed = constants()
+    head = tiny_head()
+    # A step keeps one embodiment of the head it takes, so each step gets its own copy.
+    held_head = deepcopy(head)
+    with torch.no_grad():
+        keys_values = recipe.GrootKeysValues(head, True)(torch.randn(1, 5, 32))
     inputs = (
-        torch.randn(1, 5, 32),
+        *keys_values,
         torch.randn(1, 1, 32),
         torch.randn(3, 4),
         torch.tensor([333.0]),
         fixed["task_length"],
     )
-    autocast, held = (recipe.GrootStep(tiny_head(), fixed, 0, 5, True, 1 / 3).eval() for _ in range(2))
-    held.load_state_dict(autocast.state_dict())
+    autocast = recipe.GrootStep(head, fixed, 0, 5, True, 1 / 3).eval()
+    held = recipe.GrootStep(held_head, fixed, 0, 5, True, 1 / 3).eval()
     recipe.hold_linear_weights_in_bfloat16(held)
     linears = [layer for layer in held.modules() if isinstance(layer, torch.nn.Linear)]
     assert linears and all(layer.weight.dtype == torch.bfloat16 for layer in linears)
@@ -681,6 +695,7 @@ def test_part_names_cover_remainders_and_reject_unknown_parts(recipe, monkeypatc
         "language_model_0",
         "language_model_1",
         "language_model_2",
+        "keys_values",
         "step_0",
         "step_1",
         "step_2",
