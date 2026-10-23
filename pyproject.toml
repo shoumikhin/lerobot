@@ -59,9 +59,9 @@ keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artifici
 
 dependencies = [
     # Core ML
-    "torch>=2.7,<2.15.0; sys_platform != 'darwin'",
+    "torch>=2.7,<2.16.0; sys_platform != 'darwin'",
     "torch>=2.7,<2.12.0; sys_platform == 'darwin'",
-    "torchvision>=0.22.0,<0.30.0; sys_platform != 'darwin'",
+    "torchvision>=0.22.0,<0.31.0; sys_platform != 'darwin'",
     "torchvision>=0.22.0,<0.27.0; sys_platform == 'darwin'",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
@@ -286,6 +286,7 @@ lawam = [
 ]
 
 # Features
+export = ["cuda-bindings>=12.0,<14.0; sys_platform != 'darwin'", "ml-dtypes>=0.5,<1.0"]
 # Remote inference transport and serialization.
 remote = ["eclipse-zenoh>=1.9.0,<1.11.0", "msgpack>=1.1.0,<2.0.0"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
@@ -502,6 +503,7 @@ ignore = [
 "src/lerobot/datasets/**" = ["D"]
 "src/lerobot/distributed/**" = ["D"]
 "src/lerobot/envs/**" = ["D"]
+"src/lerobot/inference/export/**" = ["D"]
 "src/lerobot/jobs/**" = ["D"]
 "src/lerobot/model/**" = ["D"]
 "src/lerobot/motors/**" = ["D"]
@@ -544,7 +546,7 @@ exclude_dirs = [
 skips = ["B101", "B311", "B404", "B603", "B615"]
 
 [tool.typos]
-default.extend-words = { trak = "trak", nd = "nd" }
+default.extend-words = { trak = "trak", nd = "nd", ptd = "ptd" }
 default.extend-ignore-re = [
     "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",                      # spellchecker:disable-line
     "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on", # spellchecker:<on|off>

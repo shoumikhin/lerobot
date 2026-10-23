@@ -22,10 +22,6 @@ from lerobot.utils.import_utils import make_device_from_device_class
 
 from .base import BaseStrategy
 from .core import RolloutStrategy
-from .dagger import DAggerStrategy
-from .episodic import EpisodicStrategy
-from .highlight import HighlightStrategy
-from .sentry import SentryStrategy
 
 if TYPE_CHECKING:
     from ..configs import RolloutStrategyConfig
@@ -37,17 +33,26 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
     Dispatches on ``config.type`` (the name registered via ``draccus.ChoiceRegistry``)
     for the built-ins, then falls back to the ``<Name>Config`` -> ``<Name>`` naming
     convention shared with the robot, camera and teleoperator factories, so a
-    third-party strategy needs no edit here.
+    third-party strategy needs no edit here. The recording strategies import torch and
+    the dataset stack, so only the chosen one is imported.
     """
     if config.type == "base":
         return BaseStrategy(config)
     if config.type == "sentry":
+        from .sentry import SentryStrategy
+
         return SentryStrategy(config)
     if config.type == "highlight":
+        from .highlight import HighlightStrategy
+
         return HighlightStrategy(config)
     if config.type == "dagger":
+        from .dagger import DAggerStrategy
+
         return DAggerStrategy(config)
     if config.type == "episodic":
+        from .episodic import EpisodicStrategy
+
         return EpisodicStrategy(config)
     try:
         return make_device_from_device_class(config)

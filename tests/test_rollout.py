@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import io
 import logging
 import os
@@ -29,6 +30,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -299,7 +301,7 @@ def test_build_rollout_context_uses_resolved_device(
         return processor, PolicyProcessorPipeline(steps=[])
 
     monkeypatch.setattr(rollout_context, "_load_pretrained_policy", load_policy)
-    monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
+    monkeypatch.setattr("lerobot.policies.factory.make_pre_post_processors", make_processors)
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
 
     try:
@@ -334,11 +336,12 @@ def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
     if failure_stage == "observation":
         monkeypatch.setattr(robot, "get_observation", MagicMock(side_effect=failure))
     elif failure_stage == "processors":
-        monkeypatch.setattr(rollout_context, "make_pre_post_processors", MagicMock(side_effect=failure))
+        monkeypatch.setattr(
+            "lerobot.policies.factory.make_pre_post_processors", MagicMock(side_effect=failure)
+        )
     else:
         monkeypatch.setattr(
-            rollout_context,
-            "make_pre_post_processors",
+            "lerobot.policies.factory.make_pre_post_processors",
             lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
         )
 
@@ -365,7 +368,7 @@ def test_load_pretrained_policy_passes_revision(monkeypatch):
     policy_class = MagicMock()
     loaded_policy = MagicMock()
     policy_class.from_pretrained.return_value = loaded_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
+    monkeypatch.setattr("lerobot.policies.factory.get_policy_class", lambda _: policy_class)
 
     policy = rollout_context._load_pretrained_policy(policy_config)
 
@@ -389,7 +392,7 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
     policy_class = MagicMock()
     base_policy = MagicMock()
     policy_class.from_pretrained.return_value = base_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
+    monkeypatch.setattr("lerobot.policies.factory.get_policy_class", lambda _: policy_class)
 
     peft_config = SimpleNamespace(
         base_model_name_or_path="user/base-policy",
@@ -400,17 +403,14 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
     peft_model_from_pretrained = MagicMock(return_value=adapted_policy)
     require_package = MagicMock()
     monkeypatch.setattr(rollout_context, "require_package", require_package)
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftConfig",
-        SimpleNamespace(from_pretrained=peft_config_from_pretrained),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftModel",
-        SimpleNamespace(from_pretrained=peft_model_from_pretrained),
-        raising=False,
+    # peft is optional, so the test stands in for the whole module the loader imports.
+    monkeypatch.setitem(
+        sys.modules,
+        "peft",
+        SimpleNamespace(
+            PeftConfig=SimpleNamespace(from_pretrained=peft_config_from_pretrained),
+            PeftModel=SimpleNamespace(from_pretrained=peft_model_from_pretrained),
+        ),
     )
 
     policy = rollout_context._load_pretrained_policy(policy_config)
@@ -1764,3 +1764,380 @@ def test_status_line_rate_counts_only_the_last_second():
 
     assert StatusLine(running, engine, 30, stream=io.StringIO())._format().startswith("loop  30/30 Hz")
     assert StatusLine(stalled, engine, 30, stream=io.StringIO())._format().startswith("loop   0/30 Hz")
+
+
+# ---------------------------------------------------------------------------
+# Exported policies
+# ---------------------------------------------------------------------------
+
+
+def _write_export_folder(folder: Path, expected_actions) -> None:
+    import json
+
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    frame = {"observation.state": np.arange(3, dtype=np.float32)}
+    save_file(
+        {**frame, "expected_actions": np.asarray(expected_actions, np.float32)}, folder / "case.safetensors"
+    )
+    info = {
+        "backend": "fake",
+        "file": "model.bin",
+        "inputs": ["observation.state"],
+        "output": "action",
+        "test_case": "case.safetensors",
+        "tolerance": 0.5,
+    }
+    (folder / "export.json").write_text(json.dumps(info))
+
+
+def _fake_program(*inputs):
+    """A program whose chunk is the state twice, then doubled: two actions of three joints."""
+    state = inputs[0]
+    return np.stack([state, 2 * state], axis=1)
+
+
+@pytest.fixture
+def cpu_export_engine(monkeypatch):
+    """Builds an export engine around `_fake_program`, on the CPU."""
+    from lerobot.inference.export import engine as export_engine
+
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
+    return lambda folder: export_engine.ExportInferenceEngine(folder, task="", robot_type="")
+
+
+def test_export_dir_tells_an_exported_folder_from_a_checkpoint(tmp_path):
+    from lerobot.inference.export import export_dir
+
+    assert export_dir(tmp_path) is None
+    assert export_dir(None) is None
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    assert export_dir(tmp_path) == tmp_path
+
+
+def test_export_engine_plays_one_chunk_one_action_per_call(tmp_path, cpu_export_engine):
+    import numpy as np
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    engine = cpu_export_engine(tmp_path)
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+
+    with patch.object(engine, "_run_chunk", wraps=engine._run_chunk) as run_chunk:
+        actions = [engine.get_action(frame) for _ in range(3)]
+
+    np.testing.assert_array_equal(actions[0], [1, 2, 3])
+    np.testing.assert_array_equal(actions[1], [2, 4, 6])
+    np.testing.assert_array_equal(actions[2], [1, 2, 3])
+    assert run_chunk.call_count == 2
+    assert len(engine.inference_times) == 2
+
+
+def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu_export_engine):
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        cpu_export_engine(tmp_path)
+
+
+def test_export_engine_applies_the_rename_map_to_the_robot_frame(tmp_path, monkeypatch):
+    import numpy as np
+
+    from lerobot.inference.export import engine as export_engine
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: _fake_program)
+    engine = export_engine.ExportInferenceEngine(
+        tmp_path, task="", robot_type="", rename_map={"observation.joints": "observation.state"}
+    )
+
+    action = engine.get_action({"observation.joints": np.array([1, 2, 3], dtype=np.float32)})
+
+    np.testing.assert_array_equal(action, [1, 2, 3])
+
+
+def test_rollout_checks_an_export_before_connecting_the_robot(tmp_path, monkeypatch):
+    import lerobot.rollout.context as rollout_context
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
+    robot_config = MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
+    robot = MockRobot(robot_config)
+    cfg = RolloutConfig(
+        robot=robot_config, policy=ACTConfig(device="cpu", pretrained_path=tmp_path), device="cpu"
+    )
+
+    def failing_engine(*args, **kwargs):
+        raise RuntimeError("does not reproduce its test case")
+
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "ExportInferenceEngine", failing_engine)
+
+    with pytest.raises(RuntimeError, match="test case"):
+        rollout_context.build_rollout_context(cfg, threading.Event())
+    assert not robot.is_connected
+
+
+def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch):
+    from lerobot.inference.export.tensorrt import TensorRTEngine
+
+    engine = TensorRTEngine.__new__(TensorRTEngine)
+    engine._input_names = ["observation.images.wrist"]
+    engine._input_shapes = [(1, 3, 480, 640)]
+    engine._context = MagicMock()
+
+    with pytest.raises(ValueError, match=r"the engine was built for \(1, 3, 480, 640\)"):
+        engine(torch.zeros(1, 3, 240, 320))
+    engine._context.set_tensor_address.assert_not_called()
+
+
+def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch):
+    """TensorRT asks for the whole engine in one read; the reader answers with at most one piece per call."""
+    import sys
+    import types
+
+    from lerobot.inference.export import tensorrt as export_tensorrt
+
+    pieces = []
+
+    class Runtime:
+        def __init__(self, logger):
+            pass
+
+        def deserialize_cuda_engine(self, reader):
+            data, size = b"", 10
+            while len(data) < size:
+                pieces.append(reader.read(size - len(data), 0))
+                data += pieces[-1]
+            return data
+
+    fake_trt = types.SimpleNamespace(
+        IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
+        IGpuAllocator=type("IGpuAllocator", (), {"__init__": lambda self: None}),
+        SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
+        Runtime=Runtime,
+        Logger=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
+    monkeypatch.setattr(export_tensorrt, "runtime", functools.cache(export_tensorrt.runtime.__wrapped__))
+    monkeypatch.setattr(export_tensorrt, "READ_CHUNK_BYTES", 4)
+    (tmp_path / "model.engine").write_bytes(b"0123456789")
+
+    assert export_tensorrt.load_engine(tmp_path / "model.engine") == b"0123456789"
+    assert [len(piece) for piece in pieces] == [4, 4, 2]
+    assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_trt.IGpuAllocator)
+
+
+@pytest.mark.parametrize(
+    "backend", ["executorch_tensorrt", "executorch_cuda", "onnx_tensorrt", "torch_tensorrt"]
+)
+def test_load_program_chains_programs_for_every_backend(tmp_path, monkeypatch, backend):
+    from lerobot.inference.export import engine as export_engine, tensorrt as export_tensorrt
+
+    loaded = []
+    monkeypatch.setattr(
+        export_engine,
+        "load_one",
+        lambda path, name, device_resident, shared_scratch: (
+            loaded.append((path.name, name, shared_scratch)) or path.name
+        ),
+    )
+    monkeypatch.setattr(
+        export_tensorrt,
+        "load_engines",
+        lambda folder, programs, cuda_graphs: dict.fromkeys(programs, "engine"),
+    )
+    programs = {
+        name: {"file": f"{name}.bin", "inputs": [], "outputs": []} for name in ("embed", "step", "actions")
+    }
+    info = {"backend": backend, "inputs": ["noise"], "programs": programs, "num_steps": 10}
+
+    chain = export_engine.load_program(tmp_path, info)
+
+    assert isinstance(chain, export_engine.ProgramChain)
+    if backend == "onnx_tensorrt":
+        assert loaded == [] and chain._programs == dict.fromkeys(programs, "engine")
+    else:
+        assert loaded == [(f"{name}.bin", backend, True) for name in programs]
+
+
+def test_program_chain_runs_each_program_once_and_the_step_once_per_euler_step():
+    """Programs run in order, each reading the values its inputs name; the step integrates from the noise."""
+    from lerobot.inference.export.engine import ProgramChain
+
+    calls, times = [], []
+
+    def program(name, function):
+        def run(*inputs):
+            calls.append(name)
+            return function(*inputs)
+
+        return run
+
+    def step(mask, key_0, key_1, x_t, timestep):
+        times.append(timestep.item())
+        return x_t * timestep
+
+    programs = {
+        "embed": program("embed", lambda state: (state + 1, np.array([[True]]))),
+        "language_model_0": program("language_model_0", lambda hidden, mask: (2 * hidden, 3 * hidden)),
+        "language_model_1": program("language_model_1", lambda hidden, mask: 5 * hidden),
+        "step": program("step", step),
+        "actions": program("actions", lambda x_0: 10 * x_0),
+    }
+    names = {
+        "embed": (["observation.state"], ["prefix_embs", "prefix_pad_masks"]),
+        "language_model_0": (["prefix_embs", "prefix_pad_masks"], ["hidden_0", "past_key_0"]),
+        "language_model_1": (["hidden_0", "prefix_pad_masks"], ["past_key_1"]),
+        "step": (["prefix_pad_masks", "past_key_0", "past_key_1", "x_t", "timestep"], ["v_t"]),
+        "actions": (["x_t"], ["action"]),
+    }
+    info = {
+        "inputs": ["observation.state", "noise"],
+        "programs": {name: {"inputs": i, "outputs": o} for name, (i, o) in names.items()},
+        "num_steps": 4,
+    }
+
+    actions = ProgramChain(programs, info)(np.zeros((1, 3)), np.ones((1, 2, 3)))
+
+    assert calls == ["embed", "language_model_0", "language_model_1", *["step"] * 4, "actions"]
+    assert times == [1.0, 0.75, 0.5, 0.25]
+    # x <- x + dt * v with dt = -1/4 and v = x * t, from x = 1.
+    expected = 10 * (1 - 0.25) * (1 - 0.1875) * (1 - 0.125) * (1 - 0.0625)
+    np.testing.assert_allclose(actions, np.full((1, 2, 3), expected))
+
+
+def test_aoti_package_runs_the_loaded_package_and_returns_its_actions(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from lerobot.inference.export import engine as export_engine
+
+    loaded = []
+
+    def aoti_load_package(path):
+        loaded.append(path)
+        return lambda state: torch.stack([state, 2 * state], dim=1)
+
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, device: self)
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", types.ModuleType("torch_tensorrt"))
+    monkeypatch.setattr(torch._inductor, "aoti_load_package", aoti_load_package)
+
+    program = export_engine.load_program(tmp_path, {"backend": "torch_tensorrt", "file": "model.pt2"})
+
+    assert loaded == [str(tmp_path / "model.pt2")]
+    np.testing.assert_array_equal(program(np.array([[1.0, 2.0]])), [[[1.0, 2.0], [2.0, 4.0]]])
+
+
+@pytest.mark.parametrize("data_file", [None, "data.ptd"])
+def test_executorch_cuda_program_loads_the_weights_file_beside_it(tmp_path, monkeypatch, data_file):
+    """A CUDA backend program gets its `.ptd` weights file, and needs no TensorRT runtime."""
+    import sys
+    import types
+
+    from lerobot.inference.export import engine as export_engine
+
+    loads = []
+
+    class Method:
+        def execute(self, inputs):
+            return [_fake_program(*inputs)]
+
+    class Runtime:
+        @staticmethod
+        def get():
+            return Runtime()
+
+        def load_program(self, path, data_path=None):
+            loads.append((path, data_path))
+            return types.SimpleNamespace(load_method=lambda name: Method())
+
+    monkeypatch.setitem(sys.modules, "executorch.runtime", types.SimpleNamespace(Runtime=Runtime))
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", None)
+    if data_file:
+        (tmp_path / data_file).write_bytes(b"")
+
+    program = export_engine.load_program(tmp_path, {"backend": "executorch_cuda", "file": "model.pte"})
+
+    assert loads == [(tmp_path / "model.pte", tmp_path / data_file if data_file else None)]
+    np.testing.assert_array_equal(program(np.array([[1.0, 2.0]])), [[[1.0, 2.0], [2.0, 4.0]]])
+
+
+def test_export_engine_feeds_the_task_tokens_and_fresh_noise(tmp_path, monkeypatch):
+    """A flow-matching program gets the text steps' tokens, the test case's noise, then new noise per chunk."""
+    import json
+
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from lerobot.inference.export import engine as export_engine
+    from lerobot.processor import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
+    from lerobot.processor.converters import TransitionKey
+
+    @ProcessorStepRegistry.register(name="test_task_length_tokens")
+    class TaskLengthTokens(ProcessorStep):
+        """Stands in for the tokenizer: one token, the length of the task text."""
+
+        def __call__(self, transition):
+            observation = dict(transition[TransitionKey.OBSERVATION])
+            task = transition[TransitionKey.COMPLEMENTARY_DATA]["task"]
+            observation["observation.language.tokens"] = torch.tensor([[float(len(task))]])
+            return {**transition, TransitionKey.OBSERVATION: observation}
+
+        def transform_features(self, features):
+            return features
+
+    def program(state, tokens, noise):
+        return state[:, None, :] + tokens[:, None, :] + noise[:, :, :3]
+
+    PolicyProcessorPipeline(steps=[TaskLengthTokens()]).save_pretrained(tmp_path, config_filename="text.json")
+    noise = np.ones((1, 2, 4), dtype=np.float32)
+    state = np.arange(3, dtype=np.float32)
+    expected = state + len("pick") + 1
+    save_file(
+        {"observation.state": state, "noise": noise, "expected_actions": np.stack([expected, expected])},
+        tmp_path / "case.safetensors",
+    )
+    info = {
+        "backend": "fake",
+        "file": "model.bin",
+        "inputs": ["observation.state", "observation.language.tokens", "noise"],
+        "text_steps": "text.json",
+        "task": "pick",
+        "noise_shape": [1, 2, 4],
+        "output": "action",
+        "test_case": "case.safetensors",
+        "tolerance": 1e-6,
+    }
+    (tmp_path / "export.json").write_text(json.dumps(info))
+    monkeypatch.setattr(export_engine, "load_program", lambda folder, info: program)
+
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="pick up", robot_type="")
+    first, second = (engine._run_chunk({"observation.state": state}, "pick up") for _ in range(2))
+
+    assert first.shape == (2, 3)
+    assert not np.allclose(first, second)
+    np.testing.assert_allclose(first.mean(), state.mean() + len("pick up"), atol=3.0)
+
+
+def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, cpu_export_engine):
+    import json
+
+    import numpy as np
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    info = json.loads((tmp_path / "export.json").read_text())
+    (tmp_path / "export.json").write_text(json.dumps({**info, "task": "pick", "task_fixed": True}))
+
+    with pytest.raises(ValueError, match="only runs the task it was exported for"):
+        cpu_export_engine(tmp_path)
+
+    from lerobot.inference.export import engine as export_engine
+
+    engine = export_engine.ExportInferenceEngine(tmp_path, task="pick", robot_type="")
+    frame = {"observation.state": np.array([1, 2, 3], dtype=np.float32)}
+    np.testing.assert_array_equal(engine.get_action(frame), [1, 2, 3])
+    engine.set_task("place")
+    with pytest.raises(ValueError, match="only runs the task it was exported for"):
+        engine.get_action(frame)

@@ -29,55 +29,41 @@ from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING
 
-import torch
-
 from lerobot.configs import FeatureType, PreTrainedConfig
-from lerobot.datasets import (
-    LeRobotDataset,
-    aggregate_pipeline_dataset_features,
-    create_initial_features,
-)
+from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.inference import (
     FeatureSpec,
     InferenceEngine,
     RemoteInferenceConfig,
     RTCInferenceConfig,
     create_inference_engine,
-    supports_rtc_inference,
-    validate_local_chunk_policy,
 )
-from lerobot.policies import (
-    PreTrainedPolicy,
-    get_policy_class,
-    make_pre_post_processors,
-    validate_trained_rtc_horizon,
-)
+from lerobot.inference.export import ExportInferenceEngine, export_dir
+from lerobot.policies import validate_trained_rtc_horizon
 from lerobot.processor import (
     PolicyProcessorPipeline,
     RenderRuntimeMessagesStep,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
-    bind_relative_anchor,
     make_default_processors,
     rename_stats,
 )
-from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
 from lerobot.robots import Robot, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
-from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.utils.import_utils import require_package
 
 from .configs import RolloutConfig
 from .planner import PlannerConfig, VlmPlanner, training_vocabulary
 from .robot_wrapper import ThreadSafeRobot
 
-if TYPE_CHECKING or _peft_available:
-    from peft import PeftConfig, PeftModel
-else:
-    PeftConfig = None
-    PeftModel = None
+# An exported policy runs without PyTorch, so torch, the PyTorch policies and the dataset stack are
+# imported where a PyTorch policy or a recording needs them.
+if TYPE_CHECKING:
+    from lerobot.datasets import LeRobotDataset
+    from lerobot.policies.pretrained import PreTrainedPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +79,8 @@ def _wrap_predict_action_chunk_with_torch_compile(
     ``torch.compile`` compiles lazily on the first invocation, so success here
     does not guarantee that backend compilation will succeed during warm-up.
     """
+    import torch
+
     if not hasattr(torch, "compile"):
         logger.warning("torch.compile is not available in this PyTorch build")
         return False
@@ -222,7 +210,8 @@ class PolicyContext:
     """Inference engine and optional local policy resources.
 
     Remote inference leaves ``policy``, ``preprocessor`` and ``postprocessor``
-    as ``None``: those resources live on the server. Strategies use ``inference``
+    as ``None``: those resources live on the server. An exported policy leaves them ``None`` too: its
+    program and the engine replace them. Strategies use ``inference``
     for policy work and ``ProcessorContext`` for robot-side processing.
     """
 
@@ -275,6 +264,8 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     pretrained_path = policy_config.pretrained_path
     if pretrained_path is None:
         raise ValueError("--policy.path is required for rollout")
+    from lerobot.policies import get_policy_class
+
     pretrained_revision = policy_config.pretrained_revision
     policy_class = get_policy_class(policy_config.type)
 
@@ -286,6 +277,7 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
         )
 
     require_package("peft", extra="peft")
+    from peft import PeftConfig, PeftModel
 
     peft_config = PeftConfig.from_pretrained(pretrained_path, revision=pretrained_revision)
     policy = policy_class.from_pretrained(
@@ -377,6 +369,8 @@ def _build_rollout_dataset(cfg: RolloutConfig, robot: Robot, dataset_features: d
     """Create the local recording destination independently of policy placement."""
     dataset = None
     if cfg.dataset is not None:
+        from lerobot.datasets import LeRobotDataset
+
         logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
         # Strategy-owned columns join the robot/policy features above the resume/create
         # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
@@ -468,39 +462,63 @@ def build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
-    policy = _load_pretrained_policy(policy_config)
-
-    if is_rtc:
-        validate_local_chunk_policy(policy)
-
-    if is_rtc and cfg.inference.rtc.enabled:
-        if not supports_rtc_inference(policy):
-            raise ValueError(
-                f"RTC inference is not supported by policy type '{policy_config.type}': "
-                "the policy must implement RTC semantics and predict_action_chunk must accept "
-                "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
-            )
-        policy.config.rtc_config = cfg.inference.rtc
-        if hasattr(policy, "init_rtc_processor"):
-            policy.init_rtc_processor()
-
-    policy = policy.to(cfg.device)
-    policy.eval()
-    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
-
-    torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
-            policy,
-            backend=cfg.torch_compile_backend,
-            mode=cfg.torch_compile_mode,
+    policy_export_dir = export_dir(policy_config.pretrained_path)
+    if policy_export_dir is not None and (is_rtc or cfg.use_torch_compile):
+        raise ValueError(
+            "An exported policy runs with the default inference: drop --inference.type and torch compile."
         )
 
-    if cfg.use_torch_compile and not torch_compile_active:
-        # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
-        # dataclasses.replace when carrying the effective state downstream.
-        cfg = copy(cfg)
-        cfg.use_torch_compile = False
+    policy: PreTrainedPolicy | None = None
+    export_engine: ExportInferenceEngine | None = None
+    torch_compile_active = False
+    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+    if policy_export_dir is not None:
+        if cfg.robot is None:
+            raise ValueError("--robot.type is required for rollout")
+        # Before connecting, so an export that fails its test case never touches the robot.
+        logger.info("Creating inference engine (type=export)...")
+        export_engine = ExportInferenceEngine(
+            policy_export_dir,
+            task=task_str,
+            robot_type=make_robot_from_config(cfg.robot).robot_type,
+            rename_map=cfg.rename_map,
+        )
+    else:
+        from lerobot.inference import supports_rtc_inference, validate_local_chunk_policy
+
+        policy = _load_pretrained_policy(policy_config)
+
+        if is_rtc:
+            validate_local_chunk_policy(policy)
+
+        if is_rtc and cfg.inference.rtc.enabled:
+            if not supports_rtc_inference(policy):
+                raise ValueError(
+                    f"RTC inference is not supported by policy type '{policy_config.type}': "
+                    "the policy must implement RTC semantics and predict_action_chunk must accept "
+                    "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
+                )
+            policy.config.rtc_config = cfg.inference.rtc
+            if hasattr(policy, "init_rtc_processor"):
+                policy.init_rtc_processor()
+
+        policy = policy.to(cfg.device)
+        policy.eval()
+        logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+
+        torch_compile_active = cfg.use_torch_compile
+        if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+            torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
+                policy,
+                backend=cfg.torch_compile_backend,
+                mode=cfg.torch_compile_mode,
+            )
+
+        if cfg.use_torch_compile and not torch_compile_active:
+            # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
+            # dataclasses.replace when carrying the effective state downstream.
+            cfg = copy(cfg)
+            cfg.use_torch_compile = False
 
     processors = _resolve_robot_processors(
         teleop_action_processor, robot_action_processor, robot_observation_processor
@@ -560,48 +578,58 @@ def build_rollout_context(
 
         dataset = _build_rollout_dataset(cfg, robot, dataset_features)
 
-        # Policy processors use recording statistics when available.
-        dataset_stats = None
-        if dataset is not None:
-            dataset_stats = rename_stats(
-                dataset.meta.stats,
-                cfg.rename_map,
+        preprocessor: PolicyProcessorPipeline | None = None
+        postprocessor: PolicyProcessorPipeline | None = None
+        if export_engine is not None:
+            # The exported program already contains the policy's processors.
+            inference_strategy: InferenceEngine = export_engine
+        else:
+            from lerobot.policies import make_pre_post_processors
+            from lerobot.processor import bind_relative_anchor
+
+            assert policy is not None
+            # Policy processors use recording statistics when available.
+            dataset_stats = None
+            if dataset is not None:
+                dataset_stats = rename_stats(
+                    dataset.meta.stats,
+                    cfg.rename_map,
+                )
+
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=policy_config,
+                pretrained_path=policy_config.pretrained_path,
+                pretrained_revision=policy_config.pretrained_revision,
+                dataset_stats=dataset_stats,
+                preprocessor_overrides={
+                    "device_processor": {"device": cfg.device},
+                    "rename_observations_processor": {"rename_map": cfg.rename_map},
+                },
             )
 
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=policy_config,
-            pretrained_path=policy_config.pretrained_path,
-            pretrained_revision=policy_config.pretrained_revision,
-            dataset_stats=dataset_stats,
-            preprocessor_overrides={
-                "device_processor": {"device": cfg.device},
-                "rename_observations_processor": {"rename_map": cfg.rename_map},
-            },
-        )
+            # Keep relative-action anchors fixed while the local policy's queued chunk drains.
+            bind_relative_anchor(policy, preprocessor)
 
-        # Keep relative-action anchors fixed while the local policy's queued chunk drains.
-        bind_relative_anchor(policy, preprocessor)
+            logger.info(
+                "Creating inference engine (type=%s)...",
+                cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+            )
+            inference_strategy = create_inference_engine(
+                cfg.inference,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                robot_wrapper=robot_wrapper,
+                dataset_features=dataset_features,
+                ordered_action_keys=ordered_action_keys,
+                task=task_str,
+                fps=cfg.fps,
+                device=cfg.device,
+                use_torch_compile=torch_compile_active,
+                compile_warmup_inferences=cfg.compile_warmup_inferences,
+                shutdown_event=shutdown_event,
+            )
 
-        logger.info(
-            "Creating inference engine (type=%s)...",
-            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
-        )
-        task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-        inference_strategy = create_inference_engine(
-            cfg.inference,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            robot_wrapper=robot_wrapper,
-            dataset_features=dataset_features,
-            ordered_action_keys=ordered_action_keys,
-            task=task_str,
-            fps=cfg.fps,
-            device=cfg.device,
-            use_torch_compile=torch_compile_active,
-            compile_warmup_inferences=cfg.compile_warmup_inferences,
-            shutdown_event=shutdown_event,
-        )
         _attach_planner(cfg, inference_strategy, robot_wrapper, preprocessor, policy_config)
 
         logger.info("Rollout context assembled successfully")
@@ -702,6 +730,8 @@ def build_remote_rollout_context(
     Failed setup closes acquired resources; successful setup transfers ownership
     to strategy teardown. Recording uses the ordinary local dataset schema.
     """
+    from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
+
     config = cfg.inference
     if not isinstance(config, RemoteInferenceConfig) or cfg.robot is None:
         raise ValueError("Remote rollout requires remote inference and robot configuration")

@@ -17,13 +17,15 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import draccus
 
-from lerobot.configs import PreTrainedConfig, parser
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
 from lerobot.robots.config import RobotConfig
@@ -269,6 +271,30 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
 
 
 @dataclass
+class ExportPolicyConfig:
+    """The checkpoint metadata rollout needs, without constructing a PyTorch policy config."""
+
+    type: str
+    pretrained_path: str
+    input_features: dict[str, PolicyFeature]
+    action_feature_names: list[str] | None = None
+    device: str = "cuda"
+
+    @classmethod
+    def from_pretrained(cls, path: str) -> ExportPolicyConfig:
+        config = json.loads((Path(path) / "config.json").read_text())
+        return cls(
+            type=config["type"],
+            pretrained_path=path,
+            input_features={
+                name: PolicyFeature(type=FeatureType(value["type"]), shape=tuple(value["shape"]))
+                for name, value in (config.get("input_features") or {}).items()
+            },
+            action_feature_names=config.get("action_feature_names"),
+        )
+
+
+@dataclass
 class RolloutConfig:
     """Top-level configuration for the ``lerobot-rollout`` CLI.
 
@@ -346,8 +372,6 @@ class RolloutConfig:
 
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
-        from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
-
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
 
@@ -413,11 +437,18 @@ class RolloutConfig:
             pretrained_revision = parser.parse_arg("pretrained_revision", cli_overrides)
             if pretrained_revision is None:
                 pretrained_revision = parser.parse_arg("pretrained_revision", yaml_overrides)
-            self.policy = PreTrainedConfig.from_pretrained(
-                policy_path,
-                revision=pretrained_revision,
-                cli_overrides=policy_overrides,
-            )
+            from lerobot.inference.export import export_dir
+
+            if export_dir(policy_path) is not None:
+                if policy_overrides:
+                    raise ValueError("An exported policy has a fixed configuration; drop --policy overrides.")
+                self.policy = ExportPolicyConfig.from_pretrained(policy_path)
+            else:
+                self.policy = PreTrainedConfig.from_pretrained(
+                    policy_path,
+                    revision=pretrained_revision,
+                    cli_overrides=policy_overrides,
+                )
             self.policy.pretrained_path = policy_path
         if self.policy is None and not remote:
             raise ValueError("--policy.path is required for rollout")
@@ -439,6 +470,12 @@ class RolloutConfig:
         # device string instead of inconsistent fallbacks.
         if remote:
             return
+        if isinstance(self.policy, ExportPolicyConfig):
+            self.device = self.device or self.policy.device
+            return
+
+        from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
+
         if self.device is None or not is_torch_device_available(self.device):
             resolved = self.policy.device
             if resolved:
