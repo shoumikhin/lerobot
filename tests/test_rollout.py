@@ -1916,6 +1916,28 @@ def test_rollout_checks_an_export_before_connecting_the_robot(tmp_path, monkeypa
     assert not built
 
 
+@pytest.mark.parametrize("option", ["trained_rtc", "torch_compile"])
+def test_rollout_refuses_rtc_and_torch_compile_for_an_export(tmp_path, option):
+    """An export runs its compiled programs inline, so it is refused before any RTC checkpoint check."""
+    import lerobot.rollout.context as rollout_context
+    from lerobot.inference import RTCInferenceConfig
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    _write_export_folder(tmp_path, [[0, 1, 2], [0, 2, 4]])
+    cfg = RolloutConfig(
+        robot=MockRobotConfig(), policy=ACTConfig(device="cpu", pretrained_path=tmp_path), device="cpu"
+    )
+    if option == "trained_rtc":
+        cfg.inference = RTCInferenceConfig(rtc=RTCConfig(mode="trained"))
+    else:
+        cfg.use_torch_compile = True
+    with pytest.raises(ValueError, match="drop --inference.type=rtc and --use_torch_compile"):
+        rollout_context.build_rollout_context(cfg, threading.Event())
+
+
 @pytest.mark.parametrize("device", [None, "cuda", "cpu", "cuda:1"])
 def test_rollout_refuses_a_device_an_export_cannot_run_on(tmp_path, monkeypatch, device):
     """The compiled programs run on the GPU they were compiled for, so another --device cannot be honored."""
