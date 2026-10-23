@@ -128,7 +128,7 @@ def act_checkpoint(path):
 def test_act_exports_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch):
     checkpoint = act_checkpoint(tmp_path / "checkpoint")
     args = Namespace(
-        policy_path=str(checkpoint), output_dir=tmp_path / "folder", tolerance=1e-5, route="onnx_trt"
+        policy_path=str(checkpoint), output_dir=tmp_path / "folder", tolerance=1e-5, route="onnx_tensorrt"
     )
     args.output_dir.mkdir()
     engine = export_with_replay("act", args, monkeypatch)
@@ -261,7 +261,7 @@ def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test_case(rec
         policy_path=str(checkpoint),
         output_dir=tmp_path / "folder",
         tolerance=1e-4,
-        route="executorch_trt",
+        route="executorch_tensorrt",
         dataset="user/dataset",
         dataset_root=None,
         task="open the drawer",
@@ -346,7 +346,7 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
         policy_path=str(checkpoint),
         output_dir=tmp_path / "folder",
         tolerance=1e-4,
-        route="executorch_trt",
+        route="executorch_tensorrt",
         task=task,
         cameras=None,
     )

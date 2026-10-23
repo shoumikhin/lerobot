@@ -62,7 +62,7 @@ def part():
 
 
 def test_executorch_route_keeps_inputs_and_outputs_on_the_gpu_and_records_cuda_graphs(route, tmp_path):
-    compile_part, stubs = route("executorch_trt")
+    compile_part, stubs = route("to_executorch_tensorrt")
     compile_part(part(), tmp_path / "step.pte")
     tensorrt = stubs["torch_tensorrt"]
     kwargs = tensorrt.save.call_args.kwargs
@@ -77,7 +77,7 @@ def test_executorch_route_keeps_inputs_and_outputs_on_the_gpu_and_records_cuda_g
 
 
 def test_onnx_route_keeps_the_onnx_file_and_builds_the_engine_beside_it(route, tmp_path):
-    compile_part, stubs = route("onnx_trt")
+    compile_part, stubs = route("to_onnx_tensorrt")
     compile_part(part(), tmp_path / "step.engine")
     onnx_path = torch.onnx.export.call_args.args[2]
     assert onnx_path == tmp_path / "step.onnx"
@@ -88,20 +88,20 @@ def test_onnx_route_keeps_the_onnx_file_and_builds_the_engine_beside_it(route, t
 
 
 def test_torch_tensorrt_route_saves_an_aoti_package(route, tmp_path):
-    compile_part, stubs = route("torch_trt")
+    compile_part, stubs = route("to_torch_tensorrt")
     compile_part(part(), tmp_path / "step.pt2")
     tensorrt = stubs["torch_tensorrt"]
     assert tensorrt.save.call_args.args[1] == str(tmp_path / "step.pt2")
     assert tensorrt.save.call_args.kwargs["output_format"] == "aot_inductor"
 
 
-@pytest.mark.parametrize("name", ["executorch_trt", "onnx_trt", "torch_trt"])
+@pytest.mark.parametrize("name", ["to_executorch_tensorrt", "to_onnx_tensorrt", "to_torch_tensorrt"])
 def test_routes_compile_with_the_shared_tensorrt_options(route, tmp_path, name):
     compile_part, stubs = route(name)
     from export import TENSORRT_OPTIONS
 
     compile_part(part(), tmp_path / "step.bin")
-    if name == "onnx_trt":
+    if name == "to_onnx_tensorrt":
         assert TENSORRT_OPTIONS["workspace_size"] == stubs["build_engine"].WORKSPACE_BYTES
         assert TENSORRT_OPTIONS["optimization_level"] == stubs["build_engine"].OPTIMIZATION_LEVEL
     else:
@@ -114,14 +114,14 @@ def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys
     monkeypatch.syspath_prepend(str(EXAMPLES))
     from export import parse_args
 
-    argv = ["executorch_trt.py", "--help"]
+    argv = ["to_executorch_tensorrt.py", "--help"]
     if checkpoint:
         (tmp_path / "config.json").write_text('{"type": "smolvla"}')
         argv.insert(1, f"--policy.path={tmp_path}")
     monkeypatch.setattr(sys, "argv", argv)
     try:
         with pytest.raises(SystemExit) as exited:
-            parse_args("Export a policy.", "executorch_trt")
+            parse_args("Export a policy.", "executorch_tensorrt")
     finally:
         for name in ("export", "smolvla"):
             sys.modules.pop(name, None)
@@ -158,7 +158,7 @@ def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
                 raise AssertionError("nothing was compiled")
 
     compiled = []
-    args = SimpleNamespace(part="b", output_dir=tmp_path, route="onnx_trt")
+    args = SimpleNamespace(part="b", output_dir=tmp_path, route="onnx_tensorrt")
     with pytest.raises(SystemExit, match="'b'"):
         export.export("unused", args, Recipe, lambda part, path: compiled.append(part.name), ".engine")
     assert not compiled
@@ -170,7 +170,7 @@ def test_route_scripts_name_no_policy():
     import re
 
     policies = {"act", "smolvla", "pi0", "pi05", "groot", "gr00t"}
-    for name in ("executorch_trt", "onnx_trt", "torch_trt"):
+    for name in ("to_executorch_tensorrt", "to_onnx_tensorrt", "to_torch_tensorrt"):
         module = ast.parse((EXAMPLES / f"{name}.py").read_text())
         names = []
         for node in ast.walk(ast.Module(body=module.body[1:], type_ignores=[])):
@@ -195,8 +195,8 @@ def test_route_scripts_name_no_policy():
 
 def test_no_export_script_shadows_a_package_it_imports():
     """A script named like a package it imports hides that package, because its own folder is first on
-    sys.path when it runs. torch_trt.py importing torch_tensorrt is the case this guards against. The
-    check is structural, so it catches the clash even where the package is not installed."""
+    sys.path when it runs, as a script named torch_tensorrt.py importing torch_tensorrt would. The check is
+    structural, so it catches the clash even where the package is not installed."""
     import ast
 
     scripts = sorted(EXAMPLES.glob("*.py"))
