@@ -14,6 +14,8 @@
 
 """Camera geometry for exports whose compiled programs cannot resize with antialiasing."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from PIL import Image
 
@@ -30,29 +32,37 @@ def resize_bicubic(image: np.ndarray, size: tuple[int, int] | list[int]) -> np.n
 
 
 def resize_images(frame: dict[str, np.ndarray], geometry: dict) -> dict[str, np.ndarray]:
-    """Apply the export's saved resize/crop geometry without changing the caller's frame."""
-    result = dict(frame)
-    for name in geometry["cameras"]:
-        image = frame[name]
-        if geometry["target_size"]:
-            if geometry["letterbox"]:
-                height, width = image.shape[:2]
-                side = max(height, width)
-                image = np.pad(
-                    image,
-                    (
-                        ((side - height) // 2, (side - height + 1) // 2),
-                        ((side - width) // 2, (side - width + 1) // 2),
-                        (0, 0),
-                    ),
-                )
-            edge = geometry["resize_edge"]
-            image = resize_bicubic(image, (edge, edge))
-            fraction = geometry["crop_fraction"]
-            if fraction is not None and 0 < fraction < 1:
-                crop = max(1, round(edge * fraction))
-                offset = (edge - crop) // 2
-                image = image[offset : offset + crop, offset : offset + crop]
-            image = resize_bicubic(image, geometry["target_size"])
-        result[name] = np.ascontiguousarray(resize_bicubic(image, geometry["image_size"]))
-    return result
+    """Apply the export's saved resize/crop geometry without changing the caller's frame.
+
+    Each camera is resized on a thread of its own: Pillow releases the GIL while it resizes, and the rollout
+    waits for this before every chunk.
+    """
+    cameras = geometry["cameras"]
+    with ThreadPoolExecutor(max(1, len(cameras))) as pool:
+        resized = pool.map(lambda name: resize_camera(frame[name], geometry), cameras)
+        return {**frame, **dict(zip(cameras, resized, strict=True))}
+
+
+def resize_camera(image: np.ndarray, geometry: dict) -> np.ndarray:
+    """One camera's image with the export's saved resize/crop geometry."""
+    if geometry["target_size"]:
+        if geometry["letterbox"]:
+            height, width = image.shape[:2]
+            side = max(height, width)
+            image = np.pad(
+                image,
+                (
+                    ((side - height) // 2, (side - height + 1) // 2),
+                    ((side - width) // 2, (side - width + 1) // 2),
+                    (0, 0),
+                ),
+            )
+        edge = geometry["resize_edge"]
+        image = resize_bicubic(image, (edge, edge))
+        fraction = geometry["crop_fraction"]
+        if fraction is not None and 0 < fraction < 1:
+            crop = max(1, round(edge * fraction))
+            offset = (edge - crop) // 2
+            image = image[offset : offset + crop, offset : offset + crop]
+        image = resize_bicubic(image, geometry["target_size"])
+    return np.ascontiguousarray(resize_bicubic(image, geometry["image_size"]))
