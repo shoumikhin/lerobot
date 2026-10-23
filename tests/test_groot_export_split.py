@@ -128,7 +128,6 @@ def constants():
         "embodiment_id": torch.tensor([2]),
         "attention_mask": torch.tensor([[1, 1, 1, 1, 0]]),
         "position_ids": torch.arange(5)[None, None].expand(3, 1, -1),
-        "visual_pos_masks": image_mask,
         "image_token_mask": image_mask[..., None].expand(1, 5, 32),
         "text_embeds": torch.randn(1, 5, 32),
     }
@@ -197,7 +196,7 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
             embeddings,
             fixed["attention_mask"],
             fixed["position_ids"],
-            fixed["visual_pos_masks"],
+            fixed["image_mask"],
             *deepstack,
         )
         expected = head.vl_self_attention(head.vlln(expected))
@@ -282,7 +281,7 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
             inputs_embeds=embeddings,
             attention_mask=fixed["attention_mask"],
             position_ids=fixed["position_ids"],
-            visual_pos_masks=fixed["visual_pos_masks"],
+            visual_pos_masks=fixed["image_mask"],
             deepstack_visual_embeds=deepstack,
         )
         actual = whole_language_model(
@@ -291,7 +290,7 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
             embeddings,
             fixed["attention_mask"],
             fixed["position_ids"],
-            fixed["visual_pos_masks"],
+            fixed["image_mask"],
             *deepstack,
         )
     expected = last[0][0] if isinstance(last[0], tuple) else last[0]
