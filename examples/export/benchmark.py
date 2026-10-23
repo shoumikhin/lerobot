@@ -86,14 +86,21 @@ def write_frames(argv: list[str]) -> None:
 
 
 class TorchProgram:
-    """A recipe part run by PyTorch, behind the engine's Program protocol like a compiled program."""
+    """A recipe part run by PyTorch, behind the engine's Program protocol like a compiled program.
 
-    def __init__(self, module):
+    The chain's first part, `starts_chunk`, starts a new CUDA graph generation each chunk: torch.compile's CUDA
+    graphs keep each part's outputs until then, for the later parts of the same chunk to read.
+    """
+
+    def __init__(self, module, starts_chunk: bool = False):
         self.module = module
+        self.starts_chunk = starts_chunk
 
     def run_device(self, *inputs):
         import torch
 
+        if self.starts_chunk:
+            torch.compiler.cudagraph_mark_step_begin()
         with torch.inference_mode():
             outputs = self.module(*(self.upload(x) if isinstance(x, np.ndarray) else x for x in inputs))
         return outputs if isinstance(outputs, tuple) else (outputs,)
@@ -128,13 +135,18 @@ def torch_engine(executor: str, argv: list[str], folder: Path):
         programs[part.name] = {"file": "", "inputs": part.input_names, "outputs": part.output_names}
         module = part.module
         if executor == "torch.compile":
-            # The graph torch.export captures, which the compiled routes build from too.
+            # The graph torch.export captures, which the compiled routes build from too, replayed as CUDA
+            # graphs, as the compiled routes replay theirs.
             with torch.no_grad():
-                module = torch.compile(torch.export.export(part.module, part.inputs).module())
+                graph = torch.export.export(part.module, part.inputs).module()
+                module = torch.compile(graph, mode="reduce-overhead")
         modules[part.name] = module
     args.output_dir = folder
     exporter.write(programs)
-    loaded = {name: TorchProgram(module) for name, module in modules.items()}
+    compiled = executor == "torch.compile"
+    loaded = {
+        name: TorchProgram(module, compiled and i == 0) for i, (name, module) in enumerate(modules.items())
+    }
     return ExportInferenceEngine(args.output_dir, task="", programs=loaded), args
 
 
@@ -191,7 +203,8 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
 
         # More graphs than parts means torch.compile broke a part into pieces and runs Python between them.
         print(
-            f"torch.compile built {counters['stats']['unique_graphs']} graphs for {len(info['programs'])} parts"
+            f"torch.compile built {counters['stats']['unique_graphs']} graphs for {len(info['programs'])} parts, "
+            f"{counters['inductor']['cudagraph_skips']} of them not replayed as CUDA graphs"
         )
 
 
