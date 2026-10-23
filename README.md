@@ -39,6 +39,10 @@ lerobot-info
 
 ## Compiled Policies on Jetson
 
+![An SO-101 arm handing over a candy](https://raw.githubusercontent.com/shoumikhin/lerobot/assets/candy.gif)
+
+_An SO-101 arm hands over a candy, driven by a policy exported with ExecuTorch-TensorRT on a Jetson Orin Nano._
+
 This fork exports trained ACT, SmolVLA, pi0.5 and GR00T policies into compiled folders that `lerobot-rollout` runs on an NVIDIA Jetson, several times faster than PyTorch and in a fraction of its memory. See the [export guide](examples/export/README.md).
 
 ## Robots & Control
