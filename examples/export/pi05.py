@@ -96,6 +96,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--task", required=True, help="A task the policy was trained on, as a sentence, for the test case."
     )
     parser.add_argument(
+        "--cameras",
+        nargs="+",
+        help="The camera slots the robot can fill, if not all of them; pi0.5 pads the rest. Default: all.",
+    )
+    parser.add_argument(
         "--max_task_tokens",
         type=int,
         help="The longest task, in tokens, the folder runs; a shorter prompt is faster. Default: what fits in "
@@ -317,7 +322,7 @@ class PI05Embed(nn.Module):
     """The start of the prefix: the raw frame, which cameras it holds and the task's embeddings in, the prefix's
     embeddings and mask out.
 
-    The rollout gives every camera the policy reads; for one the robot did not send, a blank image and False.
+    The rollout gives every camera the export takes; for one the robot did not send, a blank image and False.
     The policy then fills that camera in itself, as for a camera missing from its batch: an image of -1 left out
     of attention. It puts such cameras after the others, but a camera left out of attention adds nothing and
     shifts no position, so keeping its place gives the same actions.
@@ -338,8 +343,9 @@ class PI05Embed(nn.Module):
             images[i] = torch.where(present, images[i], -1.0)
             # Not `&`: TensorRT does not convert a bitwise and of booleans.
             img_masks[i] = torch.logical_and(img_masks[i], present)
-        # The policy's empty camera slots come last and are always left out of attention, so leaving them out
-        # of the program gives the same actions without their vision tower run and prefix tokens.
+        # The slots the frame never holds, the policy's empty ones and those --cameras leaves out, come last and
+        # are always left out of attention, so leaving them out of the program gives the same actions without
+        # their vision tower run and prefix tokens.
         cameras = len(cameras_present)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
             images[:cameras],
@@ -419,7 +425,10 @@ class Exporter:
         )
         # pi0.5 fills in its empty cameras itself, so the robot does not send them.
         empty_cameras = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(config.empty_cameras)}
-        self.cameras = [name for name in config.image_features if name not in empty_cameras]
+        available = [name for name in config.image_features if name not in empty_cameras]
+        if args.cameras is not None and not set(args.cameras) <= set(available):
+            raise SystemExit(f"Choose --cameras from {available}.")
+        self.cameras = [name for name in available if args.cameras is None or name in args.cameras]
         self.frame = {
             name: value
             for name, value in frame_from_policy(config).items()
