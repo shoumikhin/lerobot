@@ -43,19 +43,25 @@ def check_cuda(result):
 
 
 class CudaStream:
+    """A CUDA stream that keeps host inputs alive until their queued copies finish."""
+
     def __init__(self):
+        """Create the stream."""
         self.handle = check_cuda(cuda_runtime().cudaStreamCreate())
         # Host arrays that queued copies may still read, kept alive until the stream next finishes.
         self._held: list[np.ndarray] = []
 
     def hold(self, arrays: list[np.ndarray]) -> None:
+        """Keep `arrays` alive until the stream next finishes."""
         self._held.extend(arrays)
 
     def synchronize(self):
+        """Wait for the stream, then release the held host arrays."""
         check_cuda(cuda_runtime().cudaStreamSynchronize(self.handle))
         self._held.clear()
 
     def __del__(self):
+        """Destroy the stream."""
         if getattr(self, "handle", None) is not None:
             cuda_runtime().cudaStreamDestroy(self.handle)
 
@@ -64,6 +70,7 @@ class CudaBuffer:
     """Own a fixed-shape device allocation, including buffers passed between engines."""
 
     def __init__(self, shape, dtype):
+        """Allocate `shape` of `dtype` on the GPU."""
         self.shape = tuple(shape)
         self.dtype = np.dtype(dtype)
         if any(size < 0 for size in self.shape):
@@ -72,6 +79,7 @@ class CudaBuffer:
         self.ptr = check_cuda(cuda_runtime().cudaMalloc(max(self.nbytes, 1)))
 
     def numpy(self, stream: CudaStream) -> np.ndarray:
+        """A host copy of the buffer, read once the stream's queued work is done."""
         value = np.empty(self.shape, self.dtype)
         cuda = cuda_runtime()
         check_cuda(
@@ -87,6 +95,7 @@ class CudaBuffer:
         return value
 
     def __del__(self):
+        """Free the allocation."""
         if getattr(self, "ptr", 0):
             cuda_runtime().cudaFree(self.ptr)
 
@@ -174,6 +183,7 @@ class TensorRTProgram:
         stream: CudaStream,
         cuda_graphs: bool = True,
     ):
+        """Load the engine at `path`, with its outputs in buffers of their own."""
         import tensorrt
 
         self._engine = load_engine(path)
@@ -200,9 +210,11 @@ class TensorRTProgram:
 
     @property
     def scratch_bytes(self) -> int:
+        """The scratch memory the engine needs while it runs."""
         return self._engine.device_memory_size_v2
 
     def use_scratch(self, scratch: CudaBuffer) -> None:
+        """Run the engine in `scratch`, which the chain's engines share."""
         if scratch.nbytes < self.scratch_bytes:
             raise ValueError("The scratch allocation is too small")
         # The context only holds the address, so the engine keeps the allocation alive.
@@ -210,6 +222,7 @@ class TensorRTProgram:
         self._context.set_device_memory(scratch.ptr, self.scratch_bytes)
 
     def run_device(self, *inputs: np.ndarray | CudaBuffer) -> tuple[CudaBuffer, ...]:
+        """Queue the engine on its inputs and return its output buffers without waiting for them."""
         for name, shape, value in zip(self._input_names, self._input_shapes, inputs, strict=True):
             if tuple(value.shape) != shape:
                 raise ValueError(f"{name} has shape {tuple(value.shape)}; the engine was built for {shape}.")
@@ -294,16 +307,19 @@ class TensorRTProgram:
         check_cuda(cuda.cudaGraphLaunch(self._graph, stream))
 
     def __call__(self, *inputs: np.ndarray | CudaBuffer) -> np.ndarray:
+        """Run the engine and return its one output, the actions, as a host array."""
         (output,) = self.run_device(*inputs)
         return output.numpy(self._stream)
 
     def upload(self, value: np.ndarray) -> np.ndarray:
-        # Each run copies a host input into the engine's own input buffer, which a CUDA graph reads at a
-        # fixed address, so there is nothing to place ahead of time.
+        """`value` itself, since each run copies a host input into the engine's own input buffer.
+
+        A CUDA graph reads that buffer at a fixed address, so there is nothing to place ahead of time.
+        """
         return value
 
     def __del__(self):
-        # Destroy the graph and the context before releasing their bound buffers and shared scratch.
+        """Destroy the graph and the context before releasing their bound buffers and shared scratch."""
         if getattr(self, "_graph", None) is not None:
             cuda_runtime().cudaGraphExecDestroy(self._graph)
         self._context = None
