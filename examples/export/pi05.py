@@ -48,7 +48,7 @@ from transformers import AttentionInterface, DynamicCache
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference.export.engine import CAMERAS_PRESENT
+from lerobot.inference.export.engine import CAMERAS_PRESENT, NOISE
 from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
@@ -100,12 +100,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="The longest task, in tokens, the folder runs; a shorter prompt is faster. Default: what fits in "
         "the policy's prompt.",
     )
+    parser.add_argument(
+        "--one_denoise_program",
+        action="store_true",
+        help="Build every denoising step and the actions as one program, which takes more memory to compile.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
     depth = get_gemma_config(PreTrainedConfig.from_pretrained(args.policy_path).paligemma_variant).depth
     groups = range(math.ceil(depth / LANGUAGE_LAYERS_PER_PROGRAM))
-    return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
+    tail = ["denoise"] if getattr(args, "one_denoise_program", False) else ["step", "actions"]
+    return ["embed", *(f"language_model_{group}" for group in groups), *tail]
 
 
 # What `Pi05PrepareStateTokenizerProcessorStep` writes before the state; the rollout tokenizes it.
@@ -305,6 +311,23 @@ class PI05Step(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             velocity = self.model.denoise_step(prefix_pad_masks, past_key_values, x_t[None], timestep)
         return x_t + self.dt * velocity[0].float()
+
+
+class PI05Denoise(nn.Module):
+    """Every denoising step and the actions in one module: the prefix's mask and KV cache and the noise in."""
+
+    def __init__(self, step: PI05Step, actions: ChunkActions, timesteps: list[float], cache_size: int):
+        super().__init__()
+        self.step = step
+        self.actions = actions
+        self.timesteps = timesteps
+        self.cache_size = cache_size
+
+    def forward(self, prefix_pad_masks: Tensor, *inputs: Tensor) -> Tensor:
+        cache, (x_t, *state) = inputs[: self.cache_size], inputs[self.cache_size :]
+        for timestep in self.timesteps:
+            x_t = self.step(prefix_pad_masks, *cache, x_t, torch.full((1,), timestep, device=x_t.device))
+        return self.actions(x_t, *state)
 
 
 class PI05Embed(nn.Module):
@@ -517,6 +540,9 @@ class Exporter:
             step_model.denoise_attn_implementation = "pi05_shared_kv"
         step = PI05Step(step_model, self.dt, self.timesteps)
         cache_inputs = (prefix_pad_masks, *cache.values())
+        if getattr(self.args, "one_denoise_program", False):
+            yield self.denoise(step, cache_inputs, list(cache))
+            return
         x_t = self.noise
         with torch.no_grad():
             for timestep in self.timesteps:
@@ -533,6 +559,20 @@ class Exporter:
             self.expected_actions = actions(x_t, state).cpu().numpy()
         yield actions.part(self.noise, state)
 
+    def denoise(self, step: PI05Step, cache_inputs: tuple[Tensor, ...], cache_names: list[str]) -> Part:
+        """Every denoising step and the actions as one part."""
+        actions = ChunkActions(
+            self.config.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        )
+        module = PI05Denoise(step, actions, self.timesteps, len(cache_names))
+        state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
+        reads_state = actions.absolute_step is not None
+        inputs = (*cache_inputs, self.noise, *((state,) if reads_state else ()))
+        with torch.no_grad():
+            self.expected_actions = module(*inputs).cpu().numpy()
+        names = ["prefix_pad_masks", *cache_names, NOISE, *([OBS_STATE] if reads_state else [])]
+        return Part("denoise", module, inputs, names, [ACTION])
+
     def write(self, programs: dict[str, dict]) -> None:
         self.tokenizer.backend_tokenizer.save(str(self.args.output_dir / self.prompt["tokenizer"]))
         policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
@@ -546,8 +586,11 @@ class Exporter:
             self.noise,
             self.expected_actions,
             programs,
-            steps=["step"],
-            timesteps=self.timesteps,
+            **(
+                {}
+                if getattr(self.args, "one_denoise_program", False)
+                else {"steps": ["step"], "timesteps": self.timesteps}
+            ),
             prompt=self.prompt,
             optional_cameras=self.cameras,
         )
