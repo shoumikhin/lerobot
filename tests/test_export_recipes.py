@@ -413,6 +413,7 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(
         tolerance=1e-4,
         route=route,
         task=task,
+        cameras=None,
         max_task_tokens=max_task_tokens,
     )
     args.output_dir.mkdir()
@@ -448,9 +449,19 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(
 
 
 @require_hf_token
-@pytest.mark.parametrize("sent", [["observation.images.wrist"], ["observation.images.base_0_rgb"]])
-def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(recipes, tmp_path, monkeypatch, sent):
-    """A camera the robot does not send is filled in as the policy fills in a camera missing from its batch."""
+@pytest.mark.parametrize(
+    "exported,sent",
+    [
+        (None, ["observation.images.wrist"]),
+        (None, ["observation.images.base_0_rgb"]),
+        (["observation.images.wrist"], ["observation.images.wrist"]),
+    ],
+)
+def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(
+    recipes, tmp_path, monkeypatch, exported, sent
+):
+    """A camera the robot does not send, or one the export leaves out with --cameras, is filled in as the policy
+    fills in a camera missing from its batch."""
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
@@ -468,10 +479,14 @@ def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(recipes, tmp_p
         tolerance=1e-4,
         route="executorch_tensorrt",
         task="pick up the cube",
+        cameras=exported,
         max_task_tokens=None,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
+    # The program takes only the cameras chosen with --cameras.
+    info = __import__("json").loads((args.output_dir / "export.json").read_text())
+    assert info["optional_cameras"] == list(exported or cameras)
     case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
         args.output_dir / "test_case.safetensors"
     )
@@ -505,6 +520,7 @@ def test_pi05_empty_camera_slots_add_no_prefix_tokens(recipes, tmp_path, monkeyp
                 Namespace(
                     policy_path=str(checkpoint),
                     task="pick up the cube",
+                    cameras=None,
                     max_task_tokens=None,
                     route="onnx_tensorrt",
                 )
@@ -525,7 +541,13 @@ def test_pi05_language_model_hands_torch_tensorrt_sdpa_attention(recipes, tmp_pa
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     pi05 = importlib.import_module("pi05")
     exporter = pi05.Exporter(
-        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None, route=route)
+        Namespace(
+            policy_path=str(checkpoint),
+            task="pick up the cube",
+            cameras=None,
+            max_task_tokens=None,
+            route=route,
+        )
     )
     torch_tensorrt = route in ("executorch_tensorrt", "torch_tensorrt")
     sdpa = torch.ops.aten.scaled_dot_product_attention.default
@@ -577,7 +599,13 @@ def test_pi05_step_reads_the_shared_kv_head_unrepeated_where_tensorrt_is_faster(
     pi05 = importlib.import_module("pi05")
     monkeypatch.setattr(pi05, "gpu_capability", lambda: capability)
     exporter = pi05.Exporter(
-        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None, route=route)
+        Namespace(
+            policy_path=str(checkpoint),
+            task="pick up the cube",
+            cameras=None,
+            max_task_tokens=None,
+            route=route,
+        )
     )
     from transformers import AttentionInterface
 
@@ -612,7 +640,11 @@ def test_pi05_step_holds_the_schedule_modulation_instead_of_the_time_mlp(recipes
     pi05 = importlib.import_module("pi05")
     exporter = pi05.Exporter(
         Namespace(
-            policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None, route="onnx_tensorrt"
+            policy_path=str(checkpoint),
+            task="pick up the cube",
+            cameras=None,
+            max_task_tokens=None,
+            route="onnx_tensorrt",
         )
     )
     prefix_pad_masks, *cache, x_t, _ = next(part for part in exporter.parts() if part.name == "step").inputs
@@ -647,6 +679,7 @@ def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_co
         Namespace(
             policy_path=str(checkpoint),
             task="pick up the cube",
+            cameras=None,
             max_task_tokens=None,
             route="executorch_tensorrt",
         )
