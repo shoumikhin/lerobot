@@ -685,13 +685,21 @@ class Exporter:
         """Every denoising step and the actions as one part."""
         free_memory()
         blocks = self.model_config.diffusion_model_cfg["num_layers"]
-        modules = [f"{ACTION_HEAD}.model.transformer_blocks.{i}" for i in range(blocks)]
-        modules += [f"{ACTION_HEAD}.action_encoder", f"{ACTION_HEAD}.model.timestep_encoder"]
+        modules = [f"{ACTION_HEAD}.action_encoder", f"{ACTION_HEAD}.model.timestep_encoder"]
         if self.model_config.add_pos_embed:
             modules.append(f"{ACTION_HEAD}.position_embedding")
         modules += [f"{ACTION_HEAD}.model.{n}" for n in ("norm_out", "proj_out_1", "proj_out_2")]
         modules.append(f"{ACTION_HEAD}.action_decoder")
         head = self.load_modules(*modules)._groot_model.action_head
+        # The blocks are read a group at a time: each is read in float32 before its linear layers drop to
+        # bfloat16, and all of them at once in float32 do not fit an 8 GB board beside the rest.
+        for first in range(0, blocks, DIT_BLOCKS_PER_PROGRAM):
+            group = range(first, min(first + DIT_BLOCKS_PER_PROGRAM, blocks))
+            loaded = self.load_modules(*(f"{ACTION_HEAD}.model.transformer_blocks.{i}" for i in group))
+            for i in group:
+                head.model.transformer_blocks[i] = loaded._groot_model.action_head.model.transformer_blocks[i]
+            del loaded
+            free_memory()
         step = GrootStep(head, self.constants, 0, blocks, self.config.use_bf16, 1.0 / self.num_steps).eval()
         actions = ChunkActions(
             self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
