@@ -49,6 +49,7 @@ from common import (
     to_policy_input,
     write_folder,
 )
+from diffusers.models.attention_processor import AttnProcessor2_0
 from torch import Tensor, nn
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
 from transformers.utils import cached_file
@@ -98,6 +99,7 @@ def part_names(args: argparse.Namespace) -> list[str]:
     return [
         "vision",
         *(f"language_model_{i}" for i in range(language_groups)),
+        "keys_values",
         *(f"step_{i}" for i in range(step_groups)),
         "actions",
     ]
@@ -383,11 +385,78 @@ class GrootLanguageModel(nn.Module):
             return hidden
 
 
+def cross_blocks(model: nn.Module) -> list[int]:
+    """The diffusion blocks that attend to the vision-language features; with interleaving, every other one."""
+    interleave = model.config.interleave_self_attention
+    return [i for i in range(len(model.transformer_blocks)) if not (interleave and i % 2 == 1)]
+
+
+def check_cross_attention(attn: nn.Module) -> None:
+    """Refuse an attention `GivenKeysValues` would compute differently from its own processor."""
+    plain = all(
+        getattr(attn, name) is None for name in ("spatial_norm", "group_norm", "norm_q", "norm_k")
+    ) and not (attn.norm_cross or attn.residual_connection)
+    if not plain or type(attn.processor) is not AttnProcessor2_0:
+        raise ValueError(
+            "Only diffusers' default attention, with no extra norms, can take its keys and values."
+        )
+
+
+class GivenKeysValues:
+    """diffusers' default attention processor, `AttnProcessor2_0`, given the keys and values it would compute.
+
+    `encoder_hidden_states` is the pair of what `to_k` and `to_v` make of the encoder's states, which
+    `GrootKeysValues` computes once per chunk; the rest is the processor's own steps for this attention.
+    """
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None):
+        key, value = encoder_hidden_states
+        batch_size, sequence_length, inner_dim = key.shape
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+        query = attn.to_q(hidden_states)
+        head_dim = inner_dim // attn.heads
+        query, key, value = (
+            x.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2) for x in (query, key, value)
+        )
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = attn.to_out[1](attn.to_out[0](hidden_states.to(query.dtype)))
+        return hidden_states / attn.rescale_output_factor
+
+
+class GrootKeysValues(nn.Module):
+    """The keys and values each cross-attention block of the diffusion model makes of the vision-language features.
+
+    They are the same in every denoising step, so the chain computes them once per chunk, here, rather than in
+    each step, which saves most of a step's work for a long prompt.
+    """
+
+    def __init__(self, action_head, use_bf16: bool):
+        super().__init__()
+        model = action_head.model
+        self.cross = cross_blocks(model)
+        self.keys = nn.ModuleList(model.transformer_blocks[i].attn1.to_k for i in self.cross)
+        self.values = nn.ModuleList(model.transformer_blocks[i].attn1.to_v for i in self.cross)
+        self.use_bf16 = use_bf16
+
+    def forward(self, vl_embeds: Tensor) -> tuple[Tensor, ...]:
+        with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
+            vl_embeds = vl_embeds.contiguous()
+            return tuple(
+                x for k, v in zip(self.keys, self.values, strict=True) for x in (k(vl_embeds), v(vl_embeds))
+            )
+
+
 class GrootStep(nn.Module):
     """Some diffusion blocks of one denoising step.
 
     The first group encodes the noisy actions and the time. The last also takes the noisy actions and returns
-    the next ones, with the Euler update inside, so the rollout does no arithmetic between programs.
+    the next ones, with the Euler update inside, so the rollout does no arithmetic between programs. The
+    cross-attention blocks take the keys and values `GrootKeysValues` computed for them.
     """
 
     def __init__(self, action_head, constants: dict, start: int, stop: int, use_bf16: bool, dt: float):
@@ -398,6 +467,14 @@ class GrootStep(nn.Module):
             raise ValueError("Invalid diffusion block range.")
         self.start, self.last = start, stop == len(model.transformer_blocks)
         self.blocks = nn.ModuleList(model.transformer_blocks[start:stop])
+        self.cross = [i for i in cross_blocks(model) if start <= i < stop]
+        for i in self.cross:
+            attn = model.transformer_blocks[i].attn1
+            if not isinstance(attn.processor, GivenKeysValues):
+                check_cross_attention(attn)
+                attn.set_processor(GivenKeysValues())
+                # GrootKeysValues holds these projections; the step only reads what they compute.
+                del attn.to_k, attn.to_v
         self.interleave = model.config.interleave_self_attention
         self.alternate = action_head.config.use_alternate_vl_dit
         self.attend_text_every = model.attend_text_every_n_blocks if self.alternate else 1
@@ -423,12 +500,15 @@ class GrootStep(nn.Module):
             self.action_decoder = action_head.action_decoder
             select_embodiment(self.action_decoder, constants["embodiment_id"])
 
-    def forward(self, vl_embeds: Tensor, *inputs: Tensor):
-        """`inputs` holds what the previous group passes on, then the task's length."""
+    def forward(self, *inputs: Tensor):
+        """`inputs` holds the key and value of each cross-attention block, what the previous group passes on,
+        then the task's length."""
+        keys_values, inputs = inputs[: 2 * len(self.cross)], inputs[2 * len(self.cross) :]
+        given = {block: keys_values[2 * n : 2 * n + 2] for n, block in enumerate(self.cross)}
         *inputs, task_length = inputs
         # The policy attends to every token of its unpadded prompt; the padding stays out of every cross-attention.
         prompt = prompt_mask(self.head, self.task_positions, task_length)
-        with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
+        with torch.autocast(task_length.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
                 state_features, x_t, time = inputs
                 time = time.long()
@@ -442,18 +522,14 @@ class GrootStep(nn.Module):
                 hidden, temb, x_t = inputs
             else:
                 hidden, temb = inputs
-            hidden, vl_embeds = hidden.contiguous(), vl_embeds.contiguous()
+            hidden = hidden.contiguous()
             for index, block in enumerate(self.blocks, self.start):
-                self_attention = self.interleave and index % 2 == 1
-                mask = None if self_attention else prompt
-                if self.alternate and not self_attention:
+                mask = prompt if index in given else None
+                if self.alternate and index in given:
                     text = index % (2 * self.attend_text_every) == 0
                     mask = prompt & (~self.image_mask if text else self.image_mask)
                 hidden = block(
-                    hidden,
-                    encoder_hidden_states=None if self_attention else vl_embeds,
-                    encoder_attention_mask=mask,
-                    temb=temb,
+                    hidden, encoder_hidden_states=given.get(index), encoder_attention_mask=mask, temb=temb
                 )
             if self.last:
                 shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
@@ -778,13 +854,34 @@ class Exporter:
                 hidden = result
             hidden_name = outputs[0]
             del module
-        actions = self.noise
+        free_memory()
         depth = self.model_config.diffusion_model_cfg["num_layers"]
+        interleave = self.model_config.diffusion_model_cfg.get("interleave_self_attention", False)
+        crossing = [i for i in range(depth) if not (interleave and i % 2 == 1)]
+        modules = [
+            f"{ACTION_HEAD}.model.transformer_blocks.{i}.attn1.{p}"
+            for i in crossing
+            for p in ("to_k", "to_v")
+        ]
+        module = GrootKeysValues(
+            self.load_modules(*modules)._groot_model.action_head, self.config.use_bf16
+        ).eval()
+        if module.cross != crossing:
+            raise ValueError(
+                "The diffusion model's cross-attention blocks are not the ones the config names."
+            )
+        with torch.no_grad():
+            keys_values = module(vl_embeds)
+        kv_names = [f"{kind}_{i}" for i in crossing for kind in ("key", "value")]
+        yield Part("keys_values", module, (vl_embeds,), ["vl_embeds"], kv_names)
+        del module
+        given = dict(zip(kv_names, keys_values, strict=True))
+        actions = self.noise
         for iteration, bucket in enumerate(self.timesteps):
             timestep = torch.tensor([bucket], dtype=torch.float32, device=device())
             carried, names = (
                 (state_features, actions, timestep),
-                ["vl_embeds", "state_features", "x_t", "timestep"],
+                ["state_features", "x_t", "timestep"],
             )
             for group, first in enumerate(range(0, depth, DIT_BLOCKS_PER_PROGRAM)):
                 stop = min(first + DIT_BLOCKS_PER_PROGRAM, depth)
@@ -805,10 +902,11 @@ class Exporter:
                     self.config.use_bf16,
                     1.0 / self.num_steps,
                 ).eval()
-                inputs = (vl_embeds, *carried)
+                block_names = [f"{kind}_{i}" for i in module.cross for kind in ("key", "value")]
+                inputs = (*(given[n] for n in block_names), *carried)
                 if module.last and first != 0:
                     inputs, names = (*inputs, actions), [*names, "x_t"]
-                inputs, step_names = (*inputs, task_length), [*names, TASK_LENGTH]
+                inputs, step_names = (*inputs, task_length), [*block_names, *names, TASK_LENGTH]
                 with torch.no_grad():
                     result = module(*inputs)
                 if module.last:
@@ -824,7 +922,7 @@ class Exporter:
                     actions = result
                 else:
                     carried = result if first == 0 else (result, carried[-1])
-                    names = ["vl_embeds", f"step_hidden_{group}", "temb"]
+                    names = [f"step_hidden_{group}", "temb"]
                 del module
         free_memory()
         module = self.chunk_actions
