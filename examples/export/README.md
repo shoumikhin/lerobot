@@ -4,7 +4,7 @@
 
 _An SO-101 arm hands over a candy, driven by a policy exported with ExecuTorch-TensorRT on a Jetson Orin Nano._
 
-Train a policy as usual, export it into a compiled folder, and run that folder with `lerobot-rollout`, the same command you use for a PyTorch checkpoint. In the results below, a compiled policy runs 2 to 6 times faster than in PyTorch and needs about half of its memory or less, so the larger policies also fit on a small board.
+Train a policy as usual, export it into a compiled folder, and run that folder with `lerobot-rollout`, the same command you use for a PyTorch checkpoint. In the results below, a compiled policy runs 2 to 6 times faster than in PyTorch, and ExecuTorch-TensorRT and ONNX-TensorRT need about half of PyTorch's memory or less, so the larger policies also fit on a small board.
 
 Supported policies: ACT, SmolVLA, pi0.5 and GR00T N1.7.
 
@@ -23,10 +23,12 @@ git clone --branch export https://github.com/shoumikhin/lerobot.git
 cd lerobot
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -e ".[smolvla,pi,groot,feetech,export]" "torch-tensorrt[executorch]" "executorch>=1.6.0.dev20261021" \
+uv pip install -e ".[smolvla,pi,groot,feetech,export]" torch-tensorrt "executorch>=1.6.0.dev20261021" \
     --index-url https://download.pytorch.org/whl/nightly/cu132 --extra-index-url https://pypi.org/simple \
     --index-strategy unsafe-best-match --prerelease allow
 ```
+
+The ExecuTorch-TensorRT route also needs `torch-tensorrt-executorch-runtime` built for ExecuTorch 1.6.0.dev20261021 or newer. Until a matching nightly is published, [build it from source](https://github.com/pytorch/TensorRT/blob/main/py/torch-tensorrt-executorch-runtime/README.md#build). The Torch-TensorRT 2.15 release is meant to make all of this a single `pip install`.
 
 ## Export
 
@@ -91,13 +93,13 @@ lerobot-rollout \
 
 The tables compare each policy, on each board, compiled each way and in plain PyTorch. For time and accuracy, the PyTorch column runs the same parts the export compiles, in PyTorch, through the same engine as the compiled folders. For memory, it runs the policy's own PyTorch checkpoint with `lerobot-rollout`.
 
-There is no `torch.compile` column: its default mode runs without CUDA graphs, while every TensorRT route uses them, so it is not a like-for-like comparison.
+There is no `torch.compile` column: it was measured only in its default mode, without CUDA graphs, so it is left out until it is measured with them.
 
 - Both boards ran at maximum power, with the GPU clock locked.
 - **Bold** marks the best time or memory in a row.
 - OOM (out of memory) means the policy did not fit on the 8 GB Orin Nano.
 
-Measured with PyTorch 2.15.0.dev20261005, TensorRT 11.3.0.99, and this fork's scripts at commit [f6951b7c9](https://github.com/shoumikhin/lerobot/commit/f6951b7c9).
+Measured with PyTorch 2.15.0.dev20261005, TensorRT 11.3.0.99, and this fork's scripts at commits up to [f6951b7c9](https://github.com/shoumikhin/lerobot/commit/f6951b7c9).
 
 ### Time per chunk
 
@@ -121,7 +123,7 @@ Orin Nano:
 | pi0.5   |                 672 |       **655** |            OOM |     OOM |
 | GR00T   |             **268** |           276 |            276 |     OOM |
 
-Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. Every compiled policy replays its programs as CUDA graphs.
+Each value is the median of three runs of 100 chunks. Differences of a few milliseconds are within run-to-run noise. The ExecuTorch-TensorRT and ONNX-TensorRT times were measured with CUDA graphs (recorded GPU work that replays with less overhead), except GR00T on ONNX-TensorRT. The Torch-TensorRT times were measured without them. The current scripts turn CUDA graphs on for every route.
 
 ### Memory
 
@@ -149,7 +151,7 @@ On the Orin Nano these values can be up to about 0.9 GiB too low: the GPU driver
 
 ### Accuracy
 
-Mean / p95 of each frame's largest action error, in degrees, against PyTorch, over 50 frames (p95: 95% of the frames have a smaller error). The frames are spread evenly over an SO-101 dataset, and every run uses the same random noise. Lower is better. Every compiled folder passed the export's own check.
+Mean / p95 of each frame's largest action error, in degrees (percent for the gripper), against PyTorch, over 50 frames (p95: 95% of the frames have a smaller error). The frames are spread evenly over an SO-101 dataset, and every run uses the same random noise. Lower is better. Every compiled folder passed the export's own check.
 
 Thor:
 
