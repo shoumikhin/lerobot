@@ -58,21 +58,6 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     assert largest == 10.0
 
 
-def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples):
-    memory = examples("benchmark_memory")
-    meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
-    assert memory.used_mib(meminfo) == 2048
-    assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
-    steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
-    # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
-    run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
-    assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
-    assert memory.is_flat(memory.steady_window(run))
-    # Still returning its load-time memory, 7 MiB a second, is not flat, even with a teardown cliff at its end.
-    falling = [3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(120)] + [2000.0] * 6
-    assert not memory.is_flat(memory.steady_window(falling))
-
-
 def test_action_error_refuses_actions_of_another_shape(examples):
     benchmark = examples("benchmark")
     # NumPy would broadcast one action against a chunk of 100 and find no error at all.
@@ -293,18 +278,173 @@ def test_report_compares_each_result_with_the_reference_file(examples, tmp_path,
     ]
     with pytest.raises(SystemExit, match="holds no reference actions"):
         benchmark.report([str(tmp_path / "pytorch.npz"), str(tmp_path / "pytorch.npz")])
+
+
+def test_memory_counts_a_process_own_memory_and_swap_but_not_its_files(examples):
     memory = examples("benchmark_memory")
-    meminfo = {"MemTotal": 8 << 20, "MemAvailable": 6 << 20, "SwapTotal": 4 << 20, "SwapFree": 4 << 20}
-    assert memory.used_mib(meminfo) == 2048
-    assert memory.used_mib({**meminfo, "SwapFree": 3 << 20}) == 3072
-    steady = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
-    # Loading peaks, the loop holds steady, then the teardown frees everything in the last second.
-    run = [9000.0] * 10 + [3000.0] * steady + [3000.0] * 4 + [2000.0] * 2
-    assert memory.extra_mib([2000.0, 2010.0, 1990.0], run) == 1000.0
-    assert memory.is_flat(memory.steady_window(run))
-    # Still returning its load-time memory, 7 MiB a second, is not flat, even with a teardown cliff at its end.
-    falling = [3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(120)] + [2000.0] * 6
-    assert not memory.is_flat(memory.steady_window(falling))
+    rollup = "\n".join(
+        [
+            "00400000-ffffd0a1c000 ---p 00000000 00:00 0                  [rollup]",
+            "Rss:              457620 kB",
+            "Pss:              445068 kB",
+            "Pss_Anon:         323340 kB",
+            "Pss_File:         121728 kB",
+            "Pss_Shmem:          1024 kB",
+            "Swap:               4096 kB",
+            "SwapPss:            2048 kB",
+        ]
+    )
+    assert memory.own_mib(rollup) == (323340 + 1024 + 2048) / 1024
+
+
+def test_memory_reads_gpu_memory_per_process_from_nvidia_smi(examples, monkeypatch):
+    from types import SimpleNamespace
+
+    memory = examples("benchmark_memory")
+    table = "4242, 1140\n4343, 12\n"
+    monkeypatch.setattr(memory.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=table))
+    assert memory.nvidia_smi_gpu_mib() == {4242: 1140.0, 4343: 12.0}
+
+
+def test_memory_sums_each_process_gpu_memory_over_its_jtop_rows(examples):
+    memory = examples("benchmark_memory")
+    # jtop rows: process ID, user, GPU, type, priority, state, CPU %, memory and GPU memory in KiB, name.
+    rows = [
+        [4242, "user", "I", "G", 0, "S", 10.0, 900000, 102400, "python3"],
+        [4242, "user", "I", "G", 0, "S", 10.0, 900000, 51200, "python3"],
+        [4343, "user", "I", "G", 0, "S", 1.0, 20000, 1024, "nvargus"],
+    ]
+    assert memory.jtop_gpu_mib(rows) == {4242: 150.0, 4343: 1.0}
+
+
+def test_memory_times_a_sample_when_its_read_ends(examples, monkeypatch):
+    from types import SimpleNamespace
+
+    memory = examples("benchmark_memory")
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        memory, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda seconds: None)
+    )
+
+    def slow_read(pid, gpu):
+        clock.now += 1.0
+        return 3000.0
+
+    monkeypatch.setattr(memory, "process_mib", slow_read)
+    process = SimpleNamespace(pid=1, poll=iter([None, None, 0]).__next__)
+    # Timed when it starts, a read that ends after the stopped line would be counted as before it.
+    assert memory.sample(process, lambda: {}) == [(1.0, 3000.0), (2.0, 3000.0)]
+
+
+def test_memory_counts_only_the_warm_chunks(examples):
+    memory = examples("benchmark_memory")
+    # Loading peaks, compiling holds a long flat plateau, the warm chunks still give back some memory from
+    # loading, then hold steady, and the teardown frees everything.
+    use = [9000.0] * 10 + [7000.0] * 120 + [3100.0] * 80 + [3000.0] * 100 + [500.0] * 6
+    run = [(i * memory.SAMPLE_SECONDS, u) for i, u in enumerate(use)]
+    marks = {memory.WARM: 130 * memory.SAMPLE_SECONDS, memory.STOPPED: 310 * memory.SAMPLE_SECONDS}
+    steady = [mib for _, mib in memory.steady_window(run, marks)]
+    assert steady == [3000.0] * int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+
+
+def run_benchmark_memory(memory, monkeypatch, process_mib, command: str) -> None:
+    """Run benchmark_memory.py on a Python `command`, with a 0.3 s window after 0.1 s to settle."""
+    import sys
+
+    monkeypatch.setattr(memory, "SAMPLE_SECONDS", 0.02)
+    monkeypatch.setattr(memory, "STEADY_SECONDS", 0.3)
+    monkeypatch.setattr(memory, "SETTLE_SECONDS", 0.1)
+    monkeypatch.setattr(memory, "NVGPU", Path("/missing"))
+    monkeypatch.setattr(memory, "nvidia_smi_gpu_mib", lambda: {})
+    monkeypatch.setattr(memory, "process_mib", process_mib)
+    monkeypatch.setattr(sys, "argv", ["benchmark_memory.py", "--", sys.executable, "-c", command])
+    memory.main()
+
+
+def test_memory_measures_a_command_between_its_warm_and_stopped_lines(
+    examples, monkeypatch, capsys, tmp_path
+):
+    memory = examples("benchmark_memory")
+    warm = tmp_path / "warm"
+    # 9000 MiB while the command loads, then 1500 MiB once it runs warm, however long each step takes.
+    command = (
+        f"import pathlib, time; time.sleep(0.2); pathlib.Path({str(warm)!r}).touch();"
+        f"print({memory.WARM!r}, flush=True); time.sleep(1.0); print({memory.STOPPED!r}, flush=True)"
+    )
+    run_benchmark_memory(memory, monkeypatch, lambda pid, gpu: 1500 if warm.exists() else 9000, command)
+    assert capsys.readouterr().out.splitlines()[-1] == "Memory: 1500 MiB"
+
+
+def test_memory_refuses_a_run_whose_memory_still_changes(examples, monkeypatch):
+    import itertools
+
+    memory = examples("benchmark_memory")
+    reads = itertools.count()
+    command = f"import time; print({memory.WARM!r}, flush=True); time.sleep(1.0); print({memory.STOPPED!r})"
+    with pytest.raises(SystemExit, match="Invalid"):
+        run_benchmark_memory(memory, monkeypatch, lambda pid, gpu: 1000 + 50 * next(reads), command)
+
+
+def test_the_documented_memory_run_is_longer_than_the_run_the_memory_benchmark_needs(examples):
+    import re
+
+    memory = examples("benchmark_memory")
+    documented = int(re.search(r"--duration=(\d+)", memory.__doc__).group(1))
+    # The warm and stopped lines are timed as they are read, which can be a little late.
+    assert documented > memory.SETTLE_SECONDS + memory.STEADY_SECONDS
+
+
+def test_memory_refuses_a_run_too_short_to_settle(examples, monkeypatch):
+    import sys
+
+    memory = examples("benchmark_memory")
+    monkeypatch.setattr(memory, "process_mib", lambda pid, gpu: 1500)
+    command = f"print({memory.WARM!r}); print({memory.STOPPED!r})"
+    with pytest.raises(SystemExit, match="Run for at least 115 s"):
+        memory.run([sys.executable, "-c", command], lambda: {})
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux's /proc")
+def test_memory_counts_what_a_child_process_allocates(examples):
+    import subprocess
+    import sys
+
+    memory = examples("benchmark_memory")
+    sizes = []
+    for mib in (10, 210):
+        # A parent that starts a child, which touches every page of `mib` MiB and waits for its input to close.
+        child = f"data = bytearray({mib << 20}); data[::4096] = b'1' * {(mib << 20) // 4096}; print(1, flush=True); input()"
+        parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+        process = subprocess.Popen(
+            [sys.executable, "-c", parent], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+        )
+        process.stdout.readline()
+        sizes.append(memory.process_mib(process.pid, {}))
+        process.stdin.close()
+        process.wait()
+    assert sizes[1] - sizes[0] == pytest.approx(200, abs=10)
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux's /proc")
+def test_memory_adds_the_gpu_memory_of_every_process_it_counts(examples):
+    import os
+    import subprocess
+    import sys
+
+    memory = examples("benchmark_memory")
+    child = "print(1, flush=True); input()"
+    parent = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}])"
+    process = subprocess.Popen(
+        [sys.executable, "-c", parent], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    process.stdout.readline()
+    root, child_pid = memory.process_tree(process.pid)
+    # This test's own process is not one the command started.
+    gpu = {root: 100.0, child_pid: 200.0, os.getpid(): 5000.0}
+    added = memory.process_mib(process.pid, gpu) - memory.process_mib(process.pid, {})
+    process.stdin.close()
+    process.wait()
+    assert added == pytest.approx(300, abs=1)
 
 
 def test_frames_share_one_copy_of_the_file(examples, tmp_path):
@@ -317,18 +457,21 @@ def test_frames_share_one_copy_of_the_file(examples, tmp_path):
 
 def test_memory_is_flat_only_when_it_stops_changing(examples):
     memory = examples("benchmark_memory")
-    samples = int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS)
+    times = [i * memory.SAMPLE_SECONDS for i in range(int(memory.STEADY_SECONDS / memory.SAMPLE_SECONDS))]
     # A settled process whose allocator moves its use up and down by 30 MiB.
-    jitter = np.random.default_rng(0).uniform(-30, 30, samples)
-    assert memory.is_flat(list(4000.0 + jitter))
+    jitter = np.random.default_rng(0).uniform(-30, 30, len(times))
+    assert memory.is_flat(list(zip(times, 4000.0 + jitter, strict=True)))
     # The board still returning a previous job's memory: use falling 7 MiB a second.
-    assert not memory.is_flat([3000.0 - 7 * memory.SAMPLE_SECONDS * i for i in range(samples)])
+    assert not memory.is_flat([(t, 3000.0 - 7 * t) for t in times])
 
 
-def test_memory_accepts_a_60_second_rollout(examples):
+def test_memory_is_flat_measures_its_slope_on_the_samples_real_times(examples):
     memory = examples("benchmark_memory")
-    assert memory.long_enough([3000.0] * int(60 / memory.SAMPLE_SECONDS))
-    assert not memory.long_enough([3000.0] * int(40 / memory.SAMPLE_SECONDS))
+    # Each read takes time, so the samples are further apart than the time slept between them.
+    reads = np.random.default_rng(0).uniform(0.1, 0.5, 60)
+    times = np.cumsum(memory.SAMPLE_SECONDS + reads).tolist()
+    assert memory.is_flat([(t, 4000.0 - 1.5 * t) for t in times])
+    assert not memory.is_flat([(t, 4000.0 - 3 * t) for t in times])
 
 
 def test_torch_compile_replays_cuda_graphs_one_generation_per_chunk(examples, tmp_path, monkeypatch):
@@ -425,3 +568,83 @@ def test_torch_compile_starts_one_cuda_graph_generation_per_chunk_of_a_chain(exa
         engine.get_action({"state": state})
     # A generation per part would let the first part's output, which the second part reads, be overwritten.
     assert len(generations) == 2
+
+
+def test_torch_engine_frees_the_cuda_cache_its_build_left(examples, tmp_path, monkeypatch):
+    import torch
+
+    benchmark = examples("benchmark")
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(1))
+    argv = [f"--policy.path={act_checkpoint(tmp_path / 'act')}", "--frames=unused", "--output=unused"]
+    benchmark.torch_engine("pytorch", argv, tmp_path)
+    # Memory freed while building the parts would otherwise stay cached and count as the policy's.
+    assert emptied == [1]
+
+
+def test_memory_times_a_line_when_it_is_read_not_when_it_is_echoed(examples, monkeypatch):
+    import builtins
+    import time
+    from types import SimpleNamespace
+
+    memory = examples("benchmark_memory")
+    echoed = []
+
+    def slow_print(*args, **kwargs):
+        time.sleep(0.2)
+        echoed.append(time.monotonic())
+
+    monkeypatch.setattr(builtins, "print", slow_print)
+    marks = {}
+    memory.watch(SimpleNamespace(stdout=iter([f"{memory.WARM}\n", f"{memory.STOPPED}\n"])), marks)
+    # An echo that blocks, on a slow terminal, must not move the window toward the teardown.
+    assert marks[memory.WARM] < echoed[0] - 0.1 and marks[memory.STOPPED] < echoed[1] - 0.1
+def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, capsys):
+    from argparse import Namespace
+
+    from tests.export_helpers import write_export_folder
+
+    benchmark = examples("benchmark")
+    write_export_folder(tmp_path, np.zeros((2, 3)))
+    np.savez(tmp_path / "frames.npz", **{"observation.state": np.zeros((benchmark.FRAMES, 3), np.float32)})
+    chunks = []
+
+    class Program:
+        def reset(self):
+            pass
+
+        def get_action(self, frame):
+            chunks.append(capsys.readouterr().out)
+
+    args = Namespace(frames=tmp_path / "frames.npz", output=None, duration=0.2)
+    benchmark.measure_engine("folder", Program(), args, tmp_path)
+    # The warm line comes only after every warm-up chunk, the stopped line after the last chunk.
+    assert chunks[: benchmark.WARMUP_CHUNKS] == [""] * benchmark.WARMUP_CHUNKS
+    assert chunks[benchmark.WARMUP_CHUNKS] == benchmark.WARM + "\n"
+    assert len(chunks) > benchmark.WARMUP_CHUNKS + 1
+    assert capsys.readouterr().out == benchmark.STOPPED + "\n"
+
+
+def test_duration_keeps_only_a_copy_of_the_first_frame(examples, tmp_path):
+    from argparse import Namespace
+
+    from tests.export_helpers import write_export_folder
+
+    benchmark = examples("benchmark")
+    write_export_folder(tmp_path, np.zeros((2, 3)))
+    states = np.arange(benchmark.FRAMES * 3, dtype=np.float32).reshape(benchmark.FRAMES, 3)
+    np.savez(tmp_path / "frames.npz", **{"observation.state": states})
+    seen = []
+
+    class Program:
+        def reset(self):
+            pass
+
+        def get_action(self, frame):
+            seen.append(frame["observation.state"])
+
+    args = Namespace(frames=tmp_path / "frames.npz", output=None, duration=0.0)
+    benchmark.measure_engine("folder", Program(), args, tmp_path)
+    # A view of the first frame would keep every frame in memory while the run is measured.
+    assert all(state.base is None for state in seen)
+    np.testing.assert_array_equal(seen[-1], states[0])
