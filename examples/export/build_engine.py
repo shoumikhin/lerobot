@@ -38,26 +38,26 @@ WORKSPACE_BYTES = 1 << 30
 
 def build_engine(onnx_path: Path, engine_path: Path) -> None:
     """Build a TensorRT engine that keeps the ONNX file's own dtypes, as the other routes do."""
-    import tensorrt as trt
+    import tensorrt
 
-    class FileWriter(trt.IStreamWriter):
+    class FileWriter(tensorrt.IStreamWriter):
         """Writes the engine to a file as TensorRT serializes it, without another copy in memory."""
 
         def __init__(self, file):
-            trt.IStreamWriter.__init__(self)
+            tensorrt.IStreamWriter.__init__(self)
             self._file = file
 
         def write(self, data: bytes) -> int:
             return self._file.write(data)
 
-    logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
-    parser = trt.OnnxParser(network, logger)
+    logger = tensorrt.Logger(tensorrt.Logger.WARNING)
+    builder = tensorrt.Builder(logger)
+    network = builder.create_network(1 << int(tensorrt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+    parser = tensorrt.OnnxParser(network, logger)
     if not parser.parse_from_file(str(onnx_path)):
         raise SystemExit("\n".join(str(parser.get_error(i)) for i in range(parser.num_errors)))
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
+    config.set_memory_pool_limit(tensorrt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
     config.builder_optimization_level = OPTIMIZATION_LEVEL
     start = time.perf_counter()
     with engine_path.open("wb") as file:

@@ -153,12 +153,12 @@ def fake_engine(monkeypatch, fake_cuda):
             device_memory_size_v2=SCRATCH_BYTES.get(path.stem, 64),
         )
 
-    trt = SimpleNamespace(
+    fake_tensorrt = SimpleNamespace(
         nptype=lambda dtype: np.float32,
         bfloat16="bfloat16",
         ExecutionContextAllocationStrategy=SimpleNamespace(STATIC=0, USER_MANAGED=1),
     )
-    monkeypatch.setitem(sys.modules, "tensorrt", trt)
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
     monkeypatch.setattr(backend, "load_engine", load_engine)
     return contexts
 
@@ -372,10 +372,10 @@ def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
         cudaFree=MagicMock(return_value=(0,)),
     )
     monkeypatch.setattr(backend, "cuda_runtime", lambda: cuda)
-    trt = SimpleNamespace(
+    fake_tensorrt = SimpleNamespace(
         IGpuAllocator=type("Allocator", (), {}), Runtime=lambda logger: SimpleNamespace(), Logger=MagicMock()
     )
-    monkeypatch.setitem(sys.modules, "tensorrt", trt)
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
     monkeypatch.setattr(backend, "runtime", functools.cache(backend.runtime.__wrapped__))
     allocator = backend.runtime().gpu_allocator
     assert allocator.allocate(512, 256, 0) == 4096
@@ -392,14 +392,14 @@ def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
 
 def test_bfloat16_bindings_use_extension_dtype(monkeypatch):
     ml_dtypes = pytest.importorskip("ml_dtypes")
-    trt = SimpleNamespace(bfloat16="bfloat16", nptype=MagicMock(side_effect=TypeError))
-    monkeypatch.setitem(sys.modules, "tensorrt", trt)
-    dtype = backend.numpy_dtype(trt.bfloat16)
+    fake_tensorrt = SimpleNamespace(bfloat16="bfloat16", nptype=MagicMock(side_effect=TypeError))
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
+    dtype = backend.numpy_dtype(fake_tensorrt.bfloat16)
     assert dtype == np.dtype(ml_dtypes.bfloat16)
     assert dtype.itemsize == 2
     values = np.asarray([1.25, -2.5], dtype=dtype)
     np.testing.assert_array_equal(values.astype(np.float32), [1.25, -2.5])
-    trt.nptype.assert_not_called()
+    fake_tensorrt.nptype.assert_not_called()
 
 
 def test_cuda_error_is_not_ignored():

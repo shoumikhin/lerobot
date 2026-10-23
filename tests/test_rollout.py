@@ -1972,21 +1972,21 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
                 data += pieces[-1]
             return data
 
-    fake_trt = types.SimpleNamespace(
+    fake_tensorrt = types.SimpleNamespace(
         IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
         IGpuAllocator=type("IGpuAllocator", (), {"__init__": lambda self: None}),
         SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
         Runtime=Runtime,
         Logger=MagicMock(),
     )
-    monkeypatch.setitem(sys.modules, "tensorrt", fake_trt)
+    monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
     monkeypatch.setattr(export_tensorrt, "runtime", functools.cache(export_tensorrt.runtime.__wrapped__))
     monkeypatch.setattr(export_tensorrt, "READ_CHUNK_BYTES", 4)
     (tmp_path / "model.engine").write_bytes(b"0123456789")
 
     assert export_tensorrt.load_engine(tmp_path / "model.engine") == b"0123456789"
     assert [len(piece) for piece in pieces] == [4, 4, 2]
-    assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_trt.IGpuAllocator)
+    assert isinstance(export_tensorrt.runtime().gpu_allocator, fake_tensorrt.IGpuAllocator)
 
 
 def test_export_engine_refuses_another_task_before_loading_the_programs(tmp_path, monkeypatch):
