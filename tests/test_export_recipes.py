@@ -591,6 +591,40 @@ def test_pi05_step_reads_the_shared_kv_head_unrepeated_where_tensorrt_is_faster(
     assert len(calls) == (4 if folded else 0)
 
 
+@require_hf_token
+def test_pi05_step_holds_the_schedule_modulation_instead_of_the_time_mlp(recipes, tmp_path, monkeypatch):
+    """The step reads each adaptive norm's modulation for its timestep from a table, and computes the policy's step."""
+    pytest.importorskip("transformers")
+    from copy import deepcopy
+
+    from transformers import DynamicCache
+
+    from lerobot.policies.pi_gemma import PiGemmaRMSNorm
+
+    torch.manual_seed(0)
+    checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None)
+    )
+    prefix_pad_masks, *cache, x_t, _ = next(part for part in exporter.parts() if part.name == "step").inputs
+    policy = exporter.load_modules(*pi05.STEP_MODULES).model
+    # A new policy's norms ignore the time (their projections start at zero), so give them some to read.
+    for norm in policy.modules():
+        if isinstance(norm, PiGemmaRMSNorm) and norm.dense is not None:
+            torch.nn.init.normal_(norm.dense.weight, std=0.1)
+    step = pi05.PI05Step(deepcopy(policy), exporter.dt, exporter.timesteps)
+    norms = [module for module in step.modules() if isinstance(module, PiGemmaRMSNorm)]
+    assert norms and all(norm.dense.in_features == len(exporter.timesteps) for norm in norms)
+    for timestep in exporter.timesteps:
+        time = torch.tensor([timestep])
+        past = DynamicCache(tuple((k, v, None) for k, v in zip(cache[::2], cache[1::2], strict=True)))
+        with torch.no_grad():
+            expected = x_t + exporter.dt * policy.denoise_step(prefix_pad_masks, past, x_t[None], time)[0]
+            torch.testing.assert_close(step(prefix_pad_masks, *cache, x_t, time), expected)
+
+
 @require_cuda
 @require_hf_token
 def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_computes(
@@ -605,7 +639,9 @@ def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_co
     )
     with monkeypatch.context() as patch:
         patch.setattr(pi05, "hold_linear_weights_in_bfloat16", lambda module: None)
-        stock_step = pi05.PI05Step(exporter.load_modules(*pi05.STEP_MODULES).model, exporter.dt)
+        stock_step = pi05.PI05Step(
+            exporter.load_modules(*pi05.STEP_MODULES).model, exporter.dt, exporter.timesteps
+        )
     stock = {
         "embed": pi05.PI05Embed(exporter.load_modules(*pi05.EMBED_MODULES), exporter.observation),
         "step": stock_step,
