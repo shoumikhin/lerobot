@@ -412,7 +412,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         noise=noise,
         timesteps=[0, 333, 666],
         num_steps=3,
-        horizon=2,
+        n_action_steps=2,
         postprocessor=action_pipeline(),
         frame={
             "features": features.numpy(),

@@ -441,7 +441,7 @@ class Exporter:
         self.policy = self.load_modules(VISION)
         model = self.policy._groot_model
         self.model_config = model.config
-        self.horizon = self.policy._action_queue_steps
+        self.n_action_steps = self.policy._action_queue_steps
         preprocessor, self.postprocessor = processors(self.config, args.policy_path)
         check_traceable_decode(self.postprocessor, args.route)
         self.task, self.frame, self.folder_config = dataset_frame(args, self.config)
@@ -586,7 +586,9 @@ class Exporter:
                     names = ["vl_embeds", f"step_hidden_{group}", "temb"]
                 del module
         free_memory()
-        module = ChunkActions(self.horizon, self.config.output_features[ACTION].shape[0], self.postprocessor)
+        module = ChunkActions(
+            self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
+        )
         state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
         with torch.no_grad():
             self.expected_actions = module(actions, state).float().cpu().numpy()
