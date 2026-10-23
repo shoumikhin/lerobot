@@ -77,6 +77,25 @@ class SmolVLAChunk(nn.Module):
         return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
 
 
+class VisionEmbeddingsForExport(nn.Module):
+    """SmolVLM's vision embeddings, with the position ids the policy computed for the cameras held as a constant.
+
+    SmolVLA gives its vision model no patch mask, so every patch is valid and the ids never change. Computed in the
+    program, they would come from a boolean-mask index whose size depends on the data, which ExecuTorch's CUDA
+    backend cannot run.
+    """
+
+    def __init__(self, embeddings: nn.Module, position_ids: Tensor):
+        super().__init__()
+        self.patch_embedding = embeddings.patch_embedding
+        self.position_embedding = embeddings.position_embedding
+        self.register_buffer("position_ids", position_ids)
+
+    def forward(self, pixel_values: Tensor, patch_attention_mask: Tensor) -> Tensor:
+        embeddings = self.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
+        return embeddings + self.position_embedding(self.position_ids)
+
+
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     add_dataset_arguments(parser)
 
@@ -105,7 +124,14 @@ class Exporter:
         self.noise = torch.randn(
             self.policy.config.chunk_size, self.policy.config.max_action_dim, device=device()
         )
+        vision = self.policy.model.vlm_with_expert.get_vlm_model().vision_model
+        position_ids = []
+        hook = vision.embeddings.position_embedding.register_forward_pre_hook(
+            lambda module, args: position_ids.append(args[0])
+        )
         self.expected_actions = self.rollout_actions()
+        hook.remove()
+        vision.embeddings = VisionEmbeddingsForExport(vision.embeddings, position_ids[0])
 
     def parts(self) -> Iterator[Part]:
         preprocessor, postprocessor = processors(self.policy.config, self.args.policy_path)
