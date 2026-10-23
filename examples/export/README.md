@@ -34,13 +34,16 @@ python examples/export/to_executorch_tensorrt.py \
     --output_dir=outputs/export/act
 ```
 
-Each script compiles any supported policy one way. All use [TensorRT](https://developer.nvidia.com/tensorrt), NVIDIA's compiler for its GPUs. If you are not sure, start with ExecuTorch-TensorRT: it is fast and small, and it runs without PyTorch.
+Each script compiles any supported policy one way. The first three use [TensorRT](https://developer.nvidia.com/tensorrt), NVIDIA's compiler for its GPUs; the last uses ExecuTorch's own CUDA backend, which compiles with PyTorch's AOTInductor instead. If you are not sure, start with ExecuTorch-TensorRT: it is fast and small, and it runs without PyTorch.
 
-| script                      | writes                      | needs PyTorch to run |
-| --------------------------- | --------------------------- | -------------------- |
-| `to_executorch_tensorrt.py` | ExecuTorch `.pte` programs  | no                   |
-| `to_onnx_tensorrt.py`       | TensorRT `.engine` files    | no                   |
-| `to_torch_tensorrt.py`      | AOTInductor `.pt2` packages | yes                  |
+| script                      | writes                                  | needs PyTorch to run |
+| --------------------------- | --------------------------------------- | -------------------- |
+| `to_executorch_tensorrt.py` | ExecuTorch `.pte` programs              | no                   |
+| `to_onnx_tensorrt.py`       | TensorRT `.engine` files                | no                   |
+| `to_torch_tensorrt.py`      | AOTInductor `.pt2` packages             | yes                  |
+| `to_executorch_cuda.py`     | ExecuTorch `.pte` and `.ptd` programs   | no                   |
+
+`to_executorch_cuda.py` needs a CUDA build of ExecuTorch (the install command above gets one) and compiles every kernel on the board, which takes 5 to 30 minutes per policy. On an 8 GB Orin Nano, run it with `TORCHINDUCTOR_COMPILE_THREADS=1`, so the compiler's worker processes do not fill the memory. SmolVLA and GR00T need a PyTorch nightly from 2026-10-22 or newer, and GR00T also an ExecuTorch with [pytorch/executorch#24104](https://github.com/pytorch/executorch/pull/24104).
 
 Some policies need more arguments:
 

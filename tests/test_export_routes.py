@@ -37,7 +37,13 @@ def route(monkeypatch):
     def load(name):
         stubs = {
             "torch_tensorrt": MagicMock(),
-            "executorch.exir": SimpleNamespace(ExecutorchBackendConfig=MagicMock()),
+            "executorch.backends.cuda.cuda_backend": SimpleNamespace(CudaBackend=MagicMock()),
+            "executorch.backends.cuda.cuda_partitioner": SimpleNamespace(CudaPartitioner=MagicMock()),
+            "executorch.exir": SimpleNamespace(
+                EdgeCompileConfig=MagicMock(),
+                ExecutorchBackendConfig=MagicMock(),
+                to_edge_transform_and_lower=MagicMock(),
+            ),
             "executorch.exir.passes.memory_planning_pass": SimpleNamespace(MemoryPlanningPass=MagicMock()),
             "executorch.exir.passes.propagate_device_pass": SimpleNamespace(
                 PropagateDeviceConfig=MagicMock()
@@ -71,6 +77,30 @@ def test_executorch_route_keeps_inputs_and_outputs_on_the_gpu_and_records_cuda_g
     kwargs = tensorrt.save.call_args.kwargs
     assert tensorrt.save.call_args.args[1] == str(tmp_path / "step.pte")
     assert kwargs["output_format"] == "executorch" and kwargs["use_cuda_graphs"] is True
+    stubs["executorch.exir.passes.propagate_device_pass"].PropagateDeviceConfig.assert_called_once_with(
+        skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
+    )
+    stubs["executorch.exir.passes.memory_planning_pass"].MemoryPlanningPass.assert_called_once_with(
+        alloc_graph_input=False, alloc_graph_output=False
+    )
+
+
+def test_executorch_cuda_route_lowers_to_the_cuda_backend_and_names_the_data_file_after_the_part(
+    route, tmp_path
+):
+    compile_part, stubs = route("to_executorch_cuda")
+    program = stubs["executorch.exir"].to_edge_transform_and_lower.return_value.to_executorch.return_value
+    program.buffer = b"program"
+    # The backend names its data file the same whatever the program.
+    program.write_tensor_data_to_file.side_effect = lambda folder: (
+        Path(folder) / "aoti_cuda_blob.ptd"
+    ).write_bytes(b"weights")
+    compile_part(part(), tmp_path / "step.pte")
+    assert (tmp_path / "step.pte").read_bytes() == b"program"
+    assert (tmp_path / "step.ptd").read_bytes() == b"weights"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["step.ptd", "step.pte"]
+    partitioner = stubs["executorch.exir"].to_edge_transform_and_lower.call_args.kwargs["partitioner"]
+    assert partitioner == [stubs["executorch.backends.cuda.cuda_partitioner"].CudaPartitioner.return_value]
     stubs["executorch.exir.passes.propagate_device_pass"].PropagateDeviceConfig.assert_called_once_with(
         skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
     )

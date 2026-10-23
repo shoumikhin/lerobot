@@ -53,9 +53,12 @@ class Result:
 @pytest.fixture
 def executorch(monkeypatch):
     """A stand-in ExecuTorch runtime; `programs` maps a file name to its function on host arrays."""
-    programs, calls, options = {}, [], []
+    programs, calls, options, data_paths = {}, [], [], {}
+    backends = {"TensorRTBackend", "CudaBackend"}
 
-    def load(path):
+    def load(path, data_path=None):
+        data_paths[path.name] = data_path
+
         def execute(inputs):
             assert all(isinstance(value, Result) and value.device == CUDA for value in inputs), (
                 "programs only see device buffers"
@@ -65,7 +68,9 @@ def executorch(monkeypatch):
 
         return SimpleNamespace(load_method=lambda name: SimpleNamespace(execute=execute))
 
-    registry = SimpleNamespace(set_option=lambda backend, opts: options.append((backend, opts)))
+    registry = SimpleNamespace(
+        set_option=lambda backend, opts: options.append((backend, opts)), is_available=backends.__contains__
+    )
     runtime = SimpleNamespace(load_program=load, backend_registry=registry)
     monkeypatch.setitem(
         sys.modules,
@@ -73,7 +78,9 @@ def executorch(monkeypatch):
         SimpleNamespace(Runtime=SimpleNamespace(get=lambda: runtime), ExecuTorchResult=Result),
     )
     monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", SimpleNamespace())
-    return SimpleNamespace(programs=programs, calls=calls, options=options)
+    return SimpleNamespace(
+        programs=programs, calls=calls, options=options, data_paths=data_paths, backends=backends
+    )
 
 
 def chain_info(names, route="executorch_tensorrt", suffix=".pte", **info):
@@ -192,6 +199,31 @@ def test_executorch_programs_of_a_chain_share_one_activation_scratch(tmp_path, e
     info = chain_info({"model": (["observation.state"], ["action"])}, inputs=["observation.state"])
     load_programs(tmp_path, info)
     assert executorch.options == [("TensorRTBackend", {"use_shared_activation_scratch": True})]
+
+
+def test_executorch_cuda_programs_load_their_data_file_and_replay_cuda_graphs(
+    tmp_path, executorch, monkeypatch
+):
+    """A CUDA program keeps its weights and kernels in a data file beside it, and needs no TensorRT runtime."""
+    monkeypatch.setitem(sys.modules, "torch_tensorrt_executorch_runtime", None)
+    executorch.programs["model.pte"] = lambda state: [2 * state]
+    (tmp_path / "model.ptd").write_bytes(b"")
+    info = chain_info(
+        {"model": (["observation.state"], ["action"])}, route="executorch_cuda", inputs=["observation.state"]
+    )
+    program = load_programs(tmp_path, info)["model"]
+    np.testing.assert_array_equal(program(np.ones(2, np.float32)), [2, 2])
+    assert executorch.data_paths == {"model.pte": tmp_path / "model.ptd"}
+    assert executorch.options == [("CudaBackend", {"enable_cuda_graph_for_method": "forward"})]
+
+
+def test_executorch_cuda_needs_a_cuda_build_of_executorch(tmp_path, executorch):
+    executorch.backends.discard("CudaBackend")
+    info = chain_info(
+        {"model": (["observation.state"], ["action"])}, route="executorch_cuda", inputs=["observation.state"]
+    )
+    with pytest.raises(ImportError, match="CUDA build of ExecuTorch"):
+        load_programs(tmp_path, info)
 
 
 def test_executorch_host_copies_survive_the_next_run(tmp_path, executorch):

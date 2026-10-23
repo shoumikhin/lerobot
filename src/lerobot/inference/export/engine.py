@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
 NOISE = "noise"
-ROUTES = ("executorch_tensorrt", "onnx_tensorrt", "torch_tensorrt")
+ROUTES = ("executorch_tensorrt", "executorch_cuda", "onnx_tensorrt", "torch_tensorrt")
 
 
 class Program(Protocol):
@@ -71,10 +71,10 @@ def load_programs(folder: Path, info: dict) -> Mapping[str, Program]:
         from .tensorrt import load_tensorrt_programs
 
         return load_tensorrt_programs(folder, programs)
-    if route == "executorch_tensorrt":
+    if route in ("executorch_tensorrt", "executorch_cuda"):
         from .executorch import ExecuTorchProgram
 
-        return {name: ExecuTorchProgram(folder / p["file"]) for name, p in programs.items()}
+        return {name: ExecuTorchProgram(folder / p["file"], route) for name, p in programs.items()}
     if route == "torch_tensorrt":
         from .aoti import AOTInductorProgram
 

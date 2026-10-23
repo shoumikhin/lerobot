@@ -1,0 +1,1 @@
+2026-10-22 14:08 ORIN SmolVLA with module.cpu() after export: FAILED 'Expected all tensors to be on the same device, but got weight is on cpu' (to_edge retraces with the program's weights). Reverted (HEAD). Experiment queued: exp_route.py W2_SPECS=low_memory_mode=ON (shares weights in the preprocess copy), TAG executorch_cuda_lowmem. Thor ACT memory run 1: 571 MiB.

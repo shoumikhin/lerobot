@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run an exported policy's ExecuTorch programs on TensorRT, without PyTorch."""
+"""Run an exported policy's ExecuTorch programs on TensorRT or on ExecuTorch's CUDA backend, without PyTorch."""
 
 import os
 from pathlib import Path
@@ -36,24 +36,37 @@ class ExecuTorchProgram:
     Calling the last program of a chain takes host arrays and returns its one output, the actions, on the host.
     """
 
-    def __init__(self, path: Path):
-        """Load the `forward` method of the program at `path`."""
+    def __init__(self, path: Path, route: str):
+        """Load the `forward` method of the program at `path`, and its data file if it has one."""
+        cuda = route == "executorch_cuda"
+        needs = (
+            "a CUDA build of ExecuTorch 1.6.0.dev20261021 or newer"
+            if cuda
+            else 'ExecuTorch 1.6.0.dev20261021 or newer and its TensorRT runtime, which `pip install "torch-tensorrt[executorch]"` installs'
+        )
         try:
-            import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
+            if not cuda:
+                import torch_tensorrt_executorch_runtime  # noqa: F401  # registers the TensorRT backend
 
             # ExecuTorchResult arrived with the API this module uses, so an older ExecuTorch fails here.
             from executorch.runtime import ExecuTorchResult, Runtime  # noqa: F401
         except ImportError as error:
             raise ImportError(
-                "An ExecuTorch-TensorRT export needs ExecuTorch 1.6.0.dev20261021 or newer and its TensorRT "
-                'runtime, which `pip install "torch-tensorrt[executorch]"` installs; see examples/export/README.md. '
-                f"({error})"
+                f"This export needs {needs}; see examples/export/README.md. ({error})"
             ) from error
 
         runtime = Runtime.get()
-        # The programs of a chain run one after another, so they can share one activation scratch.
-        runtime.backend_registry.set_option("TensorRTBackend", {"use_shared_activation_scratch": True})
-        self._method = runtime.load_program(path).load_method("forward")
+        if cuda:
+            if not runtime.backend_registry.is_available("CudaBackend"):
+                raise ImportError(f"This export needs {needs}; see examples/export/README.md.")
+            # Replay each program's work as a CUDA graph, as the TensorRT routes do.
+            runtime.backend_registry.set_option("CudaBackend", {"enable_cuda_graph_for_method": "forward"})
+        else:
+            # The programs of a chain run one after another, so they can share one activation scratch.
+            runtime.backend_registry.set_option("TensorRTBackend", {"use_shared_activation_scratch": True})
+        data = path.with_suffix(".ptd")
+        program = runtime.load_program(path, data_path=data if data.is_file() else None)
+        self._method = program.load_method("forward")
 
     def run_device(self, *inputs: np.ndarray | Any) -> tuple[Any, ...]:
         """Run the program; its outputs stay on the GPU for the next program to read."""

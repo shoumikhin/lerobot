@@ -300,13 +300,15 @@ class Method:
 
 
 class Runtime:
-    backend_registry = type("Registry", (), {"set_option": lambda self, backend, options: None})()
+    backend_registry = type(
+        "Registry", (), {"set_option": lambda self, backend, options: None, "is_available": lambda self, name: True}
+    )()
 
     @staticmethod
     def get():
         return Runtime()
 
-    def load_program(self, path):
+    def load_program(self, path, data_path=None):
         return type("Program", (), {"load_method": lambda self, name: Method(path)})()
 """
 
@@ -363,7 +365,7 @@ assert "torch" not in sys.modules
 )
 
 
-@pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "executorch_cuda", "onnx_tensorrt"])
 def test_export_engine_runs_a_denoising_chain_without_torch(tmp_path, route):
     """With torch installed but refusing to load, the engine runs a flow-matching chain with a camera."""
     result = run_without_torch(ENGINE_WITHOUT_TORCH, tmp_path, route)
