@@ -110,15 +110,17 @@ class TorchProgram:
         return torch.from_numpy(value).to(device())
 
 
-def torch_engine(executor: str, argv: list[str]):
-    """The engine around the recipe's parts in PyTorch, or compiled by torch.compile, and its arguments."""
+def torch_engine(executor: str, argv: list[str], folder: Path):
+    """The engine around the recipe's parts in PyTorch, or compiled by torch.compile, and its arguments.
+
+    `folder` receives export.json and the test case, which the engine checks on load as for an export.
+    """
     import torch
     from common import parse_args
 
     from lerobot.inference.export import ExportInferenceEngine, engine
 
-    sys.argv = [sys.argv[0], *argv]
-    args, recipe = parse_args(__doc__, executor, (benchmark_arguments(),))
+    args, recipe = parse_args(__doc__, executor, (benchmark_arguments(),), argv)
     # The compiled routes run float32 matrix multiplications in TensorFloat-32 too.
     torch.set_float32_matmul_precision("high")
     exporter = recipe.Exporter(args)
@@ -131,8 +133,7 @@ def torch_engine(executor: str, argv: list[str]):
             with torch.no_grad():
                 module = torch.compile(torch.export.export(part.module, part.inputs).module())
         modules[part.name] = module
-    # The folder holds export.json and the test case, which the engine checks on load as for an export.
-    args.output_dir = Path(tempfile.mkdtemp())
+    args.output_dir = folder
     exporter.write(programs)
     loaded = {name: TorchProgram(module) for name, module in modules.items()}
     with mock.patch.object(engine, "load_programs", lambda folder, info: loaded):
@@ -148,17 +149,21 @@ def benchmark_arguments() -> argparse.ArgumentParser:
 
 def measure(executor: str, argv: list[str]) -> None:
     """Run one executor on the frames and save its times per chunk and its actions."""
-    from safetensors.numpy import load_file
-
     from lerobot.inference.export import ExportInferenceEngine
 
     if executor in ("pytorch", "torch.compile"):
-        program, args = torch_engine(executor, argv)
-        folder = args.output_dir
+        with tempfile.TemporaryDirectory() as folder:
+            program, args = torch_engine(executor, argv, Path(folder))
+            measure_engine(executor, program, args, Path(folder))
     else:
         args = benchmark_arguments().parse_args(argv)
-        folder = Path(executor)
-        program = ExportInferenceEngine(folder, task="")
+        measure_engine(executor, ExportInferenceEngine(Path(executor), task=""), args, Path(executor))
+
+
+def measure_engine(executor: str, program, args: argparse.Namespace, folder: Path) -> None:
+    """Time `program` on the first frame, then save its actions for every frame."""
+    from safetensors.numpy import load_file
+
     info = json.loads((folder / "export.json").read_text())
     chunk_size = len(load_file(folder / info["test_case"])["expected_actions"])
     data = np.load(args.frames)
