@@ -53,7 +53,7 @@ from lerobot.processor import (
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
-POLICIES = ("act", "smolvla", "pi05", "groot")
+POLICIES = ("act", "smolvla", "pi05", "groot", "vqbet")
 TEST_CASE = "test_case.safetensors"
 # The random test images are blends of a coarse grid of random colors (rows, columns).
 IMAGE_CELLS = (6, 8)
