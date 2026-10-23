@@ -43,3 +43,16 @@ def fake_program(*inputs):
     """A program whose chunk is the state, then doubled: two actions of three joints."""
     state = inputs[0]
     return np.stack([state, 2 * state])
+
+
+def action_pipeline(*steps):
+    """A postprocessor that takes and returns an action tensor, as the policies' own do."""
+    from lerobot.processor import (
+        PolicyProcessorPipeline,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    return PolicyProcessorPipeline(
+        steps=list(steps), to_transition=policy_action_to_transition, to_output=transition_to_policy_action
+    )
