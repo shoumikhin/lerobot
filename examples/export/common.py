@@ -37,11 +37,12 @@ import numpy as np
 import torch
 from build_engine import WORKSPACE_BYTES, check_folder
 from safetensors.numpy import save_file
+from safetensors.torch import save_file as save_tensors
 from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets import LeRobotDatasetMetadata
-from lerobot.inference.export.engine import EXPORT_INFO, NOISE
+from lerobot.inference.export.engine import CAMERAS_PRESENT, EXPORT_INFO, NOISE
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -195,13 +196,28 @@ def write_folder(
     info = {
         "route": args.route,
         "programs": programs,
-        "inputs": [*frame, *([NOISE] if noise is not None else [])],
+        "inputs": [
+            *frame,
+            *([CAMERAS_PRESENT] if "optional_cameras" in info else []),
+            *([NOISE] if noise is not None else []),
+        ],
         "test_case": TEST_CASE,
         "tolerance": args.tolerance,
         **info,
     }
     (args.output_dir / EXPORT_INFO).write_text(json.dumps(info, indent=2) + "\n")
     print(f"Wrote {args.output_dir}")
+
+
+def save_embedding_table(weight: Tensor, path: Path) -> None:
+    """Save a token embedding table for the rollout to read rows from, in bfloat16 when that holds it exactly.
+
+    GR00T's checkpoint stores its bfloat16 table in float32, which would double the file and every row read.
+    """
+    weight = weight.detach()
+    if weight.dtype == torch.float32 and torch.equal(weight, weight.to(torch.bfloat16).float()):
+        weight = weight.to(torch.bfloat16)
+    save_tensors({"weight": weight.contiguous()}, path)
 
 
 def make_output_dir(output_dir: Path | None, job_name: str) -> Path:

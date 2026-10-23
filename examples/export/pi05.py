@@ -15,10 +15,10 @@
 """The pi0.5 recipe: one action chunk of LeRobot's own pi0.5, as a chain of programs.
 
 The chunk goes from the robot's raw uint8 HWC cameras, float32 state and noise to actions in robot units.
-pi0.5 reads the state as bin numbers in its prompt, so the program digitizes it and builds the prompt from
-token pieces made at export time; no tokenizer runs at inference. The task's tokens are constants, and the
-program keeps only the vocabulary rows the prompt can hold (about 1 GiB less), so the folder runs only that
-task.
+pi0.5 reads the task and the state, as bin numbers, in its prompt. The rollout turns the task into token
+embeddings with the policy's own tokenizer and full embedding table, which the folder keeps as a file, so
+the folder runs any task. The program digitizes the state and adds its tokens after the task's, from the
+few embedding rows the state and the end of the prompt can use, so it holds no copy of the 1 GiB table.
 
 The chain is the embeddings, the language model in groups of three layers, one denoising step, and the
 actions. Each part is built in its own process with only its own weights in memory, so an 8 GB board can
@@ -39,6 +39,7 @@ from common import (
     free_memory,
     hold_linear_weights_in_bfloat16,
     processors,
+    save_embedding_table,
     to_policy_input,
     write_folder,
 )
@@ -47,6 +48,8 @@ from transformers import DynamicCache
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
+from lerobot.inference.export.engine import CAMERAS_PRESENT
+from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch, get_gemma_config
@@ -82,8 +85,20 @@ LANGUAGE_LAYERS_PER_PROGRAM = 3
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--task", required=True, help="The task the policy was trained on, as a sentence.")
-    parser.add_argument("--cameras", nargs="+", help="The camera slots the robot fills; pi0.5 pads the rest.")
+    parser.add_argument(
+        "--task", required=True, help="A task the policy was trained on, as a sentence, for the test case."
+    )
+    parser.add_argument(
+        "--cameras",
+        nargs="+",
+        help="The camera slots the robot can fill, if not all of them; pi0.5 pads the rest. Default: all.",
+    )
+    parser.add_argument(
+        "--max_task_tokens",
+        type=int,
+        help="The longest task, in tokens, the folder runs; a shorter prompt is faster. Default: what fits in "
+        "the policy's prompt.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -92,48 +107,93 @@ def part_names(args: argparse.Namespace) -> list[str]:
     return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
 
 
-class StatePrompt(nn.Module):
-    """The fixed task and normalized state as a padded Gemma prompt."""
+# What `Pi05PrepareStateTokenizerProcessorStep` writes before the state; the rollout tokenizes it.
+TASK_TEXT = "Task: {task}, State:"
 
-    def __init__(self, tokenizer: TokenizerProcessorStep, task: str, state_dim: int):
+
+class StatePrompt(nn.Module):
+    """The task and the normalized state as a padded Gemma prompt, given as the embedding rows of its tokens.
+
+    The task's rows come in, looked up by the rollout. Those of the state's bin numbers and of the end of the
+    prompt are the only others a prompt can hold, so the module keeps just them. The policy pads its prompt
+    to the tokenizer's length and leaves the padding out of attention; a prompt for `max_task_tokens` is
+    padded only to the longest prompt with that many, which gives the same actions in less time.
+    """
+
+    def __init__(
+        self,
+        tokenizer: TokenizerProcessorStep,
+        embedding: nn.Embedding,
+        state_dim: int,
+        max_task_tokens: int | None = None,
+    ):
         super().__init__()
         tok = tokenizer.input_tokenizer
-        clean = task.strip().replace("_", " ").replace("\n", " ")
-        prefix = tok.encode(f"Task: {clean}, State:")
         pieces = [tok.encode(f" {value}", add_special_tokens=False) for value in range(-1, 256)]
         suffix = tok.encode(";\nAction: ", add_special_tokens=False)
         width = max(map(len, pieces))
-        if (
-            tokenizer.padding_side != "right"
-            or len(prefix) + state_dim * width + len(suffix) > tokenizer.max_length
-        ):
-            raise ValueError("The state prompt must fit in a right-padded tokenizer window.")
-        self.pad_id = tok.pad_token_id
+        # The longest task prompt that leaves room for the widest state and the end of the prompt.
+        longest = tokenizer.max_length - state_dim * width - len(suffix)
+        self.max_task_tokens = longest if max_task_tokens is None else max_task_tokens
+        if tokenizer.padding_side != "right" or not 0 < self.max_task_tokens <= longest:
+            raise ValueError(
+                f"The task prompt must fit in a right-padded tokenizer window: at most {longest}."
+            )
+        length = self.max_task_tokens + state_dim * width + len(suffix)
+        pad_id = tok.pad_token_id
+        ids = sorted({pad_id, *suffix, *(i for p in pieces for i in p)})
+        local = {token: index for index, token in enumerate(ids)}
+        # Row i of the rows the prompt draws from is task row i, then come these.
+        offset = self.max_task_tokens
+        self.pad = offset + local[pad_id]
+        self.register_buffer(
+            "rows", embedding.weight.detach()[torch.tensor(ids, device=embedding.weight.device)]
+        )
         self.register_buffer("edges", -1 + torch.arange(256, dtype=torch.float32) / 128)
-        self.register_buffer("prefix", torch.tensor(prefix))
-        self.register_buffer("suffix", torch.tensor(suffix))
-        self.register_buffer("pieces", torch.tensor([p + [self.pad_id] * (width - len(p)) for p in pieces]))
+        self.register_buffer("suffix", torch.tensor([offset + local[i] for i in suffix]))
+        padded = [[offset + local[i] for i in p] + [self.pad] * (width - len(p)) for p in pieces]
+        self.register_buffer("pieces", torch.tensor(padded))
         self.register_buffer("lengths", torch.tensor(list(map(len, pieces))))
         self.register_buffer("piece_positions", torch.arange(width))
-        self.register_buffer("positions", torch.arange(tokenizer.max_length))
+        self.register_buffer("task_positions", torch.arange(self.max_task_tokens))
+        self.register_buffer("positions", torch.arange(length))
 
-    def forward(self, state: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, state: Tensor, task_embeddings: Tensor, task_length: Tensor) -> tuple[Tensor, Tensor]:
         bins = (state.flatten()[..., None] >= self.edges).sum(-1) - 1
         pieces = self.pieces[bins + 1].flatten()
         valid = (self.piece_positions < self.lengths[bins + 1, None]).flatten()
-        tokens = torch.cat((self.prefix, pieces, self.suffix))
+        tokens = torch.cat((self.task_positions, pieces, self.suffix))
         valid = torch.cat(
             (
-                torch.ones_like(self.prefix, dtype=torch.bool),
+                self.task_positions < task_length,
                 valid,
                 torch.ones_like(self.suffix, dtype=torch.bool),
             )
         )
-        # Each valid token owns one output position; unused piece slots own none.
+        # Each valid token owns one output position; unused task and piece slots own none.
         compact = (valid.cumsum(0)[:, None] - 1 == self.positions) & valid[:, None]
-        ids = (tokens[:, None] * compact).sum(0)
+        indices = (tokens[:, None] * compact).sum(0)
         mask = self.positions < valid.sum()
-        return torch.where(mask, ids, self.pad_id)[None], mask[None]
+        rows = torch.cat((task_embeddings.to(self.rows.dtype), self.rows))
+        return rows[torch.where(mask, indices, self.pad)][None], mask[None]
+
+
+class LookedUpEmbedding(nn.Module):
+    """The language model's token embedding, given the rows its token ids pick instead of the ids.
+
+    Its forward is the embedding's own after the table lookup, which happens before: the scale a Gemma
+    embedding multiplies its rows by, in the table's dtype.
+    """
+
+    def __init__(self, embedding: nn.Embedding):
+        super().__init__()
+        self.dtype = embedding.weight.dtype
+        scale = getattr(embedding, "embed_scale", None)
+        self.register_buffer("scale", None if scale is None else scale.detach().to(self.dtype))
+
+    def forward(self, rows: Tensor) -> Tensor:
+        rows = rows.to(self.dtype)
+        return rows if self.scale is None else rows * self.scale
 
 
 class PI05Observation(nn.Module):
@@ -145,11 +205,15 @@ class PI05Observation(nn.Module):
         self.preprocessor = preprocessor
         self.prompt = prompt
 
-    def forward(self, *frame: Tensor) -> dict[str, Tensor]:
+    def forward(self, *inputs: Tensor) -> dict[str, Tensor]:
+        *frame, task_embeddings, task_length = inputs
         batch = self.preprocessor(
             {name: to_policy_input(name, x) for name, x in zip(self.frame_names, frame, strict=True)}
         )
-        batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK] = self.prompt(batch[OBS_STATE])
+        # The language tokens are the embedding rows of the prompt's tokens; see LookedUpEmbedding.
+        batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK] = self.prompt(
+            batch[OBS_STATE], task_embeddings, task_length
+        )
         return batch
 
 
@@ -180,19 +244,39 @@ class PI05Step(nn.Module):
 
 
 class PI05Embed(nn.Module):
-    """The start of the prefix: the raw frame in, the image and prompt embeddings and their mask out."""
+    """The start of the prefix: the raw frame, which cameras it holds and the task's embeddings in, the prefix's
+    embeddings and mask out.
+
+    The rollout gives every camera the export takes; for one the robot did not send, a blank image and False.
+    The policy then fills that camera in itself, as for a camera missing from its batch: an image of -1 left out
+    of attention. It puts such cameras after the others, but a camera left out of attention adds nothing and
+    shifts no position, so keeping its place gives the same actions.
+    """
 
     def __init__(self, policy: PI05Policy, observation: PI05Observation):
         super().__init__()
         self.policy = policy
         self.observation = observation
 
-    def forward(self, *frame: Tensor) -> tuple[Tensor, Tensor]:
-        batch = self.observation(*frame)
+    def forward(self, *inputs: Tensor) -> tuple[Tensor, Tensor]:
+        *inputs, cameras_present = inputs
+        batch = self.observation(*inputs)
         # The policy's own image resize and padding, which it exposes under no public name.
         images, img_masks = self.policy._preprocess_images(batch)
+        # The frame's cameras come first, in the policy's order, which `cameras_present` follows.
+        for i, present in enumerate(cameras_present.unbind(0)):
+            images[i] = torch.where(present, images[i], -1.0)
+            # Not `&`: TensorRT does not convert a bitwise and of booleans.
+            img_masks[i] = torch.logical_and(img_masks[i], present)
+        # The slots the frame never holds, the policy's empty ones and those --cameras leaves out, come last and
+        # are always left out of attention, so leaving them out of the program gives the same actions without
+        # their vision tower run and prefix tokens.
+        cameras = len(cameras_present)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
-            images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
+            images[:cameras],
+            img_masks[:cameras],
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
         )
         return prefix_embs, prefix_pad_masks
 
@@ -235,23 +319,6 @@ class PI05LanguageModelLayers(nn.Module):
         return keys_values if self.last else (hidden_states, *keys_values)
 
 
-class CompactEmbedding(nn.Module):
-    """An embedding that keeps only the rows of `token_ids`, and finds them with a constant table."""
-
-    def __init__(self, embedding: nn.Embedding, token_ids: Tensor):
-        super().__init__()
-        token_ids = token_ids.to(embedding.weight.device)
-        rows = torch.zeros(embedding.num_embeddings, dtype=torch.long, device=token_ids.device)
-        rows[token_ids] = torch.arange(len(token_ids), device=token_ids.device)
-        self.register_buffer("rows", rows)
-        embedding.weight = nn.Parameter(embedding.weight.detach()[token_ids], requires_grad=False)
-        embedding.num_embeddings = len(token_ids)
-        self.embedding = embedding
-
-    def forward(self, token_ids: Tensor) -> Tensor:
-        return self.embedding(self.rows[token_ids])
-
-
 class Exporter:
     """Reads a trained pi0.5 checkpoint one part at a time, and writes the folder around its programs."""
 
@@ -279,26 +346,52 @@ class Exporter:
         )
         # pi0.5 fills in its empty cameras itself, so the robot does not send them.
         empty_cameras = {f"{OBS_IMAGES}.empty_camera_{i}" for i in range(config.empty_cameras)}
-        available = set(config.image_features) - empty_cameras
-        cameras = available if args.cameras is None else set(args.cameras)
-        if not cameras or not cameras <= available:
-            raise SystemExit(f"Choose --cameras from {sorted(available)}.")
+        available = [name for name in config.image_features if name not in empty_cameras]
+        if args.cameras is not None and not set(args.cameras) <= set(available):
+            raise SystemExit(f"Choose --cameras from {available}.")
+        self.cameras = [name for name in available if args.cameras is None or name in args.cameras]
         self.frame = {
             name: value
             for name, value in frame_from_policy(config).items()
-            if name not in config.image_features or name in cameras
+            if name not in config.image_features or name in self.cameras
         }
         self.folder_config = copy(config)
         self.folder_config.input_features = {name: config.input_features[name] for name in self.frame}
-        prompt = StatePrompt(tokenizer, args.task, self.frame[OBS_STATE].size).to(device())
-        self.noise = torch.randn(config.chunk_size, config.max_action_dim, device=device())
         language_model = self.policy.model.paligemma_with_expert.paligemma.model.language_model
-        token_ids = torch.cat((prompt.prefix, prompt.pieces.flatten(), prompt.suffix)).unique()
-        language_model.embed_tokens = CompactEmbedding(language_model.embed_tokens, token_ids)
+        embedding = language_model.embed_tokens
+        prompt = StatePrompt(tokenizer, embedding, self.frame[OBS_STATE].size, args.max_task_tokens).to(
+            device()
+        )
+        self.prompt = {
+            "tokenizer": "tokenizer.json",
+            "embeddings": "token_embeddings.safetensors",
+            "text": TASK_TEXT,
+            "strip": True,
+            "replace": {"_": " ", "\n": " "},
+            "max_tokens": prompt.max_task_tokens,
+            "task": args.task,
+        }
+        self.tokenizer = tokenizer.input_tokenizer
+        self.task_inputs = self.task_embeddings(args.task, embedding.weight)
+        # The rollout looks the task's rows up in the full table, so the program drops it.
+        language_model.embed_tokens = LookedUpEmbedding(embedding)
+        del embedding
+        self.noise = torch.randn(config.chunk_size, config.max_action_dim, device=device())
         self.observation = PI05Observation(list(self.frame), tensor_steps, prompt)
         self.dt = -1.0 / config.num_inference_steps
         self.timesteps = [1.0 + step * self.dt for step in range(config.num_inference_steps)]
         self.expected_actions = None
+
+    def task_embeddings(self, task: str, table: Tensor) -> tuple[Tensor, Tensor]:
+        """What the rollout gives the program for `task`: its prompt's embedding rows, padded, and their count."""
+        clean = task.strip().replace("_", " ").replace("\n", " ")
+        ids = self.tokenizer.encode(TASK_TEXT.format(task=clean))
+        if len(ids) > self.prompt["max_tokens"]:
+            raise SystemExit(f"--task is {len(ids)} tokens long; at most {self.prompt['max_tokens']} fit.")
+        self.prompt["task_ids"] = ids
+        rows = torch.zeros(self.prompt["max_tokens"], table.shape[1], device=device())
+        rows[: len(ids)] = table[torch.tensor(ids, device=table.device)].float()
+        return rows, torch.tensor([len(ids)], device=device())
 
     def load_modules(self, *modules: str) -> PI05Policy:
         """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
@@ -310,11 +403,14 @@ class Exporter:
         The test case's actions are these parts chained, the denoising step once per step.
         """
         frame = tuple(torch.from_numpy(x).to(device()) for x in self.frame.values())
+        present = torch.ones(len(self.cameras), dtype=torch.bool, device=device())
+        inputs = (*frame, *self.task_inputs, present)
         embed = PI05Embed(self.policy, self.observation)
         del self.policy
         with torch.no_grad():
-            hidden, prefix_pad_masks = embed(*frame)
-        yield Part("embed", embed, frame, list(self.frame), ["prefix_embs", "prefix_pad_masks"])
+            hidden, prefix_pad_masks = embed(*inputs)
+        names = [*self.frame, TASK_EMBEDDINGS, TASK_LENGTH, CAMERAS_PRESENT]
+        yield Part("embed", embed, inputs, names, ["prefix_embs", "prefix_pad_masks"])
         del embed
         hidden_name, cache = "prefix_embs", {}
         depth = get_gemma_config(self.config.paligemma_variant).depth
@@ -356,6 +452,11 @@ class Exporter:
         yield actions.part(self.noise, state)
 
     def write(self, programs: dict[str, dict]) -> None:
+        self.tokenizer.backend_tokenizer.save(str(self.args.output_dir / self.prompt["tokenizer"]))
+        policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
+        table = policy.model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight
+        save_embedding_table(table, self.args.output_dir / self.prompt["embeddings"])
+        del policy, table
         write_folder(
             self.args,
             self.folder_config,
@@ -365,6 +466,6 @@ class Exporter:
             programs,
             steps=["step"],
             timesteps=self.timesteps,
-            # The program holds the task's prompt tokens, so the folder runs only this task.
-            task=self.args.task,
+            prompt=self.prompt,
+            optional_cameras=self.cameras,
         )

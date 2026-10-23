@@ -129,21 +129,29 @@ def tiny_text(num_layers=4):
     return Qwen3VLTextModel(config).eval()
 
 
+# A prompt of a text token, two image tokens, then a task of one token padded to two.
+REAL = 4
+
+
 def constants():
-    image_mask = torch.tensor([[False, True, True, False, False]])
     return {
-        "image_mask": image_mask,
-        "backbone_attention_mask": torch.tensor([[True, True, True, True, False]]),
+        "image_mask": torch.tensor([[False, True, True, False, False]]),
         "embodiment_id": torch.tensor([2]),
-        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]]),
+        "attention_mask": torch.ones(1, 5, dtype=torch.long),
         "position_ids": torch.arange(5)[None, None].expand(3, 1, -1),
-        "text_embeds": torch.randn(1, 5, 32),
+        "task_positions": torch.arange(2),
+        "head": 3,
+        "head_embeds": torch.randn(1, 3, 32),
+        # Not a recipe constant: what the rollout gives the programs for the task.
+        "task_embeddings": torch.cat((torch.randn(1, 32), torch.zeros(1, 32))),
+        "task_length": torch.tensor([REAL - 3]),
     }
 
 
 def image_embeddings(fixed, images):
     """The text embeddings with the image features at the image tokens, as Qwen3-VL places them."""
-    return fixed["text_embeds"].masked_scatter(fixed["image_mask"][..., None].expand(1, 5, 32), images)
+    text = torch.cat((fixed["head_embeds"], fixed["task_embeddings"][None]), dim=1)
+    return text.masked_scatter(fixed["image_mask"][..., None].expand(1, 5, 32), images)
 
 
 def test_vision_part_preserves_deepstack_and_state(recipe):
@@ -172,14 +180,15 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
     images, state = torch.randn(2, 32), torch.randn(1, 1, 6)
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
     with torch.no_grad():
-        embeddings = image_embeddings(fixed, images)
+        # The policy runs the prompt without the task's padding.
+        embeddings = image_embeddings(fixed, images)[:, :REAL]
         expected = whole_language_model(
             recipe,
             text,
             embeddings,
-            fixed["attention_mask"],
-            fixed["position_ids"],
-            fixed["image_mask"],
+            torch.ones(1, REAL, dtype=torch.long),
+            fixed["position_ids"][..., :REAL],
+            fixed["image_mask"][:, :REAL],
             *deepstack,
         )
         expected = head.vl_self_attention(head.vlln(expected))
@@ -190,12 +199,15 @@ def test_language_slices_preserve_global_deepstack_indices_and_pre_norm_output(r
             inputs = (
                 hidden,
                 *(deepstack[i] for i in part.deepstack_layers),
-                *((state,) if part.last else ()),
+                *((fixed["task_embeddings"],) if start == 0 else ()),
+                *((state, fixed["task_length"]) if part.last else ()),
             )
             hidden = part(*inputs)
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, hidden, rtol=0, atol=0)
-    torch.testing.assert_close(hidden, (expected, expected_state), rtol=0, atol=0)
+    features, state_features = hidden
+    torch.testing.assert_close(features[:, :REAL], expected, rtol=0, atol=1e-6)
+    torch.testing.assert_close(state_features, expected_state, rtol=0, atol=0)
 
 
 def test_language_slices_have_no_data_dependent_shapes(recipe):
@@ -204,7 +216,13 @@ def test_language_slices_have_no_data_dependent_shapes(recipe):
     head, fixed = tiny_head(), constants()
     deepstack = tuple(torch.randn(2, 32) for _ in range(3))
     part = recipe.GrootLanguageModel(text, head, fixed, 0, 4, False, len(deepstack)).eval()
-    inputs = (torch.randn(2, 32), *deepstack, torch.randn(1, 1, 6))
+    inputs = (
+        torch.randn(2, 32),
+        *deepstack,
+        fixed["task_embeddings"],
+        torch.randn(1, 1, 6),
+        fixed["task_length"],
+    )
     with torch.no_grad():
         program = torch.export.export(part, inputs)
     # Autocast regions are submodules of the exported graph.
@@ -222,7 +240,8 @@ def test_last_language_slice_encodes_a_float32_state_with_bfloat16_weights(recip
     hidden, state = torch.randn(1, 5, 32, dtype=torch.bfloat16), torch.randn(1, 1, 6)
     with torch.no_grad():
         expected = head.state_encoder(state.to(torch.bfloat16), fixed["embodiment_id"])
-        _, state_features = recipe.GrootLanguageModel(text, head, fixed, 3, 4, False, 3).eval()(hidden, state)
+        part = recipe.GrootLanguageModel(text, head, fixed, 3, 4, False, 3).eval()
+        _, state_features = part(hidden, state, fixed["task_length"])
     torch.testing.assert_close(state_features, expected, rtol=0, atol=0)
 
 
@@ -246,25 +265,20 @@ def test_language_model_layers_match_the_hugging_face_text_model(recipe):
     last = []
     # GR00T reads the last layer's output, before the model's final norm.
     text.layers[-1].register_forward_hook(lambda module, args, output: last.append(output))
+    padding = torch.tensor([[1, 1, 1, 1, 0]])
     with torch.no_grad():
         text(
             inputs_embeds=embeddings,
-            attention_mask=fixed["attention_mask"],
+            attention_mask=padding,
             position_ids=fixed["position_ids"],
             visual_pos_masks=fixed["image_mask"],
             deepstack_visual_embeds=deepstack,
         )
         actual = whole_language_model(
-            recipe,
-            text,
-            embeddings,
-            fixed["attention_mask"],
-            fixed["position_ids"],
-            fixed["image_mask"],
-            *deepstack,
+            recipe, text, embeddings, padding, fixed["position_ids"], fixed["image_mask"], *deepstack
         )
     expected = last[0][0] if isinstance(last[0], tuple) else last[0]
-    valid = fixed["attention_mask"][0].bool()
+    valid = padding[0].bool()
     torch.testing.assert_close(actual[:, valid], expected[:, valid], rtol=0, atol=1e-5)
 
 
@@ -289,20 +303,22 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
     head, fixed = tiny_head(alternate, interleave), constants()
     features, state, noise = torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4)
     with torch.no_grad():
+        # The policy runs the prompt without the task's padding.
         expected = head.get_action_with_features(
-            features,
+            features[:, :REAL],
             state,
             fixed["embodiment_id"],
             BatchFeature(
                 {
-                    "image_mask": fixed["image_mask"],
-                    "backbone_attention_mask": fixed["backbone_attention_mask"],
+                    "image_mask": fixed["image_mask"][:, :REAL],
+                    "backbone_attention_mask": torch.ones(1, REAL, dtype=torch.bool),
                 }
             ),
             BatchFeature({}),
             noise=noise[None],
         )["action_pred"][0]
     split_head = deepcopy(head)
+    keys_values = recipe.GrootKeysValues(split_head, False).eval()
     parts = [
         recipe.GrootStep(split_head, fixed, start, stop, False, 1 / 3).eval()
         for start, stop in ((0, 2), (2, 3), (3, 5))
@@ -311,6 +327,8 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         for layer in part.modules():
             if isinstance(layer, recipe.CategorySpecificLinear):
                 assert layer.W.shape[0] == layer.b.shape[0] == 1
+        # The steps take the keys and values, so they hold no projections that make them.
+        assert all(part.blocks[i - part.start].attn1.to_k is None for i in part.cross)
     calls = []
 
     class Program:
@@ -330,12 +348,18 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         def upload(self, value):
             return value
 
-    programs = {f"step_{i}": Program(part, f"step_{i}") for i, part in enumerate(parts)}
+    programs = {"keys_values": Program(keys_values, "keys_values")}
+    programs.update({f"step_{i}": Program(part, f"step_{i}") for i, part in enumerate(parts)})
     programs["actions"] = Program(recipe.ChunkActions(2, 3, action_pipeline()), "actions")
+
+    def given(part):
+        return [f"{kind}_{i}" for i in part.cross for kind in ("key", "value")]
+
     names = {
-        "step_0": (["vl", "state", "x_t", "timestep"], ["hidden", "temb"]),
-        "step_1": (["vl", "hidden", "temb"], ["hidden"]),
-        "step_2": (["vl", "hidden", "temb", "x_t"], ["x_next"]),
+        "keys_values": (["vl"], given(keys_values)),
+        "step_0": ([*given(parts[0]), "state", "x_t", "timestep", "task_length"], ["hidden", "temb"]),
+        "step_1": ([*given(parts[1]), "hidden", "temb", "task_length"], ["hidden"]),
+        "step_2": ([*given(parts[2]), "hidden", "temb", "x_t", "task_length"], ["x_next"]),
         "actions": (["x_t", "robot_state"], ["actions"]),
     }
     info = {
@@ -347,22 +371,22 @@ def test_step_slices_and_program_chain_match_action_head(recipe, alternate, inte
         },
     }
     chain = ProgramChain(programs, info)
+    chain.hold({"task_length": fixed["task_length"].numpy()})
     actual = chain(features.numpy(), state.numpy(), np.zeros(6, np.float32), noise.numpy())
     np.testing.assert_allclose(actual, expected[:2, :3].numpy(), rtol=0, atol=1e-6)
-    assert calls == ["step_0", "step_1", "step_2"] * 3 + ["actions"]
-    inputs = (features, state, noise, torch.tensor([333.0]))
+    assert calls == ["keys_values"] + ["step_0", "step_1", "step_2"] * 3 + ["actions"]
+    length = fixed["task_length"]
     with torch.no_grad():
+        computed = dict(zip(given(keys_values), keys_values(features), strict=True))
+        carried = (state, noise, torch.tensor([333.0]))
         for part in parts:
+            inputs = (*(computed[n] for n in given(part)), *carried, length)
             result = part(*inputs)
             saved = torch.export.export(part, inputs).module()(*inputs)
             torch.testing.assert_close(saved, result, rtol=0, atol=0)
             if not part.last:
-                hidden, temb = result if part.start == 0 else (result, inputs[-1])
-                inputs = (
-                    (features, hidden, temb)
-                    if not parts[parts.index(part) + 1].last
-                    else (features, hidden, temb, noise)
-                )
+                hidden, temb = result if part.start == 0 else (result, carried[1])
+                carried = (hidden, temb, noise) if parts[parts.index(part) + 1].last else (hidden, temb)
 
 
 def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tmp_path):
@@ -373,11 +397,15 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     from lerobot.inference.export.engine import ProgramChain
     from lerobot.utils.constants import ACTION
 
-    class Prefix(torch.nn.Module):
+    class Vision(torch.nn.Module):
+        def forward(self, features, state, robot_state):
+            return features, state
+
+    class LanguageModel(torch.nn.Module):
         last = True
         deepstack_layers = []
 
-        def forward(self, features, state, robot_state=None):
+        def forward(self, features, task_embeddings, state, task_length):
             return features, state
 
     torch.manual_seed(14)
@@ -392,14 +420,17 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         batch={"image_grid_thw": None, "input_ids": torch.zeros(1, 5, dtype=torch.long)},
         config=SimpleNamespace(use_bf16=False, output_features={ACTION: SimpleNamespace(shape=(3,))}),
         model_config=SimpleNamespace(
-            select_layer=1, diffusion_model_cfg={"num_layers": 25}, add_pos_embed=False
+            select_layer=1,
+            diffusion_model_cfg={"num_layers": 25, "interleave_self_attention": True},
+            add_pos_embed=False,
         ),
         constants=constants(),
+        prompt={"max_tokens": 2},
         noise=noise,
         timesteps=[0, 333, 666],
         num_steps=3,
         n_action_steps=2,
-        postprocessor=action_pipeline(),
+        actions=recipe.ChunkActions(2, 3, action_pipeline()),
         frame={
             "features": features.numpy(),
             "state": state.numpy(),
@@ -408,8 +439,8 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
     )
     monkeypatch.setattr(recipe, "resize_images", lambda frame, geometry: frame)
     # Keep the prefix tiny while exercising the real recipe's diffusion modules and names.
-    monkeypatch.setattr(recipe, "GrootVision", lambda *args: Prefix())
-    monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: Prefix())
+    monkeypatch.setattr(recipe, "GrootVision", lambda *args: Vision())
+    monkeypatch.setattr(recipe, "GrootLanguageModel", lambda *args: LanguageModel())
     monkeypatch.setattr(
         exporter,
         "load_modules",
@@ -448,7 +479,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
             return value
 
     for part in exporter.parts():
-        if not (part.name.startswith("step_") or part.name == "actions"):
+        if not (part.name.startswith("step_") or part.name in ("keys_values", "actions")):
             continue
         compile_part(part, tmp_path / f"{part.name}.engine")
         session = sessions[part.name]
@@ -462,7 +493,7 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         actual = session.run(None, dict(zip(part.input_names, [x.numpy() for x in part.inputs], strict=True)))
         for got, want in zip(actual, expected, strict=True):
             np.testing.assert_allclose(got, want.numpy(), rtol=1e-5, atol=1e-5)
-    assert list(programs) == ["step_0", "step_1", "step_2", "step_3", "actions"]
+    assert list(programs) == ["keys_values", "step_0", "step_1", "step_2", "step_3", "actions"]
     info = {
         "inputs": ["vl_embeds", "state_features", "observation.state", "noise"],
         "programs": metadata,
@@ -470,7 +501,9 @@ def test_diffusion_parts_export_to_onnx_and_run_as_chain(recipe, monkeypatch, tm
         "timesteps": exporter.timesteps,
     }
     robot_state = exporter.frame["observation.state"]
-    actual = ProgramChain(programs, info)(features.numpy(), state.numpy(), robot_state, noise.numpy())
+    chain = ProgramChain(programs, info)
+    chain.hold({"task_length": np.array([2])})
+    actual = chain(features.numpy(), state.numpy(), robot_state, noise.numpy())
     np.testing.assert_allclose(actual, exporter.expected_actions, rtol=1e-5, atol=1e-5)
 
 
@@ -510,9 +543,20 @@ def test_part_loader_holds_only_linear_weights_in_bfloat16_under_autocast(recipe
 def test_bfloat16_linear_weights_compute_what_autocast_computes(recipe):
     torch.manual_seed(15)
     fixed = constants()
-    inputs = (torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4), torch.tensor([333.0]))
-    autocast, held = (recipe.GrootStep(tiny_head(), fixed, 0, 5, True, 1 / 3).eval() for _ in range(2))
-    held.load_state_dict(autocast.state_dict())
+    head = tiny_head()
+    # A step keeps one embodiment of the head it takes, so each step gets its own copy.
+    held_head = deepcopy(head)
+    with torch.no_grad():
+        keys_values = recipe.GrootKeysValues(head, True)(torch.randn(1, 5, 32))
+    inputs = (
+        *keys_values,
+        torch.randn(1, 1, 32),
+        torch.randn(3, 4),
+        torch.tensor([333.0]),
+        fixed["task_length"],
+    )
+    autocast = recipe.GrootStep(head, fixed, 0, 5, True, 1 / 3).eval()
+    held = recipe.GrootStep(held_head, fixed, 0, 5, True, 1 / 3).eval()
     recipe.hold_linear_weights_in_bfloat16(held)
     linears = [layer for layer in held.modules() if isinstance(layer, torch.nn.Linear)]
     assert linears and all(layer.weight.dtype == torch.bfloat16 for layer in linears)
@@ -541,51 +585,99 @@ def test_actions_apply_the_postprocessor_after_slicing(recipe):
     torch.testing.assert_close(saved, part(values, state))
 
 
-def n17_decoder(relative=False):
+def n17_decoder(relative=False, percentiles=False, per_step=False, transform=None):
+    """An N1.7 decode step for a two-group arm, a one-number gripper and an end effector pose."""
     from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep
 
-    rep = {"rep": "relative", "state_key": "arm"} if relative else {"rep": "absolute"}
+    rng = np.random.default_rng(0)
+
+    def stats(dim):
+        low = rng.uniform(-3, 0, (4, dim) if per_step else dim)
+        return {"min": low, "max": low + rng.uniform(1, 3, low.shape), "q01": low + 0.1, "q99": low + 0.9}
+
+    groups = {"arm": 3, "gripper": 1, "eef": 9}
+    raw_stats = {
+        "action": {k: {n: v.tolist() for n, v in stats(d).items()} for k, d in groups.items()},
+        "relative_action": {k: {n: v.tolist() for n, v in stats(d).items()} for k, d in groups.items()},
+    }
+    configs = [
+        {"rep": "relative" if relative else "absolute", "type": "non_eef", "state_key": "joints"},
+        {"rep": "absolute"},
+        {"rep": "relative" if relative else "absolute", "type": "eef", "format": "xyz_rot6d"},
+    ]
     return GrootN17ActionDecodeStep(
-        env_action_dim=3,
-        raw_stats={"action": {"arm": {"min": [-2.0, -1.0, 0.0], "max": [2.0, 1.0, 10.0]}}},
-        modality_config={"action": {"modality_keys": ["arm"], "action_configs": [rep]}},
+        env_action_dim=12,
+        raw_stats=raw_stats,
+        modality_config={
+            "action": {"modality_keys": list(groups), "action_configs": configs, "delta_indices": [0, 1, 2]}
+        },
+        use_percentiles=percentiles,
         use_relative_action=relative,
+        action_decode_transform=transform,
+    )
+
+
+def n17_pack():
+    """What the decoding reads from the packing step: the state's groups, the joints then the end effector."""
+    state = {"joints": {"min": [0.0] * 3}, "eef": {"min": [0.0] * 9}}
+    return SimpleNamespace(
+        raw_stats={"state": state}, modality_config={"state": {"modality_keys": list(state)}}
     )
 
 
 @pytest.mark.parametrize(
-    "route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt", "pytorch", "torch.compile"]
+    "options",
+    [{}, {"percentiles": True}, {"per_step": True}, {"relative": True}, {"transform": "libero"}],
 )
-def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, route):
-    from lerobot.policies.groot.processor_groot import GrootActionUnpackUnnormalizeStep
+def test_n17_decoding_in_tensors_matches_the_policy_step(recipe, options):
+    """The program's decoding computes what GR00T N1.7's own NumPy step computes, for every kind of group."""
+    torch.manual_seed(0)
+    step = n17_decoder(**options)
+    module = recipe.N17ChunkActions(4, recipe.N17ActionDecode(step, n17_pack(), 4))
+    actions = torch.rand(6, 16) * 2.4 - 1.2
+    pose = torch.cat((torch.randn(3), torch.randn(6)))
+    state = torch.cat((torch.randn(3), pose))
+    groups = {"joints": state[None, :3].numpy(), "eef": state[None, 3:].numpy()}
+    step.pack_step = SimpleNamespace(get_cached_raw_state=lambda: groups)
+    expected = action_pipeline(step)(actions[None, :4])[0]
+    torch.testing.assert_close(module(actions, state), expected, rtol=1e-5, atol=1e-5)
+    saved = torch.export.export(module, (actions, state)).module()
+    moved = torch.rand(6, 16) * 2 - 1
+    torch.testing.assert_close(saved(moved, state), module(moved, state))
 
-    recipe.check_traceable_decode(action_pipeline(GrootActionUnpackUnnormalizeStep()), route)
-    # The benchmark's plain PyTorch run of the recipe decodes in NumPy as it is, with no tracing.
-    if route in ("onnx_tensorrt", "pytorch"):
-        recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
-    else:
-        with pytest.raises(ValueError, match="only the ONNX-TensorRT route"):
-            recipe.check_traceable_decode(action_pipeline(n17_decoder()), route)
-    with pytest.raises(ValueError, match="relative actions"):
-        recipe.check_traceable_decode(action_pipeline(n17_decoder(relative=True)), route)
+
+def test_n17_decoding_refuses_what_the_policy_step_refuses(recipe):
+    step = n17_decoder(transform="unknown")
+    with pytest.raises(ValueError, match="Unsupported N1.7 action decode transform"):
+        recipe.N17ActionDecode(step, n17_pack(), 4)
 
 
-def test_numpy_action_decoding_exports_to_onnx_and_follows_new_actions(recipe, tmp_path):
+def test_n17_decoding_takes_the_state_only_for_relative_actions(recipe):
+    for relative in (False, True):
+        step = n17_decoder(relative=relative)
+        module = recipe.N17ChunkActions(4, recipe.N17ActionDecode(step, n17_pack(), 4))
+        part = module.part(torch.zeros(6, 16), torch.zeros(12))
+        assert part.input_names == (["x_t", "observation.state"] if relative else ["x_t"])
+
+
+def test_n17_decoding_exports_to_onnx_and_follows_new_actions(recipe, tmp_path):
     onnxruntime = pytest.importorskip("onnxruntime")
     pytest.importorskip("onnxscript")
 
-    module = recipe.ChunkActions(2, 3, action_pipeline(n17_decoder())).eval()
-    actions, state = torch.rand(4, 3) * 2 - 1, torch.zeros(3)
+    module = recipe.N17ChunkActions(
+        4, recipe.N17ActionDecode(n17_decoder(relative=True), n17_pack(), 4)
+    ).eval()
+    actions, state = torch.rand(6, 16) * 2 - 1, torch.randn(12)
     path = tmp_path / "actions.onnx"
     torch.onnx.export(
         module, (actions, state), path, dynamo=True, input_names=["x", "state"], output_names=["a"]
     )
     session = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    moved = torch.rand(4, 3) * 2 - 1
+    moved = torch.rand(6, 16) * 2 - 1
     with torch.no_grad():
         expected = module(moved, state).numpy()
     np.testing.assert_allclose(
-        session.run(None, {"x": moved.numpy(), "state": state.numpy()})[0], expected, atol=1e-6
+        session.run(None, {"x": moved.numpy(), "state": state.numpy()})[0], expected, atol=1e-5
     )
 
 
@@ -603,6 +695,7 @@ def test_part_names_cover_remainders_and_reject_unknown_parts(recipe, monkeypatc
         "language_model_0",
         "language_model_1",
         "language_model_2",
+        "keys_values",
         "step_0",
         "step_1",
         "step_2",

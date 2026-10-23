@@ -15,9 +15,12 @@
 """The GR00T N1.7 recipe: one action chunk of LeRobot's own GR00T, as a chain of programs.
 
 The chunk goes from resized uint8 HWC cameras, float32 state and noise to actions in robot units. Qwen3-VL
-computes its rope positions and image grid with Python loops no exporter can follow; for one task and one
-camera size they never change, so they are computed once here and held as constants, as in NVIDIA's own
-GR00T deployment code. The rollout resizes the cameras with NumPy; no tokenizer runs at inference.
+computes its rope positions and image grid with Python loops no exporter can follow; for one camera size
+they never change up to the task's text, which follows the images, so they are computed once here and held
+as constants, as in NVIDIA's own GR00T deployment code. The rollout resizes the cameras with NumPy, and turns
+the task into token embeddings with the policy's own tokenizer and embedding table, which the folder keeps
+as a file, so the folder runs any task up to `--max_task_tokens` long. The programs pad the task to that
+length and leave the padding out of every attention, so the actions are those of the unpadded prompt.
 
 The chain is the vision encoder, the language model in groups of six layers, the diffusion model in groups
 of eight blocks, and the actions. Each part is built in its own process with only its own weights in
@@ -42,36 +45,51 @@ from common import (
     hold_linear_weights_in_bfloat16,
     processors,
     renamed_inputs,
+    save_embedding_table,
     to_policy_input,
     write_folder,
 )
+from diffusers.models.attention_processor import AttnProcessor2_0
 from torch import Tensor, nn
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
 from transformers.utils import cached_file
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.inference.export.images import resize_images
+from lerobot.inference.export.prompt import TASK_EMBEDDINGS, TASK_LENGTH
+from lerobot.policies.groot.configuration_groot import GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 from lerobot.policies.groot.groot_n1_7 import CategorySpecificLinear, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
     GrootN17ActionDecodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
+    _n1_7_decode_stats_for_action,
+    _n1_7_decode_valid_horizon,
 )
+from lerobot.policies.groot.utils import config_value, stat_dim_from_entry
 from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 TOLERANCE = 5.0
 VISION = "_groot_model.backbone.model.model.visual"
 LANGUAGE_MODEL = "_groot_model.backbone.model.model.language_model"
 ACTION_HEAD = "_groot_model.action_head"
+# The text after the images in GR00T's chat prompt; the rollout tokenizes it.
+TASK_TEXT = "{task}<|im_end|>\n"
 LANGUAGE_LAYERS_PER_PROGRAM = 6
 DIT_BLOCKS_PER_PROGRAM = 8
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     add_dataset_arguments(parser)
+    parser.add_argument(
+        "--max_task_tokens",
+        type=int,
+        default=32,
+        help="The longest task, in tokens, the folder runs. Each token adds to every chunk's time.",
+    )
 
 
 def part_names(args: argparse.Namespace) -> list[str]:
@@ -81,6 +99,7 @@ def part_names(args: argparse.Namespace) -> list[str]:
     return [
         "vision",
         *(f"language_model_{i}" for i in range(language_groups)),
+        "keys_values",
         *(f"step_{i}" for i in range(step_groups)),
         "actions",
     ]
@@ -156,6 +175,12 @@ def place_image_features(hidden: Tensor, features: Tensor, image_mask: Tensor, r
     GPU memory for on every run, and a CUDA graph cannot record that.
     """
     return torch.where(image_mask[..., None], features[rows], hidden)
+
+
+def prompt_mask(head: int, task_positions: Tensor, task_length: Tensor) -> Tensor:
+    """Which tokens of the padded prompt are real: the `head` tokens before the task, then the task's own."""
+    head_mask = torch.ones(head, dtype=torch.bool, device=task_positions.device)
+    return torch.cat((head_mask, task_positions < task_length))[None]
 
 
 def deepstack_add(hidden_states: Tensor, image_mask: Tensor, rows: Tensor, visual_embeds: Tensor) -> Tensor:
@@ -279,8 +304,12 @@ class GrootLanguageModel(nn.Module):
     """Some language model layers; the first group inserts the image features, the last runs the action head's encoders.
 
     The program takes only what its layers read: the hidden states, the deepstack features added in its layer range,
-    and, in the last group, the robot state. An input a program never reads would still be a program input the GPU
-    cannot own, since an ExecuTorch export places an input on the device only when the device's backend reads it.
+    in the first group the task's embeddings, and in the last the robot state and the task's length. An input a
+    program never reads would still be a program input the GPU cannot own, since an ExecuTorch export places an
+    input on the device only when the device's backend reads it.
+
+    The task's padding follows every real token, so the causal mask already keeps it out of the real tokens'
+    attention; the action head's self-attention, which attends both ways, leaves it out with the prompt mask.
     """
 
     def __init__(
@@ -301,12 +330,13 @@ class GrootLanguageModel(nn.Module):
         self.layers = nn.ModuleList(text_model.layers[start:stop])
         self.rotary_emb = text_model.rotary_emb
         self.use_bf16 = use_bf16
-        for name in ("attention_mask", "position_ids", "image_mask"):
+        for name in ("attention_mask", "position_ids", "image_mask", "task_positions"):
             self.register_buffer(name, constants[name])
         self.register_buffer("image_rows", image_rows(constants["image_mask"]))
         if start == 0:
-            self.register_buffer("text_embeds", constants["text_embeds"])
+            self.register_buffer("head_embeds", constants["head_embeds"])
         if self.last:
+            self.head = constants["head"]
             self.vlln = action_head.vlln
             self.vl_self_attention = action_head.vl_self_attention
             self.state_encoder = action_head.state_encoder
@@ -314,13 +344,17 @@ class GrootLanguageModel(nn.Module):
             select_embodiment(self.state_encoder, constants["embodiment_id"])
 
     def forward(self, hidden: Tensor, *inputs: Tensor):
-        """`inputs` holds the deepstack features this layer range adds, in layer order, then the state in the last group."""
+        """`inputs` holds the deepstack features this layer range adds, in layer order, then the task's embeddings
+        in the first group, then the state and the task's length in the last."""
         added = len(self.deepstack_layers)
         deepstack = dict(zip(self.deepstack_layers, inputs[:added], strict=True))
+        inputs = inputs[added:]
         with torch.autocast(hidden.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
+                task_embeddings, *inputs = inputs
+                text_embeds = torch.cat((self.head_embeds, task_embeddings[None]), dim=1)
                 hidden = place_image_features(
-                    self.text_embeds, hidden.to(self.text_embeds.dtype), self.image_mask, self.image_rows
+                    text_embeds, hidden.to(text_embeds.dtype), self.image_mask, self.image_rows
                 )
             mask = causal_mask(hidden.dtype, hidden.device, *hidden.shape[:2], self.attention_mask)
             positions = self.rotary_emb(hidden, self.position_ids)
@@ -337,9 +371,13 @@ class GrootLanguageModel(nn.Module):
                         hidden, self.image_mask, self.image_rows, deepstack[index].to(hidden.dtype)
                     )
             if self.last:
-                (state,) = inputs[added:]
+                state, task_length = inputs
                 # GR00T consumes the decoder output before Qwen's final norm.
-                features = self.vl_self_attention(self.vlln(hidden))
+                features = self.vlln(hidden).contiguous()
+                mask = prompt_mask(self.head, self.task_positions, task_length)
+                # The self-attention transformer's own loop, with the mask its forward takes no argument for.
+                for block in getattr(self.vl_self_attention, "transformer_blocks", ()):
+                    features = block(features, attention_mask=mask)
                 # As GR00T's own input step does, since autocast is off when use_bf16 is false.
                 state = state.reshape(state.shape[0], 1, -1).to(self.state_encoder.layer1.W.dtype)
                 state_features = self.state_encoder(state, self.embodiment_id)
@@ -347,11 +385,78 @@ class GrootLanguageModel(nn.Module):
             return hidden
 
 
+def cross_blocks(model: nn.Module) -> list[int]:
+    """The diffusion blocks that attend to the vision-language features; with interleaving, every other one."""
+    interleave = model.config.interleave_self_attention
+    return [i for i in range(len(model.transformer_blocks)) if not (interleave and i % 2 == 1)]
+
+
+def check_cross_attention(attn: nn.Module) -> None:
+    """Refuse an attention `GivenKeysValues` would compute differently from its own processor."""
+    plain = all(
+        getattr(attn, name) is None for name in ("spatial_norm", "group_norm", "norm_q", "norm_k")
+    ) and not (attn.norm_cross or attn.residual_connection)
+    if not plain or type(attn.processor) is not AttnProcessor2_0:
+        raise ValueError(
+            "Only diffusers' default attention, with no extra norms, can take its keys and values."
+        )
+
+
+class GivenKeysValues:
+    """diffusers' default attention processor, `AttnProcessor2_0`, given the keys and values it would compute.
+
+    `encoder_hidden_states` is the pair of what `to_k` and `to_v` make of the encoder's states, which
+    `GrootKeysValues` computes once per chunk; the rest is the processor's own steps for this attention.
+    """
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None):
+        key, value = encoder_hidden_states
+        batch_size, sequence_length, inner_dim = key.shape
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+        query = attn.to_q(hidden_states)
+        head_dim = inner_dim // attn.heads
+        query, key, value = (
+            x.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2) for x in (query, key, value)
+        )
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = attn.to_out[1](attn.to_out[0](hidden_states.to(query.dtype)))
+        return hidden_states / attn.rescale_output_factor
+
+
+class GrootKeysValues(nn.Module):
+    """The keys and values each cross-attention block of the diffusion model makes of the vision-language features.
+
+    They are the same in every denoising step, so the chain computes them once per chunk, here, rather than in
+    each step, which saves most of a step's work for a long prompt.
+    """
+
+    def __init__(self, action_head, use_bf16: bool):
+        super().__init__()
+        model = action_head.model
+        self.cross = cross_blocks(model)
+        self.keys = nn.ModuleList(model.transformer_blocks[i].attn1.to_k for i in self.cross)
+        self.values = nn.ModuleList(model.transformer_blocks[i].attn1.to_v for i in self.cross)
+        self.use_bf16 = use_bf16
+
+    def forward(self, vl_embeds: Tensor) -> tuple[Tensor, ...]:
+        with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
+            vl_embeds = vl_embeds.contiguous()
+            return tuple(
+                x for k, v in zip(self.keys, self.values, strict=True) for x in (k(vl_embeds), v(vl_embeds))
+            )
+
+
 class GrootStep(nn.Module):
     """Some diffusion blocks of one denoising step.
 
     The first group encodes the noisy actions and the time. The last also takes the noisy actions and returns
-    the next ones, with the Euler update inside, so the rollout does no arithmetic between programs.
+    the next ones, with the Euler update inside, so the rollout does no arithmetic between programs. The
+    cross-attention blocks take the keys and values `GrootKeysValues` computed for them.
     """
 
     def __init__(self, action_head, constants: dict, start: int, stop: int, use_bf16: bool, dt: float):
@@ -362,6 +467,14 @@ class GrootStep(nn.Module):
             raise ValueError("Invalid diffusion block range.")
         self.start, self.last = start, stop == len(model.transformer_blocks)
         self.blocks = nn.ModuleList(model.transformer_blocks[start:stop])
+        self.cross = [i for i in cross_blocks(model) if start <= i < stop]
+        for i in self.cross:
+            attn = model.transformer_blocks[i].attn1
+            if not isinstance(attn.processor, GivenKeysValues):
+                check_cross_attention(attn)
+                attn.set_processor(GivenKeysValues())
+            # The keys and values come in, so the projections that make them belong to GrootKeysValues alone.
+            attn.to_k = attn.to_v = None
         self.interleave = model.config.interleave_self_attention
         self.alternate = action_head.config.use_alternate_vl_dit
         self.attend_text_every = model.attend_text_every_n_blocks if self.alternate else 1
@@ -369,8 +482,9 @@ class GrootStep(nn.Module):
             raise ValueError("AlternateVLDiT requires interleaved self attention.")
         self.use_bf16 = use_bf16
         self.horizon = action_head.action_horizon
-        self.register_buffer("image_mask", constants["image_mask"] & constants["backbone_attention_mask"])
-        self.register_buffer("text_mask", ~constants["image_mask"] & constants["backbone_attention_mask"])
+        self.head = constants["head"]
+        self.register_buffer("image_mask", constants["image_mask"])
+        self.register_buffer("task_positions", constants["task_positions"])
         self.register_buffer("embodiment_id", torch.zeros_like(constants["embodiment_id"]))
         if start == 0:
             self.action_encoder = action_head.action_encoder
@@ -386,8 +500,15 @@ class GrootStep(nn.Module):
             self.action_decoder = action_head.action_decoder
             select_embodiment(self.action_decoder, constants["embodiment_id"])
 
-    def forward(self, vl_embeds: Tensor, *inputs: Tensor):
-        with torch.autocast(vl_embeds.device.type, torch.bfloat16, enabled=self.use_bf16):
+    def forward(self, *inputs: Tensor):
+        """`inputs` holds the key and value of each cross-attention block, what the previous group passes on,
+        then the task's length."""
+        keys_values, inputs = inputs[: 2 * len(self.cross)], inputs[2 * len(self.cross) :]
+        given = {block: keys_values[2 * n : 2 * n + 2] for n, block in enumerate(self.cross)}
+        *inputs, task_length = inputs
+        # The policy attends to every token of its unpadded prompt; the padding stays out of every cross-attention.
+        prompt = prompt_mask(self.head, self.task_positions, task_length)
+        with torch.autocast(task_length.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
                 state_features, x_t, time = inputs
                 time = time.long()
@@ -401,17 +522,14 @@ class GrootStep(nn.Module):
                 hidden, temb, x_t = inputs
             else:
                 hidden, temb = inputs
-            hidden, vl_embeds = hidden.contiguous(), vl_embeds.contiguous()
+            hidden = hidden.contiguous()
             for index, block in enumerate(self.blocks, self.start):
-                self_attention = self.interleave and index % 2 == 1
-                mask = None
-                if self.alternate and not self_attention:
-                    mask = self.text_mask if index % (2 * self.attend_text_every) == 0 else self.image_mask
+                mask = prompt if index in given else None
+                if self.alternate and index in given:
+                    text = index % (2 * self.attend_text_every) == 0
+                    mask = prompt & (~self.image_mask if text else self.image_mask)
                 hidden = block(
-                    hidden,
-                    encoder_hidden_states=None if self_attention else vl_embeds,
-                    encoder_attention_mask=mask,
-                    temb=temb,
+                    hidden, encoder_hidden_states=given.get(index), encoder_attention_mask=mask, temb=temb
                 )
             if self.last:
                 shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
@@ -421,30 +539,156 @@ class GrootStep(nn.Module):
             return (hidden, temb) if self.start == 0 else hidden
 
 
-def check_traceable_decode(postprocessor: PolicyProcessorPipeline, route: str) -> None:
-    """Refuse at the start a checkpoint whose action decoding this route cannot compile.
+def rot6d_to_matrix(rot6d: Tensor) -> Tensor:
+    """GR00T's `rot6d_to_matrix` on a batch: the rotation whose first two rows the six numbers give.
 
-    GR00T N1.7 checkpoints with statistics for their embodiment decode actions in NumPy. The other routes
-    trace with torch.export's default non-strict mode, which cannot run NumPy on traced tensors, so the
-    export would otherwise fail at its last part after hours. The ONNX exporter traces it into the program,
-    and the benchmark's plain PyTorch run needs no tracing at all, except relative actions, which add a state
-    the decoder caches between calls. It is the only recipe check
-    that names a route, because the route decides how a program is traced. torch.export's strict mode also
-    traces the decoding, but a TensorRT build of that graph is untested, so the routes keep their default.
+    In float32 where GR00T computes in float64, which TensorRT does not support.
     """
+    row1, row2 = rot6d.unflatten(-1, (2, 3)).unbind(-2)
+    row1 = row1 / row1.norm(dim=-1, keepdim=True)
+    row2 = row2 - (row1 * row2).sum(-1, keepdim=True) * row1
+    row2 = row2 / row2.norm(dim=-1, keepdim=True)
+    return torch.stack((row1, row2, torch.linalg.cross(row1, row2)), dim=-2)
+
+
+def relative_eef_to_absolute(action: Tensor, reference: Tensor) -> Tensor:
+    """GR00T's `relative_eef_to_absolute`: xyz+rot6d poses relative to `reference`, made absolute."""
+    turn = rot6d_to_matrix(reference[:, None, 3:])
+    rotation = turn @ rot6d_to_matrix(action[..., 3:])
+    xyz = (turn @ action[..., :3, None])[..., 0] + reference[:, None, :3]
+    return torch.cat((xyz, rotation[..., :2, :].flatten(-2)), dim=-1)
+
+
+class N17ActionDecode(nn.Module):
+    """`GrootN17ActionDecodeStep`, GR00T N1.7's decoding with its embodiment statistics, as tensor operations.
+
+    The step decodes in NumPy after a copy to the host, which no program can hold, and reads the reference
+    state of relative actions from its packing step's cache; here the robot state is an input, split into the
+    packing step's state groups. Each action group is unnormalized with its statistics, relative groups are
+    then added to, or composed with, their state group, and the groups are joined and cut to the robot's
+    actions, as the step does.
+    """
+
+    def __init__(self, decode: GrootN17ActionDecodeStep, pack: GrootN17PackInputsStep, horizon: int):
+        super().__init__()
+        action = decode.modality_config["action"]
+        keys, configs = action.get("modality_keys", []), action.get("action_configs", [])
+        steps = np.zeros((1, horizon))
+        self.horizon = _n1_7_decode_valid_horizon(action, steps[..., None]) or horizon
+        self.env_action_dim = decode.env_action_dim
+        self.groups, self.relative = [], []
+        start = 0
+        for index, key in enumerate(keys):
+            entry = decode.raw_stats.get("action", {}).get(key) if isinstance(key, str) else None
+            dim = stat_dim_from_entry(entry) if isinstance(entry, dict) else 0
+            if dim <= 0:
+                continue
+            config = configs[index] if index < len(configs) and isinstance(configs[index], dict) else {}
+            low, high = _n1_7_decode_stats_for_action(
+                decode.raw_stats,
+                key,
+                config,
+                use_relative_action=decode.use_relative_action,
+                use_percentiles=decode.use_percentiles,
+            )
+            # Per-step statistics hold a row per chunk step, and a chunk starts at step 0.
+            if low.ndim == 2:
+                low, high = low[: self.horizon], high[: self.horizon]
+            self.register_buffer(f"low_{key}", torch.from_numpy(low))
+            self.register_buffer(f"high_{key}", torch.from_numpy(high))
+            self.groups.append((key, start, dim))
+            start += dim
+            if decode.use_relative_action and config_value(config.get("rep")) == "relative":
+                kind = config_value(config.get("type")), config_value(config.get("format"))
+                if kind[0] != "non_eef" and kind != ("eef", "xyz+rot6d"):
+                    raise ValueError(f"Unsupported relative N1.7 action config for {key!r}: {config}")
+                self.relative.append((key, config.get("state_key") or key, kind[0]))
+        self.state_groups = {}
+        state_start = 0
+        for key in pack.modality_config.get("state", {}).get("modality_keys", []):
+            stats = pack.raw_stats.get("state", {}).get(key, {}) if isinstance(key, str) else {}
+            dim = len(stats.get("mean") or stats.get("min") or stats.get("q01") or [])
+            if dim > 0:
+                self.state_groups[key] = (state_start, dim)
+                state_start += dim
+        self.gripper = None
+        if decode.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO:
+            gripper = [start for key, start, dim in self.groups if key == "gripper" and dim == 1]
+            if not gripper or (self.env_action_dim and gripper[0] >= self.env_action_dim):
+                raise ValueError("The LIBERO action decode transform needs a scalar gripper action group.")
+            self.gripper = gripper[0]
+        elif decode.action_decode_transform is not None:
+            raise ValueError(f"Unsupported N1.7 action decode transform {decode.action_decode_transform!r}.")
+
+    def forward(self, actions: Tensor, state: Tensor) -> Tensor:
+        """`actions` (batch, steps, model width) to robot actions, about `state` (batch, state width)."""
+        actions = actions[:, : self.horizon].float()
+        decoded = {}
+        for key, start, dim in self.groups:
+            low, high = getattr(self, f"low_{key}"), getattr(self, f"high_{key}")
+            group = actions[..., start : start + dim].clamp(-1.0, 1.0)
+            decoded[key] = (group + 1.0) * 0.5 * (high - low) + low
+        for key, state_key, kind in self.relative:
+            start, dim = self.state_groups[state_key]
+            reference = state[:, start : start + dim].float()
+            if kind == "non_eef":
+                decoded[key] = decoded[key] + reference[:, None]
+            else:
+                decoded[key] = relative_eef_to_absolute(decoded[key], reference)
+        result = torch.cat([decoded[key] for key, _, _ in self.groups], dim=-1)
+        if self.env_action_dim:
+            result = result[..., : self.env_action_dim]
+        if self.gripper is not None:
+            gripper = result[..., self.gripper : self.gripper + 1]
+            result = torch.cat(
+                (
+                    result[..., : self.gripper],
+                    -torch.sign(2.0 * gripper - 1.0),
+                    result[..., self.gripper + 1 :],
+                ),
+                dim=-1,
+            )
+        return result
+
+
+class N17ChunkActions(nn.Module):
+    """The end of the chain for a checkpoint that decodes with `GrootN17ActionDecodeStep`."""
+
+    def __init__(self, n_action_steps: int, decode: N17ActionDecode):
+        super().__init__()
+        self.n_action_steps = n_action_steps
+        self.decode = decode
+
+    def forward(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
+        return self.decode(actions[None, : self.n_action_steps], state[None] if state is not None else None)[
+            0
+        ]
+
+    def part(self, actions: Tensor, state: Tensor) -> Part:
+        """The last part, which takes the state only if a relative group reads it."""
+        if not self.decode.relative:
+            return Part("actions", self, (actions,), ["x_t"], [ACTION])
+        return Part("actions", self, (actions, state), ["x_t", OBS_STATE], [ACTION])
+
+
+def chunk_actions(
+    n_action_steps: int,
+    action_dim: int,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> nn.Module:
+    """The end of the chain: `N17ChunkActions` for a checkpoint whose postprocessor decodes with GR00T N1.7's
+    own step, otherwise the shared `ChunkActions`."""
     decode = next((s for s in postprocessor.steps if isinstance(s, GrootN17ActionDecodeStep)), None)
     if decode is None:
-        return
-    if decode.use_relative_action:
+        return ChunkActions(n_action_steps, action_dim, postprocessor)
+    rest = [s for s in postprocessor.steps if s is not decode]
+    if not all(isinstance(s, DeviceProcessorStep) for s in rest):
         raise ValueError(
-            "This checkpoint decodes relative actions with GrootN17ActionDecodeStep, which adds the state "
-            "it cached from the last observation and cannot be exported."
+            "GrootN17ActionDecodeStep must be the postprocessor's only step besides the device's."
         )
-    if route not in ("onnx_tensorrt", "pytorch"):
-        raise ValueError(
-            "This checkpoint decodes its actions with GrootN17ActionDecodeStep, which runs in NumPy and "
-            "only the ONNX-TensorRT route can export: use to_onnx_tensorrt.py."
-        )
+    pack = next(s for s in preprocessor.steps if isinstance(s, GrootN17PackInputsStep))
+    return N17ChunkActions(n_action_steps, N17ActionDecode(decode, pack, n_action_steps))
 
 
 class Exporter:
@@ -461,7 +705,13 @@ class Exporter:
         # How many actions the policy plays per chunk, which it resolves from the checkpoint and keeps private.
         self.n_action_steps = self.policy._action_queue_steps
         preprocessor, self.postprocessor = processors(self.config, args.policy_path)
-        check_traceable_decode(self.postprocessor, args.route)
+        # Built now, so a decoding the program cannot hold is refused before hours of building the other parts.
+        self.actions = chunk_actions(
+            self.n_action_steps,
+            self.config.output_features[ACTION].shape[0],
+            preprocessor,
+            self.postprocessor,
+        ).to(device())
         self.task, self.frame, self.folder_config = dataset_frame(args, self.config)
         self.batch = preprocessor(prepare_observation_for_inference(dict(self.frame), device(), self.task))
         self.observation = GrootObservation(preprocessor, self.frame, self.batch).to(device())
@@ -471,20 +721,51 @@ class Exporter:
             name: self.folder_config.input_features[name] for name in self.frame
         }
         qwen = model.backbone.model.model
-        ids, mask = self.batch["input_ids"], self.batch["attention_mask"]
+        ids = self.batch["input_ids"]
         image_mask = ids == qwen.config.image_token_id
         positions, _ = qwen.get_rope_index(
             input_ids=ids,
             mm_token_type_ids=self.batch.get("mm_token_type_ids", image_mask.int()),
             image_grid_thw=self.batch["image_grid_thw"],
-            attention_mask=mask,
+            attention_mask=self.batch["attention_mask"],
         )
+        encode = next(s for s in preprocessor.steps if isinstance(s, GrootN17VLMEncodeStep))
+        pack = next(s for s in preprocessor.steps if isinstance(s, GrootN17PackInputsStep))
+        self.tokenizer = encode.proc.tokenizer
+        # The prompt is a head that ends with the last image, then the task's text.
+        vision_end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        head = int(torch.nonzero(ids[0] == vision_end).max()) + 1
+        task_text = TASK_TEXT.format(task=self.batch["language"][0])
+        if ids[0, head:].tolist() != self.tokenizer.encode(task_text):
+            raise ValueError("The task's text does not follow the images in the prompt as expected.")
+        max_tokens = args.max_task_tokens
+        if ids.shape[1] - head > max_tokens:
+            raise SystemExit(f"The task is {ids.shape[1] - head} tokens long; raise --max_task_tokens.")
+        # Qwen3-VL numbers the text after the images on from the largest image position, in all three axes.
+        task_positions = torch.arange(max_tokens, device=ids.device)
+        text_positions = positions[:, :, :head].max() + 1 + task_positions
+        if not torch.equal(positions[:, :, head:], text_positions[: ids.shape[1] - head].expand(3, 1, -1)):
+            raise ValueError("Qwen3-VL's rope positions of the task's text are not consecutive.")
+        padded = head + max_tokens
         self.constants = {
-            "attention_mask": mask.long(),
-            "position_ids": positions,
-            "image_mask": image_mask,
-            "backbone_attention_mask": mask == 1,
+            # The policy's prompt has no padding; the programs keep the task's out of attention themselves.
+            "attention_mask": torch.ones(1, padded, dtype=torch.long, device=ids.device),
+            "position_ids": torch.cat((positions[:, :, :head], text_positions.expand(3, 1, -1)), dim=2),
+            "image_mask": F.pad(image_mask[:, :head], (0, max_tokens)),
+            "task_positions": task_positions,
+            "head": head,
             "embodiment_id": self.batch["embodiment_id"],
+        }
+        self.prompt = {
+            "tokenizer": "tokenizer.json",
+            "embeddings": "token_embeddings.safetensors",
+            "text": TASK_TEXT,
+            # What GR00T's processor runs for an empty task, and how it cleans a task.
+            "default_task": "Perform the task.",
+            "formalize": pack.formalize_language,
+            "max_tokens": max_tokens,
+            "task": self.task,
+            "task_ids": ids[0, head:].tolist(),
         }
         self.noise = torch.randn(
             self.model_config.action_horizon, self.model_config.max_action_dim, device=device()
@@ -529,8 +810,11 @@ class Exporter:
         policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
         with torch.no_grad():
             text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
-        self.constants["text_embeds"] = text
         del policy
+        head = self.constants["head"]
+        self.constants["head_embeds"] = text[:, :head]
+        task_embeddings = F.pad(text[0, head:], (0, 0, 0, self.prompt["max_tokens"] - (text.shape[1] - head)))
+        task_length = torch.tensor([text.shape[1] - head], device=device())
         depth, hidden_name = self.model_config.select_layer, "image_embeds"
         for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
             stop = min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth)
@@ -549,9 +833,20 @@ class Exporter:
                 len(deepstack),
             ).eval()
             del policy
-            state_input = ((state,), ["state"]) if module.last else ((), [])
-            inputs = (hidden, *(deepstack[i] for i in module.deepstack_layers), *state_input[0])
-            names = [hidden_name, *(deepstack_names[i] for i in module.deepstack_layers), *state_input[1]]
+            task_input = ((task_embeddings,), [TASK_EMBEDDINGS]) if first == 0 else ((), [])
+            state_input = ((state, task_length), ["state", TASK_LENGTH]) if module.last else ((), [])
+            inputs = (
+                hidden,
+                *(deepstack[i] for i in module.deepstack_layers),
+                *task_input[0],
+                *state_input[0],
+            )
+            names = [
+                hidden_name,
+                *(deepstack_names[i] for i in module.deepstack_layers),
+                *task_input[1],
+                *state_input[1],
+            ]
             with torch.no_grad():
                 result = module(*inputs)
             outputs = ["vl_embeds", "state_features"] if module.last else [f"language_hidden_{group}"]
@@ -562,13 +857,34 @@ class Exporter:
                 hidden = result
             hidden_name = outputs[0]
             del module
-        actions = self.noise
+        free_memory()
         depth = self.model_config.diffusion_model_cfg["num_layers"]
+        interleave = self.model_config.diffusion_model_cfg.get("interleave_self_attention", False)
+        crossing = [i for i in range(depth) if not (interleave and i % 2 == 1)]
+        modules = [
+            f"{ACTION_HEAD}.model.transformer_blocks.{i}.attn1.{p}"
+            for i in crossing
+            for p in ("to_k", "to_v")
+        ]
+        module = GrootKeysValues(
+            self.load_modules(*modules)._groot_model.action_head, self.config.use_bf16
+        ).eval()
+        if module.cross != crossing:
+            raise ValueError(
+                "The diffusion model's cross-attention blocks are not the ones the config names."
+            )
+        with torch.no_grad():
+            keys_values = module(vl_embeds)
+        kv_names = [f"{kind}_{i}" for i in crossing for kind in ("key", "value")]
+        yield Part("keys_values", module, (vl_embeds,), ["vl_embeds"], kv_names)
+        del module
+        given = dict(zip(kv_names, keys_values, strict=True))
+        actions = self.noise
         for iteration, bucket in enumerate(self.timesteps):
             timestep = torch.tensor([bucket], dtype=torch.float32, device=device())
             carried, names = (
                 (state_features, actions, timestep),
-                ["vl_embeds", "state_features", "x_t", "timestep"],
+                ["state_features", "x_t", "timestep"],
             )
             for group, first in enumerate(range(0, depth, DIT_BLOCKS_PER_PROGRAM)):
                 stop = min(first + DIT_BLOCKS_PER_PROGRAM, depth)
@@ -589,9 +905,11 @@ class Exporter:
                     self.config.use_bf16,
                     1.0 / self.num_steps,
                 ).eval()
-                inputs = (vl_embeds, *carried)
+                block_names = [f"{kind}_{i}" for i in module.cross for kind in ("key", "value")]
+                inputs = (*(given[n] for n in block_names), *carried)
                 if module.last and first != 0:
                     inputs, names = (*inputs, actions), [*names, "x_t"]
+                inputs, step_names = (*inputs, task_length), [*block_names, *names, TASK_LENGTH]
                 with torch.no_grad():
                     result = module(*inputs)
                 if module.last:
@@ -602,23 +920,26 @@ class Exporter:
                     outputs = [f"step_hidden_{group}"]
                 # Every denoising step runs the same programs: yield them once, then only finish the test case.
                 if iteration == 0:
-                    yield Part(f"step_{group}", module, inputs, names, outputs)
+                    yield Part(f"step_{group}", module, inputs, step_names, outputs)
                 if module.last:
                     actions = result
                 else:
                     carried = result if first == 0 else (result, carried[-1])
-                    names = ["vl_embeds", f"step_hidden_{group}", "temb"]
+                    names = [f"step_hidden_{group}", "temb"]
                 del module
         free_memory()
-        module = ChunkActions(
-            self.n_action_steps, self.config.output_features[ACTION].shape[0], self.postprocessor
-        )
+        module = self.actions
         state = torch.from_numpy(self.frame[OBS_STATE]).to(device())
         with torch.no_grad():
             self.expected_actions = module(actions, state).float().cpu().numpy()
         yield module.part(actions, state)
 
     def write(self, programs: dict[str, dict]) -> None:
+        self.tokenizer.backend_tokenizer.save(str(self.args.output_dir / self.prompt["tokenizer"]))
+        policy = self.load_modules(f"{LANGUAGE_MODEL}.embed_tokens")
+        table = policy._groot_model.backbone.language_model.get_input_embeddings().weight
+        save_embedding_table(table, self.args.output_dir / self.prompt["embeddings"])
+        del policy, table
         write_folder(
             self.args,
             self.folder_config,
@@ -629,6 +950,5 @@ class Exporter:
             steps=[name for name in programs if name.startswith("step_")],
             timesteps=self.timesteps,
             image_resize=self.image_resize,
-            # The task's token ids and rope positions are constants inside the programs.
-            task=self.task,
+            prompt=self.prompt,
         )

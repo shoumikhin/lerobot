@@ -336,7 +336,9 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
-def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
+def pi05_checkpoint(
+    path, monkeypatch, dtype=torch.float32, cameras=("observation.images.base_0_rgb",), empty_cameras=0
+):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
@@ -364,8 +366,9 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
         max_action_dim=8,
         num_inference_steps=2,
         tokenizer_max_length=48,
+        empty_cameras=empty_cameras,
         input_features={
-            "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
+            **{name: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)) for name in cameras},
             "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
         },
         output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
@@ -389,8 +392,10 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32):
 
 
 @require_hf_token
-def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
-    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise."""
+@pytest.mark.parametrize("max_task_tokens", [None, 12])
+def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkeypatch, max_task_tokens):
+    """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise,
+    for the task of the export and for another one given at run time, with the policy's prompt length or less."""
     pytest.importorskip("transformers")
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Policy
@@ -406,6 +411,7 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
         route="executorch_tensorrt",
         task=task,
         cameras=None,
+        max_task_tokens=max_task_tokens,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
@@ -419,12 +425,97 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch):
     policy = PI05Policy.from_pretrained(checkpoint, config=config).eval()
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
     frame = {name: case[name] for name in ("observation.images.base_0_rgb", "observation.state")}
+
+    def policy_actions(task, noise):
+        with torch.no_grad():
+            batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), task))
+            actions = policy.predict_action_chunk(batch, noise=torch.from_numpy(noise)[None])
+            return postprocessor(actions[:, : config.n_action_steps])[0].numpy()
+
+    np.testing.assert_allclose(
+        case["expected_actions"], policy_actions(task, case["noise"]), rtol=0, atol=1e-4
+    )
+    other = "open_the drawer\n"
+    assert engine.set_task(other)
+    np.random.seed(0)
+    actions = np.stack([engine.get_action(frame) for _ in range(config.n_action_steps)])
+    noise = np.random.RandomState(0).standard_normal(case["noise"].shape).astype(np.float32)
+    np.testing.assert_allclose(actions, policy_actions(other, noise), rtol=0, atol=1e-4)
+    # The task changes the actions, so the comparison above would catch a program that ignores it.
+    assert not np.allclose(policy_actions(task, noise), policy_actions(other, noise), atol=1e-3)
+
+
+@require_hf_token
+@pytest.mark.parametrize(
+    "exported,sent",
+    [
+        (None, ["observation.images.wrist"]),
+        (None, ["observation.images.base_0_rgb"]),
+        (["observation.images.wrist"], ["observation.images.wrist"]),
+    ],
+)
+def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(
+    recipes, tmp_path, monkeypatch, exported, sent
+):
+    """A camera the robot does not send, or one the export leaves out with --cameras, is filled in as the policy
+    fills in a camera missing from its batch."""
+    pytest.importorskip("transformers")
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.pi05 import PI05Policy
+    from lerobot.policies.utils import prepare_observation_for_inference
+
+    torch.manual_seed(0)
+    cameras = ("observation.images.base_0_rgb", "observation.images.wrist")
+    # With an empty camera slot too, which the export leaves out.
+    checkpoint, config = pi05_checkpoint(
+        tmp_path / "checkpoint", monkeypatch, cameras=cameras, empty_cameras=1
+    )
+    args = Namespace(
+        policy_path=str(checkpoint),
+        output_dir=tmp_path / "folder",
+        tolerance=1e-4,
+        route="executorch_tensorrt",
+        task="pick up the cube",
+        cameras=exported,
+        max_task_tokens=None,
+    )
+    args.output_dir.mkdir()
+    engine = export_with_replay("pi05", args, monkeypatch)
+    case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
+        args.output_dir / "test_case.safetensors"
+    )
+    frame = {name: case[name] for name in (*sent, "observation.state")}
+    np.random.seed(0)
+    actions = np.stack([engine.get_action(frame) for _ in range(config.n_action_steps)])
+    noise = np.random.RandomState(0).standard_normal(case["noise"].shape).astype(np.float32)
+    policy = PI05Policy.from_pretrained(checkpoint, config=config).eval()
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
     with torch.no_grad():
-        batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), task))
-        actions = policy.predict_action_chunk(batch, noise=torch.from_numpy(case["noise"])[None])
-        expected = postprocessor(actions[:, : config.n_action_steps])[0].numpy()
-    np.testing.assert_allclose(case["expected_actions"], expected, rtol=0, atol=1e-4)
-    assert engine.get_action(frame).shape == (3,)
+        batch = preprocessor(prepare_observation_for_inference(dict(frame), torch.device("cpu"), args.task))
+        expected = policy.predict_action_chunk(batch, noise=torch.from_numpy(noise)[None])
+        expected = postprocessor(expected[:, : config.n_action_steps])[0].numpy()
+    np.testing.assert_allclose(actions, expected, rtol=0, atol=1e-4)
+    with pytest.raises(ValueError, match="none of the policy's cameras"):
+        engine.get_action({"observation.state": case["observation.state"]})
+
+
+@require_hf_token
+def test_pi05_empty_camera_slots_add_no_prefix_tokens(recipes, tmp_path, monkeypatch):
+    """The policy leaves its empty camera slots out of attention, so the export leaves them out entirely."""
+    pytest.importorskip("transformers")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    lengths = []
+    for empty in (0, 2):
+        torch.manual_seed(0)
+        checkpoint, _ = pi05_checkpoint(tmp_path / f"checkpoint_{empty}", monkeypatch, empty_cameras=empty)
+        args = Namespace(
+            policy_path=str(checkpoint), task="pick up the cube", cameras=None, max_task_tokens=None
+        )
+        part = next(pi05.Exporter(args).parts())
+        with torch.no_grad():
+            lengths.append(part.module(*part.inputs)[1].shape[1])
+    assert lengths[0] == lengths[1]
 
 
 @require_cuda
@@ -436,7 +527,9 @@ def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_co
     torch.manual_seed(0)
     checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, dtype=torch.bfloat16)
     pi05 = importlib.import_module("pi05")
-    exporter = pi05.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube", cameras=None))
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", cameras=None, max_task_tokens=None)
+    )
     with monkeypatch.context() as patch:
         patch.setattr(pi05, "hold_linear_weights_in_bfloat16", lambda module: None)
         stock_step = pi05.PI05Step(exporter.load_modules(*pi05.STEP_MODULES).model, exporter.dt)
@@ -467,16 +560,42 @@ def test_pi05_prompt_matches_the_policy_prompt_on_bin_edges(recipes):
         tokenizer_name="google/paligemma-3b-pt-224", max_length=64, padding_side="right", padding="max_length"
     )
     state = torch.tensor([[-1.0, -1.0 + 1 / 128, 0.0, 0.5 - 1e-6, 1.0, 0.3]])
-    prompt = pi05.StatePrompt(tokenizer, "pick up the cube", state.shape[1])
-    tokens, mask = prompt(state)
-    transition = {
-        TransitionKey.OBSERVATION: {"observation.state": state},
-        TransitionKey.COMPLEMENTARY_DATA: {"task": ["pick up the cube"]},
-    }
-    transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
-    expected = tokenizer(transition)[TransitionKey.OBSERVATION]
-    torch.testing.assert_close(tokens, expected["observation.language.tokens"])
-    torch.testing.assert_close(mask, expected["observation.language.attention_mask"].bool())
+    # Row i holds i, so the rows the prompt picks spell out its token ids.
+    embedding = torch.nn.Embedding(len(tokenizer.input_tokenizer), 1)
+    embedding.weight.data = torch.arange(len(tokenizer.input_tokenizer), dtype=torch.float32)[:, None]
+    for task, max_task_tokens in (("pick up the cube", None), (" stack_the\nblocks ", None), ("pick", 9)):
+        prompt = pi05.StatePrompt(tokenizer, embedding, state.shape[1], max_task_tokens)
+        clean = task.strip().replace("_", " ").replace("\n", " ")
+        ids = tokenizer.input_tokenizer.encode(pi05.TASK_TEXT.format(task=clean))
+        task_embeddings = torch.zeros(prompt.max_task_tokens, 1)
+        task_embeddings[: len(ids), 0] = torch.tensor(ids, dtype=torch.float32)
+        rows, mask = prompt(state, task_embeddings, torch.tensor([len(ids)]))
+        transition = {
+            TransitionKey.OBSERVATION: {"observation.state": state},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": [task]},
+        }
+        transition = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=6)(transition)
+        expected = tokenizer(transition)[TransitionKey.OBSERVATION]
+        # A shorter prompt ends where only the policy's padding would follow.
+        length = mask.shape[1]
+        assert not expected["observation.language.attention_mask"][:, length:].any()
+        torch.testing.assert_close(rows[..., 0].long(), expected["observation.language.tokens"][:, :length])
+        torch.testing.assert_close(mask, expected["observation.language.attention_mask"][:, :length].bool())
+
+
+def test_embedding_tables_are_saved_in_bfloat16_only_when_that_is_exact(recipes, tmp_path):
+    from lerobot.inference.export.prompt import read_table
+
+    common = importlib.import_module("common")
+    exact = torch.randn(5, 4).to(torch.bfloat16).float()
+    inexact = exact + 1e-4
+    for table, raw_dtype in ((exact, np.uint16), (inexact, np.float32)):
+        common.save_embedding_table(table, tmp_path / "table.safetensors")
+        saved = read_table(tmp_path / "table.safetensors")
+        assert saved.dtype == raw_dtype
+        if raw_dtype == np.uint16:
+            saved = (saved.astype(np.uint32) << 16).view(np.float32)
+        np.testing.assert_array_equal(saved, table.numpy())
 
 
 @pytest.mark.parametrize(
