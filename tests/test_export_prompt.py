@@ -76,6 +76,14 @@ def test_the_exported_task_needs_no_tokenizer(folder):
     assert prompt(folder, text="{task}").token_ids("cube") == [5]
 
 
+def test_a_task_seen_before_needs_no_tokenizer(folder):
+    exported = prompt(folder, text="{task}")
+    ids = exported.token_ids("pick up the cube")
+    (folder / "tokenizer.json").unlink()
+    assert exported.token_ids("cube") == [5]
+    assert exported.token_ids("pick up the cube") == ids == [2, 3, 4, 5]
+
+
 def test_a_tokenizer_that_splits_the_exported_task_otherwise_is_refused(folder):
     exported = TaskPrompt(
         folder,

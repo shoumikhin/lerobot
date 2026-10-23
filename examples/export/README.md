@@ -202,5 +202,5 @@ python examples/export/benchmark_memory.py -- python examples/export/benchmark.p
 ## Good to know
 
 - **Orin Nano memory.** Compiling SmolVLA, pi0.5 or GR00T on the 8 GB board may need swap space.
-- **Changing the task.** A pi0.5 or GR00T folder tokenizes a new task in a short-lived process, which takes about 2 s on the Orin Nano while the arm holds still. The task the folder was exported with needs none.
+- **Changing the task.** A pi0.5 or GR00T folder tokenizes a new task in a short-lived process, which takes about 2 s on the Orin Nano while the arm holds still. The task the folder was exported with, and any task it has already run, needs none.
 - **The checks show that the compiled policy matches PyTorch.** They do not show that the robot is safe or that it does the task.
