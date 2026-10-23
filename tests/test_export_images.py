@@ -23,24 +23,25 @@ from lerobot.inference.export.images import resize_bicubic, resize_images
 
 
 @pytest.mark.parametrize("size", [(3, 5), (15, 21), (1, 1), (7, 11)])
-def test_bicubic_matches_antialiased_reference(size):
+def test_bicubic_matches_the_policies_torchvision_resize(size):
     import torch
-    import torch.nn.functional as functional
+
+    pytest.importorskip("torchvision")
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms.v2 import functional
 
     image = np.random.default_rng(7).integers(0, 256, (7, 11, 3), dtype=np.uint8)
     original = image.copy()
     expected = (
-        functional.interpolate(
-            torch.from_numpy(image).permute(2, 0, 1)[None].float(),
-            size=size,
-            mode="bicubic",
-            align_corners=False,
+        functional.resize(
+            torch.from_numpy(image).permute(2, 0, 1),
+            list(size),
+            interpolation=InterpolationMode.BICUBIC,
             antialias=True,
         )
-        .clamp(0, 255)
-        .round()[0]
         .permute(1, 2, 0)
         .numpy()
+        .astype(np.float32)
     )
     actual = resize_bicubic(image, size)
     assert actual.dtype == np.uint8 and actual.flags.c_contiguous
@@ -98,7 +99,7 @@ def test_camera_geometry_matches_the_policy_image_transform(letterbox):
     )
     actual = resize_images({"camera": image}, geometry)["camera"]
     difference = np.abs(actual.astype(np.int16) - expected.permute(1, 2, 0).numpy().astype(np.int16))
-    assert difference.max() <= 2, difference.max()
+    assert difference.max() <= 1, difference.max()
 
 
 def test_runtime_resizes_both_startup_and_live_frames(tmp_path, monkeypatch):
