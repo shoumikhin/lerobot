@@ -323,7 +323,9 @@ class GrootLanguageModel(nn.Module):
                 (state,) = inputs[added:]
                 # GR00T consumes the decoder output before Qwen's final norm.
                 features = self.vl_self_attention(self.vlln(hidden))
-                state_features = self.state_encoder(state.reshape(state.shape[0], 1, -1), self.embodiment_id)
+                # As GR00T's own input step does, since autocast is off when use_bf16 is false.
+                state = state.reshape(state.shape[0], 1, -1).to(self.state_encoder.layer1.W.dtype)
+                state_features = self.state_encoder(state, self.embodiment_id)
                 return features, state_features
             return hidden
 
