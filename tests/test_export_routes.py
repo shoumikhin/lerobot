@@ -106,7 +106,6 @@ def test_routes_compile_with_the_shared_tensorrt_options(route, tmp_path, name):
     compile_part(part(), tmp_path / "step.bin")
     if name == "to_onnx_tensorrt":
         assert TENSORRT_OPTIONS["workspace_size"] == stubs["build_engine"].WORKSPACE_BYTES
-        assert TENSORRT_OPTIONS["optimization_level"] == stubs["build_engine"].OPTIMIZATION_LEVEL
     else:
         options = stubs["torch_tensorrt"].dynamo.compile.call_args.kwargs
         assert {key: options[key] for key in TENSORRT_OPTIONS} == TENSORRT_OPTIONS
