@@ -80,10 +80,15 @@ class Part:
     output_names: list[str]
 
 
-def parse_args(description: str, route: str) -> tuple[argparse.Namespace, Any]:
-    """The route's command line with the arguments of the checkpoint's recipe, and that recipe."""
+def parse_args(
+    description: str, route: str, parents: tuple[argparse.ArgumentParser, ...] = ()
+) -> tuple[argparse.Namespace, Any]:
+    """The route's command line with the arguments of the checkpoint's recipe and of `parents`, and that recipe."""
     parser = argparse.ArgumentParser(
-        description=description, formatter_class=argparse.RawDescriptionHelpFormatter, add_help=False
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,
+        parents=list(parents),
     )
     parser.add_argument("--policy.path", dest="policy_path", required=True, help="Trained policy checkpoint.")
     parser.add_argument(
