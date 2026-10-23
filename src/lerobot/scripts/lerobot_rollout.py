@@ -190,7 +190,14 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
-from lerobot.rollout import InteractiveSession, LinkedEvent, RolloutConfig
+from lerobot.rollout import (
+    InteractiveSession,
+    LinkedEvent,
+    RolloutConfig,
+    build_rollout_context,
+    create_strategy,
+)
+from lerobot.rollout.status_line import StatusLine
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -218,10 +225,6 @@ logger = logging.getLogger(__name__)
 @parser.wrap()
 def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
-    # The rollout runtime imports torch and the dataset stack, so it loads after the arguments are parsed.
-    from lerobot.rollout import build_rollout_context, create_strategy
-    from lerobot.rollout.status_line import StatusLine
-
     init_logging(console_level=cfg.inference.log_level)
 
     if cfg.display_data:
