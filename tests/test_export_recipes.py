@@ -31,6 +31,9 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.inference.export import ExportInferenceEngine, engine as export_engine
 from tests.utils import require_hf_token
 
+pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
+pytest.importorskip("av", reason="the export examples require lerobot[dataset]")
+
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 
 

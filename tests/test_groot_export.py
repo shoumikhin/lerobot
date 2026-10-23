@@ -17,6 +17,9 @@ from pathlib import Path
 import pytest
 import torch
 
+pytest.importorskip("datasets", reason="the export examples require lerobot[dataset]")
+pytest.importorskip("av", reason="the export examples require lerobot[dataset]")
+
 
 @pytest.mark.parametrize(
     "cameras,t,p,m,gh,gw", [(2, 2, 16, 2, 16, 16), (1, 1, 2, 2, 4, 4), (2, 3, 3, 2, 4, 6)]
