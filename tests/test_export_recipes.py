@@ -394,8 +394,9 @@ def pi05_checkpoint(
 @require_hf_token
 @pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
 @pytest.mark.parametrize("max_task_tokens", [None, 12])
+@pytest.mark.parametrize("one_denoise_program", [False, True])
 def test_pi05_chain_reproduces_the_policy_for_any_task(
-    recipes, tmp_path, monkeypatch, route, max_task_tokens
+    recipes, tmp_path, monkeypatch, route, max_task_tokens, one_denoise_program
 ):
     """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise,
     for the task of the export and for another one given at run time, with the policy's prompt length or less."""
@@ -415,12 +416,15 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(
         task=task,
         cameras=None,
         max_task_tokens=max_task_tokens,
+        one_denoise_program=one_denoise_program,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
     info = __import__("json").loads((args.output_dir / "export.json").read_text())
-    assert list(info["programs"]) == ["embed", "language_model_0", "language_model_1", "step", "actions"]
-    assert info["steps"] == ["step"] and info["timesteps"] == [1.0, 0.5]
+    tail = ["denoise"] if one_denoise_program else ["step", "actions"]
+    assert list(info["programs"]) == ["embed", "language_model_0", "language_model_1", *tail]
+    if not one_denoise_program:
+        assert info["steps"] == ["step"] and info["timesteps"] == [1.0, 0.5]
 
     case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
         args.output_dir / "test_case.safetensors"
