@@ -191,12 +191,48 @@ class PI05Step(nn.Module):
 
     The prefix's mask and KV cache, the noisy actions and the time go in; the next noisy actions come out, so
     the rollout runs the steps one after another with no arithmetic between them.
+
+    The time conditions the action expert only through its adaptive norms, whose scale, shift and gate depend
+    on the time alone, and the folder fixes the schedule. So the step holds them for each of the schedule's
+    timesteps, computed once in float32, instead of the time MLP and every norm's projection, which would
+    otherwise be about a quarter of the weights every step reads. It runs only the schedule's timesteps.
     """
 
-    def __init__(self, model: PI05Pytorch, dt: float):
+    def __init__(self, model: PI05Pytorch, dt: float, timesteps: list[float]):
         super().__init__()
         self.model = model
         self.dt = dt
+        self.register_buffer("timesteps", torch.tensor(timesteps, device=device()))
+        expert = model.paligemma_with_expert.gemma_expert.model
+        norms = [
+            norm
+            for layer in expert.layers
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+        ]
+        x_t = torch.zeros(
+            len(timesteps), model.config.chunk_size, model.config.max_action_dim, device=device()
+        )
+        # The time MLP runs in float32 here, whatever dtype the checkpoint holds it in.
+        for module in (model.action_in_proj, model.time_mlp_in, model.time_mlp_out):
+            module.float()
+        with torch.no_grad():
+            *_, cond = model.embed_suffix(x_t, self.timesteps)
+            for norm in (*norms, expert.norm):
+                modulation = nn.functional.linear(
+                    cond.float(), norm.dense.weight.float(), norm.dense.bias.float()
+                )
+                # Fed the schedule step as a one-hot row, this returns that step's modulation exactly.
+                norm.dense = nn.Linear(len(timesteps), modulation.shape[1], bias=False, device=device())
+                norm.dense.weight.copy_(modulation.T)
+                norm.cond_dim = len(timesteps)
+        embed_suffix = model.embed_suffix
+
+        def scheduled_embed_suffix(noisy_actions: Tensor, timestep: Tensor) -> tuple[Tensor, ...]:
+            # The schedule step as a one-hot row, in place of the time embedding the norms no longer read.
+            *suffix, _ = embed_suffix(noisy_actions, timestep)
+            return *suffix, (self.timesteps == timestep[:, None]).float()
+
+        model.embed_suffix = scheduled_embed_suffix
         if device().type == "cuda":
             hold_linear_weights_in_bfloat16(model)
 
@@ -397,7 +433,7 @@ class Exporter:
         step_model = self.load_modules(*STEP_MODULES).model
         if torch_tensorrt and gpu_capability() in SHARED_KV_ATTENTION_GPUS:
             step_model.denoise_attn_implementation = "pi05_shared_kv"
-        step = PI05Step(step_model, self.dt)
+        step = PI05Step(step_model, self.dt, self.timesteps)
         cache_inputs = (prefix_pad_masks, *cache.values())
         x_t = self.noise
         with torch.no_grad():
