@@ -16,7 +16,10 @@
 
 A Jetson's CPU and GPU share one memory, and a process's own counters miss some GPU allocations, so this
 reads the whole board from /proc/meminfo: the drop in available memory plus the growth in swap, from the
-5 s before the command starts to the last 30 s of its run, in MiB. Keep the board otherwise idle.
+10 s before the command starts to the last 30 s of its run, in MiB. Keep the board otherwise idle.
+
+The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
+use is flat, and a run whose baseline or last 30 s are not flat is reported as invalid, not as a number.
 
     python examples/export/benchmark_memory.py -- lerobot-rollout --policy.path=outputs/export/act \\
         --robot.type=replay --robot.frames_dir=outputs/replay_frames \\
@@ -29,8 +32,10 @@ import sys
 import time
 
 SAMPLE_SECONDS = 0.5
-BASELINE_SECONDS = 5
+BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
+FLAT_MIB_PER_SECOND = 2
+SETTLE_LIMIT_SECONDS = 300
 
 
 def used_mib(meminfo: dict[str, int]) -> float:
@@ -42,6 +47,12 @@ def extra_mib(baseline: list[float], run: list[float]) -> float:
     """The median use over the last 30 s of the run minus the median use before it started."""
     steady = run[-int(STEADY_SECONDS / SAMPLE_SECONDS) :]
     return statistics.median(steady) - statistics.median(baseline)
+
+
+def is_flat(samples: list[float]) -> bool:
+    """Whether memory use, sampled every half second, changes by less than 2 MiB/s on a fitted line."""
+    times = [i * SAMPLE_SECONDS for i in range(len(samples))]
+    return abs(statistics.linear_regression(times, samples).slope) < FLAT_MIB_PER_SECOND
 
 
 def read_meminfo() -> dict[str, int]:
@@ -65,7 +76,14 @@ def main() -> None:
         print(__doc__)
         return
     command = sys.argv[sys.argv.index("--") + 1 :]
+    window = int(BASELINE_SECONDS / SAMPLE_SECONDS)
     baseline = sample(BASELINE_SECONDS)
+    settle_end = time.monotonic() + SETTLE_LIMIT_SECONDS
+    while not is_flat(baseline[-window:]):
+        if time.monotonic() > settle_end:
+            raise SystemExit(f"Invalid: memory use was still changing after {SETTLE_LIMIT_SECONDS} s.")
+        baseline += sample(SAMPLE_SECONDS)
+    baseline = baseline[-window:]
     process = subprocess.Popen(command)
     run = sample(process=process)
     if process.returncode != 0:
@@ -74,6 +92,8 @@ def main() -> None:
         raise SystemExit(
             f"Run for at least {2 * STEADY_SECONDS} s, so the last {STEADY_SECONDS} s are steady."
         )
+    if not is_flat(run[-int(STEADY_SECONDS / SAMPLE_SECONDS) :]):
+        raise SystemExit(f"Invalid: memory use was still changing in the last {STEADY_SECONDS} s of the run.")
     print(f"Extra memory: {extra_mib(baseline, run):.0f} MiB")
 
 
