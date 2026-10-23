@@ -54,6 +54,8 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 POLICIES = ("act", "smolvla", "pi05", "groot")
 TEST_CASE = "test_case.safetensors"
+# The random test images are blends of a coarse grid of random colors (rows, columns).
+IMAGE_CELLS = (6, 8)
 # The same for every policy: they fit the builds into an 8 GB Jetson Orin Nano beside the rest.
 TENSORRT_OPTIONS = {
     "min_block_size": 1,
@@ -225,13 +227,25 @@ def to_policy_input(name: str, x: Tensor) -> Tensor:
     return x.unsqueeze(0)
 
 
+def random_image(height: int, width: int, channels: int) -> np.ndarray:
+    """A random uint8 HWC image that changes smoothly across the frame, as a camera's image does.
+
+    On independent random pixels, which look like no camera image, a vision-language policy's bfloat16
+    actions differ by several robot units between two correct compilations, so its check would measure noise.
+    """
+    coarse = torch.rand(1, channels, *IMAGE_CELLS) * 255
+    image = nn.functional.interpolate(coarse, size=(height, width), mode="bilinear")
+    # Contiguous, because safetensors saves a strided array in memory order, which scrambles it.
+    return image[0].permute(1, 2, 0).round().to(torch.uint8).contiguous().numpy()
+
+
 def frame_from_policy(config: PreTrainedConfig) -> dict[str, np.ndarray]:
     """A random observation shaped like the policy's inputs: uint8 HWC images, float32 state."""
     frame = {}
     for name, feature in config.input_features.items():
         if name in config.image_features:
             channels, height, width = feature.shape
-            frame[name] = np.random.randint(0, 256, (height, width, channels), dtype=np.uint8)
+            frame[name] = random_image(height, width, channels)
         else:
             frame[name] = np.random.rand(*feature.shape).astype(np.float32)
     return frame
@@ -248,7 +262,7 @@ def frame_from_dataset(features: dict[str, dict]) -> dict[str, np.ndarray]:
             # The robot's cameras give HWC frames; a dataset may store the shape channel first.
             if feature["names"][2] not in ("channel", "channels"):
                 shape = (shape[1], shape[2], shape[0])
-            frame[name] = np.random.randint(0, 256, shape, dtype=np.uint8)
+            frame[name] = random_image(*shape)
         else:
             frame[name] = np.random.rand(*shape).astype(np.float32)
     return frame
