@@ -41,7 +41,7 @@ from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets import LeRobotDatasetMetadata
-from lerobot.inference.export.engine import EXPORT_INFO, NOISE
+from lerobot.inference.export.engine import CAMERAS_PRESENT, EXPORT_INFO, NOISE
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -197,7 +197,11 @@ def write_folder(
     info = {
         "route": args.route,
         "programs": programs,
-        "inputs": [*frame, *([NOISE] if noise is not None else [])],
+        "inputs": [
+            *frame,
+            *([CAMERAS_PRESENT] if "optional_cameras" in info else []),
+            *([NOISE] if noise is not None else []),
+        ],
         "test_case": TEST_CASE,
         "tolerance": args.tolerance,
         **info,

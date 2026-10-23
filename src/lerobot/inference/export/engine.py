@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
 NOISE = "noise"
+# For a folder whose policy fills in a camera the robot does not send: which of its `optional_cameras` came.
+CAMERAS_PRESENT = "cameras_present"
 ROUTES = ("executorch_tensorrt", "onnx_tensorrt", "torch_tensorrt")
 
 
@@ -163,6 +165,10 @@ class ExportInferenceEngine(InferenceEngine):
             raise ValueError(error)
         super().__init__(task=task)
         self._frame_names = [name for name in info["inputs"] if name != NOISE]
+        self._optional_cameras: list[str] = info.get("optional_cameras", [])
+        # What a camera the robot does not send gives the programs: a blank image of the test case's shape.
+        test_case = load_file(folder / info["test_case"])
+        self._blank_cameras = {name: np.zeros_like(test_case[name]) for name in self._optional_cameras}
         self._noise_shape = tuple(info["noise_shape"]) if "noise_shape" in info else None
         self._image_resize = info.get("image_resize")
         self._rename = rename_map or {}
@@ -176,6 +182,11 @@ class ExportInferenceEngine(InferenceEngine):
         logger.info("Exported policy loaded from %s (%s)", folder, info["route"])
 
     def _run_chunk(self, frame: dict[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
+        if self._optional_cameras:
+            present = np.array([name in frame for name in self._optional_cameras])
+            if not present.any():
+                raise ValueError(f"The robot sends none of the policy's cameras, {self._optional_cameras}.")
+            frame = {**self._blank_cameras, **frame, CAMERAS_PRESENT: present}
         if self._image_resize is not None:
             from .images import resize_images
 
