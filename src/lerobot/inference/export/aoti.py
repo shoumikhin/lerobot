@@ -28,10 +28,8 @@ class AOTInductorProgram:
 
     def __init__(self, path: Path):
         """Load the package at `path`."""
-        import torch_tensorrt  # registers the TensorRT engine op the package calls
+        import torch_tensorrt  # noqa: F401  # registers the TensorRT engine op the package calls
 
-        # Replay each engine's work as a CUDA graph, as the other routes do.
-        torch_tensorrt.runtime.set_cudagraphs_mode(True)
         self._model = torch._inductor.aoti_load_package(str(path))
 
     def run_device(self, *inputs: np.ndarray | torch.Tensor) -> tuple[torch.Tensor, ...]:
