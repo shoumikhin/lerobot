@@ -37,6 +37,7 @@ from common import (
 )
 from torch import Tensor, nn
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import NewLineTaskProcessorStep, PolicyProcessorPipeline, TokenizerProcessorStep
@@ -89,7 +90,10 @@ class Exporter:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(device()).eval()
+        config = PreTrainedConfig.from_pretrained(args.policy_path)
+        # As `lerobot-rollout` does: how the policy runs, not the saved checkpoint, decides what compiles it.
+        config.compile_model = False
+        self.policy = SmolVLAPolicy.from_pretrained(args.policy_path, config=config).to(device()).eval()
         self.task, frame, self.folder_config = dataset_frame(args, self.policy.config)
         renamed = renamed_inputs(processors(self.policy.config, args.policy_path)[0])
         # A dataset camera the policy was not trained on stays out of the program, so the robot need not send it.

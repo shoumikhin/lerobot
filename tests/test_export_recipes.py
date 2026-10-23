@@ -306,6 +306,34 @@ def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test_case(rec
     assert engine.get_action(frame).shape == (3,)
 
 
+def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(recipes, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    from lerobot.configs import PreTrainedConfig
+
+    vlm = tiny_smolvlm(tmp_path / "vlm")
+    checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", vlm)
+    config = PreTrainedConfig.from_pretrained(checkpoint)
+    config.compile_model = True
+    config.save_pretrained(checkpoint)
+    features = {
+        "observation.images.front": {
+            "dtype": "video",
+            "shape": (32, 32, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "observation.state": {"dtype": "float32", "shape": (3,), "names": None},
+        "action": {"dtype": "float32", "shape": (3,), "names": None},
+    }
+    metadata = dataset_metadata(features, ["pick the cup"])
+    monkeypatch.setattr(
+        importlib.import_module("common"), "LeRobotDatasetMetadata", lambda repo_id, root=None: metadata
+    )
+    args = Namespace(policy_path=str(checkpoint), dataset="user/dataset", dataset_root=None, task=None)
+    exporter = importlib.import_module("smolvla").Exporter(args)
+    # The policy compiles its sampler by replacing the method on the instance.
+    assert "sample_actions" not in vars(exporter.policy.model)
+
+
 def pi05_checkpoint(path, monkeypatch):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
