@@ -54,6 +54,7 @@ from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch, get_gemma_config
 from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
+from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.processor import PolicyProcessorPipeline, TokenizerProcessorStep
 from lerobot.utils.constants import (
     ACTION,
@@ -250,12 +251,47 @@ class PI05Step(nn.Module):
 
     The prefix's mask and KV cache, the noisy actions and the time go in; the next noisy actions come out, so
     the rollout runs the steps one after another with no arithmetic between them.
+
+    The time conditions the action expert only through its adaptive norms, whose scale, shift and gate depend
+    on the time alone, and the folder fixes the schedule. So the step holds them for each of the schedule's
+    timesteps, computed once in float32, instead of the time MLP and every norm's projection, which would
+    otherwise be about a quarter of the weights every step reads. It runs only the schedule's timesteps.
     """
 
-    def __init__(self, model: PI05Pytorch, dt: float):
+    def __init__(self, model: PI05Pytorch, dt: float, timesteps: list[float]):
         super().__init__()
         self.model = model
         self.dt = dt
+        self.register_buffer("timesteps", torch.tensor(timesteps, device=device()))
+        expert = model.paligemma_with_expert.gemma_expert.model
+        # The time MLP runs in float32 here, whatever dtype the checkpoint holds it in.
+        model.time_mlp_in.float()
+        model.time_mlp_out.float()
+        x_t = torch.zeros(
+            len(timesteps),
+            model.config.chunk_size,
+            model.config.max_action_dim,
+            dtype=model.action_in_proj.weight.dtype,
+            device=device(),
+        )
+        with torch.no_grad():
+            *_, cond = model.embed_suffix(x_t, self.timesteps)
+
+            def scheduled(norm: PiGemmaRMSNorm) -> PiGemmaRMSNorm:
+                # Fed the schedule step as a one-hot row, the new norm's projection returns that step's
+                # modulation exactly.
+                table = PiGemmaRMSNorm(norm.dim, norm.eps, cond_dim=len(timesteps)).to(device())
+                table.dense.weight.copy_(
+                    nn.functional.linear(cond.float(), norm.dense.weight.float(), norm.dense.bias.float()).T
+                )
+                table.dense.bias.zero_()
+                return table
+
+            for layer in expert.layers:
+                layer.input_layernorm = scheduled(layer.input_layernorm)
+                layer.post_attention_layernorm = scheduled(layer.post_attention_layernorm)
+            expert.norm = scheduled(expert.norm)
+        del model.time_mlp_in, model.time_mlp_out
         if device().type == "cuda":
             hold_linear_weights_in_bfloat16(model)
 
@@ -267,7 +303,13 @@ class PI05Step(nn.Module):
         # Every matrix multiplication of the step runs in bfloat16. The checkpoint keeps some weights in
         # float32, such as the expert's adaptive norms, and this halves them, which the Orin Nano needs.
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            velocity = self.model.denoise_step(prefix_pad_masks, past_key_values, x_t[None], timestep)
+            velocity = self.model.denoise_step(
+                prefix_pad_masks,
+                past_key_values,
+                x_t[None],
+                timestep,
+                (self.timesteps == timestep[:, None]).float(),
+            )
         return x_t + self.dt * velocity[0].float()
 
 
@@ -479,7 +521,7 @@ class Exporter:
         step_model = self.load_modules(*STEP_MODULES).model
         if torch_tensorrt and gpu_capability() in SHARED_KV_ATTENTION_GPUS:
             step_model.denoise_attn_implementation = "pi05_shared_kv"
-        step = PI05Step(step_model, self.dt)
+        step = PI05Step(step_model, self.dt, self.timesteps)
         cache_inputs = (prefix_pad_masks, *cache.values())
         x_t = self.noise
         with torch.no_grad():
