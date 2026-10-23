@@ -344,6 +344,7 @@ class ChunkActions(nn.Module):
     def forward(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
         actions = self.postprocessor(actions[None, : self.n_action_steps, : self.action_dim])
         if self.absolute_step is not None:
+            # The relative step has no public mask accessor; LeRobot's own RTC and stats code call this one too.
             mask = self.absolute_step.relative_step._build_mask(actions.shape[-1])
             actions = to_absolute_actions(actions, state[None], mask)
         return actions[0]
