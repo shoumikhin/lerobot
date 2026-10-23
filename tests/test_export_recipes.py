@@ -392,8 +392,11 @@ def pi05_checkpoint(
 
 
 @require_hf_token
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
 @pytest.mark.parametrize("max_task_tokens", [None, 12])
-def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkeypatch, max_task_tokens):
+def test_pi05_chain_reproduces_the_policy_for_any_task(
+    recipes, tmp_path, monkeypatch, route, max_task_tokens
+):
     """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise,
     for the task of the export and for another one given at run time, with the policy's prompt length or less."""
     pytest.importorskip("transformers")
@@ -408,7 +411,7 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(recipes, tmp_path, monkey
         policy_path=str(checkpoint),
         output_dir=tmp_path / "folder",
         tolerance=1e-4,
-        route="executorch_tensorrt",
+        route=route,
         task=task,
         max_task_tokens=max_task_tokens,
     )
@@ -499,12 +502,42 @@ def test_pi05_empty_camera_slots_add_no_prefix_tokens(recipes, tmp_path, monkeyp
         checkpoint, _ = pi05_checkpoint(tmp_path / f"checkpoint_{empty}", monkeypatch, empty_cameras=empty)
         part = next(
             pi05.Exporter(
-                Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None)
+                Namespace(
+                    policy_path=str(checkpoint),
+                    task="pick up the cube",
+                    max_task_tokens=None,
+                    route="onnx_tensorrt",
+                )
             ).parts()
         )
         with torch.no_grad():
             lengths.append(part.module(*part.inputs)[1].shape[1])
     assert lengths[0] == lengths[1]
+
+
+@require_hf_token
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt", "torch.compile"])
+def test_pi05_language_model_hands_torch_tensorrt_sdpa_attention(recipes, tmp_path, monkeypatch, route):
+    """For the Torch-TensorRT routes the language model parts carry SDPA, which TensorRT must not decompose."""
+    pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    pi05 = importlib.import_module("pi05")
+    exporter = pi05.Exporter(
+        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None, route=route)
+    )
+    torch_tensorrt = route in ("executorch_tensorrt", "torch_tensorrt")
+    sdpa = torch.ops.aten.scaled_dot_product_attention.default
+    checked = 0
+    for part in exporter.parts():
+        if not part.name.startswith("language_model"):
+            continue
+        graph = torch.export.export(part.module, part.inputs).graph
+        assert any(node.target == sdpa for node in graph.nodes) == torch_tensorrt, part.name
+        assert part.tensorrt_options == ({"decompose_attention": False} if torch_tensorrt else {}), part.name
+        checked += 1
+    assert checked == 2
 
 
 @require_cuda
@@ -516,8 +549,14 @@ def test_pi05_parts_hold_linear_weights_in_bfloat16_and_compute_what_autocast_co
     torch.manual_seed(0)
     checkpoint, _ = pi05_checkpoint(tmp_path / "checkpoint", monkeypatch, dtype=torch.bfloat16)
     pi05 = importlib.import_module("pi05")
+    # A Torch-TensorRT route, so the language model parts run SDPA in bfloat16 on the GPU too.
     exporter = pi05.Exporter(
-        Namespace(policy_path=str(checkpoint), task="pick up the cube", max_task_tokens=None)
+        Namespace(
+            policy_path=str(checkpoint),
+            task="pick up the cube",
+            max_task_tokens=None,
+            route="executorch_tensorrt",
+        )
     )
     with monkeypatch.context() as patch:
         patch.setattr(pi05, "hold_linear_weights_in_bfloat16", lambda module: None)

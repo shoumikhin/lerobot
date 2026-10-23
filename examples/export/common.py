@@ -67,7 +67,7 @@ TENSORRT_OPTIONS = {
     # On a Jetson the CPU and GPU share memory: CPU memory can swap during the build, GPU memory cannot.
     "offload_module_to_cpu": True,
     "workspace_size": WORKSPACE_BYTES,
-    # Attention as plain matrix products, as the ONNX route writes it, so both TensorRT routes build alike.
+    # Attention as plain matrix products, as the ONNX route writes it, unless a part sets its own options.
     "decompose_attention": True,
 }
 
