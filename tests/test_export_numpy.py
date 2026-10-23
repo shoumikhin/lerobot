@@ -334,7 +334,9 @@ def test_torch_tensorrt_package_takes_host_arrays_and_returns_host_actions(tmp_p
 
         return run
 
-    monkeypatch.setitem(sys.modules, "torch_tensorrt", SimpleNamespace())
+    cudagraphs = []
+    runtime = SimpleNamespace(set_cudagraphs_mode=cudagraphs.append)
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", SimpleNamespace(runtime=runtime))
     monkeypatch.setattr(torch._inductor, "aoti_load_package", load_package)
     monkeypatch.setattr(torch.Tensor, "to", lambda self, *args, **kwargs: self)
     if chain:
@@ -370,3 +372,4 @@ def test_torch_tensorrt_package_takes_host_arrays_and_returns_host_actions(tmp_p
         np.testing.assert_array_equal(actions, np.full((1, 3), 20.0))
     assert isinstance(actions, np.ndarray)
     assert all(kind is torch.Tensor for _, kinds in received for kind in kinds), received
+    assert cudagraphs and all(cudagraphs)
