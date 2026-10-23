@@ -132,6 +132,22 @@ def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys
         assert "--tolerance" in text and "--dataset.repo_id" in text and "--task" in text
 
 
+@pytest.mark.parametrize("parts", [["model"], ["embed", "step", "actions"]], ids=["one_part", "chain"])
+def test_export_builds_each_part_in_its_own_process_then_checks_the_folder(tmp_path, monkeypatch, parts):
+    """Every route fails at export time, not first on the robot, when its programs miss the test case."""
+    monkeypatch.syspath_prepend(str(EXAMPLES))
+    import common
+
+    sys.modules.pop("common", None)
+    events = []
+    monkeypatch.setattr(common.subprocess, "run", lambda command, check: events.append(command[-1]))
+    monkeypatch.setattr(common, "check_folder", lambda folder: events.append(folder))
+    recipe = SimpleNamespace(__name__="recipe", part_names=lambda args: parts)
+    args = SimpleNamespace(part=None, output_dir=tmp_path / "folder", route="executorch_tensorrt")
+    common.run_route("script.py", args, recipe, None, ".pte")
+    assert events == [*(f"--part={name}" for name in parts), tmp_path / "folder"]
+
+
 def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
     """A recipe whose part names and parts disagree would otherwise write a folder with nothing compiled."""
     monkeypatch.syspath_prepend(str(EXAMPLES))
