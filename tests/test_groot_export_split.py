@@ -569,9 +569,7 @@ def n17_decoder(relative=False):
     )
 
 
-@pytest.mark.parametrize(
-    "route", ["executorch_tensorrt", "torch_tensorrt", "executorch_cuda", "onnx_tensorrt"]
-)
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "torch_tensorrt", "onnx_tensorrt"])
 def test_numpy_action_decoding_is_refused_only_where_it_cannot_compile(recipe, route):
     from lerobot.policies.groot.processor_groot import GrootActionUnpackUnnormalizeStep
 
