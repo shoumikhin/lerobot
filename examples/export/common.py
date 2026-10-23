@@ -66,6 +66,8 @@ TENSORRT_OPTIONS = {
     "offload_module_to_cpu": True,
     "optimization_level": OPTIMIZATION_LEVEL,
     "workspace_size": WORKSPACE_BYTES,
+    # Attention as plain matrix products, as the ONNX route writes it, so both TensorRT routes build alike.
+    "decompose_attention": True,
 }
 
 
