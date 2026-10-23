@@ -16,9 +16,9 @@
 
 """Write recorded episodes as the frames folder the replay robot plays.
 
-    python examples/export/replay_robot/write_frames.py \
-        --dataset.repo_id=<user>/so101_dataset \
-        --episodes 0 1 2 3 \
+    python examples/export/replay_robot/write_frames.py \\
+        --dataset.repo_id=<user>/so101_dataset \\
+        --episodes 0 1 2 3 \\
         --output_dir=outputs/replay_frames
 
 The folder holds each camera's frames as JPEG, one file per camera, plus the joint state, the joint and camera

@@ -17,7 +17,7 @@
 Run it on the board that will run the policy, because a TensorRT engine only runs on the GPU model that
 built it:
 
-    python examples/export/to_executorch_tensorrt.py \
+    python examples/export/to_executorch_tensorrt.py \\
         --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model
 
 Then run the folder it writes with `lerobot-rollout --policy.path=<folder>`.
