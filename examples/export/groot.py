@@ -625,7 +625,4 @@ class Exporter:
             image_resize=self.image_resize,
             # The task's token ids and rope positions are constants inside the programs.
             task=self.task,
-            # Read only by ONNX-TensorRT, where one of GR00T's engines allocates GPU memory while it is
-            # queued, and CUDA forbids that during graph capture.
-            cuda_graphs=False,
         )
