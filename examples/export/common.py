@@ -163,7 +163,7 @@ def run_route(
     else:
         raise SystemExit(f"The recipe built no part named {args.part!r}; its parts are {list(programs)}.")
     if args.part == names[-1]:
-        exporter.write(programs, args)
+        exporter.write(programs)
 
 
 def write_folder(
