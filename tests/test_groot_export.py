@@ -140,6 +140,11 @@ def test_cameras_follow_the_checkpoint_order_and_its_wrist_alias(monkeypatch):
     assert observation.image_resize["cameras"] == observation.cameras
 
 
+def test_a_dataset_camera_the_checkpoint_does_not_use_is_not_a_program_input(monkeypatch):
+    observation = observation_for(monkeypatch, ["front", "extra"], ["front"])
+    assert observation.frame_names == ["observation.images.front", "observation.state"]
+
+
 def test_resize_geometry_names_the_cameras_the_frame_carries(monkeypatch):
     observation = observation_for(
         monkeypatch, ["front"], ["ego_view"], {"observation.images.front": "observation.images.ego_view"}

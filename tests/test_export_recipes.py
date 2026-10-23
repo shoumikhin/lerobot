@@ -271,6 +271,12 @@ def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test_case(rec
             "shape": (3, 32, 32),
             "names": ["channels", "height", "width"],
         },
+        # A camera the dataset recorded but the policy was not trained on.
+        "observation.images.side": {
+            "dtype": "video",
+            "shape": (32, 32, 3),
+            "names": ["height", "width", "channels"],
+        },
         "observation.state": {"dtype": "float32", "shape": (3,), "names": None},
         "action": {"dtype": "float32", "shape": (3,), "names": None},
     }

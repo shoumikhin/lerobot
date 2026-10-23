@@ -47,6 +47,7 @@ from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     DeviceProcessorStep,
     PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
     to_absolute_actions,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
@@ -299,6 +300,16 @@ def dataset_frame(args: argparse.Namespace, config: PreTrainedConfig) -> tuple[s
     features = dataset_to_policy_features(metadata.features)
     folder_config.input_features = {name: features[name] for name in frame}
     return dataset_task(metadata, args.task), frame, folder_config
+
+
+def renamed_inputs(preprocessor: PolicyProcessorPipeline) -> dict[str, str]:
+    """The saved preprocessor's renames, from the robot's observation names to the policy's."""
+    return {
+        old: new
+        for step in preprocessor.steps
+        if isinstance(step, RenameObservationsProcessorStep)
+        for old, new in step.rename_map.items()
+    }
 
 
 def anchored_postprocessor(postprocessor: PolicyProcessorPipeline) -> tuple[PolicyProcessorPipeline, Any]:
