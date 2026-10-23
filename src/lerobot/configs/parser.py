@@ -226,26 +226,38 @@ def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
     could come from for an unknown name. Registries with a `load_all_choices()` also load everything for
     `--help`, for a nested `--<field>.<sub>.type`, and for `--<field>.*` flags given without that field's
     `.type` or `.path`, since its type may then come from a config file and draccus needs that class to
-    accept the flags."""
-    hints = get_type_hints(config_class)
+    accept the flags. Fields of plain nested dataclasses count too, under their dotted names."""
     load_all = any(arg in ("--help", "-h") or re.match(r"--\w+\.[\w.]+\.type(=|$)", arg) for arg in cli_args)
-    for field in dataclasses.fields(config_class):
-        types = [
-            t for t in get_args(hints[field.name]) or (hints[field.name],) if draccus.utils.is_choice_type(t)
-        ]
-        lazy = [t for t in types if hasattr(t, "load_all_choices")]
-        if not types or get_path_arg(field.name, cli_args):
-            continue
-        names = get_type_args(field.name, cli_args)
-        for name in names:
-            for choice_type in types:
-                with contextlib.suppress(KeyError):  # draccus reports unknown names itself
-                    choice_type.get_choice_class(name)
-        if not names and lazy and any(arg.startswith(f"--{field.name}.") for arg in cli_args):
-            load_all = True
-    if load_all:
+    if _look_up_choices(config_class, cli_args) or load_all:
         for registry in _lazy_registries(config_class):
             registry.load_all_choices()
+
+
+def _look_up_choices(config_class: type, cli_args: Sequence[str], prefix: str = "") -> bool:
+    """Look up the `.type` values of the config's choice fields, and tell whether a field's flags need all
+    of its registry's choices."""
+    hints = get_type_hints(config_class)
+    load_all = False
+    for field in dataclasses.fields(config_class):
+        name = prefix + field.name
+        candidates = get_args(hints[field.name]) or (hints[field.name],)
+        types = [t for t in candidates if draccus.utils.is_choice_type(t)]
+        if not types:
+            for nested in candidates:
+                if isinstance(nested, type) and dataclasses.is_dataclass(nested):
+                    load_all |= _look_up_choices(nested, cli_args, f"{name}.")
+            continue
+        if get_path_arg(name, cli_args):
+            continue
+        names = get_type_args(name, cli_args)
+        for type_name in names:
+            for choice_type in types:
+                with contextlib.suppress(KeyError):  # draccus reports unknown names itself
+                    choice_type.get_choice_class(type_name)
+        lazy = any(hasattr(t, "load_all_choices") for t in types)
+        if not names and lazy and any(arg.startswith(f"--{name}.") for arg in cli_args):
+            load_all = True
+    return load_all
 
 
 def _lazy_registries(config_class: type) -> set[Any]:

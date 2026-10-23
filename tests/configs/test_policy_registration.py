@@ -251,7 +251,7 @@ def test_nested_policy_type(args):
     assert "NESTED ACTConfig" in result.stdout
 
 
-def test_policy_inside_a_plain_nested_config():
+def test_policy_inside_a_plain_nested_config(tmp_path):
     code = """
 import sys
 from dataclasses import dataclass, field
@@ -268,14 +268,20 @@ class Root:
 
 @parser.wrap()
 def main(cfg: Root):
-    print("NESTED", type(cfg.worker.policy).__name__)
+    print("NESTED", type(cfg.worker.policy).__name__, cfg.worker.policy.chunk_size)
 
 sys.argv = ["prog", *sys.argv[1:]]
 main()
 """
     result = run_python(code, "--worker.policy.type=act")
     assert result.returncode == 0, result.stderr
-    assert "NESTED ACTConfig" in result.stdout
+    assert "NESTED ACTConfig 100" in result.stdout
+    # The policy type comes from a config file, and a flag overrides one of its fields.
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"worker": {"policy": {"type": "act"}}}))
+    result = run_python(code, f"--config_path={config}", "--worker.policy.chunk_size=200")
+    assert result.returncode == 0, result.stderr
+    assert "NESTED ACTConfig 200" in result.stdout
 
 
 def test_policy_class_resolves_in_a_fresh_process():
