@@ -599,6 +599,23 @@ def test_memory_times_a_line_when_it_is_read_not_when_it_is_echoed(examples, mon
     memory.watch(SimpleNamespace(stdout=iter([f"{memory.WARM}\n", f"{memory.STOPPED}\n"])), marks)
     # An echo that blocks, on a slow terminal, must not move the window toward the teardown.
     assert marks[memory.WARM] < echoed[0] - 0.1 and marks[memory.STOPPED] < echoed[1] - 0.1
+
+
+def test_torch_compile_compiles_in_the_benchmark_process(examples, tmp_path, monkeypatch):
+    import torch
+
+    benchmark = examples("benchmark")
+    monkeypatch.setattr(torch._inductor.config, "compile_threads", 8)
+    threads = []
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda module, **options: threads.append(torch._inductor.config.compile_threads) or module,
+    )
+    argv = [f"--policy.path={act_checkpoint(tmp_path / 'act')}", "--frames=unused", "--output=unused"]
+    benchmark.torch_engine("torch.compile", argv, tmp_path)
+    # More than one thread starts worker processes that stay alive while the memory is measured.
+    assert threads == [1]
 def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, capsys):
     from argparse import Namespace
 
