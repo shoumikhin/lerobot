@@ -142,12 +142,26 @@ def causal_mask(dtype, device, batch_size: int, seq_len: int, attention_mask: Te
     return causal + padding
 
 
-def deepstack_add(hidden_states: Tensor, visual_pos_masks: Tensor, visual_embeds: Tensor) -> Tensor:
+def image_rows(image_mask: Tensor) -> Tensor:
+    """For each token, the row of the image features that `place_image_features` puts there."""
+    return (image_mask.cumsum(-1) - 1).clamp(min=0)
+
+
+def place_image_features(hidden: Tensor, features: Tensor, image_mask: Tensor, rows: Tensor) -> Tensor:
+    """`hidden` with the image features at the image tokens, in order, as Qwen3-VL's `masked_scatter` puts them.
+
+    The image tokens are constants for one task, so a gather by the constant `rows` replaces `masked_scatter`,
+    whose ONNX form finds the tokens at run time: a result of data-dependent size, which TensorRT allocates
+    GPU memory for on every run, and a CUDA graph cannot record that.
+    """
+    return torch.where(image_mask[..., None], features[rows], hidden)
+
+
+def deepstack_add(hidden_states: Tensor, image_mask: Tensor, rows: Tensor, visual_embeds: Tensor) -> Tensor:
     """Add a layer's deepstack image features at the image token positions, as Qwen3-VL does."""
-    delta = torch.zeros_like(hidden_states).masked_scatter(
-        visual_pos_masks.unsqueeze(-1).expand_as(hidden_states), visual_embeds
+    return hidden_states + place_image_features(
+        torch.zeros_like(hidden_states), visual_embeds, image_mask, rows
     )
-    return hidden_states + delta
 
 
 class GrootObservation(nn.Module):
@@ -288,9 +302,9 @@ class GrootLanguageModel(nn.Module):
         self.use_bf16 = use_bf16
         for name in ("attention_mask", "position_ids", "image_mask"):
             self.register_buffer(name, constants[name])
+        self.register_buffer("image_rows", image_rows(constants["image_mask"]))
         if start == 0:
             self.register_buffer("text_embeds", constants["text_embeds"])
-            self.register_buffer("image_token_mask", constants["image_token_mask"])
         if self.last:
             self.vlln = action_head.vlln
             self.vl_self_attention = action_head.vl_self_attention
@@ -304,8 +318,8 @@ class GrootLanguageModel(nn.Module):
         deepstack = dict(zip(self.deepstack_layers, inputs[:added], strict=True))
         with torch.autocast(hidden.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
-                hidden = self.text_embeds.masked_scatter(
-                    self.image_token_mask, hidden.to(self.text_embeds.dtype)
+                hidden = place_image_features(
+                    self.text_embeds, hidden.to(self.text_embeds.dtype), self.image_mask, self.image_rows
                 )
             mask = causal_mask(hidden.dtype, hidden.device, *hidden.shape[:2], self.attention_mask)
             positions = self.rotary_emb(hidden, self.position_ids)
@@ -318,7 +332,9 @@ class GrootLanguageModel(nn.Module):
                     position_embeddings=positions,
                 )
                 if index in deepstack:
-                    hidden = deepstack_add(hidden, self.image_mask, deepstack[index].to(hidden.dtype))
+                    hidden = deepstack_add(
+                        hidden, self.image_mask, self.image_rows, deepstack[index].to(hidden.dtype)
+                    )
             if self.last:
                 (state,) = inputs[added:]
                 # GR00T consumes the decoder output before Qwen's final norm.
@@ -508,7 +524,6 @@ class Exporter:
         with torch.no_grad():
             text = policy._groot_model.backbone.language_model.get_input_embeddings()(self.batch["input_ids"])
         self.constants["text_embeds"] = text
-        self.constants["image_token_mask"] = self.constants["image_mask"][..., None].expand_as(text)
         del policy
         depth, hidden_name = self.model_config.select_layer, "image_embeds"
         for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
