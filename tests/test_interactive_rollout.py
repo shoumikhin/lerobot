@@ -1172,6 +1172,25 @@ def test_engine_autosteer_stops_and_reports_on_failure():
     assert len(engine.seen_queries) == 1
 
 
+def test_engine_checks_a_planner_subtask_outside_the_query_lock():
+    """An exported policy tokenizes a new subtask to check it, which can take a second, and the control loop
+    takes the query lock every tick, so the check must not hold it."""
+    engine = _FakeEngine()
+    held = []
+    check = engine.text_input_error
+
+    def recording_check(text, *, instruction=False):
+        held.append(engine._query_lock.locked())
+        return check(text, instruction=instruction)
+
+    engine.text_input_error = recording_check
+    engine.external_text = lambda obs, query, task: PlannerReply(text="wipe the table")
+    engine.start_autosteer("tidy the table", interval_s=0.0)
+    held.clear()
+    assert _tick_until(engine, {"joint.pos": 0.0}, lambda: engine.task == "wipe the table")
+    assert held == [False]
+
+
 def test_engine_autosteer_does_not_double_queue_while_generation_is_in_flight():
     """Async backends free the query slot at claim time, so without in-flight tracking every tick
     of a seconds-long generation would queue a duplicate turn."""

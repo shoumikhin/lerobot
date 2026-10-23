@@ -55,6 +55,8 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 POLICIES = ("act", "smolvla", "pi05", "groot")
 TEST_CASE = "test_case.safetensors"
+# Rows of a token embedding table written at a time: 16 MiB of a 2048-wide bfloat16 table.
+TABLE_ROWS_PER_WRITE = 4096
 # The random test images are blends of a coarse grid of random colors (rows, columns).
 IMAGE_CELLS = (6, 8)
 # The same for every policy: they fit the builds into an 8 GB Jetson Orin Nano beside the rest.
@@ -202,6 +204,27 @@ def write_folder(
     }
     (args.output_dir / EXPORT_INFO).write_text(json.dumps(info, indent=2) + "\n")
     print(f"Wrote {args.output_dir}")
+
+
+def save_embedding_table(weight: Tensor, path: Path) -> None:
+    """Save a token embedding table for the rollout to read rows from, in bfloat16 when that holds it exactly.
+
+    GR00T's checkpoint stores its bfloat16 table in float32, which would double the file and every row read.
+    The safetensors file is written a block of rows at a time, so no second copy of the table is held on the host:
+    after safetensors 0.9's own `save_file` wrote a 1 GiB table, a Jetson Thor process held about 1 GiB more.
+    """
+    weight = weight.detach()
+    if weight.dtype == torch.float32 and torch.equal(weight, weight.to(torch.bfloat16).float()):
+        weight = weight.to(torch.bfloat16)
+    dtype = {torch.bfloat16: "BF16", torch.float32: "F32"}[weight.dtype]
+    size = weight.numel() * weight.element_size()
+    header = json.dumps({"weight": {"dtype": dtype, "shape": list(weight.shape), "data_offsets": [0, size]}})
+    # Padded with spaces so the data starts on an 8-byte boundary, as the format recommends.
+    header = header.ljust(-(-len(header) // 8) * 8).encode()
+    with open(path, "wb") as file:
+        file.write(len(header).to_bytes(8, "little") + header)
+        for rows in weight.split(TABLE_ROWS_PER_WRITE):
+            file.write(rows.contiguous().view(torch.uint8).cpu().numpy())
 
 
 def make_output_dir(output_dir: Path | None, job_name: str) -> Path:

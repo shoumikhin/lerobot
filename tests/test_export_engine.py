@@ -462,6 +462,23 @@ def test_export_engine_refuses_another_task_before_loading_the_programs(tmp_path
         export_engine.ExportInferenceEngine(tmp_path, task="place")
 
 
+def test_export_engine_refuses_a_task_its_tokenizer_fails_on():
+    """A failing tokenizer refuses the task, so a planner's subtask is reported instead of ending its thread."""
+    from types import SimpleNamespace
+
+    from lerobot.inference.export import engine as export_engine
+
+    def check(task):
+        raise RuntimeError("Tokenizing the task failed: no tokenizer file")
+
+    engine = export_engine.ExportInferenceEngine.__new__(export_engine.ExportInferenceEngine)
+    engine._prompt, engine._fixed_task = SimpleNamespace(check=check), None
+    assert (
+        engine.text_input_error("wipe the table", instruction=True)
+        == "Tokenizing the task failed: no tokenizer file"
+    )
+
+
 def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, cpu_export_engine):
     import json
 
