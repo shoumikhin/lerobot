@@ -31,7 +31,7 @@ from collections.abc import Iterator
 from copy import copy
 
 import torch
-from export import (
+from common import (
     ChunkActions,
     Part,
     device,
@@ -77,7 +77,7 @@ STEP_MODULES = (
     "model.time_mlp_out",
 )
 # The most language model layers whose TensorRT build fits an 8 GB Jetson Orin Nano beside the rest.
-LAYERS_PER_PROGRAM = 3
+LANGUAGE_LAYERS_PER_PROGRAM = 3
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -87,7 +87,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def part_names(args: argparse.Namespace) -> list[str]:
     depth = get_gemma_config(PreTrainedConfig.from_pretrained(args.policy_path).paligemma_variant).depth
-    groups = range(math.ceil(depth / LAYERS_PER_PROGRAM))
+    groups = range(math.ceil(depth / LANGUAGE_LAYERS_PER_PROGRAM))
     return ["embed", *(f"language_model_{group}" for group in groups), "step", "actions"]
 
 
@@ -179,13 +179,13 @@ class PI05Step(nn.Module):
 class PI05Embed(nn.Module):
     """The start of the prefix: the raw frame in, the image and prompt embeddings and their mask out."""
 
-    def __init__(self, policy: PI05Policy, preprocessor: PI05Observation):
+    def __init__(self, policy: PI05Policy, observation: PI05Observation):
         super().__init__()
         self.policy = policy
-        self.preprocessor = preprocessor
+        self.observation = observation
 
-    def forward(self, *observation: Tensor) -> tuple[Tensor, Tensor]:
-        batch = self.preprocessor(*observation)
+    def forward(self, *frame: Tensor) -> tuple[Tensor, Tensor]:
+        batch = self.observation(*frame)
         images, img_masks = self.policy._preprocess_images(batch)
         prefix_embs, prefix_pad_masks, _ = self.policy.model.embed_prefix(
             images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK]
@@ -248,7 +248,7 @@ class CompactEmbedding(nn.Module):
         return self.embedding(self.rows[token_ids])
 
 
-class Export:
+class Exporter:
     """Reads a trained pi0.5 checkpoint one part at a time, and writes the folder around its programs."""
 
     def __init__(self, args: argparse.Namespace):
@@ -256,7 +256,7 @@ class Export:
         self.config = PreTrainedConfig.from_pretrained(args.policy_path)
         self.config.device = str(device())
         self.model_file = cached_file(args.policy_path, "model.safetensors")
-        self.policy = self.load_part(*EMBED_MODULES)
+        self.policy = self.load_modules(*EMBED_MODULES)
         config = self.policy.config
         if config.use_visual_memory or config.use_proprioceptive_memory:
             raise SystemExit("A pi0.5 policy with observation memory cannot be exported.")
@@ -291,7 +291,7 @@ class Export:
         self.timesteps = [1.0 + step * self.dt for step in range(config.num_inference_steps)]
         self.expected_actions = None
 
-    def load_part(self, *modules: str) -> PI05Policy:
+    def load_modules(self, *modules: str) -> PI05Policy:
         """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
         return load_checkpoint_modules(PI05Policy, self.model_file, self.config, list(modules))
 
@@ -309,11 +309,11 @@ class Export:
         del embed
         hidden_name, cache = "prefix_embs", {}
         depth = get_gemma_config(self.config.paligemma_variant).depth
-        for group, first in enumerate(range(0, depth, LAYERS_PER_PROGRAM)):
-            layers = range(first, min(first + LAYERS_PER_PROGRAM, depth))
+        for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PROGRAM)):
+            layers = range(first, min(first + LANGUAGE_LAYERS_PER_PROGRAM, depth))
             free_memory()
             module = PI05LanguageModelLayers(
-                self.load_part(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
+                self.load_modules(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
             )
             inputs = (hidden, prefix_pad_masks)
             with torch.no_grad():
@@ -328,7 +328,7 @@ class Export:
             del module
             hidden_name = outputs[0]
         free_memory()
-        step = PI05Step(self.load_part(*STEP_MODULES).model, self.dt)
+        step = PI05Step(self.load_modules(*STEP_MODULES).model, self.dt)
         cache_inputs = (prefix_pad_masks, *cache.values())
         x_t = self.noise
         with torch.no_grad():

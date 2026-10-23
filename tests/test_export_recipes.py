@@ -38,7 +38,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 def recipes(monkeypatch):
     monkeypatch.syspath_prepend(str(EXAMPLES))
     yield
-    for name in ("export", "act", "smolvla", "pi05", "groot"):
+    for name in ("common", "act", "smolvla", "pi05", "groot"):
         sys.modules.pop(name, None)
 
 
@@ -63,7 +63,7 @@ class Replay:
 
 def export_with_replay(recipe_name, args, monkeypatch):
     """Export through the shared part loop, compiling each part into a `Replay` the engine then loads."""
-    export = importlib.import_module("export")
+    common = importlib.import_module("common")
     recipe = importlib.import_module(recipe_name)
     compiled = {}
 
@@ -79,7 +79,7 @@ def export_with_replay(recipe_name, args, monkeypatch):
     names = recipe.part_names(args)
     for name in names:
         args.part = name
-        export.export("unused", args, recipe, compile_part, ".bin")
+        common.run_route("unused", args, recipe, compile_part, ".bin")
     monkeypatch.setattr(
         export_engine,
         "load_programs",
@@ -153,7 +153,7 @@ def test_act_with_temporal_ensembling_is_refused(recipes, monkeypatch):
     policy.eval = lambda: policy
     monkeypatch.setattr(act.ACTPolicy, "from_pretrained", lambda path: policy)
     with pytest.raises(SystemExit, match="temporal_ensemble_coeff"):
-        act.Export(Namespace(policy_path="checkpoint"))
+        act.Exporter(Namespace(policy_path="checkpoint"))
 
 
 def tiny_smolvlm(path):
@@ -255,7 +255,7 @@ def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test_case(rec
     }
     metadata = dataset_metadata(features, ["pick the cup", "open the drawer"])
     monkeypatch.setattr(
-        importlib.import_module("export"), "LeRobotDatasetMetadata", lambda repo_id, root=None: metadata
+        importlib.import_module("common"), "LeRobotDatasetMetadata", lambda repo_id, root=None: metadata
     )
     args = Namespace(
         policy_path=str(checkpoint),

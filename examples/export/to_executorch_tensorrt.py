@@ -27,10 +27,10 @@ from pathlib import Path
 
 import torch
 import torch_tensorrt
+from common import TENSORRT_OPTIONS, Part, parse_args, run_route
 from executorch.exir import ExecutorchBackendConfig
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
-from export import TENSORRT_OPTIONS, Part, export, parse_args
 
 
 def compile_part(part: Part, path: Path) -> None:
@@ -58,4 +58,4 @@ def compile_part(part: Part, path: Path) -> None:
 
 if __name__ == "__main__":
     args, recipe = parse_args(__doc__, "executorch_tensorrt")
-    export(__file__, args, recipe, compile_part, ".pte")
+    run_route(__file__, args, recipe, compile_part, ".pte")

@@ -51,12 +51,12 @@ def route(monkeypatch):
         return runpy.run_path(str(EXAMPLES / f"{name}.py"))["compile_part"], stubs
 
     yield load
-    sys.modules.pop("export", None)
+    sys.modules.pop("common", None)
     sys.modules.pop("build_engine", None)
 
 
 def part():
-    from export import Part
+    from common import Part
 
     return Part("step", torch.nn.Linear(2, 2), (torch.zeros(2),), ["x_t"], ["x_next"])
 
@@ -98,7 +98,7 @@ def test_torch_tensorrt_route_saves_an_aoti_package(route, tmp_path):
 @pytest.mark.parametrize("name", ["to_executorch_tensorrt", "to_onnx_tensorrt", "to_torch_tensorrt"])
 def test_routes_compile_with_the_shared_tensorrt_options(route, tmp_path, name):
     compile_part, stubs = route(name)
-    from export import TENSORRT_OPTIONS
+    from common import TENSORRT_OPTIONS
 
     compile_part(part(), tmp_path / "step.bin")
     if name == "to_onnx_tensorrt":
@@ -112,7 +112,7 @@ def test_routes_compile_with_the_shared_tensorrt_options(route, tmp_path, name):
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["alone", "with_checkpoint"])
 def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys, checkpoint):
     monkeypatch.syspath_prepend(str(EXAMPLES))
-    from export import parse_args
+    from common import parse_args
 
     argv = ["to_executorch_tensorrt.py", "--help"]
     if checkpoint:
@@ -123,7 +123,7 @@ def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys
         with pytest.raises(SystemExit) as exited:
             parse_args("Export a policy.", "executorch_tensorrt")
     finally:
-        for name in ("export", "smolvla"):
+        for name in ("common", "smolvla"):
             sys.modules.pop(name, None)
     assert exited.value.code == 0
     text = capsys.readouterr().out
@@ -135,9 +135,9 @@ def test_help_lists_the_route_and_recipe_arguments(tmp_path, monkeypatch, capsys
 def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
     """A recipe whose part names and parts disagree would otherwise write a folder with nothing compiled."""
     monkeypatch.syspath_prepend(str(EXAMPLES))
-    import export
+    import common
 
-    sys.modules.pop("export", None)
+    sys.modules.pop("common", None)
 
     class Recipe:
         __name__ = "recipe"
@@ -146,13 +146,13 @@ def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
         def part_names(args):
             return ["a", "b"]
 
-        class Export:
+        class Exporter:
             def __init__(self, args):
                 pass
 
             def parts(self):
                 for name in ("a", "b_misnamed"):
-                    yield export.Part(name, torch.nn.Identity(), (torch.zeros(1),), ["x"], ["y"])
+                    yield common.Part(name, torch.nn.Identity(), (torch.zeros(1),), ["x"], ["y"])
 
             def write(self, programs, args):
                 raise AssertionError("nothing was compiled")
@@ -160,7 +160,7 @@ def test_export_refuses_a_part_the_recipe_does_not_build(tmp_path, monkeypatch):
     compiled = []
     args = SimpleNamespace(part="b", output_dir=tmp_path, route="onnx_tensorrt")
     with pytest.raises(SystemExit, match="'b'"):
-        export.export("unused", args, Recipe, lambda part, path: compiled.append(part.name), ".engine")
+        common.run_route("unused", args, Recipe, lambda part, path: compiled.append(part.name), ".engine")
     assert not compiled
 
 
@@ -202,7 +202,7 @@ def test_no_export_script_shadows_a_package_it_imports():
     scripts = sorted(EXAMPLES.glob("*.py"))
     filenames = {s.name for s in scripts}
     # The modules a sibling is meant to import locally: the shared driver, the engine rebuilder, the recipes.
-    local = {"export", "build_engine", "act", "smolvla", "pi05", "groot"}
+    local = {"common", "build_engine", "act", "smolvla", "pi05", "groot"}
     imported = set()
     for script in scripts:
         for node in ast.walk(ast.parse(script.read_text())):

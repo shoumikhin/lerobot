@@ -24,7 +24,7 @@ import argparse
 from collections.abc import Iterator
 
 import torch
-from export import (
+from common import (
     NOISE,
     Part,
     add_dataset_arguments,
@@ -83,14 +83,16 @@ def part_names(args: argparse.Namespace) -> list[str]:
     return ["model"]
 
 
-class Export:
+class Exporter:
     """Loads a trained SmolVLA checkpoint, and writes the folder around its compiled program."""
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(device()).eval()
-        self.task, self.frame, self.config = dataset_frame(args, self.policy.config)
-        self.noise = torch.randn(self.config.chunk_size, self.config.max_action_dim, device=device())
+        self.task, self.frame, self.folder_config = dataset_frame(args, self.policy.config)
+        self.noise = torch.randn(
+            self.policy.config.chunk_size, self.policy.config.max_action_dim, device=device()
+        )
         self.expected_actions = self.rollout_actions()
 
     def parts(self) -> Iterator[Part]:
@@ -99,8 +101,8 @@ class Export:
             s for s in preprocessor.steps if isinstance(s, NewLineTaskProcessorStep | TokenizerProcessorStep)
         ]
         prompt = PolicyProcessorPipeline(steps=text)(self.observation())
-        tensors = PolicyProcessorPipeline(steps=[s for s in preprocessor.steps if s not in text])
-        module = SmolVLAChunk(self.policy, tensors, postprocessor, list(self.frame), prompt)
+        tensor_steps = PolicyProcessorPipeline(steps=[s for s in preprocessor.steps if s not in text])
+        module = SmolVLAChunk(self.policy, tensor_steps, postprocessor, list(self.frame), prompt)
         inputs = (*(torch.from_numpy(x).to(device()) for x in self.frame.values()), self.noise)
         yield Part("model", module, inputs, [*self.frame, NOISE], [ACTION])
 
@@ -122,7 +124,7 @@ class Export:
     def write(self, programs: dict[str, dict], args: argparse.Namespace) -> None:
         write_folder(
             args,
-            self.config,
+            self.folder_config,
             self.frame,
             self.noise,
             self.expected_actions,

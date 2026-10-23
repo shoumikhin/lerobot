@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 import torch_tensorrt
-from export import TENSORRT_OPTIONS, Part, export, parse_args
+from common import TENSORRT_OPTIONS, Part, parse_args, run_route
 
 
 def compile_part(part: Part, path: Path) -> None:
@@ -40,4 +40,4 @@ def compile_part(part: Part, path: Path) -> None:
 
 if __name__ == "__main__":
     args, recipe = parse_args(__doc__, "torch_tensorrt")
-    export(__file__, args, recipe, compile_part, ".pt2")
+    run_route(__file__, args, recipe, compile_part, ".pt2")

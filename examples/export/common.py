@@ -113,7 +113,7 @@ def parse_args(description: str, route: str) -> tuple[argparse.Namespace, Any]:
     return parser.parse_args(), recipe
 
 
-def export(
+def run_route(
     script: str,
     args: argparse.Namespace,
     recipe: Any,
@@ -142,7 +142,7 @@ def export(
         args.part = names[0]
     if args.part not in names:
         raise SystemExit(f"Unknown part {args.part!r}; choose from {names}.")
-    exporter = recipe.Export(args)
+    exporter = recipe.Exporter(args)
     programs = {}
     for part in exporter.parts():
         programs[part.name] = {

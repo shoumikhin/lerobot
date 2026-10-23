@@ -24,7 +24,7 @@ from collections.abc import Iterator
 
 import numpy as np
 import torch
-from export import Part, device, frame_from_policy, processors, to_policy_input, write_folder
+from common import Part, device, frame_from_policy, processors, to_policy_input, write_folder
 from torch import Tensor, nn
 
 from lerobot.inference import SyncInferenceEngine
@@ -45,11 +45,11 @@ class ACTChunk(nn.Module):
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
-        self.input_names = list(policy.config.input_features)
+        self.frame_names = list(policy.config.input_features)
 
     def forward(self, *frame: Tensor) -> Tensor:
         observation = {
-            name: to_policy_input(name, x) for name, x in zip(self.input_names, frame, strict=True)
+            name: to_policy_input(name, x) for name, x in zip(self.frame_names, frame, strict=True)
         }
         actions = self.policy.predict_action_chunk(self.preprocessor(observation))
         return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
@@ -63,7 +63,7 @@ def part_names(args: argparse.Namespace) -> list[str]:
     return ["model"]
 
 
-class Export:
+class Exporter:
     """Loads a trained ACT checkpoint, and writes the folder around its compiled program."""
 
     def __init__(self, args: argparse.Namespace):
