@@ -330,6 +330,8 @@ def write_fakes(tmp_path: Path) -> Path:
 
 
 def run_without_torch(code: str, tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    if "executorch_tensorrt" in args:
+        pytest.importorskip("ml_dtypes", reason="the ExecuTorch stand-in returns bfloat16 actions")
     env = {
         **os.environ,
         "PYTHONPATH": os.pathsep.join([str(write_fakes(tmp_path)), os.environ.get("PYTHONPATH", "")]),
