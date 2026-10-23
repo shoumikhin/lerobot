@@ -19,7 +19,8 @@ reads the whole board from /proc/meminfo: the drop in available memory plus the 
 10 s before the command starts to the last 30 s of its run, in MiB. Keep the board otherwise idle.
 
 The board keeps returning memory for a while after a GPU job ends, so the baseline waits until memory
-use is flat, and a run whose baseline or last 30 s are not flat is reported as invalid, not as a number.
+use is flat. The run's window ends 3 s before the command exits, since its teardown frees everything,
+and a run whose window is not steady is reported as invalid, not as a number.
 
     python examples/export/benchmark_memory.py -- lerobot-rollout --policy.path=outputs/export/act \\
         --robot.type=replay --robot.frames_dir=outputs/replay_frames \\
@@ -35,6 +36,8 @@ SAMPLE_SECONDS = 0.5
 BASELINE_SECONDS = 10
 STEADY_SECONDS = 30
 FLAT_MIB_PER_SECOND = 2
+STEADY_MIB = 8
+TEARDOWN_SECONDS = 3
 SETTLE_LIMIT_SECONDS = 300
 
 
@@ -43,10 +46,20 @@ def used_mib(meminfo: dict[str, int]) -> float:
     return (meminfo["MemTotal"] - meminfo["MemAvailable"] + meminfo["SwapTotal"] - meminfo["SwapFree"]) / 1024
 
 
+def steady_window(run: list[float]) -> list[float]:
+    """The last 30 s of the run before the command's teardown."""
+    return run[: -int(TEARDOWN_SECONDS / SAMPLE_SECONDS)][-int(STEADY_SECONDS / SAMPLE_SECONDS) :]
+
+
 def extra_mib(baseline: list[float], run: list[float]) -> float:
-    """The median use over the last 30 s of the run minus the median use before it started."""
-    steady = run[-int(STEADY_SECONDS / SAMPLE_SECONDS) :]
-    return statistics.median(steady) - statistics.median(baseline)
+    """The median use over the run's steady window minus the median use before it started."""
+    return statistics.median(steady_window(run)) - statistics.median(baseline)
+
+
+def is_steady(samples: list[float]) -> bool:
+    """Whether the medians of the first and second halves differ by less than 8 MiB, which one outlier cannot move."""
+    half = len(samples) // 2
+    return abs(statistics.median(samples[half:]) - statistics.median(samples[:half])) < STEADY_MIB
 
 
 def is_flat(samples: list[float]) -> bool:
@@ -88,11 +101,11 @@ def main() -> None:
     run = sample(process=process)
     if process.returncode != 0:
         raise SystemExit(f"{command[0]} exited with {process.returncode}")
-    if len(run) * SAMPLE_SECONDS < 2 * STEADY_SECONDS:
+    if len(run) * SAMPLE_SECONDS < 2 * STEADY_SECONDS + TEARDOWN_SECONDS:
         raise SystemExit(
             f"Run for at least {2 * STEADY_SECONDS} s, so the last {STEADY_SECONDS} s are steady."
         )
-    if not is_flat(run[-int(STEADY_SECONDS / SAMPLE_SECONDS) :]):
+    if not is_steady(steady_window(run)):
         raise SystemExit(f"Invalid: memory use was still changing in the last {STEADY_SECONDS} s of the run.")
     print(f"Extra memory: {extra_mib(baseline, run):.0f} MiB")
 
