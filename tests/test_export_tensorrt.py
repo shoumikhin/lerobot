@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from lerobot.inference.export import tensorrt as backend
+from lerobot.inference.export import tensorrt as export_tensorrt
 
 HOST_TO_DEVICE, DEVICE_TO_HOST, DEVICE_TO_DEVICE = 1, 2, 3
 
@@ -99,7 +99,7 @@ def fake_cuda(monkeypatch):
         queues=queues,
         copies=copies,
     )
-    monkeypatch.setattr(backend, "cuda_runtime", lambda: cuda)
+    monkeypatch.setattr(export_tensorrt, "cuda_runtime", lambda: cuda)
     return cuda
 
 
@@ -159,12 +159,14 @@ def fake_engine(monkeypatch, fake_cuda):
         ExecutionContextAllocationStrategy=SimpleNamespace(STATIC=0, USER_MANAGED=1),
     )
     monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
-    monkeypatch.setattr(backend, "load_engine", load_engine)
+    monkeypatch.setattr(export_tensorrt, "load_engine", load_engine)
     return contexts
 
 
 def test_engine_copies_host_inputs_and_owns_returned_actions(tmp_path, fake_cuda, fake_engine):
-    engine = backend.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], backend.CudaStream())
+    engine = export_tensorrt.TensorRTProgram(
+        tmp_path / "model.engine", ["x"], ["y"], export_tensorrt.CudaStream()
+    )
     values = np.arange(6, dtype=np.float64).reshape(1, 6)[:, ::2]
     first = engine(values)
     np.testing.assert_array_equal(first, [[0, 4, 8]])
@@ -177,10 +179,10 @@ def test_engine_copies_host_inputs_and_owns_returned_actions(tmp_path, fake_cuda
 
 
 def test_engines_share_cache_on_device_and_retain_scratch(tmp_path, fake_cuda, fake_engine):
-    stream = backend.CudaStream()
-    prefix = backend.TensorRTProgram(tmp_path / "prefix.engine", ["x"], ["y"], stream)
-    step = backend.TensorRTProgram(tmp_path / "step.engine", ["x"], ["y"], stream)
-    scratch = backend.CudaBuffer((SCRATCH_BYTES["step"],), np.uint8)
+    stream = export_tensorrt.CudaStream()
+    prefix = export_tensorrt.TensorRTProgram(tmp_path / "prefix.engine", ["x"], ["y"], stream)
+    step = export_tensorrt.TensorRTProgram(tmp_path / "step.engine", ["x"], ["y"], stream)
+    scratch = export_tensorrt.CudaBuffer((SCRATCH_BYTES["step"],), np.uint8)
     prefix.use_scratch(scratch)
     step.use_scratch(scratch)
     pointer = scratch.ptr
@@ -196,9 +198,9 @@ def test_engines_share_cache_on_device_and_retain_scratch(tmp_path, fake_cuda, f
 
 def test_chained_engines_wait_for_the_gpu_only_to_return_the_actions(tmp_path, fake_cuda, fake_engine):
     """Engines on one stream run in order, so waiting after each one would only stall the CPU."""
-    stream = backend.CudaStream()
-    first = backend.TensorRTProgram(tmp_path / "first.engine", ["x"], ["y"], stream)
-    second = backend.TensorRTProgram(tmp_path / "second.engine", ["x"], ["y"], stream)
+    stream = export_tensorrt.CudaStream()
+    first = export_tensorrt.TensorRTProgram(tmp_path / "first.engine", ["x"], ["y"], stream)
+    second = export_tensorrt.TensorRTProgram(tmp_path / "second.engine", ["x"], ["y"], stream)
     synchronize = fake_cuda.cudaStreamSynchronize
     waits = []
     fake_cuda.cudaStreamSynchronize = lambda handle: waits.append(handle) or synchronize(handle)
@@ -218,7 +220,7 @@ def test_a_chain_of_engines_shares_one_stream_and_scratch_and_feeds_the_step_its
         "step": {"file": "step.engine", "inputs": ["x_t", "timestep"], "outputs": ["x_next"]},
         "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
-    engines = backend.load_tensorrt_programs(tmp_path, programs)
+    engines = export_tensorrt.load_tensorrt_programs(tmp_path, programs)
     step, actions = fake_engine
     strategy = sys.modules["tensorrt"].ExecutionContextAllocationStrategy.USER_MANAGED
     assert step.strategy == actions.strategy == strategy
@@ -248,8 +250,8 @@ def test_engine_keeps_host_inputs_alive_until_the_stream_finishes(
         return result
 
     monkeypatch.setattr(np, "ascontiguousarray", tracked)
-    stream = backend.CudaStream()
-    engine = backend.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], stream)
+    stream = export_tensorrt.CudaStream()
+    engine = export_tensorrt.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], stream)
     (output,) = engine.run_device(np.ones((1, 3), np.float64))
     gc.collect()
     assert copies and all(ref() is not None for ref in copies)
@@ -259,34 +261,38 @@ def test_engine_keeps_host_inputs_alive_until_the_stream_finishes(
 
 
 def test_engine_refuses_a_gpu_input_of_another_dtype(tmp_path, fake_cuda, fake_engine):
-    engine = backend.load_tensorrt_programs(
+    engine = export_tensorrt.load_tensorrt_programs(
         tmp_path, {"model": {"file": "model.engine", "inputs": ["x"], "outputs": ["y"]}}
     )
     with pytest.raises(ValueError, match="the engine expects float32"):
-        engine["model"].run_device(backend.CudaBuffer((1, 3), np.float16))
+        engine["model"].run_device(export_tensorrt.CudaBuffer((1, 3), np.float16))
 
 
 def test_engine_refuses_its_own_output_of_another_dtype(tmp_path, fake_cuda, fake_engine, monkeypatch):
     """Copying a float16 output into a float32 input would read past the end of the output."""
-    load_engine = backend.load_engine
+    load_engine = export_tensorrt.load_engine
 
     def half_output(path):
         engine = load_engine(path)
         engine.get_tensor_dtype = lambda name: "half" if name == "x_next" else "float"
         return engine
 
-    monkeypatch.setattr(backend, "load_engine", half_output)
+    monkeypatch.setattr(export_tensorrt, "load_engine", half_output)
     monkeypatch.setattr(
         sys.modules["tensorrt"], "nptype", lambda dtype: np.float16 if dtype == "half" else np.float32
     )
-    engine = backend.TensorRTProgram(tmp_path / "step.engine", ["x_t"], ["x_next"], backend.CudaStream())
+    engine = export_tensorrt.TensorRTProgram(
+        tmp_path / "step.engine", ["x_t"], ["x_next"], export_tensorrt.CudaStream()
+    )
     (x_next,) = engine.run_device(np.ones((1, 3), np.float32))
     with pytest.raises(ValueError, match="the engine expects float32"):
         engine.run_device(x_next)
 
 
 def test_engine_synchronizes_copies_after_execution_failure(tmp_path, fake_cuda, fake_engine):
-    engine = backend.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], backend.CudaStream())
+    engine = export_tensorrt.TensorRTProgram(
+        tmp_path / "model.engine", ["x"], ["y"], export_tensorrt.CudaStream()
+    )
     fake_engine[0].execute_async_v3 = lambda stream: False
     with pytest.raises(RuntimeError, match="could not run"):
         engine(np.ones((1, 3), np.float32))
@@ -302,7 +308,9 @@ def test_engine_records_one_cuda_graph_and_replays_it(tmp_path, fake_cuda, fake_
         lambda stream, mode: queued_before_capture.append(fake_engine[0].enqueued)
         or begin_capture(stream, mode),
     )
-    engine = backend.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], backend.CudaStream())
+    engine = export_tensorrt.TensorRTProgram(
+        tmp_path / "model.engine", ["x"], ["y"], export_tensorrt.CudaStream()
+    )
     np.testing.assert_array_equal(engine(np.ones((1, 3))), [[2, 2, 2]])
     np.testing.assert_array_equal(engine(np.full((1, 3), 3.0)), [[6, 6, 6]])
     # TensorRT updates its state on the first run, so the graph records the second; later runs replay it.
@@ -313,10 +321,12 @@ def test_engine_records_one_cuda_graph_and_replays_it(tmp_path, fake_cuda, fake_
 
 
 def test_engine_graph_refuses_an_input_buffer_it_did_not_record(tmp_path, fake_cuda, fake_engine):
-    engine = backend.TensorRTProgram(tmp_path / "model.engine", ["x"], ["y"], backend.CudaStream())
-    engine.run_device(backend.CudaBuffer((1, 3), np.float32))
+    engine = export_tensorrt.TensorRTProgram(
+        tmp_path / "model.engine", ["x"], ["y"], export_tensorrt.CudaStream()
+    )
+    engine.run_device(export_tensorrt.CudaBuffer((1, 3), np.float32))
     with pytest.raises(ValueError, match="same ones every run"):
-        engine.run_device(backend.CudaBuffer((1, 3), np.float32))
+        engine.run_device(export_tensorrt.CudaBuffer((1, 3), np.float32))
 
 
 def test_a_split_denoising_step_runs_with_a_cuda_graph_per_engine(tmp_path, fake_cuda, fake_engine):
@@ -328,7 +338,7 @@ def test_a_split_denoising_step_runs_with_a_cuda_graph_per_engine(tmp_path, fake
         "step_1": {"file": "step_1.engine", "inputs": ["hidden", "x_t"], "outputs": ["x_next"]},
         "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
-    engines = backend.load_tensorrt_programs(tmp_path, programs)
+    engines = export_tensorrt.load_tensorrt_programs(tmp_path, programs)
     info = {
         "inputs": ["noise"],
         "programs": programs,
@@ -371,13 +381,13 @@ def test_allocator_uses_plain_malloc_and_handles_failure(monkeypatch):
         cudaMalloc=MagicMock(return_value=(0, 4096)),
         cudaFree=MagicMock(return_value=(0,)),
     )
-    monkeypatch.setattr(backend, "cuda_runtime", lambda: cuda)
+    monkeypatch.setattr(export_tensorrt, "cuda_runtime", lambda: cuda)
     fake_tensorrt = SimpleNamespace(
         IGpuAllocator=type("Allocator", (), {}), Runtime=lambda logger: SimpleNamespace(), Logger=MagicMock()
     )
     monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
-    monkeypatch.setattr(backend, "runtime", functools.cache(backend.runtime.__wrapped__))
-    allocator = backend.runtime().gpu_allocator
+    monkeypatch.setattr(export_tensorrt, "runtime", functools.cache(export_tensorrt.runtime.__wrapped__))
+    allocator = export_tensorrt.runtime().gpu_allocator
     assert allocator.allocate(512, 256, 0) == 4096
     cuda.cudaMalloc.assert_called_once_with(512)
     assert allocator.deallocate(4096)
@@ -394,7 +404,7 @@ def test_bfloat16_bindings_use_extension_dtype(monkeypatch):
     ml_dtypes = pytest.importorskip("ml_dtypes")
     fake_tensorrt = SimpleNamespace(bfloat16="bfloat16", nptype=MagicMock(side_effect=TypeError))
     monkeypatch.setitem(sys.modules, "tensorrt", fake_tensorrt)
-    dtype = backend.numpy_dtype(fake_tensorrt.bfloat16)
+    dtype = export_tensorrt.numpy_dtype(fake_tensorrt.bfloat16)
     assert dtype == np.dtype(ml_dtypes.bfloat16)
     assert dtype.itemsize == 2
     values = np.asarray([1.25, -2.5], dtype=dtype)
@@ -404,7 +414,7 @@ def test_bfloat16_bindings_use_extension_dtype(monkeypatch):
 
 def test_cuda_error_is_not_ignored():
     with pytest.raises(RuntimeError, match="CUDA runtime call failed"):
-        backend.check_cuda((2, 0))
+        export_tensorrt.check_cuda((2, 0))
 
 
 @pytest.mark.parametrize("noise_shape", [(1, 4, 3), (4, 3)])
@@ -440,15 +450,15 @@ def test_chained_engines_share_scratch_and_keep_the_cache_on_device(tmp_path, mo
         def upload(self, value):
             return value
 
-    monkeypatch.setattr(backend, "TensorRTProgram", Engine)
-    monkeypatch.setattr(backend, "CudaStream", lambda: "stream")
-    monkeypatch.setattr(backend, "CudaBuffer", lambda *a: object())
+    monkeypatch.setattr(export_tensorrt, "TensorRTProgram", Engine)
+    monkeypatch.setattr(export_tensorrt, "CudaStream", lambda: "stream")
+    monkeypatch.setattr(export_tensorrt, "CudaBuffer", lambda *a: object())
     programs = {
         "prefix": {"file": "prefix.engine", "inputs": ["state"], "outputs": ["past_key_0"]},
         "step": {"file": "step.engine", "inputs": ["past_key_0", "x_t", "timestep"], "outputs": ["x_next"]},
         "actions": {"file": "actions.engine", "inputs": ["x_t"], "outputs": ["action"]},
     }
-    engines = backend.load_tensorrt_programs(tmp_path, programs)
+    engines = export_tensorrt.load_tensorrt_programs(tmp_path, programs)
     assert all(engine.args == ("stream", True) for engine in engines.values())
     assert len(scratch) == 3 and all(buffer is scratch[0] for buffer in scratch)
     info = {
@@ -464,9 +474,7 @@ def test_chained_engines_share_scratch_and_keep_the_cache_on_device(tmp_path, mo
 
 
 def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch):
-    from lerobot.inference.export.tensorrt import TensorRTProgram
-
-    engine = TensorRTProgram.__new__(TensorRTProgram)
+    engine = export_tensorrt.TensorRTProgram.__new__(export_tensorrt.TensorRTProgram)
     engine._input_names = ["observation.images.wrist"]
     engine._input_shapes = [(1, 3, 480, 640)]
     engine._context = MagicMock()
@@ -478,11 +486,6 @@ def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch
 
 def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch):
     """TensorRT asks for the whole engine in one read; the reader answers with at most one piece per call."""
-    import sys
-    import types
-
-    from lerobot.inference.export import tensorrt as export_tensorrt
-
     pieces = []
 
     class Runtime:
@@ -496,10 +499,10 @@ def test_tensorrt_engine_loads_the_file_a_piece_at_a_time(tmp_path, monkeypatch)
                 data += pieces[-1]
             return data
 
-    fake_tensorrt = types.SimpleNamespace(
+    fake_tensorrt = SimpleNamespace(
         IStreamReaderV2=type("IStreamReaderV2", (), {"__init__": lambda self: None}),
         IGpuAllocator=type("IGpuAllocator", (), {"__init__": lambda self: None}),
-        SeekPosition=types.SimpleNamespace(SET=0, CUR=1, END=2),
+        SeekPosition=SimpleNamespace(SET=0, CUR=1, END=2),
         Runtime=Runtime,
         Logger=MagicMock(),
     )
