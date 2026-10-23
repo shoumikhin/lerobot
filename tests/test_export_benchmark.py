@@ -42,9 +42,10 @@ def test_action_error_takes_each_frames_largest_difference(examples):
     actions = reference.copy()
     actions[:, 1, 2] = 0.5  # every frame is off by 0.5 on one joint of one action
     actions[7, 0, 0] = 10.0  # and one frame by 10
-    mean, p95 = benchmark.action_error(actions, reference)
+    mean, p95, largest = benchmark.action_error(actions, reference)
     assert mean == pytest.approx((19 * 0.5 + 10.0) / 20)
     assert p95 == pytest.approx(0.5 + 0.05 * (10.0 - 0.5))
+    assert largest == 10.0
 
 
 def test_memory_counts_swap_and_ignores_the_load_peak_and_the_teardown(examples):

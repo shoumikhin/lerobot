@@ -16,8 +16,8 @@
 
 Time per chunk is the median of three runs of 100 chunks, after 20 warm-up chunks, through the inference
 engine `lerobot-rollout` uses. Accuracy compares the actions with PyTorch's on 50 dataset frames, with the
-same random noise: the largest difference in each frame, then the mean and the 95th percentile over the
-frames, in robot units (degrees, and percent for the gripper).
+same random noise: the largest difference in each frame, then the mean, the 95th percentile and the largest
+over the frames, in robot units (degrees, and percent for the gripper).
 
 The PyTorch and torch.compile runs execute the export recipe's own parts through the same engine, so only
 what runs the parts differs. Run each step on the board that will run the policy:
@@ -57,10 +57,10 @@ def time_per_chunk(chunk_ms: np.ndarray) -> float:
     return float(np.median(np.median(chunk_ms, axis=1)))
 
 
-def action_error(actions: np.ndarray, reference: np.ndarray) -> tuple[float, float]:
-    """The mean and the 95th percentile, over frames, of each frame's largest action difference."""
+def action_error(actions: np.ndarray, reference: np.ndarray) -> tuple[float, float, float]:
+    """The mean, the 95th percentile and the largest, over frames, of each frame's largest action difference."""
     per_frame = np.abs(actions - reference).max(axis=(1, 2))
-    return float(per_frame.mean()), float(np.percentile(per_frame, 95))
+    return float(per_frame.mean()), float(np.percentile(per_frame, 95)), float(per_frame.max())
 
 
 def write_frames(argv: list[str]) -> None:
@@ -198,11 +198,13 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
 def report(paths: list[str]) -> None:
     """Print each file's time per chunk and its action error against the first file's actions."""
     reference = np.load(paths[0])["actions"]
-    print(f"{'':40} {'ms per chunk':>12} {'mean error':>11} {'p95 error':>10}")
+    print(f"{'':40} {'ms per chunk':>12} {'mean error':>11} {'p95 error':>10} {'max error':>10}")
     for path in paths:
         result = np.load(path)
-        mean, p95 = action_error(result["actions"], reference)
-        print(f"{Path(path).stem:40} {time_per_chunk(result['chunk_ms']):12.1f} {mean:11.3f} {p95:10.3f}")
+        mean, p95, largest = action_error(result["actions"], reference)
+        print(
+            f"{Path(path).stem:40} {time_per_chunk(result['chunk_ms']):12.1f} {mean:11.3f} {p95:10.3f} {largest:10.3f}"
+        )
 
 
 if __name__ == "__main__":
