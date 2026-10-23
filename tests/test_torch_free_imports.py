@@ -133,7 +133,7 @@ def run(name, values):
     return {"action": values["x_t"] * np.array([[1], [2]], np.float32)}
 
 
-def write_folder(folder, backend, camera):
+def write_folder(folder, route, camera):
     frame = {"observation.state": STATE}
     if camera:
         frame["observation.images.camera"] = np.full((6, 8, 3), 255, dtype=np.uint8)
@@ -144,7 +144,7 @@ def write_folder(folder, backend, camera):
         "actions": {"file": "actions.bin", "inputs": ["x_t"], "outputs": ["action"]},
     }
     info = {
-        "backend": backend,
+        "route": route,
         "programs": programs,
         "inputs": [*names, "noise"],
         "noise_shape": [2, 3],
@@ -353,9 +353,9 @@ import numpy as np
 
 import export_fakes
 
-folder, backend = Path(sys.argv[1]), sys.argv[2]
-frame = export_fakes.write_folder(folder, backend, camera=True)
-if backend == "onnx_tensorrt":
+folder, route = Path(sys.argv[1]), sys.argv[2]
+frame = export_fakes.write_folder(folder, route, camera=True)
+if route == "onnx_tensorrt":
     export_fakes.install_tensorrt()
 
 from lerobot.inference.export import ExportInferenceEngine
@@ -370,10 +370,10 @@ assert "torch" not in sys.modules
 )
 
 
-@pytest.mark.parametrize("backend", ["executorch_tensorrt", "onnx_tensorrt"])
-def test_export_engine_runs_a_denoising_chain_without_torch(tmp_path, backend):
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
+def test_export_engine_runs_a_denoising_chain_without_torch(tmp_path, route):
     """With torch installed but refusing to load, the engine runs a flow-matching chain with a camera."""
-    result = run_without_torch(ENGINE_WITHOUT_TORCH, tmp_path, backend)
+    result = run_without_torch(ENGINE_WITHOUT_TORCH, tmp_path, route)
     assert result.returncode == 0, result.stderr[-4000:]
 
 
@@ -386,10 +386,10 @@ from types import SimpleNamespace
 
 import export_fakes
 
-folder, backend, planner = Path(sys.argv[1]), sys.argv[2], sys.argv[4] == "planner"
+folder, route, planner = Path(sys.argv[1]), sys.argv[2], sys.argv[4] == "planner"
 sys.path.insert(0, sys.argv[3])
-export_fakes.write_folder(folder, backend, camera=False)
-if backend == "onnx_tensorrt":
+export_fakes.write_folder(folder, route, camera=False)
+if route == "onnx_tensorrt":
     export_fakes.install_tensorrt()
 
 from tests.mocks.mock_robot import MockRobot
@@ -418,7 +418,7 @@ assert "torch" not in sys.modules
 # The first actions the robot gets are the chunk the programs computed from its state, one per tick.
 names = ["motor_1.pos", "motor_2.pos", "motor_3.pos"]
 assert sent[:2] == [dict(zip(names, row.tolist())) for row in export_fakes.ACTIONS], sent[:2]
-if backend == "executorch_tensorrt":
+if route == "executorch_tensorrt":
     import executorch.runtime
 
     assert executorch.runtime.OUTPUT_AT_IMPORT == "executorch", executorch.runtime.OUTPUT_AT_IMPORT
@@ -428,14 +428,14 @@ if backend == "executorch_tensorrt":
 
 @pytest.mark.skipif(not _datasets_available, reason="datasets not installed")
 @pytest.mark.parametrize("planner", ["", "planner"], ids=["no_planner", "planner"])
-@pytest.mark.parametrize("backend", ["executorch_tensorrt", "onnx_tensorrt"])
-def test_rollout_runs_an_export_with_torch_unimportable(tmp_path, backend, planner):
+@pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
+def test_rollout_runs_an_export_with_torch_unimportable(tmp_path, route, planner):
     """`lerobot-rollout` loads an ExecuTorch-TensorRT or ONNX-TensorRT folder and drives a robot without torch.
 
     With a planner, the rollout also looks for the vocabulary of the dataset the checkpoint was trained on.
     """
     repo = Path(__file__).resolve().parents[1]
-    result = run_without_torch(ROLLOUT_WITHOUT_TORCH, tmp_path, backend, str(repo), planner)
+    result = run_without_torch(ROLLOUT_WITHOUT_TORCH, tmp_path, route, str(repo), planner)
     assert result.returncode == 0, result.stderr[-4000:]
 
 
@@ -449,7 +449,7 @@ from pathlib import Path
 folder = Path(sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 (folder / "export.json").write_text(json.dumps({
-    "backend": "onnx_tensorrt", "programs": {"model": {"file": "model.engine", "inputs": [], "outputs": []}}
+    "route": "onnx_tensorrt", "programs": {"model": {"file": "model.engine", "inputs": [], "outputs": []}}
 }))
 import build_engine
 

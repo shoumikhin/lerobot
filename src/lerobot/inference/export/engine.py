@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 EXPORT_INFO = "export.json"
 NOISE = "noise"
-BACKENDS = ("executorch_tensorrt", "onnx_tensorrt", "torch_tensorrt")
+ROUTES = ("executorch_tensorrt", "onnx_tensorrt", "torch_tensorrt")
 
 
 class Program(Protocol):
@@ -62,24 +62,22 @@ def export_dir(path: str | Path | None) -> Path | None:
 
 
 def load_programs(folder: Path, info: dict) -> Mapping[str, Program]:
-    """Load the folder's programs with the backend `export.json` names."""
-    backend = info["backend"]
+    """Load the folder's programs for the route `export.json` names."""
+    route = info["route"]
     programs = info["programs"]
-    if backend == "onnx_tensorrt":
+    if route == "onnx_tensorrt":
         from .tensorrt import load_engines
 
         return load_engines(folder, programs, info.get("cuda_graphs", True))
-    if backend == "executorch_tensorrt":
+    if route == "executorch_tensorrt":
         from .executorch import ExecuTorchProgram
 
         return {name: ExecuTorchProgram(folder / p["file"]) for name, p in programs.items()}
-    if backend == "torch_tensorrt":
+    if route == "torch_tensorrt":
         from .aoti import AOTInductorPackage
 
         return {name: AOTInductorPackage(folder / p["file"]) for name, p in programs.items()}
-    raise ValueError(
-        f"Unknown export backend {backend!r} in {folder / EXPORT_INFO}; expected one of {BACKENDS}."
-    )
+    raise ValueError(f"Unknown export route {route!r} in {folder / EXPORT_INFO}; expected one of {ROUTES}.")
 
 
 class ProgramChain:
@@ -144,7 +142,7 @@ class ExportInferenceEngine(InferenceEngine):
         self._chain = ProgramChain(load_programs(folder, info), info)
         self._actions: deque[np.ndarray] = deque()
         self._check(folder / info["test_case"], info["tolerance"])
-        logger.info("Exported policy loaded from %s (%s)", folder, info["backend"])
+        logger.info("Exported policy loaded from %s (%s)", folder, info["route"])
 
     def _run_chunk(self, frame: dict[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
         if self._image_resize is not None:

@@ -74,9 +74,9 @@ def executorch(monkeypatch):
     return SimpleNamespace(programs=programs, calls=calls, options=options)
 
 
-def chain_info(names, backend="executorch_tensorrt", suffix=".pte", **info):
+def chain_info(names, route="executorch_tensorrt", suffix=".pte", **info):
     return {
-        "backend": backend,
+        "route": route,
         "inputs": info.pop("inputs"),
         "programs": {
             name: {"file": f"{name}{suffix}", "inputs": inputs, "outputs": outputs}
@@ -260,9 +260,9 @@ def test_executorch_names_the_packages_it_needs(tmp_path, executorch, monkeypatc
         load_programs(tmp_path, info)
 
 
-def test_unknown_backends_are_refused(tmp_path):
-    with pytest.raises(ValueError, match="Unknown export backend"):
-        load_programs(tmp_path, {"backend": "executorch_cuda", "programs": {}})
+def test_unknown_routes_are_refused(tmp_path):
+    with pytest.raises(ValueError, match="Unknown export route"):
+        load_programs(tmp_path, {"route": "executorch_cuda", "programs": {}})
 
 
 @pytest.mark.parametrize("image_first", [False, True])
@@ -279,7 +279,7 @@ def test_engine_feeds_the_raw_frame_and_fresh_noise_and_plays_the_chunk(tmp_path
     frame = {"observation.state": state, "observation.images.camera": image}
     info = chain_info(
         {"model": ([*names, "noise"], ["action"])},
-        backend="onnx_tensorrt",
+        route="onnx_tensorrt",
         suffix=".engine",
         inputs=[*names, "noise"],
         noise_shape=[4, 3],
@@ -346,7 +346,7 @@ def test_torch_tensorrt_package_takes_host_arrays_and_returns_host_actions(tmp_p
             "actions": (["x_t"], ["action"]),
         }
         info = {
-            "backend": "torch_tensorrt",
+            "route": "torch_tensorrt",
             "inputs": ["observation.state", "noise"],
             "programs": {
                 name: {"file": f"{name}.pt2", "inputs": inputs, "outputs": outputs}

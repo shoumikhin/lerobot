@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The route scripts: each compiles a part with its backend, the same way for every policy."""
+"""The route scripts: each compiles a part with its compiler, the same way for every policy."""
 
 import runpy
 import sys
