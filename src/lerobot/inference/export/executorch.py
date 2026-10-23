@@ -20,8 +20,6 @@ from typing import Any
 
 import numpy as np
 
-from lerobot.utils.import_utils import require_package
-
 # ExecuTorch returns its own results rather than torch tensors, even where torch is installed, so running
 # a program never imports torch. The bindings read this once, when they first load, and the code below
 # only reads their own results, so a shell setting of "torch" is overridden.
@@ -64,7 +62,7 @@ class ExecuTorchProgram:
     def __call__(self, *inputs: np.ndarray | Any) -> np.ndarray:
         """Run the program and return its one output, the actions, as a host array."""
         (output,) = self.run_device(*inputs)
-        return to_host(output)
+        return np.asarray(output.to_host())
 
     def upload(self, value: np.ndarray) -> Any:
         """`value` in GPU memory, for many runs to read without another copy."""
@@ -82,18 +80,3 @@ def on_device(value: np.ndarray | Any) -> Any:
     if not isinstance(value, ExecuTorchResult):
         return ExecuTorchResult.from_host(np.ascontiguousarray(value))
     return value if value.__dlpack_device__()[0] == DLPACK_CUDA else ExecuTorchResult.from_host(value)
-
-
-def to_host(result: Any) -> np.ndarray:
-    """A host copy of a program's result, in the result's own layout, read without copying it again.
-
-    NumPy has no bfloat16, so the bindings export a bfloat16 result's raw bytes in storage order, and
-    ml_dtypes reads them with the result's strides.
-    """
-    host = np.asarray(result.to_host())
-    if result.dtype_name == "bfloat16":
-        require_package("ml-dtypes", extra="export", import_name="ml_dtypes")
-        from ml_dtypes import bfloat16
-
-        return np.lib.stride_tricks.as_strided(host.view(bfloat16), result.shape, result.strides)
-    return host
