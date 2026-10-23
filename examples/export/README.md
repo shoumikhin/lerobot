@@ -120,7 +120,7 @@ Orin Nano:
 | pi0.5   |                 630 |       **612** |            OOM |             OOM |     OOM |
 | GR00T   |             **266** |           274 |            275 |             OOM |     OOM |
 
-Each value is the median of three runs of 100 chunks, measured with [benchmark.py](benchmark.py). Differences of a few milliseconds are within run-to-run noise.
+Each value is the median of three runs of 100 chunks, measured with [benchmark.py](benchmark.py). Differences of a few milliseconds are within run-to-run noise. Every compiled policy replays its programs as CUDA graphs, except GR00T on ONNX-TensorRT, where TensorRT allocates GPU memory on every run of one of its engines.
 
 ### Memory
 
