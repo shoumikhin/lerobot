@@ -69,6 +69,8 @@ class Replay:
 def export_with_replay(recipe_name, args, monkeypatch):
     """Export through the shared part loop, compiling each part into a `Replay` the engine then loads."""
     common = importlib.import_module("common")
+    # The replay runs the parts on host arrays, so the recipe runs as on a machine without a GPU.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     recipe = importlib.import_module(recipe_name)
     compiled = {}
 
