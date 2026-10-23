@@ -87,7 +87,8 @@ class ProgramChain:
 
     The frame and the noise are the first values. The programs named in `steps` run once per denoising
     step, from the noisy actions `x_t` and the `timestep`. The last returns the next noisy actions, `x_next`,
-    which become `x_t`, so no arithmetic runs between programs.
+    which become `x_t`, so no arithmetic runs between programs. The first `x_t` is the noise, unless an earlier
+    program returns one.
     Values stay where the programs left them until the last program returns the actions to the host.
     """
 
@@ -112,7 +113,7 @@ class ProgramChain:
             if name not in self._steps:
                 self._run(name, values)
             elif name == self._steps[0]:
-                values["x_t"] = values[NOISE]
+                values.setdefault("x_t", values[NOISE])
                 for timestep in self._timesteps:
                     values["timestep"] = timestep
                     for step in self._steps:
@@ -129,7 +130,8 @@ class ExportInferenceEngine(InferenceEngine):
     """Inline inference with an exported policy: one run of its programs per action chunk.
 
     Plays the chunk one action per call, as `SyncInferenceEngine` does with the PyTorch policy's action
-    queue. Before running, it replays the folder's test case and refuses to start if the actions differ by
+    queue. A policy that reads its last `n_obs_steps` frames gets them stacked, oldest first, from the frames
+    of every call, as the policy's own observation queues keep them. Before running, it replays the folder's test case and refuses to start if the actions differ by
     more than the folder's tolerance from the test case's expected actions, which the export computed in
     PyTorch.
     """
@@ -152,6 +154,7 @@ class ExportInferenceEngine(InferenceEngine):
         self._frame_names = [name for name in info["inputs"] if name != NOISE]
         self._noise_shape = tuple(info["noise_shape"]) if "noise_shape" in info else None
         self._image_resize = info.get("image_resize")
+        self._history: deque[dict[str, np.ndarray]] = deque(maxlen=info.get("n_obs_steps", 1))
         self._rename = rename_map or {}
         self._chain = ProgramChain(load_programs(folder, info) if programs is None else programs, info)
         self._actions: deque[np.ndarray] = deque()
@@ -229,6 +232,7 @@ class ExportInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Drop the queued actions and any pending task change."""
         self._actions.clear()
+        self._history.clear()
         self._discard_task_change()
 
     def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
@@ -238,9 +242,16 @@ class ExportInferenceEngine(InferenceEngine):
         task, task_changed = self._take_task()
         if task_changed:
             self._actions.clear()
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        if self._history.maxlen > 1:
+            # Like the policy's queues, the first frame fills the whole history.
+            while len(self._history) < self._history.maxlen - 1:
+                self._history.append(frame)
+            self._history.append(frame)
         if not self._actions:
             start = time.perf_counter()
-            frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+            if self._history.maxlen > 1:
+                frame = {name: np.stack([f[name] for f in self._history]) for name in self._frame_names}
             self._actions.extend(self._run_chunk(frame))
             end = time.perf_counter()
             self.inference_times.append((end, end - start))
