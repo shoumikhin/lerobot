@@ -392,7 +392,10 @@ def pi05_checkpoint(path, monkeypatch, dtype=torch.float32, empty_cameras=0):
 @require_hf_token
 @pytest.mark.parametrize("route", ["executorch_tensorrt", "onnx_tensorrt"])
 @pytest.mark.parametrize("empty_cameras", [0, 1])
-def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route, empty_cameras):
+@pytest.mark.parametrize("one_denoise_program", [False, True])
+def test_pi05_chain_reproduces_the_policy(
+    recipes, tmp_path, monkeypatch, route, empty_cameras, one_denoise_program
+):
     """The chained parts compute what `PI05Policy.predict_action_chunk` computes, from the same frame and noise.
 
     With an empty camera slot, the policy attends past a blank image that the chain leaves out.
@@ -412,12 +415,15 @@ def test_pi05_chain_reproduces_the_policy(recipes, tmp_path, monkeypatch, route,
         route=route,
         task=task,
         cameras=None,
+        one_denoise_program=one_denoise_program,
     )
     args.output_dir.mkdir()
     engine = export_with_replay("pi05", args, monkeypatch)
     info = __import__("json").loads((args.output_dir / "export.json").read_text())
-    assert list(info["programs"]) == ["embed", "language_model_0", "language_model_1", "step", "actions"]
-    assert info["steps"] == ["step"] and info["timesteps"] == [1.0, 0.5]
+    tail = ["denoise"] if one_denoise_program else ["step", "actions"]
+    assert list(info["programs"]) == ["embed", "language_model_0", "language_model_1", *tail]
+    if not one_denoise_program:
+        assert info["steps"] == ["step"] and info["timesteps"] == [1.0, 0.5]
 
     case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
         args.output_dir / "test_case.safetensors"
