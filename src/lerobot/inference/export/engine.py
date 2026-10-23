@@ -66,17 +66,17 @@ def load_programs(folder: Path, info: dict) -> Mapping[str, Program]:
     route = info["route"]
     programs = info["programs"]
     if route == "onnx_tensorrt":
-        from .tensorrt import load_engines
+        from .tensorrt import load_tensorrt_programs
 
-        return load_engines(folder, programs, info.get("cuda_graphs", True))
+        return load_tensorrt_programs(folder, programs, info.get("cuda_graphs", True))
     if route == "executorch_tensorrt":
         from .executorch import ExecuTorchProgram
 
         return {name: ExecuTorchProgram(folder / p["file"]) for name, p in programs.items()}
     if route == "torch_tensorrt":
-        from .aoti import AOTInductorPackage
+        from .aoti import AOTInductorProgram
 
-        return {name: AOTInductorPackage(folder / p["file"]) for name, p in programs.items()}
+        return {name: AOTInductorProgram(folder / p["file"]) for name, p in programs.items()}
     raise ValueError(f"Unknown export route {route!r} in {folder / EXPORT_INFO}; expected one of {ROUTES}.")
 
 

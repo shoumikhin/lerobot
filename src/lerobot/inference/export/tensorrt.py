@@ -157,7 +157,7 @@ def numpy_dtype(dtype):
     return np.dtype(tensorrt.nptype(dtype))
 
 
-class TensorRTEngine:
+class TensorRTProgram:
     """Run a fixed-shape engine on a stream and a scratch allocation that the engines of a chain share.
 
     `run_device` queues the work and returns without waiting for it, keeping the outputs in device buffers,
@@ -310,16 +310,16 @@ class TensorRTEngine:
         self._engine = None
 
 
-def load_engines(
+def load_tensorrt_programs(
     folder: Path, programs: dict[str, dict], cuda_graphs: bool = True
-) -> dict[str, TensorRTEngine]:
+) -> dict[str, TensorRTProgram]:
     """Load a chain's engines on one stream, with one scratch allocation the size of the largest.
 
     The engines run one after another, so none needs its own scratch.
     """
     stream = CudaStream()
     engines = {
-        name: TensorRTEngine(
+        name: TensorRTProgram(
             folder / program["file"],
             program["inputs"],
             program["outputs"],

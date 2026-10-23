@@ -1940,9 +1940,9 @@ def test_rollout_refuses_a_device_an_export_cannot_run_on(tmp_path, monkeypatch,
 
 
 def test_tensorrt_engine_refuses_an_input_of_another_shape(tmp_path, monkeypatch):
-    from lerobot.inference.export.tensorrt import TensorRTEngine
+    from lerobot.inference.export.tensorrt import TensorRTProgram
 
-    engine = TensorRTEngine.__new__(TensorRTEngine)
+    engine = TensorRTProgram.__new__(TensorRTProgram)
     engine._input_names = ["observation.images.wrist"]
     engine._input_shapes = [(1, 3, 480, 640)]
     engine._context = MagicMock()
