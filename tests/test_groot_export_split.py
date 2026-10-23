@@ -482,13 +482,42 @@ def test_part_loader_preserves_precision_without_changing_policy_config(recipe, 
     monkeypatch.setattr(
         recipe.GrootPolicy,
         "load_checkpoint_modules",
-        lambda path, config, modules: calls.append((path, config, modules)),
+        lambda path, config, modules: calls.append((path, config, modules)) or torch.nn.Module(),
     )
     exporter.load_modules(recipe.VISION)
     assert exporter.config.use_bf16
     path, config, modules = calls[0]
     assert path == exporter.model_file and modules == [recipe.VISION]
     assert not config.use_bf16 and config.dtype == torch.float32
+
+
+@pytest.mark.parametrize("use_bf16", [True, False])
+def test_part_loader_holds_only_linear_weights_in_bfloat16_under_autocast(recipe, monkeypatch, use_bf16):
+    exporter = recipe.Exporter.__new__(recipe.Exporter)
+    exporter.config = SimpleNamespace(use_bf16=use_bf16, dtype=torch.float32)
+    exporter.model_file = "checkpoint"
+    head = tiny_head()
+    monkeypatch.setattr(recipe.GrootPolicy, "load_checkpoint_modules", lambda path, config, modules: head)
+    exporter.load_modules(recipe.ACTION_HEAD)
+    expected = torch.bfloat16 if use_bf16 else torch.float32
+    linear = [m for m in head.modules() if isinstance(m, torch.nn.Linear)]
+    assert linear and all(p.dtype == expected for m in linear for p in m.parameters())
+    # Norms, embeddings and per-embodiment layers keep the float32 the residual additions need.
+    others = [p for m in head.modules() if not isinstance(m, torch.nn.Linear) for p in m.parameters(False)]
+    assert others and all(p.dtype == torch.float32 for p in others)
+
+
+def test_bfloat16_linear_weights_compute_what_autocast_computes(recipe):
+    torch.manual_seed(15)
+    fixed = constants()
+    inputs = (torch.randn(1, 5, 32), torch.randn(1, 1, 32), torch.randn(3, 4), torch.tensor([333.0]))
+    autocast, held = (recipe.GrootStep(tiny_head(), fixed, 0, 5, True, 1 / 3).eval() for _ in range(2))
+    held.load_state_dict(autocast.state_dict())
+    recipe.hold_linear_weights_in_bfloat16(held)
+    linears = [layer for layer in held.modules() if isinstance(layer, torch.nn.Linear)]
+    assert linears and all(layer.weight.dtype == torch.bfloat16 for layer in linears)
+    with torch.no_grad():
+        torch.testing.assert_close(held(*inputs), autocast(*inputs), rtol=0, atol=0)
 
 
 def test_actions_apply_the_postprocessor_after_slicing(recipe):

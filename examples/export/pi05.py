@@ -37,6 +37,7 @@ from common import (
     device,
     frame_from_policy,
     free_memory,
+    hold_linear_weights_in_bfloat16,
     processors,
     to_policy_input,
     write_folder,
@@ -163,6 +164,8 @@ class PI05Step(nn.Module):
         super().__init__()
         self.model = model
         self.dt = dt
+        if device().type == "cuda":
+            hold_linear_weights_in_bfloat16(model)
 
     def forward(self, prefix_pad_masks: Tensor, *inputs: Tensor) -> Tensor:
         *cache, x_t, timestep = inputs
@@ -258,6 +261,11 @@ class Exporter:
         self.config.device = str(device())
         self.model_file = cached_file(args.policy_path, "model.safetensors")
         self.policy = self.load_modules(*EMBED_MODULES)
+        vlm = self.policy.model.paligemma_with_expert
+        # The policy runs its float32 vision tower under bfloat16 autocast on a GPU, as `_vision_autocast` decides.
+        if vlm.precision == torch.bfloat16 and device().type == "cuda":
+            hold_linear_weights_in_bfloat16(vlm.paligemma.model.vision_tower)
+            hold_linear_weights_in_bfloat16(vlm.paligemma.model.multi_modal_projector)
         config = self.policy.config
         if config.use_visual_memory or config.use_proprioceptive_memory:
             raise SystemExit("A pi0.5 policy with observation memory cannot be exported.")
