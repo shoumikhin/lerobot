@@ -2034,8 +2034,8 @@ def test_export_engine_refuses_another_task_than_a_fixed_task_export(tmp_path, c
     info = json.loads((tmp_path / "export.json").read_text())
     (tmp_path / "export.json").write_text(json.dumps({**info, "task": "pick"}))
 
-    with pytest.raises(ValueError, match="only runs the task it was exported for"):
-        cpu_export_engine(tmp_path)
+    # Without --task, the rollout runs the task the folder was exported for.
+    assert cpu_export_engine(tmp_path).task == "pick"
 
     from lerobot.inference.export import engine as export_engine
 

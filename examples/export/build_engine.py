@@ -83,8 +83,7 @@ def main() -> None:
 
 def check_folder(folder: Path) -> None:
     """Run the rollout's own startup check, which raises unless the programs reproduce the test case."""
-    info = json.loads((folder / EXPORT_INFO).read_text())
-    ExportInferenceEngine(folder, task=info.get("task", ""))
+    ExportInferenceEngine(folder, task="")
     print(f"{folder} reproduces its test case")
 
 

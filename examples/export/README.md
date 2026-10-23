@@ -67,7 +67,7 @@ lerobot-rollout \
     --duration=30
 ```
 
-SmolVLA, pi0.5 and GR00T run only the task they were exported for, so pass the same `--task`. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
+SmolVLA, pi0.5 and GR00T run only the task they were exported for, so leave out `--task` or pass the same one. If your camera names differ from the policy's, add `--rename_map`, for example `--rename_map='{"observation.images.scene": "observation.images.base_0_rgb"}'`.
 
 Before the robot moves, the rollout checks that the compiled policy reproduces the actions PyTorch computed at export time, and stops if it does not.
 

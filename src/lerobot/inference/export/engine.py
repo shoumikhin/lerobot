@@ -131,10 +131,13 @@ class ExportInferenceEngine(InferenceEngine):
     """
 
     def __init__(self, folder: Path, task: str, rename_map: dict[str, str] | None = None) -> None:
-        super().__init__(task=task)
         info = json.loads((folder / EXPORT_INFO).read_text())
         self._fixed_task: str | None = info.get("task")
-        self._check_task(task)
+        # Without --task, a folder exported for one task runs that task.
+        task = task or self._fixed_task or ""
+        if error := self._task_error(task):
+            raise ValueError(error)
+        super().__init__(task=task)
         self._frame_names = [name for name in info["inputs"] if name != NOISE]
         self._noise_shape = tuple(info["noise_shape"]) if "noise_shape" in info else None
         self._image_resize = info.get("image_resize")
@@ -165,10 +168,6 @@ class ExportInferenceEngine(InferenceEngine):
                 f"not {task!r}. Export it again with the new task."
             )
         return None
-
-    def _check_task(self, task: str) -> None:
-        if error := self._task_error(task):
-            raise ValueError(error)
 
     def _check(self, path: Path, tolerance: float) -> None:
         case = load_file(path)
