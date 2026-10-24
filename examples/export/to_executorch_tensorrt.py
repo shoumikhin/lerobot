@@ -23,22 +23,24 @@ built it:
 Then run the folder it writes with `lerobot-rollout --policy.path=<folder>`.
 """
 
+import functools
 from pathlib import Path
 
 import torch
 import torch_tensorrt
-from common import TENSORRT_OPTIONS, Part, parse_args, run_route
+from common import TENSORRT_OPTIONS, Part, parse_args, quantize_arguments, quantized, run_route
 from executorch.exir import ExecutorchBackendConfig
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
 
 
-def compile_part(part: Part, path: Path) -> None:
-    with torch.no_grad():
-        program = torch.export.export(part.module, part.inputs)
-    engine = torch_tensorrt.dynamo.compile(
-        program, arg_inputs=part.inputs, **{**TENSORRT_OPTIONS, **part.tensorrt_options}
-    )
+def compile_part(part: Part, path: Path, quantize: str | None = None) -> None:
+    with quantized(part, quantize):
+        with torch.no_grad():
+            program = torch.export.export(part.module, part.inputs)
+        engine = torch_tensorrt.dynamo.compile(
+            program, arg_inputs=part.inputs, **{**TENSORRT_OPTIONS, **part.tensorrt_options}
+        )
     del program
     torch_tensorrt.save(
         engine,
@@ -57,5 +59,5 @@ def compile_part(part: Part, path: Path) -> None:
 
 
 if __name__ == "__main__":
-    args, recipe = parse_args(__doc__, "executorch_tensorrt")
-    run_route(__file__, args, recipe, compile_part, ".pte")
+    args, recipe = parse_args(__doc__, "executorch_tensorrt", parents=(quantize_arguments(),))
+    run_route(__file__, args, recipe, functools.partial(compile_part, quantize=args.quantize), ".pte")

@@ -57,6 +57,23 @@ A few checkpoints cannot be exported: ACT with temporal ensembling, and pi0.5 wi
 
 To run an ONNX-TensorRT export on another board, copy the folder there and rebuild its engines with `python examples/export/build_engine.py <folder>`.
 
+### Quantize (optional)
+
+`to_executorch_tensorrt.py --quantize` runs most of the policy with 8-bit numbers, using the default settings of [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer). The folder gets smaller and can run faster, but its actions move further from the policy's, so measure them before you rely on the folder.
+
+```bash
+uv pip install "nvidia-modelopt>=0.47"
+python examples/export/to_executorch_tensorrt.py \
+    --policy.path=outputs/train/groot_so101/checkpoints/last/pretrained_model \
+    --dataset.repo_id=<user>/so101_dataset --quantize=fp8
+```
+
+- `fp8` runs on a Jetson Thor with TensorRT 11.4 or newer (with 11.3 the build of pi0.5's gated GELU layers crashes), `int8` on both boards. 4-bit `nvfp4` is not offered yet: Model Optimizer 0.47 cannot prepare it with PyTorch nightly ([NVIDIA/Model-Optimizer#2810](https://github.com/NVIDIA/Model-Optimizer/issues/2810)).
+- Model Optimizer quantizes linear and convolution layers and the inputs of pooling layers. Vision encoders keep their precision; ACT's backbone does not.
+- Each layer's number range is measured on the export's test frame, a random image, and for a denoising step only at its first step. The export's check replays that same frame, so passing it says little about real frames, and two exports of the same policy can differ. Measure the folder with `benchmark.py`, as in [Reproduce](#reproduce).
+
+Measured that way on Thor, with TensorRT 11.4 for both folders: GR00T with `fp8` takes 42 ms per chunk instead of 62, its folder is 3.4 GB instead of 5.3 GB, and its mean / 95th percentile error grows from 0.68 / 2.09 to 1.7 / 4.6 and 1.7 / 5.0 degrees in two exports. pi0.5 does not quantize well yet: with `int8` the export's own check refuses the folder (actions 84 and 85 degrees off on Thor and Orin Nano, TensorRT 11.3), and with `fp8` TensorRT 11.4 fails to build its language model.
+
 ## Run
 
 Use the same calibrated robot and camera settings as when you recorded the training data:

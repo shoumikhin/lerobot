@@ -14,10 +14,13 @@
 
 """The route scripts: each compiles a part with its compiler, the same way for every policy."""
 
+import contextlib
+import importlib.util
+import os
 import runpy
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,6 +80,137 @@ def test_executorch_route_keeps_inputs_and_outputs_on_the_gpu_and_records_cuda_g
     stubs["executorch.exir.passes.memory_planning_pass"].MemoryPlanningPass.assert_called_once_with(
         alloc_graph_input=False, alloc_graph_output=False
     )
+
+
+@pytest.fixture
+def modelopt(monkeypatch):
+    """ModelOpt stubbed out: its quantize enables one weight quantizer, its export mode records when it is on."""
+    events = []
+
+    class TensorQuantizer(torch.nn.Module):
+        is_enabled = True
+
+    def quantize(module, config, forward_loop):
+        events.append(
+            ("quantize", config, module.training, os.environ.get("MODELOPT_SKIP_WEIGHT_QUANT_CHECK"))
+        )
+        forward_loop(module)
+        module.weight_quantizer = TensorQuantizer()
+
+    @contextlib.contextmanager
+    def export_torch_mode():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    mtq = ModuleType("modelopt.torch.quantization")
+    mtq.quantize, mtq.nn = quantize, SimpleNamespace(TensorQuantizer=TensorQuantizer)
+    for name in ("FP8", "INT8"):
+        setattr(mtq, f"{name}_DEFAULT_CFG", {"quant_cfg": [{"quantizer_name": name}]})
+    utils = ModuleType("modelopt.torch.quantization.utils")
+    utils.export_torch_mode = export_torch_mode
+    for name, module in {
+        "modelopt": ModuleType("modelopt"),
+        "modelopt.torch": ModuleType("modelopt.torch"),
+        "modelopt.torch.quantization": mtq,
+        "modelopt.torch.quantization.utils": utils,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    # Set, so that the test's teardown puts back whatever the environment had.
+    monkeypatch.setenv("MODELOPT_SKIP_WEIGHT_QUANT_CHECK", "0")
+    return events
+
+
+@pytest.mark.parametrize("precision", ["fp8", "int8"])
+def test_executorch_route_quantizes_calibrated_on_the_part_inputs_and_compiles_the_quantized_graph(
+    route, tmp_path, modelopt, precision
+):
+    compile_part, stubs = route("to_executorch_tensorrt")
+    calibrated = []
+    quantized_part = part()
+    quantized_part.module.register_forward_hook(lambda module, inputs, output: calibrated.append(inputs))
+    torch.export.export.side_effect = lambda *args: modelopt.append("export")
+    stubs["torch_tensorrt"].dynamo.compile.side_effect = lambda *args, **kwargs: modelopt.append("compile")
+    compile_part(quantized_part, tmp_path / "step.pte", quantize=precision)
+    # Model Optimizer's config for the precision, which also keeps GR00T's vision encoder and the inputs of
+    # LayerNorm layers, calibrated in eval mode, which it then keeps for every layer, with its
+    # nothing-to-quantize check off.
+    keep_vision = {"quantizer_name": "*vision*", "enable": False}
+    keep_layer_norm = {"quantizer_name": "*input_quantizer", "parent_class": "nn.LayerNorm", "enable": False}
+    config = {"quant_cfg": [{"quantizer_name": precision.upper()}, keep_vision, keep_layer_norm]}
+    assert modelopt == [("quantize", config, False, "1"), "enter", "export", "compile", "exit"]
+    assert len(calibrated) == 1 and calibrated[0][0] is quantized_part.inputs[0]
+    # The config was copied: the module-level preset is unchanged.
+    assert sys.modules["modelopt.torch.quantization"].FP8_DEFAULT_CFG["quant_cfg"] == [
+        {"quantizer_name": "FP8"}
+    ]
+
+
+def test_executorch_route_compiles_each_part_with_the_quantize_argument(route, monkeypatch):
+    route("to_executorch_tensorrt")
+    import common
+
+    passed = {}
+
+    def parse_args(description, route, parents=()):
+        passed["options"] = {option for parser in parents for option in parser._option_string_actions}
+        return SimpleNamespace(quantize="int8"), None
+
+    monkeypatch.setattr(common, "parse_args", parse_args)
+    monkeypatch.setattr(common, "run_route", lambda *args: passed.update(compile_part=args[3]))
+    runpy.run_path(str(EXAMPLES / "to_executorch_tensorrt.py"), run_name="__main__")
+    assert "--quantize" in passed["options"]
+    assert passed["compile_part"].keywords == {"quantize": "int8"}
+
+
+@pytest.mark.parametrize(
+    "capability, runs",
+    [
+        ((8, 7), {"int8"}),
+        ((8, 9), {"int8", "fp8"}),
+        ((9, 0), {"int8", "fp8"}),
+        ((10, 0), {"int8", "fp8", "nvfp4"}),
+    ],
+    ids=["orin", "ada", "hopper", "blackwell"],
+)
+def test_quantize_refuses_a_precision_this_gpu_cannot_run_before_the_policy_loads(
+    monkeypatch, capability, runs
+):
+    """TensorRT would otherwise fail only at the end of the first part's build."""
+    monkeypatch.syspath_prepend(str(EXAMPLES))
+    from common import QUANTIZATIONS, quantize_arguments
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    try:
+        for precision in QUANTIZATIONS:
+            if precision in runs:
+                assert quantize_arguments().parse_args([f"--quantize={precision}"]).quantize == precision
+            else:
+                with pytest.raises(SystemExit):
+                    quantize_arguments().parse_args([f"--quantize={precision}"])
+    finally:
+        sys.modules.pop("common", None)
+
+
+@pytest.mark.parametrize("missing", ["precision", "modelopt", "gpu"])
+def test_quantize_refuses_what_this_machine_cannot_do(monkeypatch, capsys, missing):
+    monkeypatch.syspath_prepend(str(EXAMPLES))
+    from common import quantize_arguments
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if missing == "modelopt" else object())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: missing != "gpu")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (11, 0))
+    try:
+        with pytest.raises(SystemExit):
+            quantize_arguments().parse_args(
+                ["--quantize=int4" if missing == "precision" else "--quantize=int8"]
+            )
+    finally:
+        sys.modules.pop("common", None)
+    expected = {"precision": "choose from", "modelopt": "pip install 'nvidia-modelopt", "gpu": "NVIDIA GPU"}
+    assert expected[missing] in capsys.readouterr().err
 
 
 def test_onnx_route_keeps_the_onnx_file_and_builds_the_engine_beside_it(route, tmp_path):

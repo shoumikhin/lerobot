@@ -21,15 +21,18 @@ recipe then writes the test case and `export.json`, which `lerobot-rollout` read
 """
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import gc
 import importlib
+import importlib.util
 import json
+import os
 import subprocess
 import sys
-from collections.abc import Callable
-from copy import copy
+from collections.abc import Callable, Iterator
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +72,12 @@ TENSORRT_OPTIONS = {
     "workspace_size": WORKSPACE_BYTES,
     # Attention as plain matrix products, as the ONNX route writes it, unless a part sets its own options.
     "decompose_attention": True,
+}
+
+# What --quantize offers: an NVIDIA Model Optimizer config, and the lowest compute capability TensorRT runs it on.
+QUANTIZATIONS = {
+    "fp8": ("FP8_DEFAULT_CFG", (8, 9)),
+    "int8": ("INT8_DEFAULT_CFG", (0, 0)),
 }
 
 
@@ -128,6 +137,74 @@ def parse_args(
     )
     parser.set_defaults(route=route)
     return parser.parse_args(argv), recipe
+
+
+def quantization(precision: str) -> str:
+    """`precision`, if this machine can quantize to it: checked as the arguments are read, before the policy loads."""
+    if precision not in QUANTIZATIONS:
+        raise argparse.ArgumentTypeError(f"choose from {', '.join(QUANTIZATIONS)}")
+    if importlib.util.find_spec("modelopt") is None:
+        raise argparse.ArgumentTypeError(
+            "quantizing needs NVIDIA Model Optimizer: pip install 'nvidia-modelopt>=0.47'"
+        )
+    if not torch.cuda.is_available():
+        raise argparse.ArgumentTypeError("quantizing needs the NVIDIA GPU that will run the policy")
+    major, minor = QUANTIZATIONS[precision][1]
+    if torch.cuda.get_device_capability() < (major, minor):
+        raise argparse.ArgumentTypeError(
+            f"TensorRT runs {precision} on NVIDIA GPUs of compute capability {major}.{minor} or newer"
+        )
+    return precision
+
+
+def quantize_arguments() -> argparse.ArgumentParser:
+    """`--quantize`, for the ExecuTorch-TensorRT route."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--quantize",
+        type=quantization,
+        metavar="{" + ",".join(QUANTIZATIONS) + "}",
+        help="Run the policy with 8-bit numbers: fp8 (a Jetson Thor, or an Ada, Hopper or Blackwell GPU) or int8 "
+        "(any). Needs `pip install 'nvidia-modelopt>=0.47'`. Default: the precision the policy runs in.",
+    )
+    return parser
+
+
+@contextlib.contextmanager
+def quantized(part: Part, precision: str | None) -> Iterator[None]:
+    """Quantize `part` with NVIDIA Model Optimizer's default config for `precision`, calibrated on its example
+    inputs, and export and compile it inside, so Torch-TensorRT turns the quantizers into TensorRT's own.
+    """
+    if precision is None:
+        yield
+        return
+    import modelopt.torch.quantization as mtq
+    from modelopt.torch.quantization.utils import export_torch_mode
+
+    config = deepcopy(getattr(mtq, QUANTIZATIONS[precision][0]))
+    # Model Optimizer's configs keep vision encoders as they are by their usual names, such as pi0.5's
+    # vision_tower; GR00T's export names its encoder vision, which they miss.
+    config["quant_cfg"].append({"quantizer_name": "*vision*", "enable": False})
+    # Model Optimizer 0.44 to 0.48 also quantize the inputs of LayerNorm layers, which its 0.49 calls a bug that
+    # adds error to the residual stream.
+    config["quant_cfg"].append(
+        {"quantizer_name": "*input_quantizer", "parent_class": "nn.LayerNorm", "enable": False}
+    )
+    # Calibration ends by putting every layer in the mode of the outermost one, and some part wrappers, such as
+    # pi0.5's, are left in training mode around a policy in eval mode; its vision tower then skips its autocast.
+    part.module.eval()
+    # Model Optimizer reports a model with nothing to quantize as an error, and a part can be one: a vision
+    # encoder, or the actions part. Each part is built in its own process, so this setting ends with it.
+    os.environ["MODELOPT_SKIP_WEIGHT_QUANT_CHECK"] = "1"
+    with torch.no_grad():
+        mtq.quantize(part.module, config, forward_loop=lambda module: module(*part.inputs))
+    quantized_layers = sum(
+        isinstance(m, mtq.nn.TensorQuantizer) and m.is_enabled and name.endswith("weight_quantizer")
+        for name, m in part.module.named_modules()
+    )
+    print(f"Quantized {quantized_layers} layers of {part.name} to {precision}", flush=True)
+    with export_torch_mode():
+        yield
 
 
 def run_route(
