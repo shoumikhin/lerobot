@@ -55,6 +55,8 @@ GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 # to the embodiment default ('libero' for 'libero_sim', otherwise None). It is distinct from an
 # explicit 'none' (resolved to None) so an opt-out survives a draccus save/load round-trip.
 GROOT_ACTION_DECODE_TRANSFORM_AUTO = "auto"
+# A fine-tune checkpoint keeps copies of the base model config files in this subfolder.
+_BASE_CONFIG_DIR = "groot_base_config"
 
 _GROOT_MODEL_VERSION_ALIASES = {
     "n1.7": GROOT_N1_7,
@@ -133,6 +135,18 @@ def is_raw_groot_n1_7_checkpoint(model_path: str | Path | None) -> bool:
 
     config = read_json(config_path)
     return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
+
+
+def resolve_groot_base_config_path(checkpoint: str | Path | None, base_model_path: str | None) -> str | None:
+    """Return where to read the base model config files: the checkpoint's copies, else the base model.
+
+    A save writes config.json last, so a copies folder without it is incomplete and is not used.
+    """
+    if checkpoint is not None:
+        copies = Path(checkpoint) / _BASE_CONFIG_DIR
+        if (copies / "config.json").is_file():
+            return str(copies)
+    return base_model_path
 
 
 def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
@@ -456,6 +470,18 @@ class GrootConfig(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
+        # Set by GrootPolicy.from_pretrained to the folder it read the base config files from. Not saved.
+        self._loaded_base_config_path: str | None = None
+
+    @property
+    def base_config_path(self) -> str | None:
+        """Return where the base model config files are read.
+
+        The folder a load used, else the copies in a local checkpoint folder, else base_model_path.
+        """
+        if self._loaded_base_config_path is not None:
+            return self._loaded_base_config_path
+        return resolve_groot_base_config_path(self.pretrained_path, self.base_model_path)
 
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""
@@ -533,7 +559,7 @@ class GrootConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
         model_action_horizon = (
-            infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
+            infer_groot_n1_7_action_horizon(self.base_config_path, self.embodiment_tag) or 40
         )
         return list(range(min(self.chunk_size, model_action_horizon)))
 

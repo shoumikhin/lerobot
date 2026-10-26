@@ -32,9 +32,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, Unpack
 
 import torch
-from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError, LocalEntryNotFoundError
 from safetensors import safe_open
 from torch import Tensor
 
@@ -46,6 +46,7 @@ from ..chunk import ChunkPolicySpec
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
+    _BASE_CONFIG_DIR,
     GROOT_N1_5,
     GROOT_N1_5_REMOVAL_GUIDANCE,
     GROOT_N1_7,
@@ -53,6 +54,7 @@ from .configuration_groot import (
     infer_groot_model_version,
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
+    resolve_groot_base_config_path,
 )
 from .groot_n1_7 import GR00TN17, GR00TN17Config, _tie_unused_qwen_lm_head
 
@@ -71,6 +73,10 @@ _TIED_WEIGHT_NAMES = (
     "backbone.model.model.language_model.embed_tokens.weight",
 )
 
+# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR. config.json
+# comes last, as it marks a complete copy (see resolve_groot_base_config_path).
+_BASE_CONFIG_FILES = ("processor_config.json", CONFIG_NAME)
+
 
 class GrootPolicy(PreTrainedPolicy):
     """Wrapper around external Groot model for LeRobot integration."""
@@ -88,9 +94,12 @@ class GrootPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self._base_config_path = config.base_config_path
 
         # Initialize GR00T model using ported components, unless from_pretrained built it from a checkpoint.
         self._groot_model = self._create_groot_model() if _groot_model is None else _groot_model
+        # Read once here, as a save must not depend on the base model still being reachable.
+        self._base_config_files = self._read_base_config_files(self._base_config_path)
         self._action_queue_steps = self._resolve_action_queue_steps()
         self._warned_native_relative_rtc_prefix_disabled = False
 
@@ -125,6 +134,8 @@ class GrootPolicy(PreTrainedPolicy):
         """Create and initialize the GR00T N1.7 model using the ported components."""
         model = GR00TN17.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
+            # The same files the horizon reads and a save writes, so a save describes the model built here.
+            config=self._base_config_path,
             **self._groot_config_overrides(self.config),
             **self._groot_tuning_kwargs(self.config),
             transformers_loading_kwargs={"trust_remote_code": True},
@@ -176,7 +187,7 @@ class GrootPolicy(PreTrainedPolicy):
                 state_dict[lm_head] = state_dict[embedding]
 
             groot_config = GR00TN17Config.from_pretrained(
-                config.base_model_path, **cls._groot_config_overrides(config)
+                config.base_config_path, **cls._groot_config_overrides(config)
             )
             if config.dtype != torch.float32 and groot_config.dtype is None:
                 # "auto" then falls back to the dtype of the base weights, which only the regular path reads.
@@ -242,6 +253,51 @@ class GrootPolicy(PreTrainedPolicy):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self._action_queue_steps)
 
+    @staticmethod
+    def _read_base_config_files(base_config_path: str | None) -> dict[str, bytes]:
+        if base_config_path is None:
+            return {}
+        if os.path.isdir(base_config_path):
+            folder = Path(base_config_path)
+            # A save writes these files into the next checkpoint, so a link out of the folder is not followed.
+            # The Hugging Face cache links the files of a snapshot into its repo folder.
+            snapshots = next((parent for parent in folder.parents if parent.name == "snapshots"), None)
+            root = folder if snapshots is None else snapshots.parent
+            files: list[Path] = []
+            for path in (folder / name for name in _BASE_CONFIG_FILES):
+                if path.resolve().is_relative_to(root.resolve()):
+                    files.append(path)
+                else:
+                    logger.warning("%s links outside %s, so a save does not copy it.", path, folder)
+        else:
+            # Only config.json, as a Hub base model's processor_config.json is never read. Building the model
+            # already downloaded it, so the cache has it.
+            try:
+                cached = try_to_load_from_cache(base_config_path, CONFIG_NAME)
+            except HFValidationError:
+                # Neither a folder nor a repo id, for example a folder on another machine.
+                cached = None
+            files = [Path(cached)] if isinstance(cached, str) else []
+        return {file.name: file.read_bytes() for file in files if file.is_file()}
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """Save the policy, plus the base model config files that loading it reads."""
+        from lerobot.distributed.utils import is_main_process
+
+        super()._save_pretrained(save_directory)
+        if not is_main_process():
+            return
+        target = save_directory / _BASE_CONFIG_DIR
+        target.mkdir(exist_ok=True)
+        # Written last, so a save that stops halfway leaves a folder that loading does not use.
+        (target / CONFIG_NAME).unlink(missing_ok=True)
+        for name in _BASE_CONFIG_FILES:
+            if name in self._base_config_files:
+                (target / name).write_bytes(self._base_config_files[name])
+            else:
+                # Drops a copy left by an earlier save into this directory.
+                (target / name).unlink(missing_ok=True)
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -266,7 +322,9 @@ class GrootPolicy(PreTrainedPolicy):
 
         Args:
             pretrained_name_or_path: Path to the GR00T model or fine-tuned checkpoint
-            config: Optional GrootConfig. If None, loads from checkpoint or creates default
+            config: Optional GrootConfig. If None, loads from checkpoint or creates default. For a fine-tuned
+                checkpoint, it records the folder the base config files are read from
+                (see GrootConfig.base_config_path).
             force_download: Force download even if cached
             resume_download: Resume interrupted download
             proxies: Proxy settings
@@ -316,23 +374,44 @@ class GrootPolicy(PreTrainedPolicy):
 
         if is_finetuned_checkpoint:
             logger.info("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
+            if config is None:
+                config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    **kwargs,
+                )
+            if not os.path.isdir(model_id):
+                try:
+                    # Fetched into the snapshot folder that holds the weights file found above.
+                    snapshot_download(
+                        repo_id=model_id,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        token=token,
+                        local_files_only=local_files_only,
+                        allow_patterns=[f"{_BASE_CONFIG_DIR}/{name}" for name in _BASE_CONFIG_FILES],
+                    )
+                except (LocalEntryNotFoundError, HfHubHTTPError):
+                    logger.warning(
+                        "Could not get the checkpoint's base config copies; reading base_model_path."
+                    )
+            # Every way of building the policy below reads the base config files there, as does the config.
+            config._loaded_base_config_path = resolve_groot_base_config_path(
+                os.path.dirname(model_file), config.base_model_path
+            )
             if force_download and not os.path.isdir(model_id):
                 # The weights above were downloaded without forcing, so only the regular load honors
                 # force_download. A local folder has nothing to download.
                 logger.info("force_download is set, so the checkpoint loads the regular way.")
             elif cls is GrootPolicy:
-                if config is None:
-                    config = PreTrainedConfig.from_pretrained(
-                        pretrained_name_or_path=pretrained_name_or_path,
-                        force_download=force_download,
-                        resume_download=resume_download,
-                        proxies=proxies,
-                        token=token,
-                        cache_dir=cache_dir,
-                        local_files_only=local_files_only,
-                        revision=revision,
-                        **kwargs,
-                    )
                 groot_model = cls._build_groot_model_from_checkpoint(config, model_file)
                 if groot_model is not None:
                     policy = cls(config, _groot_model=groot_model, **kwargs)
@@ -411,11 +490,11 @@ class GrootPolicy(PreTrainedPolicy):
     def _resolve_action_queue_steps(self) -> int:
         n_action_steps = int(self.config.n_action_steps)
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         execution_horizon = infer_groot_n1_7_action_execution_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         horizons = [n_action_steps]
@@ -443,7 +522,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         horizons = [available_steps]
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         if checkpoint_action_horizon is not None:
