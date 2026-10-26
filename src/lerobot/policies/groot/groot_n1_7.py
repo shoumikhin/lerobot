@@ -359,7 +359,11 @@ class Qwen3Backbone(nn.Module):
         if _is_cosmos_reason2_backbone(model_name):
             backbone_config = _cosmos_reason2_qwen3_vl_config()
         else:
-            backbone_config = AutoConfig.from_pretrained(model_name, **config_kwargs)
+            # Qwen3-VL is built into transformers, so reading the config of a backbone that a checkpoint names
+            # runs no code from that folder.
+            backbone_config = AutoConfig.from_pretrained(
+                model_name, **{**config_kwargs, "trust_remote_code": False}
+            )
         return Qwen3VLForConditionalGeneration._from_config(backbone_config, **model_kwargs)
 
     def prepare_input(self, batch: dict[str, Any]) -> BatchFeature:

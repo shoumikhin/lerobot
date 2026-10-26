@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from huggingface_hub.constants import CONFIG_NAME
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, DiffuserSchedulerConfig
@@ -55,6 +56,11 @@ GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 # to the embodiment default ('libero' for 'libero_sim', otherwise None). It is distinct from an
 # explicit 'none' (resolved to None) so an opt-out survives a draccus save/load round-trip.
 GROOT_ACTION_DECODE_TRANSFORM_AUTO = "auto"
+# A fine-tune checkpoint keeps copies of the base model config files in this subfolder.
+_BASE_CONFIG_DIR = "groot_base_config"
+# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR. config.json
+# comes last, as it marks a complete copy (see resolve_groot_base_config_path).
+_BASE_CONFIG_FILES = ("processor_config.json", CONFIG_NAME)
 
 _GROOT_MODEL_VERSION_ALIASES = {
     "n1.7": GROOT_N1_7,
@@ -133,6 +139,18 @@ def is_raw_groot_n1_7_checkpoint(model_path: str | Path | None) -> bool:
 
     config = read_json(config_path)
     return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
+
+
+def resolve_groot_base_config_path(checkpoint: str | Path | None, base_model_path: str | None) -> str | None:
+    """Return where to read the base model config files: the checkpoint's copies, else the base model.
+
+    A save writes config.json last, so a copies folder without it is incomplete and is not used.
+    """
+    if checkpoint is not None:
+        copies = Path(checkpoint) / _BASE_CONFIG_DIR
+        if (copies / CONFIG_NAME).is_file():
+            return str(copies)
+    return base_model_path
 
 
 def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
@@ -280,6 +298,8 @@ class GrootConfig(PreTrainedConfig):
     # `config.json` carries a `type` field, whereas a raw NVIDIA GR00T checkpoint has no such
     # field and so can only be loaded through `base_model_path` (`--policy.base_model_path`).
     # Defaults to GROOT_N1_7_BASE_MODEL when unset (resolved in __post_init__).
+    # A checkpoint saved by GrootPolicy also keeps the base model config files it read (in groot_base_config/)
+    # and the two horizons below, and loading it reads those instead of base_model_path.
     base_model_path: str | None = None
 
     # Optional named action transform applied after raw N1.7 checkpoint decoding and before env.step().
@@ -289,6 +309,14 @@ class GrootConfig(PreTrainedConfig):
 
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
+
+    # How many action steps the base model's processor_config.json gives embodiment_horizons_tag, and how
+    # many of them run before the policy predicts again. Filled in for embodiment_tag when the policy is
+    # built, so a saved fine-tune keeps them without its base model. Unset, or for another tag, they are
+    # read from the base config files, as the policy reads them.
+    embodiment_action_horizon: int | None = None
+    embodiment_execution_horizon: int | None = None
+    embodiment_horizons_tag: str | None = None
 
     # Fine-tuning control arguments
 
@@ -456,6 +484,14 @@ class GrootConfig(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
+        if any(
+            horizon is not None and horizon < 1
+            for horizon in (self.embodiment_action_horizon, self.embodiment_execution_horizon)
+        ):
+            raise ValueError(
+                "embodiment_action_horizon and embodiment_execution_horizon must be positive, got "
+                f"{self.embodiment_action_horizon} and {self.embodiment_execution_horizon}."
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""
@@ -533,9 +569,13 @@ class GrootConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
         model_action_horizon = (
-            infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
+            self.embodiment_action_horizon if self.embodiment_horizons_tag == self.embodiment_tag else None
         )
-        return list(range(min(self.chunk_size, model_action_horizon)))
+        if model_action_horizon is None:
+            # The files a policy built from this config reads.
+            base_config_path = resolve_groot_base_config_path(self.pretrained_path, self.base_model_path)
+            model_action_horizon = infer_groot_n1_7_action_horizon(base_config_path, self.embodiment_tag)
+        return list(range(min(self.chunk_size, model_action_horizon or 40)))
 
     @property
     def drop_n_last_frames(self) -> int:
