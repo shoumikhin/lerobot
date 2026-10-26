@@ -32,8 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, Unpack
 
 import torch
-from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors import safe_open
 from torch import Tensor
@@ -46,6 +46,7 @@ from ..chunk import ChunkPolicySpec
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
+    _BASE_CONFIG_DIR,
     GROOT_N1_5,
     GROOT_N1_5_REMOVAL_GUIDANCE,
     GROOT_N1_7,
@@ -53,6 +54,7 @@ from .configuration_groot import (
     infer_groot_model_version,
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
+    resolve_groot_base_config_path,
 )
 from .groot_n1_7 import GR00TN17, GR00TN17Config, _tie_unused_qwen_lm_head
 
@@ -71,6 +73,9 @@ _TIED_WEIGHT_NAMES = (
     "backbone.model.model.language_model.embed_tokens.weight",
 )
 
+# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR.
+_BASE_CONFIG_FILES = (CONFIG_NAME, "processor_config.json")
+
 
 class GrootPolicy(PreTrainedPolicy):
     """Wrapper around external Groot model for LeRobot integration."""
@@ -82,15 +87,30 @@ class GrootPolicy(PreTrainedPolicy):
     def supports_rtc(self) -> bool:
         return True
 
-    def __init__(self, config: GrootConfig, *, _groot_model: GR00TN17 | None = None, **kwargs):
+    def __init__(
+        self,
+        config: GrootConfig,
+        *,
+        _groot_model: GR00TN17 | None = None,
+        _base_config_path: str | None = None,
+        **kwargs,
+    ):
         """Initialize Groot policy wrapper."""
         require_package("transformers", extra="groot")
         super().__init__(config)
         config.validate_features()
         self.config = config
+        # Like GrootConfig.action_delta_indices, a local checkpoint's copies first: they describe its weights.
+        self._base_config_path = (
+            resolve_groot_base_config_path(config.pretrained_path, config.base_model_path)
+            if _base_config_path is None
+            else _base_config_path
+        )
 
         # Initialize GR00T model using ported components, unless from_pretrained built it from a checkpoint.
         self._groot_model = self._create_groot_model() if _groot_model is None else _groot_model
+        # Read once here, as a save must not depend on the base model still being reachable.
+        self._base_config_files = self._read_base_config_files(self._base_config_path)
         self._action_queue_steps = self._resolve_action_queue_steps()
         self._warned_native_relative_rtc_prefix_disabled = False
 
@@ -125,6 +145,8 @@ class GrootPolicy(PreTrainedPolicy):
         """Create and initialize the GR00T N1.7 model using the ported components."""
         model = GR00TN17.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
+            # The same files the horizon reads and a save writes, so a save describes the model built here.
+            config=self._base_config_path,
             **self._groot_config_overrides(self.config),
             **self._groot_tuning_kwargs(self.config),
             transformers_loading_kwargs={"trust_remote_code": True},
@@ -144,7 +166,9 @@ class GrootPolicy(PreTrainedPolicy):
                 parameter.data = parameter.data.to(torch.float32)
 
     @classmethod
-    def _build_groot_model_from_checkpoint(cls, config: GrootConfig, model_file: str) -> GR00TN17 | None:
+    def _build_groot_model_from_checkpoint(
+        cls, config: GrootConfig, model_file: str, base_config_path: str | None
+    ) -> GR00TN17 | None:
         """Build GR00T from a fine-tuned checkpoint without downloading or loading NVIDIA's base weights.
 
         Reads only NVIDIA's config files. Returns None when the checkpoint does not match what the regular path
@@ -176,7 +200,7 @@ class GrootPolicy(PreTrainedPolicy):
                 state_dict[lm_head] = state_dict[embedding]
 
             groot_config = GR00TN17Config.from_pretrained(
-                config.base_model_path, **cls._groot_config_overrides(config)
+                base_config_path, **cls._groot_config_overrides(config)
             )
             if config.dtype != torch.float32 and groot_config.dtype is None:
                 # "auto" then falls back to the dtype of the base weights, which only the regular path reads.
@@ -241,6 +265,35 @@ class GrootPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self._action_queue_steps)
+
+    @staticmethod
+    def _read_base_config_files(base_config_path: str | None) -> dict[str, bytes]:
+        if base_config_path is None:
+            return {}
+        if os.path.isdir(base_config_path):
+            files = [os.path.join(base_config_path, name) for name in _BASE_CONFIG_FILES]
+        else:
+            # Only config.json, as a Hub base model's processor_config.json is never read. Building the model
+            # already downloaded it, so the cache has it.
+            cached = try_to_load_from_cache(base_config_path, CONFIG_NAME)
+            files = [cached] if isinstance(cached, str) else []
+        return {os.path.basename(file): Path(file).read_bytes() for file in files if os.path.isfile(file)}
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """Save the policy, plus the base model config files that loading it reads."""
+        from lerobot.distributed.utils import is_main_process
+
+        super()._save_pretrained(save_directory)
+        if not is_main_process():
+            return
+        target = save_directory / _BASE_CONFIG_DIR
+        target.mkdir(exist_ok=True)
+        for name in _BASE_CONFIG_FILES:
+            if name in self._base_config_files:
+                (target / name).write_bytes(self._base_config_files[name])
+            else:
+                # Drops a copy left by an earlier save into this directory.
+                (target / name).unlink(missing_ok=True)
 
     @classmethod
     def from_pretrained(
@@ -316,26 +369,45 @@ class GrootPolicy(PreTrainedPolicy):
 
         if is_finetuned_checkpoint:
             logger.info("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
+            if config is None:
+                config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif config.pretrained_path is None:
+                # As in PreTrainedConfig.from_pretrained, so the config reads a local checkpoint's copies too.
+                config.pretrained_path = Path(model_id)
+            if os.path.isdir(model_id):
+                checkpoint_dir = model_id
+            else:
+                checkpoint_dir = snapshot_download(
+                    repo_id=model_id,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
+                    allow_patterns=f"{_BASE_CONFIG_DIR}/*",
+                )
             if force_download and not os.path.isdir(model_id):
                 # The regular load below passes force_download on, as it did before. A local folder has
                 # nothing to download, so it does not need that.
                 logger.info("force_download is set, so the checkpoint loads the regular way.")
             elif cls is GrootPolicy:
-                if config is None:
-                    config = PreTrainedConfig.from_pretrained(
-                        pretrained_name_or_path=pretrained_name_or_path,
-                        force_download=force_download,
-                        resume_download=resume_download,
-                        proxies=proxies,
-                        token=token,
-                        cache_dir=cache_dir,
-                        local_files_only=local_files_only,
-                        revision=revision,
-                        **kwargs,
-                    )
-                groot_model = cls._build_groot_model_from_checkpoint(config, model_file)
+                base_config_path = resolve_groot_base_config_path(checkpoint_dir, config.base_model_path)
+                groot_model = cls._build_groot_model_from_checkpoint(config, model_file, base_config_path)
                 if groot_model is not None:
-                    policy = cls(config, _groot_model=groot_model, **kwargs)
+                    policy = cls(
+                        config, _groot_model=groot_model, _base_config_path=base_config_path, **kwargs
+                    )
                     policy.to(config.device)
                     policy.eval()
                     return policy
@@ -345,19 +417,25 @@ class GrootPolicy(PreTrainedPolicy):
                     "%s is a subclass, so it builds its own model from the base weights before loading.",
                     cls.__name__,
                 )
-            return super().from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                config=config,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                strict=strict,
-                **kwargs,
-            )
+            # The constructor finds the copies through pretrained_path, which may name a Hub repo id or
+            # another checkpoint, so like make_policy, point it at this checkpoint's folder while it builds.
+            pretrained_path, config.pretrained_path = config.pretrained_path, Path(checkpoint_dir)
+            try:
+                return super().from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    config=config,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    strict=strict,
+                    **kwargs,
+                )
+            finally:
+                config.pretrained_path = pretrained_path
 
         # This is a base GR00T model - load it fresh
         logger.info("Detected base GR00T model, loading from HuggingFace...")
@@ -411,11 +489,11 @@ class GrootPolicy(PreTrainedPolicy):
     def _resolve_action_queue_steps(self) -> int:
         n_action_steps = int(self.config.n_action_steps)
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         execution_horizon = infer_groot_n1_7_action_execution_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         horizons = [n_action_steps]
@@ -443,7 +521,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         horizons = [available_steps]
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
+            self._base_config_path,
             self.config.embodiment_tag,
         )
         if checkpoint_action_horizon is not None:
