@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from huggingface_hub.constants import CONFIG_NAME
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, DiffuserSchedulerConfig
@@ -55,6 +56,8 @@ GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 # to the embodiment default ('libero' for 'libero_sim', otherwise None). It is distinct from an
 # explicit 'none' (resolved to None) so an opt-out survives a draccus save/load round-trip.
 GROOT_ACTION_DECODE_TRANSFORM_AUTO = "auto"
+# A fine-tune checkpoint keeps a copy of the base model's config.json in this subfolder.
+_BASE_CONFIG_DIR = "groot_base_config"
 
 _GROOT_MODEL_VERSION_ALIASES = {
     "n1.7": GROOT_N1_7,
@@ -135,66 +138,37 @@ def is_raw_groot_n1_7_checkpoint(model_path: str | Path | None) -> bool:
     return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
 
 
-def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
+def resolve_groot_base_config_path(checkpoint: str | Path | None, base_model_path: str | None) -> str | None:
+    """Return where to read the base model's config.json: the checkpoint's copy, else the base model."""
+    if checkpoint is not None:
+        copies = Path(checkpoint) / _BASE_CONFIG_DIR
+        if (copies / CONFIG_NAME).is_file():
+            return str(copies)
+    return base_model_path
+
+
+def read_groot_n1_7_action_horizons(model_path: str | Path | None) -> dict[str, int]:
+    """Return the action horizon that the processor_config.json in model_path gives each embodiment tag."""
     if model_path is None:
-        return None
-
-    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
-    processor_config = read_json(processor_config_path)
-
-    modality_configs = processor_config.get("processor_kwargs", {}).get("modality_configs", {})
-    if not isinstance(modality_configs, dict):
-        return None
-    if "libero_sim" in modality_configs:
-        return "libero_sim"
-    if len(modality_configs) == 1:
-        return next(iter(modality_configs))
-    return None
-
-
-def infer_groot_n1_7_action_horizon(
-    model_path: str | Path | None, embodiment_tag: str | None = None
-) -> int | None:
-    if model_path is None:
-        return None
-
-    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
-    processor_config = read_json(processor_config_path)
-
+        return {}
+    processor_config = read_json(Path(model_path).expanduser() / "processor_config.json")
     processor_kwargs = processor_config.get("processor_kwargs", {})
     if not isinstance(processor_kwargs, dict):
-        return None
+        return {}
     modality_configs = processor_kwargs.get("modality_configs", {})
     if not isinstance(modality_configs, dict):
-        return None
-
-    if embodiment_tag is None:
-        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
-    if embodiment_tag is None:
-        return None
-
-    embodiment_config = modality_configs.get(embodiment_tag, {})
-    if not isinstance(embodiment_config, dict):
-        return None
-    action_config = embodiment_config.get("action", {})
-    if not isinstance(action_config, dict):
-        return None
-    delta_indices = action_config.get("delta_indices", [])
-    if not isinstance(delta_indices, list):
-        return None
-    return len(delta_indices) or None
+        return {}
+    horizons = {}
+    for tag, embodiment_config in modality_configs.items():
+        action_config = embodiment_config.get("action", {}) if isinstance(embodiment_config, dict) else {}
+        delta_indices = action_config.get("delta_indices") if isinstance(action_config, dict) else None
+        if isinstance(delta_indices, list) and delta_indices:
+            horizons[tag] = len(delta_indices)
+    return horizons
 
 
-def infer_groot_n1_7_action_execution_horizon(
-    model_path: str | Path | None, embodiment_tag: str | None = None
-) -> int | None:
-    action_horizon = infer_groot_n1_7_action_horizon(model_path, embodiment_tag)
-    if action_horizon is None:
-        return None
-
-    if embodiment_tag is None:
-        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
-    if embodiment_tag == "libero_sim":
+def groot_n1_7_action_execution_horizon(action_horizon: int | None, embodiment_tag: str | None) -> int | None:
+    if action_horizon is not None and embodiment_tag == "libero_sim":
         # NVIDIA's N1.7 LIBERO rollout wrapper replans after 8 of the 16 decoded
         # actions. Keeping that execution cadence avoids stale open-loop chunks.
         return min(action_horizon, 8)
@@ -280,6 +254,8 @@ class GrootConfig(PreTrainedConfig):
     # `config.json` carries a `type` field, whereas a raw NVIDIA GR00T checkpoint has no such
     # field and so can only be loaded through `base_model_path` (`--policy.base_model_path`).
     # Defaults to GROOT_N1_7_BASE_MODEL when unset (resolved in __post_init__).
+    # A checkpoint saved by GrootPolicy also keeps the base model's config.json (in groot_base_config/) and
+    # embodiment_action_horizons, and loading it reads those instead of base_model_path.
     base_model_path: str | None = None
 
     # Optional named action transform applied after raw N1.7 checkpoint decoding and before env.step().
@@ -289,6 +265,13 @@ class GrootConfig(PreTrainedConfig):
 
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
+
+    # Derived, not a setting: how many action steps the base model's processor_config.json gives each
+    # embodiment tag. The policy writes it when it is built, so a saved fine-tune keeps it, and a config
+    # loaded with its checkpoint (pretrained_path set) uses it instead of base_model_path. Without a
+    # checkpoint, the policy reads base_model_path again and replaces it, even a value set by hand, and the
+    # dataset fails if base_model_path then gives no horizons.
+    embodiment_action_horizons: dict[str, int] | None = None
 
     # Fine-tuning control arguments
 
@@ -404,7 +387,7 @@ class GrootConfig(PreTrainedConfig):
         # wrapper applies this conversion; mirror it here so eval on the
         # 'libero_sim' embodiment grasps correctly instead of scoring 0% success.
         # This matches the embodiment-specific handling already done for the
-        # action execution horizon (see infer_groot_n1_7_action_execution_horizon).
+        # action execution horizon (see groot_n1_7_action_execution_horizon).
         # Only the 'auto' sentinel resolves to the embodiment default; an explicit
         # 'none' (normalized to None above) keeps the transform disabled.
         if self.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_AUTO:
@@ -455,6 +438,10 @@ class GrootConfig(PreTrainedConfig):
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
+            )
+        if any(horizon < 1 for horizon in (self.embodiment_action_horizons or {}).values()):
+            raise ValueError(
+                f"embodiment_action_horizons must be positive, got {self.embodiment_action_horizons}."
             )
 
     def validate_features(self) -> None:
@@ -529,13 +516,25 @@ class GrootConfig(PreTrainedConfig):
         """Return indices for delta observations (None for Groot)."""
         return None
 
+    def resolve_embodiment_action_horizons(self) -> dict[str, int]:
+        """Return each embodiment tag's action horizon, as a policy built from this config uses them."""
+        if self.pretrained_path is not None and self.embodiment_action_horizons is not None:
+            return self.embodiment_action_horizons
+        return read_groot_n1_7_action_horizons(self.base_model_path)
+
     @property
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
-        model_action_horizon = (
-            infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
-        )
-        return list(range(min(self.chunk_size, model_action_horizon)))
+        horizons = self.resolve_embodiment_action_horizons()
+        if self.embodiment_action_horizons and not horizons:
+            # For example a run resumed after its base model was deleted: lerobot-train builds the dataset
+            # before the policy that loads the checkpoint, which keeps the saved horizons.
+            raise ValueError(
+                f"base_model_path {self.base_model_path!r} gives no action horizons, but this config was "
+                f"saved with {self.embodiment_action_horizons}. Restore that base model, or set "
+                "pretrained_path to the checkpoint saved with this config."
+            )
+        return list(range(min(self.chunk_size, horizons.get(self.embodiment_tag) or 40)))
 
     @property
     def drop_n_last_frames(self) -> int:
