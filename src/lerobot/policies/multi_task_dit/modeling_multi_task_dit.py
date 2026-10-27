@@ -38,6 +38,7 @@ from torch import Tensor
 
 from lerobot.utils.import_utils import _diffusers_available, _transformers_available, require_package
 
+from ..common.ddpm_scheduler import ExportableDDPMScheduler
 from .configuration_multi_task_dit import MultiTaskDiTConfig
 from .processor_multi_task_dit import OBS_LANGUAGE_ROW_INDEX
 
@@ -683,7 +684,7 @@ class DiffusionObjective(nn.Module):
         }
 
         if config.noise_scheduler_type == "DDPM":
-            self.noise_scheduler: DDPMScheduler | DDIMScheduler = DDPMScheduler(**scheduler_kwargs)
+            self.noise_scheduler: DDPMScheduler | DDIMScheduler = ExportableDDPMScheduler(**scheduler_kwargs)
         elif config.noise_scheduler_type == "DDIM":
             self.noise_scheduler = DDIMScheduler(**scheduler_kwargs)
         else:
@@ -694,6 +695,15 @@ class DiffusionObjective(nn.Module):
             if config.num_inference_steps is not None
             else self.noise_scheduler.config.num_train_timesteps
         )
+
+    @property
+    def num_inference_steps(self) -> int:
+        return self.noise_scheduler.num_inference_steps
+
+    @num_inference_steps.setter
+    def num_inference_steps(self, value: int) -> None:
+        # Here, not in the traced sampling call, where the timesteps could not be read back as ints.
+        self.noise_scheduler.set_timesteps(value)
 
     def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
         clean_actions = batch[ACTION]
@@ -738,8 +748,7 @@ class DiffusionObjective(nn.Module):
             )
         sample = noise.to(device=device, dtype=dtype)
 
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.noise_scheduler.timesteps:
+        for t in self.noise_scheduler.timesteps.tolist():
             model_output = model(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
