@@ -290,6 +290,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             noise (Tensor | None): Optional starting action sample of shape
                 `[B, action_horizon, action_dim]`. When None, each sample draws it with
                 the seed in `batch["seed"]`, or `config.inference_seed` if the batch has none.
+                torch.export needs it, so the exported program takes its noise as an input.
 
         Returns:
             Tensor: Action chunk with shape `[B, action_horizon, action_dim]`.
