@@ -143,7 +143,8 @@ class VQBeTPolicy(PreTrainedPolicy):
 
         self._queues = populate_queues(self._queues, batch)
 
-        if not self.vqbet.action_head.vqvae_model.discretized.item():
+        # torch.export cannot branch on the buffer value.
+        if not torch.compiler.is_compiling() and not self.vqbet.action_head.vqvae_model.discretized.item():
             warnings.warn(
                 "To evaluate in the environment, your VQ-BeT model should contain a pretrained Residual VQ.",
                 stacklevel=1,
