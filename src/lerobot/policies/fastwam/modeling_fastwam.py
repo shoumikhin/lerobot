@@ -287,9 +287,12 @@ class FastWAMPolicy(PreTrainedPolicy):
         Args:
             batch (dict[str, Tensor]): Inference batch with `input_image` or
                 image observation keys, plus `context/context_mask` or `prompt`.
+                torch.export needs `context/context_mask`.
             noise (Tensor | None): Optional starting action sample of shape
                 `[B, action_horizon, action_dim]`. When None, each sample draws it with
                 the seed in `batch["seed"]`, or `config.inference_seed` if the batch has none.
+                torch.export needs it, so the exported program takes its noise as an input. Only
+                non-strict export checks this; strict export without it fails inside the generator.
 
         Returns:
             Tensor: Action chunk with shape `[B, action_horizon, action_dim]`.
