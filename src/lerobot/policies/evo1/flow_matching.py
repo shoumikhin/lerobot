@@ -20,6 +20,7 @@ import math
 import torch
 import torch.nn as nn
 
+from ..common.export_utils import is_non_strict_exporting
 from ..common.flow_matching import (
     FlowConvention,
     euler_integrate,
@@ -95,8 +96,9 @@ class CategorySpecificLinear(nn.Module):
                 raise ValueError(
                     f"category_id length {category_id.numel()} does not match flattened batch {x_flat.size(0)}"
                 )
-            weight_selected = self.weight[category_id]
-            bias_selected = self.bias[category_id]
+            # Unlike indexing, index_select rejects negative ids, also in an exported program.
+            weight_selected = self.weight.index_select(0, category_id)
+            bias_selected = self.bias.index_select(0, category_id)
             out = torch.bmm(x_flat.unsqueeze(1), weight_selected).squeeze(1) + bias_selected
         out_shape = orig_shape[:-1] + (out.shape[-1],)
         return out.view(out_shape)
@@ -305,8 +307,11 @@ class FlowmatchingActionHead(nn.Module):
         device = fused_tokens.device
         if embodiment_id is None:
             embodiment_id = torch.zeros(batch_size, dtype=torch.long, device=device)
-        elif self.num_categories > 1 and (
-            int(embodiment_id.min()) < 0 or int(embodiment_id.max()) >= self.num_categories
+        elif (
+            self.num_categories > 1
+            # torch.export cannot read the ids; an out-of-range id still fails in CategorySpecificLinear.
+            and not is_non_strict_exporting()
+            and (int(embodiment_id.min()) < 0 or int(embodiment_id.max()) >= self.num_categories)
         ):
             raise ValueError(
                 f"embodiment ids must be in [0, num_categories={self.num_categories}), "
