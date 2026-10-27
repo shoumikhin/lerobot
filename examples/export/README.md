@@ -174,9 +174,20 @@ Orin Nano:
 
 ExecuTorch-TensorRT and Torch-TensorRT build the same TensorRT engines, so their accuracy is the same up to the kernels TensorRT picks in each build. `torch.compile` changes its actions a little from one compile to the next: SmolVLA's 95th percentile on Thor ranged from 0.9 to 1.4 degrees over four compiles. Each cell comes from one build. The reference ran on Thor: in float32, pi0.5 and GR00T do not fit on the Orin Nano.
 
+### pi0, on an H100
+
+pi0 was exported with `to_executorch_tensorrt.py` and measured with `benchmark.py` on an NVIDIA H100, not on a Jetson, with the checkpoint `lerobot/pi0_base`. No dataset has its cameras, so the frames are 50 random ones shaped like its inputs, made with `frame_from_policy` from `common.py`. Times are the median of three runs. Error is the mean / 95th percentile of each frame's largest difference from the original policy in float32. `lerobot/pi0_base` saves no normalization statistics, so its actions, and the errors, are in the policy's normalized units.
+
+|                     | ExecuTorch-TensorRT |       PyTorch |
+| ------------------- | ------------------: | ------------: |
+| Time per chunk (ms) |            **42.9** |         176.4 |
+| Error               |       0.002 / 0.005 | 0.003 / 0.007 |
+
+Measured with PyTorch 2.16.0.dev20261026, TensorRT 11.4.0.106, and ExecuTorch 1.6.0 and Torch-TensorRT 2.16.0.dev0 built from source.
+
 ### Reproduce
 
-Run each step on the board you measure, except the reference: it is the same on every board, so run it once where the policy fits in float32. For SmolVLA, pi0.5 and GR00T, give `benchmark.py pytorch` and `torch.compile` the same extra arguments as the export script.
+Run each step on the board you measure, except the reference: it is the same on every board, so run it once where the policy fits in float32. For SmolVLA, pi0, pi0.5 and GR00T, give `benchmark.py pytorch` and `torch.compile` the same extra arguments as the export script.
 
 ```bash
 # 50 frames from the dataset
