@@ -53,6 +53,7 @@ from lerobot.processor import (
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
+# The policies with their own recipe module; `generic` exports the others it knows.
 POLICIES = ("act", "smolvla", "pi05", "groot")
 TEST = "test.safetensors"
 # Rows of a token embedding table written at a time: 16 MiB of a 2048-wide bfloat16 table.
@@ -111,11 +112,10 @@ def parse_args(
     recipe = None
     if policy_path is not None:
         policy_type = PreTrainedConfig.from_pretrained(policy_path).type
-        if policy_type not in POLICIES:
-            raise SystemExit(
-                f"No export recipe for {policy_type!r} policies; supported: {', '.join(POLICIES)}."
-            )
-        recipe = importlib.import_module(policy_type)
+        recipe = importlib.import_module(policy_type if policy_type in POLICIES else "generic")
+        if recipe.__name__ == "generic" and policy_type not in recipe.SPECS:
+            supported = ", ".join((*POLICIES, *recipe.SPECS))
+            raise SystemExit(f"No export recipe for {policy_type!r} policies; supported: {supported}.")
         parser.add_argument(
             "--tolerance",
             type=float,

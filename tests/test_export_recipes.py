@@ -43,7 +43,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "export"
 def recipes(monkeypatch):
     monkeypatch.syspath_prepend(str(EXAMPLES))
     yield
-    for name in ("common", "act", "smolvla", "pi05", "groot"):
+    for name in ("common", "act", "smolvla", "generic", "pi05", "groot"):
         sys.modules.pop(name, None)
 
 
@@ -336,26 +336,97 @@ def test_smolvla_recipe_runs_a_checkpoint_saved_with_compile_model_uncompiled(re
     assert "sample_actions" not in vars(exporter.policy.model)
 
 
+def use_four_layer_gemma(monkeypatch, modeling):
+    """Give the PaliGemma policy in `modeling` a four-layer Gemma, so a chain splits it into two groups."""
+    from tests.policies.pi0_pi05.utils.meta_load import use_tiny_backbone
+
+    use_tiny_backbone(monkeypatch, modeling)
+    tiny = modeling.GemmaConfig(width=16, depth=4, mlp_dim=32, num_heads=1, num_kv_heads=1, head_dim=16)
+    monkeypatch.setattr(modeling, "get_gemma_config", lambda variant: tiny)
+    paligemma = modeling.PaliGemmaForConditionalGenerationWithPiGemma
+
+    def small_projector(config):
+        # The policy fixes the image projector at Gemma 2B's width; the four-layer Gemma here is narrower.
+        config.vision_config.projection_dim = tiny.width
+        config.vision_config.intermediate_size = 32
+        return paligemma(config=config)
+
+    monkeypatch.setattr(modeling, "PaliGemmaForConditionalGenerationWithPiGemma", small_projector)
+
+
+def pi0_checkpoint(path, monkeypatch):
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.pi0 import PI0Config, PI0Policy, modeling_pi0
+
+    use_four_layer_gemma(monkeypatch, modeling_pi0)
+    torch.manual_seed(0)
+    config = PI0Config(
+        device="cpu",
+        image_resolution=(28, 28),
+        chunk_size=4,
+        n_action_steps=2,
+        max_state_dim=8,
+        max_action_dim=8,
+        num_inference_steps=2,
+        empty_cameras=1,
+        input_features={
+            "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 28, 28)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+        },
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
+    )
+    PI0Policy(config).save_pretrained(path)
+    stats = {key: {"mean": torch.zeros(3), "std": torch.ones(3)} for key in ("observation.state", "action")}
+    for processor in make_pre_post_processors(config, dataset_stats=stats):
+        processor.save_pretrained(path)
+    return path
+
+
+@require_hf_token
+def test_pi0_exports_through_the_generic_recipe_and_reproduces_its_test(recipes, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    args = Namespace(
+        policy_path=str(pi0_checkpoint(tmp_path / "checkpoint", monkeypatch)),
+        output_dir=tmp_path / "folder",
+        tolerance=1e-4,
+        route="executorch_tensorrt",
+        task="pick up the cube",
+    )
+    args.output_dir.mkdir()
+    # The engine starts only if the program reproduces the actions the PyTorch policy computed for its test.
+    export_with_replay("generic", args, monkeypatch)
+    info = __import__("json").loads((args.output_dir / "export.json").read_text())
+    assert info["inputs"] == ["observation.images.base_0_rgb", "observation.state", "noise"]
+    assert info["task"] == "pick up the cube"
+
+
+@require_hf_token
+def test_generic_recipe_refuses_a_policy_that_draws_its_own_random_numbers(recipes, tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+    from lerobot.policies.pi0 import PI0Policy
+
+    checkpoint = pi0_checkpoint(tmp_path / "checkpoint", monkeypatch)
+    predict = PI0Policy.predict_action_chunk
+    monkeypatch.setattr(
+        PI0Policy,
+        "predict_action_chunk",
+        lambda self, batch, **kw: predict(self, batch, **kw).add(torch.rand(1)),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    generic = importlib.import_module("generic")
+    with pytest.raises(SystemExit, match="another chunk from the same frame and noise"):
+        generic.Exporter(Namespace(policy_path=str(checkpoint), task="pick up the cube"))
+
+
 def pi05_checkpoint(
     path, monkeypatch, dtype=torch.float32, cameras=("observation.images.base_0_rgb",), empty_cameras=0
 ):
     """A pi0.5 checkpoint with a four-layer Gemma, so the chain splits its language model into two groups."""
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05
-    from tests.policies.pi0_pi05.utils.meta_load import save_checkpoint, use_tiny_backbone
+    from tests.policies.pi0_pi05.utils.meta_load import save_checkpoint
 
-    use_tiny_backbone(monkeypatch, modeling_pi05)
-    tiny = modeling_pi05.GemmaConfig(width=16, depth=4, mlp_dim=32, num_heads=1, num_kv_heads=1, head_dim=16)
-    monkeypatch.setattr(modeling_pi05, "get_gemma_config", lambda variant: tiny)
-    paligemma = modeling_pi05.PaliGemmaForConditionalGenerationWithPiGemma
-
-    def small_projector(config):
-        # pi0.5 fixes the image projector at Gemma 2B's width; the four-layer Gemma here is narrower.
-        config.vision_config.projection_dim = tiny.width
-        config.vision_config.intermediate_size = 32
-        return paligemma(config=config)
-
-    monkeypatch.setattr(modeling_pi05, "PaliGemmaForConditionalGenerationWithPiGemma", small_projector)
+    use_four_layer_gemma(monkeypatch, modeling_pi05)
     config = PI05Config(
         device="cpu",
         dtype=dtype,
