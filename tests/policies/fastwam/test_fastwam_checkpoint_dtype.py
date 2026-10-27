@@ -113,6 +113,22 @@ def training_batch():
 
 
 @pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
+def test_compiled_action_inference_matches_eager(offline_components, monkeypatch, flags):
+    # compile_action_infer compiles with fullgraph=True, which fails on any size read back from a tensor.
+    # The eager backend checks exactly that, without the cost of Inductor.
+    compile_fn = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: compile_fn(fn, backend="eager", fullgraph=True))
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.float32, compile_action_infer=True, **flags)).eval()
+    batch, noise = training_batch(), torch.randn(1, 8, 3)
+    with torch.no_grad():
+        compiled = policy.predict_action_chunk(batch, noise=noise)
+        policy.config.compile_action_infer = False
+        eager = policy.predict_action_chunk(batch, noise=noise)
+    torch.testing.assert_close(compiled, eager)
+
+
+@pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
 @pytest.mark.parametrize(
     "device,dtype",
     [
