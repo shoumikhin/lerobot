@@ -34,6 +34,7 @@ from lerobot.policies.fastwam import modeling_fastwam
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
 from lerobot.policies.fastwam.wan import LiteKVFusion
+from lerobot.policies.fastwam.wan.modular import FastWAM
 
 DOT_FLAGS = {
     "action_expert_layers": 1,
@@ -110,6 +111,34 @@ def training_batch():
         "context_mask": torch.ones(1, 4, dtype=torch.bool),
         "action": torch.randn(1, 32, 3),
     }
+
+
+@pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
+def test_compiled_action_inference_matches_eager(offline_components, monkeypatch, flags):
+    # compile_action_infer compiles with fullgraph=True, which fails on any size read back from a tensor.
+    # The eager backend checks exactly that, without the cost of Inductor.
+    compile_fn = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: compile_fn(fn, backend="eager", fullgraph=True))
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.float32, compile_action_infer=True, **flags)).eval()
+    batch, noise = training_batch(), torch.randn(1, 8, 3)
+    with torch.no_grad():
+        compiled = policy.predict_action_chunk(batch, noise=noise)
+        policy.config.compile_action_infer = False
+        eager = policy.predict_action_chunk(batch, noise=noise)
+    torch.testing.assert_close(compiled, eager)
+
+
+def test_encode_prompt_zeroes_padding_on_either_side():
+    mask = torch.tensor([[True, True, True, False], [False, True, True, True]])
+    owner = SimpleNamespace(
+        device=torch.device("cpu"),
+        tokenizer=lambda prompt, **kw: (torch.zeros(mask.shape, dtype=torch.long), mask),
+        text_encoder=lambda ids, mask: torch.ones(*mask.shape, 2),
+    )
+    emb, context_mask = FastWAM.encode_prompt(owner, ["right padded", "left padded"])
+    assert torch.equal(emb, mask.unsqueeze(-1).expand(-1, -1, 2).float())
+    assert context_mask.all()
 
 
 @pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
