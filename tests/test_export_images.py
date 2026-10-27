@@ -111,7 +111,7 @@ def test_runtime_resizes_both_startup_and_live_frames(tmp_path, monkeypatch):
         "route": "torch_tensorrt",
         "programs": {"model": {"file": "model.pt2", "inputs": list(frame), "outputs": ["action"]}},
         "inputs": list(frame),
-        "test_case": "case.safetensors",
+        "test": "test.safetensors",
         "tolerance": 0,
         "image_resize": {
             "cameras": ["observation.images.camera"],
@@ -123,7 +123,7 @@ def test_runtime_resizes_both_startup_and_live_frames(tmp_path, monkeypatch):
         },
     }
     (tmp_path / "export.json").write_text(json.dumps(info))
-    save_file({**frame, "expected_actions": expected}, tmp_path / "case.safetensors")
+    save_file({**frame, "expected_actions": expected}, tmp_path / "test.safetensors")
     calls = []
 
     def program(camera, joints):

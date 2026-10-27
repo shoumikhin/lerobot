@@ -54,7 +54,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 POLICIES = ("act", "smolvla", "pi05", "groot")
-TEST_CASE = "test_case.safetensors"
+TEST = "test.safetensors"
 # Rows of a token embedding table written at a time: 16 MiB of a 2048-wide bfloat16 table.
 TABLE_ROWS_PER_WRITE = 4096
 # The random test images are blends of a coarse grid of random colors (rows, columns).
@@ -194,7 +194,7 @@ def write_folder(
     if noise is not None:
         case[NOISE] = noise.cpu().numpy()
         info["noise_shape"] = list(noise.shape)
-    save_file(case, args.output_dir / TEST_CASE)
+    save_file(case, args.output_dir / TEST)
     config.save_pretrained(args.output_dir)
     info = {
         "route": args.route,
@@ -204,7 +204,7 @@ def write_folder(
             *([CAMERAS_PRESENT] if "optional_cameras" in info else []),
             *([NOISE] if noise is not None else []),
         ],
-        "test_case": TEST_CASE,
+        "test": TEST,
         "tolerance": args.tolerance,
         **info,
     }

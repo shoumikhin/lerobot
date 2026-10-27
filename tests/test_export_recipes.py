@@ -132,7 +132,7 @@ def act_checkpoint(path):
     return path
 
 
-def test_act_exports_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch):
+def test_act_exports_and_reproduces_its_test(recipes, tmp_path, monkeypatch):
     checkpoint = act_checkpoint(tmp_path / "checkpoint")
     args = Namespace(
         policy_path=str(checkpoint), output_dir=tmp_path / "folder", tolerance=1e-5, route="onnx_tensorrt"
@@ -151,7 +151,7 @@ def test_act_exports_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch
     assert all(action.shape == (3,) for action in actions)
 
 
-def test_test_case_images_change_smoothly_like_a_camera_image(recipes):
+def test_test_images_change_smoothly_like_a_camera_image(recipes):
     """Random pixels make a vision-language policy's bfloat16 actions swing, so the test case avoids them."""
 
     from common import IMAGE_CELLS, frame_from_policy
@@ -262,7 +262,7 @@ def smolvla_checkpoint(path, vlm):
     return path
 
 
-def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test_case(recipes, tmp_path, monkeypatch):
+def test_smolvla_exports_for_the_robots_cameras_and_reproduces_its_test(recipes, tmp_path, monkeypatch):
     pytest.importorskip("transformers")
     vlm = tiny_smolvlm(tmp_path / "vlm")
     checkpoint = smolvla_checkpoint(tmp_path / "checkpoint", vlm)
@@ -423,7 +423,7 @@ def test_pi05_chain_reproduces_the_policy_for_any_task(
     assert info["steps"] == ["step"] and info["timesteps"] == [1.0, 0.5]
 
     case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
-        args.output_dir / "test_case.safetensors"
+        args.output_dir / "test.safetensors"
     )
     policy = PI05Policy.from_pretrained(checkpoint, config=config).eval()
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(checkpoint))
@@ -488,7 +488,7 @@ def test_pi05_runs_any_cameras_the_robot_sends_as_the_policy_does(
     info = __import__("json").loads((args.output_dir / "export.json").read_text())
     assert info["optional_cameras"] == list(exported or cameras)
     case = __import__("safetensors.numpy", fromlist=["load_file"]).load_file(
-        args.output_dir / "test_case.safetensors"
+        args.output_dir / "test.safetensors"
     )
     frame = {name: case[name] for name in (*sent, "observation.state")}
     np.random.seed(0)

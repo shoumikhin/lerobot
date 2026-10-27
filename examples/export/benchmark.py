@@ -209,7 +209,7 @@ def measure_engine(executor: str, program, args: argparse.Namespace, folder: Pat
     from safetensors.numpy import load_file
 
     info = json.loads((folder / "export.json").read_text())
-    chunk_size = len(load_file(folder / info["test_case"])["expected_actions"])
+    chunk_size = len(load_file(folder / info["test"])["expected_actions"])
     frames = load_frames(args.frames)
     if args.duration is not None:
         # A frame is a view of every frame, so only a copy lets the others go before memory is measured.
@@ -276,7 +276,7 @@ def write_reference(argv: list[str]) -> None:
     info = json.loads((args.folder / "export.json").read_text())
     # The engine gives the programs only these, so a camera the export left out stays out of the reference too.
     names = [name for name in info["inputs"] if name not in (NOISE, CAMERAS_PRESENT)]
-    chunk_size = len(load_file(args.folder / info["test_case"])["expected_actions"])
+    chunk_size = len(load_file(args.folder / info["test"])["expected_actions"])
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     config.device = str(device())
     config.use_amp = False

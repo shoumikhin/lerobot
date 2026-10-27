@@ -164,12 +164,10 @@ def test_reference_loads_the_checkpoint_in_float32_whatever_dtype_it_names(examp
         "inputs": [camera, "observation.state", "noise"],
         "noise_shape": [config.chunk_size, config.max_action_dim],
         "task": "pick up the cube",
-        "test_case": "test_case.safetensors",
+        "test": "test.safetensors",
     }
     (folder / "export.json").write_text(json.dumps(info))
-    save_file(
-        {"expected_actions": np.zeros((config.n_action_steps, 3), np.float32)}, folder / info["test_case"]
-    )
+    save_file({"expected_actions": np.zeros((config.n_action_steps, 3), np.float32)}, folder / info["test"])
     frames = {
         camera: np.full((1, 28, 28, 3), 127, np.uint8),
         "observation.state": np.zeros((1, 3), np.float32),
@@ -548,12 +546,12 @@ def test_torch_compile_starts_one_cuda_graph_generation_per_chunk_of_a_chain(exa
 
         def write(self, programs):
             case = {"state": state, "expected_actions": np.stack([state + 1, 2 * state + 2])}
-            save_file(case, self.args.output_dir / "case.safetensors")
+            save_file(case, self.args.output_dir / "test.safetensors")
             info = {
                 "route": "fake",
                 "programs": programs,
                 "inputs": ["state"],
-                "test_case": "case.safetensors",
+                "test": "test.safetensors",
             }
             (self.args.output_dir / "export.json").write_text(json.dumps({**info, "tolerance": 1e-6}))
 
@@ -616,6 +614,8 @@ def test_torch_compile_compiles_in_the_benchmark_process(examples, tmp_path, mon
     benchmark.torch_engine("torch.compile", argv, tmp_path)
     # More than one thread starts worker processes that stay alive while the memory is measured.
     assert threads == [1]
+
+
 def test_duration_runs_warm_chunks_between_its_two_lines(examples, tmp_path, capsys):
     from argparse import Namespace
 

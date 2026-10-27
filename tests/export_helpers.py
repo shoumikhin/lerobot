@@ -27,13 +27,13 @@ def write_export_folder(folder: Path, expected_actions) -> None:
 
     frame = {"observation.state": np.arange(3, dtype=np.float32)}
     save_file(
-        {**frame, "expected_actions": np.asarray(expected_actions, np.float32)}, folder / "case.safetensors"
+        {**frame, "expected_actions": np.asarray(expected_actions, np.float32)}, folder / "test.safetensors"
     )
     info = {
         "route": "fake",
         "programs": {"model": {"file": "model.bin", "inputs": ["observation.state"], "outputs": ["action"]}},
         "inputs": ["observation.state"],
-        "test_case": "case.safetensors",
+        "test": "test.safetensors",
         "tolerance": 0.5,
     }
     (folder / "export.json").write_text(json.dumps(info))

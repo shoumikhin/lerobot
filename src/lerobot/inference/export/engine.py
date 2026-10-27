@@ -167,8 +167,8 @@ class ExportInferenceEngine(InferenceEngine):
         self._frame_names = [name for name in info["inputs"] if name != NOISE]
         self._optional_cameras: list[str] = info.get("optional_cameras", [])
         # What a camera the robot does not send gives the programs: a blank image of the test case's shape.
-        test_case = load_file(folder / info["test_case"])
-        self._blank_cameras = {name: np.zeros_like(test_case[name]) for name in self._optional_cameras}
+        test = load_file(folder / info["test"])
+        self._blank_cameras = {name: np.zeros_like(test[name]) for name in self._optional_cameras}
         self._noise_shape = tuple(info["noise_shape"]) if "noise_shape" in info else None
         self._image_resize = info.get("image_resize")
         self._rename = rename_map or {}
@@ -177,7 +177,7 @@ class ExportInferenceEngine(InferenceEngine):
         self._prompt_task: str | None = None
         # The test case was computed for the task the folder was exported with.
         self._use_task(self._prompt.task if self._prompt is not None else task)
-        self._check(folder / info["test_case"], info["tolerance"])
+        self._check(folder / info["test"], info["tolerance"])
         self._use_task(task)
         logger.info("Exported policy loaded from %s (%s)", folder, info["route"])
 

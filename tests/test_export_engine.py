@@ -247,11 +247,11 @@ def test_engine_feeds_the_raw_frame_and_fresh_noise_and_plays_the_chunk(tmp_path
         inputs=[*names, "noise"],
         noise_shape=[4, 3],
         task="pick",
-        test_case="case.safetensors",
+        test="test.safetensors",
         tolerance=0.0,
     )
     (tmp_path / "export.json").write_text(json.dumps(info))
-    save_file({**frame, "noise": noise, "expected_actions": expected}, tmp_path / "case.safetensors")
+    save_file({**frame, "noise": noise, "expected_actions": expected}, tmp_path / "test.safetensors")
     calls = []
 
     def program(*arrays):
@@ -373,7 +373,7 @@ def test_export_engine_plays_one_chunk_one_action_per_call(tmp_path, cpu_export_
     assert len(engine.inference_times) == 2
 
 
-def test_export_engine_refuses_a_program_that_misses_its_test_case(tmp_path, cpu_export_engine):
+def test_export_engine_refuses_a_program_that_misses_its_test(tmp_path, cpu_export_engine):
     write_export_folder(tmp_path, [[0, 1, 2], [0, 9, 9]])
     with pytest.raises(RuntimeError, match="does not reproduce its test case"):
         cpu_export_engine(tmp_path)

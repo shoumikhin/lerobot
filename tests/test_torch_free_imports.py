@@ -151,7 +151,7 @@ def write_folder(folder, route, camera):
         "noise_shape": [2, 3],
         "steps": ["step"],
         "timesteps": [1.0, 0.5],
-        "test_case": "case.safetensors",
+        "test": "test.safetensors",
         "tolerance": 0.0,
     }
     if camera:
@@ -174,7 +174,7 @@ def write_folder(folder, route, camera):
         "action_feature_names": ["motor_1.pos", "motor_2.pos", "motor_3.pos"],
     }))
     case = {**frame, "noise": np.zeros((2, 3), np.float32), "expected_actions": ACTIONS}
-    save_file(case, folder / "case.safetensors")
+    save_file(case, folder / "test.safetensors")
     return frame
 
 
