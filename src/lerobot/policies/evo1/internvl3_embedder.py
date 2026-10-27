@@ -27,9 +27,10 @@ from lerobot.utils.device_utils import auto_select_torch_device
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
     from transformers.utils import is_flash_attn_2_available
 else:
+    AutoConfig = None
     AutoModel = None
     AutoTokenizer = None
     is_flash_attn_2_available = None
@@ -141,8 +142,23 @@ class InternVL3Embedder(nn.Module):
                 "Flash Attention 2 is unavailable on this runtime. Falling back to eager attention."
             )
 
+        config = AutoConfig.from_pretrained(model_name, **hub_kwargs)
+        text_config = config.text_config
+        rope_parameters = text_config.rope_parameters
+        # Below max_position_embeddings dynamic RoPE equals default RoPE, and export cannot trace its update.
+        if (
+            rope_parameters.get("rope_type") == "dynamic"
+            and max_text_length <= text_config.max_position_embeddings
+        ):
+            text_config.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": rope_parameters["rope_theta"],
+                "partial_rotary_factor": rope_parameters.get("partial_rotary_factor", 1.0),
+            }
+
         self.model = AutoModel.from_pretrained(
             model_name,
+            config=config,
             torch_dtype=model_dtype,
             attn_implementation=attn_implementation,
             low_cpu_mem_usage=True,
