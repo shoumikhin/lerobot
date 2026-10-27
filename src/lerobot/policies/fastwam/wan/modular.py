@@ -390,7 +390,7 @@ class MoTLayer(nn.Module):
         self,
         name: str,
         x: torch.Tensor,
-        freqs: torch.Tensor | dict[str, torch.Tensor],
+        freqs: torch.Tensor | dict[str, Any],
         t_mod: torch.Tensor,
     ):
         """Build this expert's attention tensors and post-block states for the layer.
@@ -902,7 +902,7 @@ class MoT(nn.Module):
     def prepare_action_kv_context(
         self,
         video_kv_cache: list[dict[str, torch.Tensor]],
-        video_freqs: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        video_freqs: torch.Tensor | dict[str, Any] | None = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prepare the per-action-layer video K/V context from the prefilled cache.
 
@@ -1261,11 +1261,9 @@ class FastWAM(torch.nn.Module):
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
         # Match FastWAM/Wan2.2 context semantics: padding embeddings are zeroed,
         # while cross-attention still sees a fixed-length context.
+        prompt_emb = prompt_emb.masked_fill(~mask.unsqueeze(-1), 0)
         mask = torch.ones_like(mask)
         return prompt_emb.to(device=self.device), mask
 
