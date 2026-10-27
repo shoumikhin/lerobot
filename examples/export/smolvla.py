@@ -27,54 +27,23 @@ import torch
 from common import (
     NOISE,
     Part,
+    TaskChunk,
     add_dataset_arguments,
     dataset_frame,
     device,
     processors,
     renamed_inputs,
-    to_policy_input,
     write_folder,
 )
-from torch import Tensor, nn
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.processor import NewLineTaskProcessorStep, PolicyProcessorPipeline, TokenizerProcessorStep
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+from lerobot.processor import NewLineTaskProcessorStep, TokenizerProcessorStep
+from lerobot.utils.constants import ACTION
 
 # TensorRT reorders bfloat16 math, so actions drift by up to about 4; wrong noise gives 13 or more.
 TOLERANCE = 5.0
-
-
-class SmolVLAChunk(nn.Module):
-    """One action chunk: the robot's frame and the noise in, the actions to play out, in robot units."""
-
-    def __init__(
-        self,
-        policy: SmolVLAPolicy,
-        preprocessor: PolicyProcessorPipeline,
-        postprocessor: PolicyProcessorPipeline,
-        frame_names: list[str],
-        prompt: dict[str, Tensor],
-    ):
-        super().__init__()
-        self.policy = policy
-        self.preprocessor = preprocessor
-        self.postprocessor = postprocessor
-        self.frame_names = frame_names
-        self.register_buffer("tokens", prompt[OBS_LANGUAGE_TOKENS])
-        self.register_buffer("attention_mask", prompt[OBS_LANGUAGE_ATTENTION_MASK])
-
-    def forward(self, *inputs: Tensor) -> Tensor:
-        *frame, noise = inputs
-        observation = {
-            name: to_policy_input(name, x) for name, x in zip(self.frame_names, frame, strict=True)
-        }
-        observation[OBS_LANGUAGE_TOKENS] = self.tokens
-        observation[OBS_LANGUAGE_ATTENTION_MASK] = self.attention_mask
-        actions = self.policy.predict_action_chunk(self.preprocessor(observation), noise=noise[None])
-        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -108,13 +77,13 @@ class Exporter:
         self.expected_actions = self.rollout_actions()
 
     def parts(self) -> Iterator[Part]:
-        preprocessor, postprocessor = processors(self.policy.config, self.args.policy_path)
-        text = [
-            s for s in preprocessor.steps if isinstance(s, NewLineTaskProcessorStep | TokenizerProcessorStep)
-        ]
-        prompt = PolicyProcessorPipeline(steps=text)(self.observation())
-        tensor_steps = PolicyProcessorPipeline(steps=[s for s in preprocessor.steps if s not in text])
-        module = SmolVLAChunk(self.policy, tensor_steps, postprocessor, list(self.frame), prompt)
+        module = TaskChunk(
+            self.policy,
+            *processors(self.policy.config, self.args.policy_path),
+            list(self.frame),
+            self.observation(),
+            text_steps=(NewLineTaskProcessorStep, TokenizerProcessorStep),
+        )
         inputs = (*(torch.from_numpy(x).to(device()) for x in self.frame.values()), self.noise)
         yield Part("model", module, inputs, [*self.frame, NOISE], [ACTION])
 

@@ -268,6 +268,44 @@ def to_policy_input(name: str, x: Tensor) -> Tensor:
     return x.unsqueeze(0)
 
 
+class TaskChunk(nn.Module):
+    """One action chunk of a policy, for one task: the robot's frame and the noise in, the actions to play out,
+    in robot units.
+
+    A program cannot tokenize, so the preprocessor's `text_steps` run here once, on `observation`'s task, and
+    the module holds what they add to the frame, such as the token ids, as constants, which ties the folder
+    to that task. The program runs the other steps.
+    """
+
+    def __init__(
+        self,
+        policy: nn.Module,
+        preprocessor: PolicyProcessorPipeline,
+        postprocessor: PolicyProcessorPipeline,
+        frame_names: list[str],
+        observation: dict,
+        text_steps: tuple[type, ...],
+    ):
+        super().__init__()
+        text = [s for s in preprocessor.steps if isinstance(s, text_steps)]
+        prompt = PolicyProcessorPipeline(steps=text)(observation)
+        self.policy = policy
+        self.preprocessor = PolicyProcessorPipeline(steps=[s for s in preprocessor.steps if s not in text])
+        self.postprocessor = postprocessor
+        self.frame_names = frame_names
+        self.constants = {name: value for name, value in prompt.items() if name not in frame_names}
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        *frame, noise = inputs
+        observation = {
+            name: to_policy_input(name, x) for name, x in zip(self.frame_names, frame, strict=True)
+        }
+        actions = self.policy.predict_action_chunk(
+            self.preprocessor({**observation, **self.constants}), noise=noise[None]
+        )
+        return self.postprocessor(actions[:, : self.policy.config.n_action_steps])[0]
+
+
 def random_image(height: int, width: int, channels: int) -> np.ndarray:
     """A random uint8 HWC image that changes smoothly across the frame, as a camera's image does.
 
