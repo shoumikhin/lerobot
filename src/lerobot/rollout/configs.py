@@ -26,6 +26,7 @@ import draccus
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
+from lerobot.inference.export import ExportBundle, is_export_bundle
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
@@ -283,6 +284,8 @@ class RolloutConfig:
 
     # Policy (loaded from --policy.path via __post_init__)
     policy: PreTrainedConfig | None = None
+    # Set instead of `policy` when --policy.path is a bundle written by lerobot-export.
+    export: ExportBundle | None = field(default=None, init=False, repr=False)
 
     # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger|episodic,
     # or any name registered by a third-party package)
@@ -413,13 +416,27 @@ class RolloutConfig:
             pretrained_revision = parser.parse_arg("pretrained_revision", cli_overrides)
             if pretrained_revision is None:
                 pretrained_revision = parser.parse_arg("pretrained_revision", yaml_overrides)
-            self.policy = PreTrainedConfig.from_pretrained(
-                policy_path,
-                revision=pretrained_revision,
-                cli_overrides=policy_overrides,
-            )
-            self.policy.pretrained_path = policy_path
-        if self.policy is None and not remote:
+            if is_export_bundle(policy_path):
+                if (
+                    policy_overrides
+                    or not isinstance(self.inference, SyncInferenceConfig)
+                    or self.use_torch_compile
+                    or self.device is not None
+                ):
+                    raise ValueError(
+                        "An exported policy runs as it was compiled: with sync inference, on the device it was "
+                        "compiled for. Drop the --policy.* overrides, --inference.type, --use_torch_compile "
+                        "and --device."
+                    )
+                self.export = ExportBundle.read(policy_path)
+            else:
+                self.policy = PreTrainedConfig.from_pretrained(
+                    policy_path,
+                    revision=pretrained_revision,
+                    cli_overrides=policy_overrides,
+                )
+                self.policy.pretrained_path = policy_path
+        if self.policy is None and self.export is None and not remote:
             raise ValueError("--policy.path is required for rollout")
 
         # --- Task resolution ---
@@ -437,7 +454,7 @@ class RolloutConfig:
         # Resolve device from the policy config when not explicitly set so all
         # components (policy.to, preprocessor, inference engine) use the same
         # device string instead of inconsistent fallbacks.
-        if remote:
+        if remote or self.export is not None:
             return
         if self.device is None or not is_torch_device_available(self.device):
             resolved = self.policy.device
