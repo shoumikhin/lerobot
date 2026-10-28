@@ -696,7 +696,7 @@ def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
     policy.predict_action_chunk(obs)
 
     def velocity(samples, t):  # a stand-in for the DiT
-        return {"x": samples["x"] * t}
+        return {"x": samples["x"] * float(t)}
 
     class EulerSampler(nn.Module):
         def forward(self, x):
