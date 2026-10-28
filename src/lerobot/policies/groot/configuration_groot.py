@@ -327,6 +327,9 @@ class GrootConfig(PreTrainedConfig):
     # the backbone transparently falls back to SDPA, which is numerically equivalent.
     # Set to True only after installing a flash-attn build matching your torch/CUDA env.
     use_flash_attention: bool = False
+    # Compute the Qwen3-VL image grid metadata on the first call and reuse it, which torch.export needs.
+    # Only valid when the camera image sizes never change.
+    precompute_grid_thw: bool = False
 
     # Enable GR00T-style state-relative action chunks (action chunk expressed relative to the current
     # observation state).
