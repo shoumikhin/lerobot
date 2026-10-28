@@ -73,7 +73,9 @@ def _bilinear_indices_and_weights(
         h_floor, w_floor = h_idxs.int(), w_idxs.int()
         h_ceil, w_ceil = (h_floor + 1).clip(max=side - 1), (w_floor + 1).clip(max=side - 1)
         dh, dw = h_idxs - h_floor, w_idxs - w_floor
-        index = torch.stack([(a[:, None] * side + b[None]).flatten() for a in (h_floor, h_ceil) for b in (w_floor, w_ceil)])
+        index = torch.stack(
+            [(a[:, None] * side + b[None]).flatten() for a in (h_floor, h_ceil) for b in (w_floor, w_ceil)]
+        )
         weight = torch.stack([(a[:, None] * b[None]).flatten() for a in (1 - dh, dh) for b in (1 - dw, dw)])
         order = (
             torch.arange(h * w)
@@ -107,7 +109,9 @@ class Qwen3VisionGrid:
     def build(cls, visual: "Qwen3VLVisionModel", grid_thw: Tensor) -> "Qwen3VisionGrid":
         """Compute the grid metadata exactly as `Qwen3VLVisionModel.forward` does."""
         grid = grid_thw.tolist()
-        indices, weights = _bilinear_indices_and_weights(grid, visual.num_grid_per_side, visual.spatial_merge_size)
+        indices, weights = _bilinear_indices_and_weights(
+            grid, visual.num_grid_per_side, visual.spatial_merge_size
+        )
         rotary_pos_emb = visual.rot_pos_emb(grid_thw).reshape(indices.shape[1], -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         device = visual.pos_embed.weight.device
@@ -168,7 +172,10 @@ def qwen3_vision_forward(
     visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid: Qwen3VisionGrid
 ) -> tuple[Tensor, list[Tensor]]:
     """`Qwen3VLVisionModel.forward` on a precomputed grid: merged image embeddings and DeepStack features."""
-    corners = visual.pos_embed(grid.pos_embed_indices) * grid.pos_embed_weights.to(visual.pos_embed.weight.dtype)[..., None]
+    corners = (
+        visual.pos_embed(grid.pos_embed_indices)
+        * grid.pos_embed_weights.to(visual.pos_embed.weight.dtype)[..., None]
+    )
     pos_embeds = corners[0] + corners[1] + corners[2] + corners[3]
     hidden_states = visual.patch_embed(pixel_values.type(visual.dtype)) + pos_embeds
     deepstack_features = []

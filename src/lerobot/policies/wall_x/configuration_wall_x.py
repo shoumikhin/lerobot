@@ -148,7 +148,9 @@ class WallXConfig(PreTrainedConfig):
                 f"{self.vision_attn_implementation!r}"
             )
         if self.precompute_grid_thw and self.vision_attn_implementation == "varlen":
-            raise ValueError("precompute_grid_thw runs the vision attention per chunk, so it cannot use 'varlen'.")
+            raise ValueError(
+                "precompute_grid_thw runs the vision attention per chunk, so it cannot use 'varlen'."
+            )
         if self.tokenizer_max_length < self.chunk_size + 1:
             raise ValueError("tokenizer_max_length must leave room for the WALL-OSS action chunk.")
         if self.flow_loss_weight < 0 or self.text_loss_weight < 0:

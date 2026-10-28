@@ -647,7 +647,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
         if self.config.precompute_grid_thw and pixel_values is not None:
-            self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(self._vision_grid, vlm.visual, image_grid_thw)
+            self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+                self._vision_grid, vlm.visual, image_grid_thw
+            )
             position_ids = qwen2_5_image_rope_index(
                 input_ids,
                 attention_mask,

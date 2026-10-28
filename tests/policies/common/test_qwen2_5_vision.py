@@ -19,8 +19,9 @@
 import pytest
 import torch
 
-transformers = pytest.importorskip("transformers")
+pytest.importorskip("transformers")
 
+import transformers  # noqa: E402
 from packaging.version import Version  # noqa: E402
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig  # noqa: E402
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (  # noqa: E402

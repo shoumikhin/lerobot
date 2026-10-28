@@ -281,7 +281,9 @@ def _model_with_tiny_qwen(precompute_grid_thw: bool) -> VLAJEPAModel:
     model = VLAJEPAModel.__new__(VLAJEPAModel)
     nn.Module.__init__(model)
     model.qwen = SimpleNamespace(model=Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval())
-    model.config = SimpleNamespace(precompute_grid_thw=precompute_grid_thw, num_embodied_action_tokens_per_instruction=2)
+    model.config = SimpleNamespace(
+        precompute_grid_thw=precompute_grid_thw, num_embodied_action_tokens_per_instruction=2
+    )
     model.embodied_action_token_id = 9
     model._vision_grid = None
     return model

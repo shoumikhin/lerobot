@@ -24,9 +24,10 @@ import pytest
 import torch
 from torch import nn
 
-transformers = pytest.importorskip("transformers")
+pytest.importorskip("transformers")
 
-from packaging.version import Version  # noqa: E402
+import transformers
+from packaging.version import Version
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
