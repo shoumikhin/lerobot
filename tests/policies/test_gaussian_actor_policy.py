@@ -20,10 +20,15 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 import torch  # noqa: E402
 from torch import Tensor, nn  # noqa: E402
+from torch.distributions import MultivariateNormal, TanhTransform, TransformedDistribution  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.gaussian_actor.configuration_gaussian_actor import GaussianActorConfig  # noqa: E402
-from lerobot.policies.gaussian_actor.modeling_gaussian_actor import MLP, GaussianActorPolicy  # noqa: E402
+from lerobot.policies.gaussian_actor.modeling_gaussian_actor import (  # noqa: E402
+    MLP,
+    GaussianActorPolicy,
+    TanhMultivariateNormalDiag,
+)
 from lerobot.rl.algorithms.sac import SACAlgorithm, SACAlgorithmConfig  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE  # noqa: E402
 from lerobot.utils.random_utils import seeded_context, set_seed  # noqa: E402
@@ -81,6 +86,25 @@ def test_mlp_with_custom_final_activation():
     y = mlp(x)
     assert y.shape == (1, 256)
     assert (y >= -1).all() and (y <= 1).all()
+
+
+def test_tanh_diag_gaussian_matches_the_multivariate_normal_it_replaced():
+    gen = torch.Generator().manual_seed(0)
+    loc = torch.randn(256, 6, generator=gen)
+    scale_diag = torch.rand(256, 6, generator=gen) + 0.05
+    dist = TanhMultivariateNormalDiag(loc, scale_diag)
+    reference = TransformedDistribution(
+        MultivariateNormal(loc, torch.diag_embed(scale_diag)), [TanhTransform(cache_size=1)]
+    )
+    torch.manual_seed(1)
+    sample = dist.rsample()
+    torch.manual_seed(1)
+    expected = reference.rsample()
+    torch.testing.assert_close(sample, expected)
+    # Each log_prob of its own sample, as the actor computes it.
+    torch.testing.assert_close(dist.log_prob(sample), reference.log_prob(expected))
+    torch.testing.assert_close(dist.base_dist.entropy(), reference.base_dist.entropy())
+    torch.testing.assert_close(dist.base_dist.stddev, reference.base_dist.stddev)
 
 
 def test_gaussian_actor_policy_with_default_args():
