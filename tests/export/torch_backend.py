@@ -85,8 +85,11 @@ class _Offset(nn.Module):
         self.module = module
         self.offset = offset
 
-    def forward(self, *inputs: Tensor) -> Tensor:
-        return self.module(*inputs) + self.offset
+    def forward(self, *inputs: Tensor) -> Tensor | tuple[Tensor, ...]:
+        outputs = self.module(*inputs)
+        if isinstance(outputs, tuple):
+            return tuple(x + self.offset for x in outputs)
+        return outputs + self.offset
 
 
 @ExportBackendConfig.register_subclass("torch_test")

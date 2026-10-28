@@ -85,7 +85,11 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(checkpoint, bundle):
         None,
         None,
     )
-    assert [(p.inputs, p.outputs) for p in manifest.programs] == [([IMAGE, OBS_STATE], [ACTION])]
+    prepared = [f"prepared.{IMAGE}", f"prepared.{OBS_STATE}"]
+    assert [(p.inputs, p.outputs) for p in manifest.programs] == [
+        ([IMAGE, OBS_STATE], prepared),
+        (prepared, [ACTION]),
+    ]
 
     policy = ACTPolicy.from_pretrained(checkpoint)
     reference = SyncInferenceEngine(
