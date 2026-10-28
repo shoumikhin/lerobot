@@ -289,6 +289,10 @@ lawam = [
 # Remote inference transport and serialization.
 remote = ["eclipse-zenoh>=1.9.0,<1.11.0", "msgpack>=1.1.0,<2.0.0"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
+# NOTE: `export` (ExecuTorch, to run a bundle written by lerobot-export) is not an extra yet. It needs
+# `executorch>=1.6.0,<1.7.0; sys_platform == 'linux'`, which needs torchao 0.19; neither is on PyPI yet, so
+# the lock cannot resolve it. Torch-TensorRT stays out of it even then: it pins one torch minor version, which uv's single lock
+# would impose on every extra, as vllm would (see `annotations`).
 
 # Annotation pipeline (lerobot-annotate). The only backend is ``openai``,
 # which talks to any OpenAI-compatible server (``vllm serve`` /
@@ -413,6 +417,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-export="lerobot.scripts.lerobot_export:main"
 lerobot-policy-server="lerobot.scripts.lerobot_policy_server:main"
 
 # ---------------- Tool Configurations ----------------
