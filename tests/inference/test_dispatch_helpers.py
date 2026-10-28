@@ -16,6 +16,7 @@
 
 from contextlib import contextmanager
 
+import numpy as np
 import pytest
 import torch
 
@@ -89,9 +90,12 @@ class Timer:
         self.starved += 1
 
 
-def test_permitted_ticks_pull_once_per_policy_action_and_send_each_interpolated_target():
+@pytest.mark.parametrize(
+    "convert", [torch.tensor, lambda a: np.array(a, dtype=np.float32)], ids=["tensor", "numpy"]
+)
+def test_permitted_ticks_pull_once_per_policy_action_and_send_each_interpolated_target(convert):
     engine = GateEngine()
-    engine.actions = [torch.tensor([3.0]), torch.tensor([6.0])]
+    engine.actions = [convert([3.0]), convert([6.0])]
     interpolator = ActionInterpolator(multiplier=3)
     robot, timer = Robot(), Timer()
     frames_built = 0
