@@ -73,6 +73,7 @@ if attempts:
         "lerobot.configs",
         "lerobot.policies",
         "lerobot.inference",
+        "lerobot.inference.export",
         "lerobot.processor",
         "lerobot.utils.action_interpolator",
         pytest.param(
