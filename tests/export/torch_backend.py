@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A test runtime for bundles, so tests need no compiler: programs are saved `torch.export` programs, run in
-PyTorch. A bundle names this module in `runtime_imports`, which registers the runtime, as a compiler's own
-module registers its kernels with a real runtime.
+"""A test runtime and backend for bundles, so tests need no compiler: programs are saved `torch.export`
+programs, run in PyTorch. A bundle names this module in `runtime_imports`, which registers the runtime, as a
+compiler's own module registers its kernels with a real runtime.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
 from lerobot.bundle.runtime import Runtime, register_runtime
+from lerobot.export.configs import ExportBackendConfig
 from lerobot.utils.constants import ACTION
 
 
@@ -39,7 +41,8 @@ class TorchProgram:
         self._module = torch.export.load(path).module()
 
     def __call__(self, *inputs: Any) -> tuple[Tensor, ...]:
-        outputs = self._module(*(torch.as_tensor(x) for x in inputs))
+        with torch.no_grad():
+            outputs = self._module(*(torch.as_tensor(x) for x in inputs))
         return outputs if isinstance(outputs, tuple) else (outputs,)
 
     def to_numpy(self, value: Tensor) -> np.ndarray:
@@ -90,3 +93,32 @@ def make_bundle(
     )
     Bundle(folder, manifest).write()
     return Bundle.read(folder)
+
+
+class _Offset(nn.Module):
+    def __init__(self, module: nn.Module, offset: float):
+        super().__init__()
+        self.module = module
+        self.offset = offset
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        return self.module(*inputs) + self.offset
+
+
+@ExportBackendConfig.register_subclass("torch_test")
+@dataclass
+class TorchTestBackend(ExportBackendConfig):
+    """Saves the `torch.export` program. A nonzero `offset` is added to its outputs, to fail the check."""
+
+    runtime = "torch_test"
+    file_suffix = ".pt2"
+    device = "cpu"
+    runtime_imports = ("tests.export.torch_backend",)
+
+    offset: float = 0.0
+
+    def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+        if self.offset:
+            args, _ = program.example_inputs
+            program = torch.export.export(_Offset(program.module(), self.offset), args)
+        torch.export.save(program, path)
