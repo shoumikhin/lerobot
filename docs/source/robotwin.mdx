@@ -68,7 +68,7 @@ ds = load_dataset("lerobot/robotwin_unified", split="train")
 
 ## Installation
 
-RoboTwin 2.0 requires **Linux** with an NVIDIA GPU and a CUDA 13 driver (580.65 or newer). Installation takes approximately 20 minutes.
+RoboTwin 2.0 requires **Linux** with an NVIDIA GPU, a CUDA 13 driver (580.65 or newer) and the CUDA 13 compiler (`nvcc`) to build CuRobo. Installation takes approximately 20 minutes.
 
 ### 1. Create a conda environment
 
@@ -94,7 +94,7 @@ bash script/_install.sh
 bash script/_download_assets.sh
 ```
 
-The install script handles all Python dependencies including SAPIEN, CuRobo, mplib, and pytorch3d.
+The install script handles the Python dependencies, including SAPIEN, CuRobo, mplib and pytorch3d. On PyTorch 2.12 and newer its CuRobo and pytorch3d builds fail, so install those two manually as shown below.
 
 <Tip warning={true}>
 If the automated install fails, install manually.
