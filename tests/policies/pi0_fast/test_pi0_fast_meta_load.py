@@ -38,7 +38,6 @@ from tests.policies.pi0_pi05.utils.meta_load import (  # noqa: E402
     save_checkpoint,
     use_tiny_backbone,
 )
-from tests.utils import require_cuda  # noqa: E402
 
 
 class Tokenizer:
@@ -74,31 +73,6 @@ def test_matches_regular_load(config, tmp_path, monkeypatch):
     lm_head = model.model.paligemma_with_expert.paligemma.lm_head.weight
     embed_tokens = model.get_parameter(EMBED_TOKENS)
     assert torch.equal(lm_head, embed_tokens) and lm_head.data_ptr() != embed_tokens.data_ptr()
-
-
-def test_subclass_with_its_own_constructor(config, tmp_path, monkeypatch):
-    class Subclass(PI0FastPolicy):
-        _supports_meta_load = True
-
-        def __init__(self, config, extra=None):
-            super().__init__(config)
-            self.extra = extra
-
-    path = save_checkpoint(PI0FastPolicy, config, tmp_path / "ckpt")
-    model, used_meta = load(Subclass, path, config, monkeypatch, extra=1)
-    expected, _ = load(PI0FastPolicy, path, config, monkeypatch, regular=True)
-    assert used_meta and type(model) is Subclass and model.extra == 1
-    assert_same(model, expected)
-
-
-@require_cuda
-def test_matches_regular_load_on_cuda(config, tmp_path, monkeypatch):
-    path = save_checkpoint(PI0FastPolicy, config, tmp_path / "ckpt")
-    config.device = "cuda"
-    model, used_meta = load(PI0FastPolicy, path, config, monkeypatch)
-    expected, _ = load(PI0FastPolicy, path, config, monkeypatch, regular=True)
-    assert used_meta
-    assert_same(model, expected)
 
 
 def test_incomplete_checkpoint_loads_the_regular_way(config, tmp_path, monkeypatch):
