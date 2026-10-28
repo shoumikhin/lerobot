@@ -89,12 +89,12 @@ class ExportInferenceEngine(InferenceEngine):
             for name, shape in self._frame_spec.items()
             if tuple(observation_shapes.get(name, ())) != shape
         ]
+        hint = " Use --rename_map to map the robot's names to the bundle's." if problems else ""
         if len(action_names) != self._action_dim:
             problems.append(f"{self._action_dim} action components (the robot takes {len(action_names)})")
         if problems:
             raise ValueError(
-                "The robot does not match the exported policy, which takes " + "; ".join(problems) + ". "
-                "Use --rename_map to map camera names."
+                "The robot does not match the exported policy, which takes " + "; ".join(problems) + "." + hint
             )
 
     def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
