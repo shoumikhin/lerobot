@@ -21,6 +21,7 @@ from typing import Any
 
 import draccus
 import torch
+from draccus.choice_types import ChoiceRegistryBase
 from safetensors.torch import load_file, save_file
 
 from lerobot.utils.constants import (
@@ -42,8 +43,48 @@ OptimizerParams = (
 )
 
 
+class ChoicesFromPolicies(ChoiceRegistryBase):
+    """Base for a draccus registry that policy packages add choices to, like the optimizers and schedulers.
+
+    Policies are imported on demand, so a name that is not registered yet imports every policy before the
+    lookup fails. It is not a `draccus.ChoiceRegistry` itself, since the registries that use it would then
+    share one set of choices.
+    """
+
+    # The names policy packages register, each with the package that owns it, so a plugin cannot take one
+    # before that package is imported.
+    POLICY_CHOICES = {
+        "molmoact2_adamw": "molmoact2",
+        "molmoact2_cosine_with_warmup": "molmoact2",
+        "lawam_cosine_with_min_lr": "lawam",
+    }
+
+    @classmethod
+    def register_subclass(cls, name: str, choice_type: Any = None) -> Any:
+        owner = cls.POLICY_CHOICES.get(name)
+        if (
+            choice_type is not None
+            and owner
+            and not choice_type.__module__.startswith(f"lerobot.policies.{owner}.")
+        ):
+            raise ValueError(f"'{name}' is reserved for the {owner} policy.")
+        return super().register_subclass(name, choice_type)
+
+    @classmethod
+    def get_choice_class(cls, name: str) -> Any:
+        if name not in cls.get_known_choices():
+            cls.load_all_choices()
+        return super().get_choice_class(name)
+
+    @classmethod
+    def load_all_choices(cls) -> None:
+        from lerobot.configs.policies import PreTrainedConfig
+
+        PreTrainedConfig.load_all_choices()
+
+
 @dataclass
-class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
+class OptimizerConfig(ChoicesFromPolicies, draccus.ChoiceRegistry, abc.ABC):
     lr: float
     weight_decay: float
     grad_clip_norm: float
