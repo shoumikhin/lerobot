@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn.modules import module as torch_module
 
-from lerobot.policies.pretrained import _load_state_dict_into_meta_model, _parameters_on_meta
+from lerobot.policies.common.openpi_checkpoint import _load_state_dict_into_meta_model, _parameters_on_meta
 from tests.utils import require_cuda
 
 
