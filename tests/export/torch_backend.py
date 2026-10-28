@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A test runtime for bundles, so tests need no compiler: programs are saved `torch.export` programs, run in
-PyTorch. A bundle names this module in `runtime_imports`, which registers the runtime, as a compiler's own
-module registers its kernels with a real runtime.
+"""A test runtime and backend for bundles, so tests need no compiler: programs are saved `torch.export`
+programs, run in PyTorch. A bundle names this module in `runtime_imports`, which registers the runtime, as a
+compiler's own module registers its kernels with a real runtime.
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ import torch
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
+from lerobot.export.configs import ExportBackendConfig
+from lerobot.export.recipe import Part
 from lerobot.inference.bundle import MANIFEST, RUNTIMES, Bundle, BundleManifest, ProgramSpec, Runtime
 from lerobot.inference.bundle.manifest import NOISE, TEST_CASE
 from lerobot.utils.constants import ACTION
@@ -90,3 +93,30 @@ def make_bundle(
     )
     (folder / MANIFEST).write_text(json.dumps(manifest.to_dict()))
     return Bundle.read(folder)
+
+
+class _Offset(nn.Module):
+    def __init__(self, module: nn.Module, offset: float):
+        super().__init__()
+        self.module = module
+        self.offset = offset
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        return self.module(*inputs) + self.offset
+
+
+@ExportBackendConfig.register_subclass("torch_test")
+@dataclass
+class TorchTestBackend(ExportBackendConfig):
+    """Saves the `torch.export` program. A nonzero `offset` is added to its outputs, to fail the check."""
+
+    runtime = "torch_test"
+    file_suffix = ".pt2"
+    device = "cpu"
+    runtime_imports = ("tests.export.torch_backend",)
+
+    offset: float = 0.0
+
+    def compile(self, part: Part, path: Path) -> None:
+        module = _Offset(part.module, self.offset) if self.offset else part.module
+        torch.export.save(torch.export.export(module, part.example_inputs), path)
