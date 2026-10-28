@@ -39,7 +39,10 @@ class ExecuTorchProgram:
             ) from error
 
         self._from_host = ExecuTorchResult.from_host
-        self._method = Runtime.get().load_program(path).load_method("forward")
+        # A backend may keep the program's weights in a data file beside it.
+        data = path.with_suffix(".ptd")
+        program = Runtime.get().load_program(path, data_path=data if data.is_file() else None)
+        self._method = program.load_method("forward")
         meta = self._method.metadata
         self._devices = [meta.input_tensor_meta(i).device() for i in range(meta.num_inputs())]
 
