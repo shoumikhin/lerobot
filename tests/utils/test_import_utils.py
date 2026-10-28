@@ -27,6 +27,7 @@ INSTALLED = [
     "lerobot_policy_brain",
     "lerobot_env_world",
     "lerobot_strategy_plan",
+    "lerobot_backend_compiler",
     "numpy",
     "lerobot_robotics_tools",  # not a robot plugin: no "_" right after "robot"
 ]
@@ -41,10 +42,10 @@ def imported(monkeypatch):
     return imported
 
 
-def test_every_plugin_kind_loads_by_default_and_kinds_narrow_it(imported):
+def test_the_default_leaves_out_backend_plugins_and_kinds_narrow_it(imported):
     import_utils.register_third_party_plugins()
     assert imported == INSTALLED[:6]
 
     imported.clear()
-    import_utils.register_third_party_plugins(kinds=("camera", "policy"))
-    assert imported == ["lerobot_camera_eye", "lerobot_policy_brain"]
+    import_utils.register_third_party_plugins(kinds=("camera", "backend"))
+    assert imported == ["lerobot_camera_eye", "lerobot_backend_compiler"]

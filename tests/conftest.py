@@ -64,6 +64,11 @@ def restore_torch_backend_flags() -> Iterator[None]:
     deterministic = torch.backends.cudnn.deterministic
     matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    # A tuple in PyTorch 2.10 and newer, so that its split-K part is restored too.
+    bf16_reduction = (
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        getattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction_split_k", None),
+    )
     try:
         yield
     finally:
@@ -71,6 +76,9 @@ def restore_torch_backend_flags() -> Iterator[None]:
         torch.backends.cudnn.deterministic = deterministic
         torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
         torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+            bf16_reduction[0] if bf16_reduction[1] is None else bf16_reduction
+        )
 
 
 # Marks selecting the tests of each Fast Tests tier (`-m dataset`, see .github/workflows/fast_tests.yml);

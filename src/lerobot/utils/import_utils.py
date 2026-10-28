@@ -18,7 +18,7 @@ import importlib.metadata
 import importlib.util
 import logging
 from collections.abc import Sequence
-from typing import Any, Literal, get_args, overload
+from typing import Any, Literal, overload
 
 from draccus.choice_types import ChoiceRegistry
 
@@ -247,8 +247,9 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy"]
-PLUGIN_KINDS: tuple[PluginKind, ...] = get_args(PluginKind)
+PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy", "backend"]
+# What a command loads unless it names its kinds. An export backend loads only where it is used.
+PLUGIN_KINDS: tuple[PluginKind, ...] = ("robot", "camera", "teleoperator", "policy", "env", "strategy")
 
 
 def register_third_party_plugins(kinds: tuple[PluginKind, ...] = PLUGIN_KINDS) -> None:
@@ -261,7 +262,7 @@ def register_third_party_plugins(kinds: tuple[PluginKind, ...] = PLUGIN_KINDS) -
 
     Args:
         kinds (`tuple[PluginKind, ...]`, *optional*, defaults to `('robot', 'camera', 'teleoperator', 'policy', 'env', 'strategy')`):
-            The plugin kinds to import, from `PLUGIN_KINDS`. Pass only the kinds the command uses, so
+            The plugin kinds to import, from `PluginKind`. Pass only the kinds the command uses, so
             plugins of other kinds cannot slow it down or log unrelated import errors.
     """
     prefixes = tuple(f"lerobot_{kind}_" for kind in kinds)
