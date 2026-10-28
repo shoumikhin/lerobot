@@ -43,6 +43,7 @@ else:
     DDIMScheduler = None
     DDPMScheduler = None
 
+from ..common.ddpm_scheduler import ExportableDDPMScheduler
 from ..pretrained import PreTrainedPolicy
 from ..utils import (
     get_device_from_parameters,
@@ -184,7 +185,7 @@ def _make_noise_scheduler(name: str, **kwargs: Any) -> "DDPMScheduler | DDIMSche
     require_package("diffusers", extra="diffusion")
 
     if name == "DDPM":
-        return DDPMScheduler(**kwargs)
+        return ExportableDDPMScheduler(**kwargs)
     elif name == "DDIM":
         return DDIMScheduler(**kwargs)
     else:
@@ -248,6 +249,8 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+        # Set here, not in the traced sampling call: timesteps made while tracing cannot be read back as ints.
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
     # ========= inference  ============
     def conditional_sample(
@@ -272,9 +275,9 @@ class DiffusionModel(nn.Module):
             )
         )
 
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-
-        for t in self.noise_scheduler.timesteps:
+        if self.noise_scheduler.num_inference_steps != self.num_inference_steps:
+            self.noise_scheduler.set_timesteps(self.num_inference_steps)
+        for t in self.noise_scheduler.timesteps.tolist():
             # Predict model output.
             model_output = self.unet(
                 sample,
