@@ -250,8 +250,8 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy", "runtime"]
-# What a command loads unless it names its kinds; a bundle runtime loads only for the bundle that names it.
+PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy", "runtime", "backend"]
+# What a command loads unless it names its kinds. A bundle runtime or an export backend loads only where it is used.
 PLUGIN_KINDS: tuple[PluginKind, ...] = ("robot", "camera", "teleoperator", "policy", "env", "strategy")
 DEVICE_PLUGIN_KINDS: tuple[PluginKind, ...] = ("robot", "camera", "teleoperator")
 # A sim robot (`--robot.type=sim`) takes its env from the EnvConfig registry when the command line is

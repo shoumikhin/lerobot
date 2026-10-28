@@ -26,6 +26,9 @@ from typing import Any
 MANIFEST = "export.json"
 FORMAT_VERSION = 1
 TEST_CASE = "test.safetensors"
+CONSTANTS = "constants.safetensors"
+# Not `config.json`, so that the folder does not look like a policy checkpoint.
+POLICY_CONFIG = "policy_config.json"
 # The test case and the programs name the starting noise of a sampling policy this way.
 NOISE = "noise"
 
