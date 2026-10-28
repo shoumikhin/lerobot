@@ -113,6 +113,9 @@ class VLAJEPAConfig(PreTrainedConfig):
     causal_world_model_context: bool = False
 
     resize_images_to: tuple[int, int] | None = None
+    # Compute the Qwen3-VL image grid metadata on the first call and reuse it, which torch.export needs.
+    # Only valid when the camera image sizes never change.
+    precompute_grid_thw: bool = False
     # Gripper post-processing from the starVLA LIBERO eval loop. Off by default: only correct for
     # LIBERO's action convention, and pins the gripper to a constant when its physical range is not
     # roughly [0, 1]. See the docs for why.

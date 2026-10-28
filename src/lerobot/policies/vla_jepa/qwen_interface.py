@@ -30,6 +30,9 @@ else:
 
 from .configuration_vla_jepa import VLAJEPAConfig
 
+# The tensors `Qwen3VLInterface.build_inputs` returns.
+QWEN_INPUT_KEYS = ("input_ids", "attention_mask", "mm_token_type_ids", "pixel_values", "image_grid_thw")
+
 
 class Qwen3VLInterface(torch.nn.Module):
     def __init__(self, config: VLAJEPAConfig) -> None:
