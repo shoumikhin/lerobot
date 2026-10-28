@@ -25,6 +25,7 @@ from safetensors import safe_open
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
 from lerobot.policies.factory import (
     make_policy,
     make_pre_post_processors,
@@ -876,6 +877,16 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
         assert len(vision_calls) == 1
         assert decoded_lengths == [ids.shape[1] - 2] + [2] * 10
+        grid = Qwen2_5VisionGrid.build(model.visual, inputs["image_grid_thw"])
+        fixed_grid = model.generate_flow_action(
+            **inputs,
+            action_horizon=2,
+            action_dim=26,
+            num_inference_timesteps=10,
+            noise=noise,
+            vision_grid=grid,
+        )["predict_action"]
+        assert torch.equal(fixed_grid, actual)
         # A new observation must get its own prefix cache.
         inputs["pixel_values"] = inputs["pixel_values"] + 1
         expected = _uncached_flow_sample(model, inputs, noise)

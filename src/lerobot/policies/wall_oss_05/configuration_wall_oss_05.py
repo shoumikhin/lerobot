@@ -77,6 +77,9 @@ class WallOSS05Config(PreTrainedConfig):
     # comes from output_features[ACTION], independently of state width.
     postprocess_action_dim: int | None = None
     num_inference_timesteps: int = 10
+    # Inference only, for a fixed camera image grid: compute the vision grid metadata from the first batch and
+    # reuse it, so action prediction reads no grid values on the host (torch.export needs this).
+    precompute_grid_thw: bool = False
     action_branch: str = "flow"
     # Render the active recipe for annotated training, as in WALL-X. Retain the
     # switch for saved configs that explicitly disabled language supervision.
