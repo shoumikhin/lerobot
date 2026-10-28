@@ -110,8 +110,10 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(checkpoint, bundle):
         None,
         None,
     )
-    assert [(p.inputs, p.outputs, p.data) for p in manifest.programs] == [
-        ([IMAGE, OBS_STATE], [ACTION], None)
+    prepared = [f"prepared.{IMAGE}", f"prepared.{OBS_STATE}"]
+    assert [(p.inputs, p.outputs) for p in manifest.programs] == [
+        ([IMAGE, OBS_STATE], prepared),
+        (prepared, [ACTION]),
     ]
     np.testing.assert_allclose(manifest.action_scale, [30.0, 30.0, 30.0], rtol=1e-6)
     assert (bundle.path / POLICY_CONFIG).is_file() and not (bundle.path / "config.json").exists()
