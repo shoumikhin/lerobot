@@ -943,13 +943,17 @@ class WallOSS05Policy(PreTrainedPolicy):
         return loss, metrics
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Any) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor], *, noise: Tensor | None = None, **kwargs: Any
+    ) -> Tensor:
+        """`noise` is the optional starting sample, shape `(batch_size, chunk_size, max_action_dim)`."""
         del kwargs
         inputs = self._pretokenized_inputs(batch)
         output = self.model.generate_flow_action(
             action_horizon=self.config.chunk_size,
             action_dim=self.config.max_action_dim,
             num_inference_timesteps=self.config.num_inference_timesteps,
+            noise=noise,
             **inputs,
         )
         return output["predict_action"]
