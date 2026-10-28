@@ -20,7 +20,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.utils import torch_compilable_check
 
+from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
 from lerobot.policies.lawam.lam_core.core.lam_model import build_latent_action_model
 from lerobot.policies.lawam.latent_world.processor_utils import (
     build_latent_world_processor_spec,
@@ -73,6 +76,7 @@ class LatentWorldPolicyConfig:
     # Independent additions
     num_action_queries: int = 8
     flow_action_num_queries: int = 8
+    precompute_grid_thw: bool = False
 
 
 # ============================================================================
@@ -322,6 +326,7 @@ class LatentWorldPolicyBackend(nn.Module):
         self.flow.action_horizon = int(self.model_cfg.action_horizon)
         self.flow.effective_action_horizon = int(self.model_cfg.effective_action_horizon)
         self.sync_training_modes(mode=self.training)
+        self._vision_grid: Qwen3VisionGrid | None = None
 
     def _inject_queries(
         self,
@@ -335,29 +340,22 @@ class LatentWorldPolicyBackend(nn.Module):
         device = inputs_embeds.device
         placeholder_mask = placeholder_mask.to(device=device, dtype=torch.bool)
 
-        bsz, seq_len = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+        bsz = int(inputs_embeds.shape[0])
         expected = int(bsz * num_queries)
-        got = int(placeholder_mask.sum().item())
-        if got != expected:
-            raise ValueError(
-                f"[LatentWorldPolicyBackend] {name} placeholder count mismatch: got={got}, expected={expected}"
-            )
-
         per_sample = placeholder_mask.sum(dim=1)
-        if not torch.all(per_sample == int(num_queries)):
-            bad = torch.nonzero(per_sample != int(num_queries), as_tuple=False).flatten()
-            b = int(bad[0].item()) if bad.numel() > 0 else -1
-            got_b = int(per_sample[b].item()) if b >= 0 else -1
-            raise ValueError(
-                f"[LatentWorldPolicyBackend] {name} placeholder count mismatch for sample {b}: got={got_b}, expected={num_queries}"
-            )
+        torch_compilable_check(
+            per_sample.sum() == expected,
+            lambda: f"[LatentWorldPolicyBackend] {name} placeholder count mismatch: got={int(per_sample.sum())}, expected={expected}",
+        )
 
-        idx = placeholder_mask.nonzero(as_tuple=False)
-        flat = idx[:, 0] * seq_len + idx[:, 1]
-        idx = idx[flat.argsort()]
-        b_idx, p_idx = idx[:, 0], idx[:, 1]
-        q_idx = torch.arange(int(num_queries), device=device).repeat(bsz)
-        inputs_embeds[b_idx, p_idx, :] = queries[q_idx]
+        def per_sample_mismatch() -> str:
+            b = int(torch.nonzero(per_sample != int(num_queries))[0])
+            return f"[LatentWorldPolicyBackend] {name} placeholder count mismatch for sample {b}: got={int(per_sample[b])}, expected={num_queries}"
+
+        torch_compilable_check(per_sample == int(num_queries), per_sample_mismatch)
+
+        # Fills the placeholders in row-major order, which repeats the queries once per sample.
+        inputs_embeds.masked_scatter_(placeholder_mask.unsqueeze(-1), queries.repeat(bsz, 1))
 
     def _run_vlm_stage(
         self,
@@ -393,12 +391,26 @@ class LatentWorldPolicyBackend(nn.Module):
 
         # HF transformers 4.57 Qwen3VL causal wrapper drops `hidden_states`
         # from the returned output; use the underlying multimodal model output.
-        vlm_out = self.vlm.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-        )
+        if self.model_cfg.precompute_grid_thw:
+            self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+                self._vision_grid, self.vlm.model.visual, image_grid_thw
+            )
+            hidden = qwen3_vl_forward(
+                self.vlm.model,
+                inputs_embeds,
+                attention_mask,
+                pixel_values,
+                self._vision_grid,
+                image_mask=input_ids == self.vlm.config.image_token_id,
+            )
+            vlm_out = BaseModelOutputWithPast(last_hidden_state=hidden)
+        else:
+            vlm_out = self.vlm.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
         if vlm_out is None:
             raise RuntimeError(
                 "[LatentWorldPolicyBackend] Qwen3VL base model forward returned None; "
@@ -414,15 +426,11 @@ class LatentWorldPolicyBackend(nn.Module):
             )
         bsz = int(hidden.shape[0])
         q = int(self.num_action_queries)
-        h_act = hidden[act_placeholder_mask]
-        if h_act.numel() == 0:
-            raise ValueError(
-                "[LatentWorldPolicyBackend] empty action hidden selection; check act_placeholder_mask."
-            )
-        if h_act.shape[0] != bsz * q:
-            raise ValueError(
-                f"[LatentWorldPolicyBackend] action hidden count mismatch: got={h_act.shape[0]}, expected={bsz * q}"
-            )
+        # `_inject_queries` checked that every sample has exactly q action placeholders. The j-th one
+        # sits after every token whose running placeholder count is still at most j.
+        query_ids = torch.arange(q, device=hidden.device).view(1, q, 1)
+        positions = (act_placeholder_mask.cumsum(dim=1).unsqueeze(1) <= query_ids).sum(dim=-1)
+        h_act = hidden.gather(1, positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
 
         pred_latent = self.vlm_to_lam(h_act.view(bsz, q, -1))
         return {
