@@ -17,6 +17,7 @@
 import inspect
 import json
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -217,6 +218,37 @@ def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypa
             select_layer=0,
             use_flash_attention=False,
         )
+
+
+def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from transformers import Qwen3VLForConditionalGeneration
+    from transformers.feature_extraction_utils import BatchFeature
+
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+
+    torch.manual_seed(0)
+    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
+    monkeypatch.setattr(
+        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
+    )
+    batch = BatchFeature(image_prompts(qwen.config))
+    stock, fixed = (
+        groot_n1_7.Qwen3Backbone(select_layer=2, tune_visual=True, precompute_grid_thw=precompute)
+        for precompute in (False, True)
+    )
+
+    for _ in range(2):  # The second step reuses the cached grid, and backward must still reach pos_embed.
+        for backbone in (stock, fixed):
+            backbone.zero_grad()
+        expected = stock(batch)["backbone_features"]
+        expected.square().sum().backward()
+        actual = fixed(batch)["backbone_features"]
+        actual.square().sum().backward()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(fixed.visual.pos_embed.weight.grad, stock.visual.pos_embed.weight.grad)
 
 
 def _write_raw_n1_7_libero_checkpoint(path):
