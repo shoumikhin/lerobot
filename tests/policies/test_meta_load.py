@@ -16,6 +16,8 @@
 
 """Building parameters on the meta device and loading a checkpoint into them."""
 
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -23,7 +25,7 @@ import torch
 from torch import nn
 from torch.nn.modules import module as torch_module
 
-from lerobot.policies.pretrained import _load_state_dict_into_meta_model, _parameters_on_meta
+from lerobot.policies.common.openpi_checkpoint import _load_state_dict_into_meta_model, _parameters_on_meta
 from tests.utils import require_cuda
 
 
@@ -100,7 +102,18 @@ def test_other_threads_build_real_parameters():
     assert not built[0].weight.is_meta
 
 
-def test_hook_registry_never_changes():
+def test_importing_the_loader_registers_no_hook():
+    code = (
+        "import lerobot.policies, lerobot.policies.common.openpi_checkpoint\n"
+        "from torch.nn.modules import module\n"
+        "assert not module._global_parameter_registration_hooks, module._global_parameter_registration_hooks"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_hook_is_registered_once():
+    with _parameters_on_meta():
+        pass
     hooks = dict(torch_module._global_parameter_registration_hooks)
     with _parameters_on_meta(), _parameters_on_meta():
         Toy()
