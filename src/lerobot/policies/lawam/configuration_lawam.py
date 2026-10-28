@@ -119,6 +119,9 @@ class LaWAMConfig(PreTrainedConfig):
     latent_action_placeholder_token: str = "<ACT_PH>"
     num_action_queries: int = 8
     flow_action_num_queries: int = 8
+    # Compute the Qwen3-VL image grid metadata on the first call and reuse it, which torch.export needs.
+    # Only valid when the camera image sizes never change.
+    precompute_grid_thw: bool = False
     perceptual_weight: float = 0.1
     lam_encoder_distill_weight: float = 0.1
     enable_loss_distill: bool = True

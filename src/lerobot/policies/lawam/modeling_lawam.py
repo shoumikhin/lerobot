@@ -147,6 +147,7 @@ def _build_native_policy_config(config: LaWAMConfig) -> LatentWorldPolicyConfig:
     policy_cfg.repeated_diffusion_steps = int(config.repeated_diffusion_steps)
     policy_cfg.num_action_queries = int(config.num_action_queries)
     policy_cfg.flow_action_num_queries = int(config.flow_action_num_queries)
+    policy_cfg.precompute_grid_thw = bool(config.precompute_grid_thw)
     return policy_cfg
 
 
