@@ -30,8 +30,10 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.cache_utils import Cache
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+from transformers.utils import torch_compilable_check
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+from lerobot.policies.common.qwen3_vision import qwen3_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import populate_queues
@@ -169,6 +171,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         self.cu_seqlens = None
         self.visual_split_sizes = None
         self.visual_max_seqlen = None
+        self.visual_grid_thw = None
         # Capture-context flag: set by the full-prefix CUDA-graph wrapper so the vision
         # grid metadata (pos_embeds / cu_seqlens / split_sizes / max_seqlen) is hoisted
         # out of the per-call host-sync path and cached once. See ``_prefix_graphed``.
@@ -250,6 +253,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                 self.visual_split_sizes,
                 self.visual_max_seqlen,
             ) = self.qwenvl.model.visual.preprcess_grid_thw(grid_thw=image_grid_thw)
+            self.visual_grid_thw = image_grid_thw.tolist()
         image_embeds, deepstack_image_embeds = self.qwenvl.model.visual(
             pixel_values,
             grid_thw=image_grid_thw,
@@ -283,24 +287,14 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         emb = self.embed_language_tokens(token).to(dtype=dtype)
         return emb.view(1, 1, 1, -1).expand(batch, count, 1, -1)
 
-    def build_prefix_position_ids(self, input_ids, attention_mask, image_grid_thw=None, video_grid_thw=None):
-        # transformers>=5.5 externalized modality detection: get_rope_index now takes an
-        # explicit ``mm_token_type_ids`` (0=text, 1=image, 2=video) instead of matching
-        # the placeholder token ids internally. Reconstruct it from the vision token ids.
+    def build_prefix_position_ids(self, input_ids, attention_mask, image_grid_thw: list[list[int]]):
         vlm_cfg = self.qwenvl.config
-        image_token_id = getattr(vlm_cfg, "image_token_id", None)
-        video_token_id = getattr(vlm_cfg, "video_token_id", None)
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        if image_token_id is not None:
-            mm_token_type_ids[input_ids == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[input_ids == video_token_id] = 2
-        position_ids, _ = self.qwenvl.model.get_rope_index(
-            input_ids=input_ids,
-            mm_token_type_ids=mm_token_type_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            attention_mask=attention_mask,
+        position_ids = qwen3_image_rope_index(
+            input_ids,
+            attention_mask,
+            image_grid_thw,
+            vlm_cfg.vision_config.spatial_merge_size,
+            vlm_cfg.image_token_id,
         )
         # transformers 4.57 (which the 6B checkpoint was trained under) filled masked
         # (padding) rope positions with 1; transformers 5.5 fills them with 0. Restore the
@@ -921,15 +915,17 @@ class FlowMatchingV2(FlowMatchingV1):
         else:
             att_masks = torch.zeros((bsize, embs.shape[1]), device=device, dtype=torch.bool)
 
-        flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
-        rope_grid_thw = flat_grid_thw[flat_img_masks]
-        if rope_grid_thw.numel() == 0:
-            rope_grid_thw = flat_grid_thw[:1]
+        # Under precompute_grid_thw the grid cached with the vision metadata avoids a host read.
+        rope_grid_thw = self.qwenvl_with_expert.visual_grid_thw
+        if rope_grid_thw is None or len(rope_grid_thw) != flat_grid_thw.shape[0]:
+            rope_grid_thw = flat_grid_thw.tolist()
+        else:
+            torch_compilable_check(
+                flat_grid_thw == flat_grid_thw.new_tensor(rope_grid_thw),
+                "The image grid differs from the one cached for precompute_grid_thw.",
+            )
         prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
-            prefix_input_ids,
-            pad_masks.long(),
-            image_grid_thw=rope_grid_thw,
-            video_grid_thw=None,
+            prefix_input_ids, pad_masks.long(), rope_grid_thw
         )
         # Dense (capture-safe) deepstack layout: zero-masked per-camera embeds
         # laid out over the full prefix length instead of bool-filtered rows.
@@ -1520,6 +1516,7 @@ class FlowMatchingV2(FlowMatchingV1):
             core.cu_seqlens,
             core.visual_split_sizes,
             core.visual_max_seqlen,
+            core.visual_grid_thw,
         )
         static_in = images.clone()
         try:
@@ -1533,6 +1530,7 @@ class FlowMatchingV2(FlowMatchingV1):
             core.cu_seqlens = None
             core.visual_split_sizes = None
             core.visual_max_seqlen = None
+            core.visual_grid_thw = None
 
             def run_vit():
                 return core.embed_image(static_in, flat_grid_thw)
@@ -1558,6 +1556,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 core.cu_seqlens,
                 core.visual_split_sizes,
                 core.visual_max_seqlen,
+                core.visual_grid_thw,
             ) = prev_grid
             self._vision_graph_disabled = True
             return None
@@ -1579,6 +1578,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 core.cu_seqlens,
                 core.visual_split_sizes,
                 core.visual_max_seqlen,
+                core.visual_grid_thw,
             ) = prev_grid
             self._vision_graph_disabled = True
             return None
@@ -1617,9 +1617,8 @@ class FlowMatchingV2(FlowMatchingV1):
 
         if self.config.use_cudagraph_prefix_full:
             # Vision tower as its own graph (grid metadata cached on `core`); the embed
-            # glue (language embed / masks / mrope ids / dense deepstack) stays eager —
-            # it is light and get_rope_index's data-dependent host syncs cannot be
-            # captured. The 36-layer KV fill graph below is unchanged.
+            # glue (language embed / masks / mrope ids / dense deepstack) stays eager,
+            # it is light. The 36-layer KV fill graph below is unchanged.
             flat_grid_thw = (
                 einops.rearrange(image_grid_thw, "b n d -> (b n) d")
                 if image_grid_thw.ndim == 3
