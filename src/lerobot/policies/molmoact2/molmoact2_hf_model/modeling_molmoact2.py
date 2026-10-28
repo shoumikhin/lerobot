@@ -54,6 +54,7 @@ from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
     logging,
+    torch_compilable_check,
 )
 
 from .configuration_molmoact2 import (
@@ -1839,7 +1840,6 @@ class MolmoAct2VisionBackbone(nn.Module):
         image_features = self.image_feature_dropout(image_features)
         dim = image_features.shape[-1]
         valid = pooled_patches_idx >= 0
-        valid_token = torch.any(valid, -1)
 
         # Use `pooled_patches_idx` to arrange the features for image pooling
         batch_idx = torch.arange(
@@ -1869,7 +1869,7 @@ class MolmoAct2VisionBackbone(nn.Module):
 
         # MLP layer to map the feature.
         pooled_features = self.image_projector(pooled_features)
-        return pooled_features.view(-1, pooled_features.shape[-1])[valid_token.flatten()]
+        return pooled_features.view(-1, pooled_features.shape[-1])
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -2826,28 +2826,20 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         return kv_states
 
     @staticmethod
-    def _mask_discrete_output_span(
-        row_ids: torch.Tensor,
-        row_mask: torch.Tensor,
+    def _mask_discrete_output_spans(
+        input_ids: torch.Tensor,
+        mask: torch.Tensor,
         start_id: int | None,
         end_id: int | None,
-    ) -> None:
+    ) -> torch.Tensor:
         if start_id is None or end_id is None:
-            return
-        start_positions = (row_ids == start_id).nonzero(as_tuple=False).flatten().tolist()
-        if not start_positions:
-            return
-        end_positions = (row_ids == end_id).nonzero(as_tuple=False).flatten().tolist()
-        end_ptr = 0
-        for start_pos in start_positions:
-            while end_ptr < len(end_positions) and end_positions[end_ptr] < start_pos:
-                end_ptr += 1
-            if end_ptr >= len(end_positions):
-                row_mask[start_pos:] = False
-                break
-            end_pos = end_positions[end_ptr]
-            row_mask[start_pos : end_pos + 1] = False
-            end_ptr += 1
+            return mask
+        # Open spans per position; an end with no open span is ignored, so the count never goes below zero.
+        step = (input_ids == start_id).long() - (input_ids == end_id).long()
+        total = step.cumsum(-1)
+        depth = total - total.cummin(-1).values.clamp(max=0)
+        depth_before = F.pad(depth[..., :-1], (1, 0))
+        return mask & (depth == 0) & (depth_before == 0)
 
     def _get_encoder_attention_mask(
         self,
@@ -2865,14 +2857,12 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         eos_id = getattr(self.config, "eos_token_id", None)
         if eos_id is not None:
             mask &= input_ids != int(eos_id)
-        for batch_idx in range(input_ids.shape[0]):
-            self._mask_discrete_output_span(
-                input_ids[batch_idx],
-                mask[batch_idx],
-                self.config.action_start_token_id,
-                self.config.action_end_token_id,
-            )
-        return mask
+        return self._mask_discrete_output_spans(
+            input_ids,
+            mask,
+            self.config.action_start_token_id,
+            self.config.action_end_token_id,
+        )
 
     def _get_depth_token_mask(
         self,
@@ -3187,156 +3177,49 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         image_grids: torch.Tensor,
         image_num_crops: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 1) Count the number of images in each example
-        raw_counts = (input_ids == self.config.image_end_token_id).sum(1)  # [N]
-        total_images = int(image_grids.size(0))
-        total_end_tokens = int(raw_counts.sum().item())
-        if total_images <= 0:
-            counts = raw_counts.new_zeros(raw_counts.shape)
-        elif total_end_tokens == total_images:
-            counts = raw_counts
-        elif total_end_tokens == 2 * total_images:
-            counts = raw_counts // 2
-        else:
-            raise ValueError(
-                "Could not infer image counts from image end tokens: "
-                f"end_tokens={total_end_tokens}, image_grids={total_images}."
-            )
-        N = counts.size(0)
-        device = input_ids.device
-
-        # Total number of images in the batch
-        num_images = total_images
-
-        # Sanity check
-        assert image_grids.size(0) == num_images, (
-            f"Expected {num_images} image grids, but got {image_grids.size(0)}"
+        # Crops are encoded independently, so all crops of all examples are passed as a single
+        # sequence. Pooled features then come out in the same example-major order as the image
+        # tokens, and no per-example padding (with data-dependent sizes) is needed.
+        num_images = image_grids.size(0)
+        num_end_tokens = (input_ids == self.config.image_end_token_id).sum()
+        torch_compilable_check(
+            num_images == 0 or (num_end_tokens == num_images) | (num_end_tokens == 2 * num_images),
+            lambda: "Could not infer image counts from image end tokens: "
+            f"end_tokens={int(num_end_tokens)}, image_grids={num_images}.",
         )
         assert image_num_crops.size(0) == num_images, (
             f"Expected {num_images} image num crops, but got {image_num_crops.size(0)}"
         )
 
-        # 1-1) Compute per-image pooled patch count from image grids
-        with torch.no_grad():
-            first_prod = image_grids[:, :2].prod(dim=1)  # [num_images]
-            second_prod = image_grids[:, 2:].prod(dim=1)  # [num_images]
-            num_pooled_patches_per_image = (first_prod + second_prod).to(
-                image_num_crops.dtype
-            )  # [num_images]
-
         # pixel_values: [n_crops, n_patches, pixels_per_patch]
-        n_crops, n_patches, pixels_per_patch = pixel_values.shape
-
-        # 2) Map each image index → example index
-        # Example: if counts = [2, 1, 3], then this becomes [0,0,1,2,2,2]
-        example_ids_for_image = torch.arange(N, device=device).repeat_interleave(counts)  # [num_images]
-        assert example_ids_for_image.numel() == num_images
-
-        # 2-1) Compute crops_per_example by summing per-image crop counts
-        crops_per_example = torch.zeros(N, dtype=image_num_crops.dtype, device=image_num_crops.device)
-        crops_per_example.index_add_(0, example_ids_for_image, image_num_crops)  # [N]
-
-        # 2-2) Per-image number of patches = (crops per image) * n_patches
-        patches_per_image = image_num_crops * n_patches  # [num_images]
-
-        # 2-3) Compute per-example per-image patch offsets
-        counts_list = counts.tolist()
-        index_offset_per_example_list = []
-        offset_img = 0
-        for c in counts_list:
-            per_img_patches = patches_per_image[offset_img : offset_img + c]  # [c]
-            # Offsets: [0, img0_total_patches, img0+img1_total_patches, ...]
-            index_offset = [0] + per_img_patches.cumsum(0).tolist()[:-1]
-            index_offset_per_example_list.append(index_offset)
-            offset_img += c
-
-        # 2-4) Compute num_pooled_patches_per_example
-        num_pooled_patches_per_example = torch.zeros(
-            N,
-            dtype=num_pooled_patches_per_image.dtype,
-            device=num_pooled_patches_per_image.device,
+        n_crops, n_patches, _ = pixel_values.shape
+        torch_compilable_check(
+            image_num_crops.sum() == n_crops,
+            lambda: f"Expected {int(image_num_crops.sum())} crops, but got {n_crops}",
+            error_type=AssertionError,
         )
-        num_pooled_patches_per_example.index_add_(0, example_ids_for_image, num_pooled_patches_per_image)
-
-        # Sanity checks
-        total_crops = int(crops_per_example.sum().item())
-        assert total_crops == n_crops, f"Expected {total_crops} crops, but got {n_crops}"
-
-        total_num_pooled_patches = int(num_pooled_patches_per_example.sum().item())
-        assert total_num_pooled_patches == image_token_pooling.size(0), (
-            f"Expected {total_num_pooled_patches} pooled patches, but got {image_token_pooling.size(0)}"
+        num_pooled_patches_per_image = image_grids[:, :2].prod(dim=1) + image_grids[:, 2:].prod(dim=1)
+        num_pooled_patches = image_token_pooling.size(0)
+        torch_compilable_check(
+            num_pooled_patches_per_image.sum() == num_pooled_patches,
+            lambda: f"Expected {int(num_pooled_patches_per_image.sum())} pooled patches, "
+            f"but got {num_pooled_patches}",
+            error_type=AssertionError,
         )
 
-        # 3) Build images tensor filled with -1
-        M = int(crops_per_example.max().item())
-        images = torch.full(
-            (N, M, n_patches, pixels_per_patch),
-            fill_value=-1,
-            dtype=pixel_values.dtype,
-            device=pixel_values.device,
+        # Pooling indices are relative to their own image; shift them by the patches of all
+        # preceding images.
+        patches_per_image = image_num_crops * n_patches
+        image_offsets = patches_per_image.cumsum(0) - patches_per_image
+        rows = torch.arange(num_pooled_patches, device=num_pooled_patches_per_image.device)
+        image_of_row = (rows[:, None] >= num_pooled_patches_per_image.cumsum(0)[None, :]).sum(1)
+        row_offsets = image_offsets[image_of_row]
+        token_pooling = torch.where(
+            image_token_pooling >= 0,
+            image_token_pooling + row_offsets[:, None].to(image_token_pooling.dtype),
+            image_token_pooling,
         )
-
-        # 4) Fill images with per-example slices from pixel_values
-        offset_crop = 0
-        for i in range(N):
-            num = int(crops_per_example[i].item())
-            cur = pixel_values[offset_crop : offset_crop + num]  # [num, n_patches, pixels_per_patch]
-            images[i, :num] = cur
-            offset_crop += num
-
-        # Sanity check
-        assert offset_crop == n_crops
-
-        # 5) Build new_token_pooling tensor filled with -1
-        P = int(num_pooled_patches_per_example.max().item())
-        _, dim = image_token_pooling.shape
-        new_token_pooling = torch.full(
-            (N, P, dim),
-            fill_value=-1,
-            dtype=image_token_pooling.dtype,
-            device=image_token_pooling.device,
-        )
-
-        # 6) Fill token_pooling with per-example slices, adding per-image patch offsets
-        patch_offset = 0
-        img_offset = 0
-
-        for i, c in enumerate(counts_list):
-            num_patches = int(num_pooled_patches_per_example[i].item())
-
-            # Subsequence of pooled tokens belonging to this example
-            cur = image_token_pooling[patch_offset : patch_offset + num_patches].clone()  # [num_patches, dim]
-
-            index_offset_per_example = index_offset_per_example_list[i]  # length = c
-            per_img_pooled = num_pooled_patches_per_image[img_offset : img_offset + c]  # [c]
-
-            assert len(index_offset_per_example) == per_img_pooled.numel()
-
-            # Apply per-image offsets to the (ragged) subsequence
-            offset = 0
-            for j in range(c):
-                index_offset = int(index_offset_per_example[j])
-                n = int(per_img_pooled[j].item())
-                cur_slice = cur[offset : offset + n]
-
-                # Apply offset across all columns
-                cur[offset : offset + n] = torch.where(
-                    cur_slice >= 0,
-                    cur_slice + index_offset,
-                    cur_slice,
-                )
-                offset += n
-
-            new_token_pooling[i, :num_patches] = cur
-
-            patch_offset += num_patches
-            img_offset += c
-
-        # Final sanity checks
-        assert patch_offset == total_num_pooled_patches
-        assert img_offset == num_images
-
-        return images, new_token_pooling
+        return pixel_values[None], token_pooling[None]
 
     def build_batched_videos(
         self,
@@ -3345,105 +3228,46 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         video_token_pooling: torch.Tensor,
         video_grids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 1) Count the number of videos in each example
+        # Same single-sequence layout as `build_batched_images`, one video per example.
         if self.config.use_frame_special_tokens:
             end_token_id = self.config.frame_end_token_id
         else:
             end_token_id = self.config.image_end_token_id
-        counts = (input_ids == end_token_id).any(dim=1).long()  # [N]
-        N = counts.size(0)
-        device = input_ids.device
-
-        # Total number of videos in the batch
-        num_videos = int(counts.sum().item())
-
-        # Sanity check
-        assert video_grids.size(0) == num_videos, (
-            f"Expected {num_videos} videos, but got {video_grids.size(0)}"
+        num_videos = (input_ids == end_token_id).any(dim=1).sum()
+        torch_compilable_check(
+            num_videos == video_grids.size(0),
+            lambda: f"Expected {int(num_videos)} videos, but got {video_grids.size(0)}",
+            error_type=AssertionError,
         )
-
-        video_num_frames = video_grids[:, 0]  # [num_videos]
-        num_pooled_patches_per_video = video_grids.prod(dim=1)  # [num_videos]
 
         # pixel_values_videos: [n_frames, n_patches, pixels_per_patch]
-        n_frames, n_patches, pixels_per_patch = pixel_values_videos.shape
-
-        # 2) Map each video index -> example index
-        # Example: if counts = [2, 1, 3], then this becomes [0,0,1,2,2,2]
-        example_ids_for_video = torch.arange(N, device=device).repeat_interleave(counts)  # [num_videos]
-        assert example_ids_for_video.numel() == num_videos
-
-        # 2-1) Compute frames_per_example by summing per-video frame counts
-        frames_per_example = torch.zeros(
-            N,
-            dtype=video_num_frames.dtype,
-            device=device,
+        n_frames, n_patches, _ = pixel_values_videos.shape
+        video_num_frames = video_grids[:, 0]
+        torch_compilable_check(
+            video_num_frames.sum() == n_frames,
+            lambda: f"Expected {int(video_num_frames.sum())} frames, but got {n_frames}",
+            error_type=AssertionError,
         )
-        frames_per_example.index_add_(0, example_ids_for_video, video_num_frames)  # [N]
-
-        # 2-2) Compute num_pooled_patches_per_example
-        num_pooled_patches_per_example = torch.zeros(
-            N,
-            dtype=num_pooled_patches_per_video.dtype,
-            device=num_pooled_patches_per_video.device,
-        )
-        num_pooled_patches_per_example.index_add_(
-            0,
-            example_ids_for_video,
-            num_pooled_patches_per_video,
+        num_pooled_patches_per_video = video_grids.prod(dim=1)
+        num_pooled_patches = video_token_pooling.size(0)
+        torch_compilable_check(
+            num_pooled_patches_per_video.sum() == num_pooled_patches,
+            lambda: f"Expected {int(num_pooled_patches_per_video.sum())} pooled patches, "
+            f"but got {num_pooled_patches}",
+            error_type=AssertionError,
         )
 
-        # Sanity checks
-        total_frames = int(frames_per_example.sum().item())
-        assert total_frames == n_frames, f"Expected {total_frames} frames, but got {n_frames}"
-
-        total_num_pooled_patches = int(num_pooled_patches_per_example.sum().item())
-        assert total_num_pooled_patches == video_token_pooling.size(0), (
-            f"Expected {total_num_pooled_patches} pooled patches, but got {video_token_pooling.size(0)}"
+        patches_per_video = video_num_frames * n_patches
+        video_offsets = patches_per_video.cumsum(0) - patches_per_video
+        rows = torch.arange(num_pooled_patches, device=num_pooled_patches_per_video.device)
+        video_of_row = (rows[:, None] >= num_pooled_patches_per_video.cumsum(0)[None, :]).sum(1)
+        row_offsets = video_offsets[video_of_row]
+        token_pooling = torch.where(
+            video_token_pooling >= 0,
+            video_token_pooling + row_offsets[:, None].to(video_token_pooling.dtype),
+            video_token_pooling,
         )
-
-        # 3) Build videos tensor filled with -1
-        M = int(frames_per_example.max().item())
-        videos = torch.full(
-            (N, M, n_patches, pixels_per_patch),
-            fill_value=-1,
-            dtype=pixel_values_videos.dtype,
-            device=device,
-        )
-
-        # 4) Fill videos with per-examples slices from pixel_values_videos
-        offset_frame = 0
-        for i in range(N):
-            num = int(frames_per_example[i].item())
-            cur = pixel_values_videos[offset_frame : offset_frame + num]  # [num, n_patches, pixels_per_patch]
-            videos[i, :num] = cur
-            offset_frame += num
-
-        # Sanity check
-        assert offset_frame == n_frames
-
-        # 5) Build new token_pooling tensor filled with -1
-        P = int(num_pooled_patches_per_example.max().item())
-        _, dim = video_token_pooling.shape
-        new_token_pooling = torch.full(
-            (N, P, dim),
-            fill_value=-1,
-            dtype=video_token_pooling.dtype,
-            device=video_token_pooling.device,
-        )
-
-        # 6) Fill new token_pooling with per-examples slices from video_token_pooling
-        patch_offset = 0
-        for i in range(N):
-            num_patches = int(num_pooled_patches_per_example[i].item())
-            cur = video_token_pooling[patch_offset : patch_offset + num_patches]  # [num_patches, dim]
-            new_token_pooling[i, :num_patches] = cur
-            patch_offset += num_patches
-
-        # Final sanity checks
-        assert patch_offset == total_num_pooled_patches
-
-        return videos, new_token_pooling
+        return pixel_values_videos[None], token_pooling[None]
 
     def merge_visual_inputs(
         self,
@@ -3496,12 +3320,18 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             # parameter storage and autocast can otherwise make them differ.
             image_features = self.vision_backbone(images, token_pooling).to(device=x.device, dtype=x.dtype)
             is_image_patch = input_ids.reshape(-1) == self.config.image_patch_id
-            if is_image_patch.sum() != len(image_features):
-                raise RuntimeError(
-                    f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}."
-                )
-            flat_x = x.reshape(-1, x.shape[-1]).clone()
-            flat_x[is_image_patch] = flat_x[is_image_patch] + image_features
+            torch_compilable_check(
+                is_image_patch.sum() == len(image_features),
+                lambda: f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}.",
+                error_type=RuntimeError,
+            )
+            # The k-th image patch token takes the k-th feature. Row 0 of the padded features is
+            # never selected, it only keeps the gather in range when there are no image features.
+            padded_features = F.pad(image_features, (0, 0, 1, 0))
+            flat_x = x.reshape(-1, x.shape[-1])
+            flat_x = torch.where(
+                is_image_patch[:, None], flat_x + padded_features[is_image_patch.cumsum(0)], flat_x
+            )
             x = flat_x.reshape_as(x)
 
         # shape: (batch_size, seq_len, d_model)

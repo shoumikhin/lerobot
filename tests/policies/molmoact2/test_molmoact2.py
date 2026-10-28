@@ -3189,6 +3189,32 @@ def test_both_action_expert_mask_retains_checkpoint_span_masking():
     assert policy.model.model.calls == 1
 
 
+def test_discrete_output_spans_are_masked_from_start_to_matching_end():
+    start, end = 7, 9
+    input_ids = torch.tensor(
+        [
+            [1, 7, 2, 9, 3, 3],  # one span, both boundary tokens masked
+            [9, 1, 7, 2, 9, 3],  # an end token with no open span is ignored
+            [7, 7, 9, 1, 9, 3],  # a nested start extends the span to the next end
+            [1, 2, 7, 3, 3, 3],  # an unterminated span runs to the end
+        ]
+    )
+
+    mask = hf_molmoact2_modeling.MolmoAct2Model._mask_discrete_output_spans(
+        input_ids, torch.ones_like(input_ids, dtype=torch.bool), start, end
+    )
+
+    expected = torch.tensor(
+        [
+            [True, False, False, False, True, True],
+            [True, True, False, False, False, True],
+            [False, False, False, False, False, True],
+            [True, True, False, False, False, False],
+        ]
+    )
+    assert torch.equal(mask, expected)
+
+
 def test_rtc_generation_uses_previous_chunk_prefix():
     class DummyActionExpert(torch.nn.Module):
         def __init__(self):
