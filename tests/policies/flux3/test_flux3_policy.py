@@ -685,6 +685,42 @@ def test_policy_single_layout_relative_actions_and_cfg_one(fake_vae):
     assert torch.isfinite(loss) and info["n_valid_windows"] == 2
 
 
+class _ExportableChunk(nn.Module):
+    def __init__(self, policy: Flux3Policy):
+        super().__init__()
+        self.policy = policy
+
+    def forward(self, image, state, noise, video_noise):
+        obs = {"observation.images.top": image, OBS_STATE: state, "task": ["stack the cubes"]}
+        return self.policy.predict_action_chunk(obs, noise=noise, video_noise=video_noise)
+
+
+def test_euler_schedule_follows_settings_and_export(fake_vae):
+    cfg = single_config(sampler="euler", num_inference_steps=1)
+    policy = Flux3Policy(cfg).eval()
+    gen = torch.Generator().manual_seed(2)
+    inputs = (
+        torch.rand(1, 3, 64, 96, generator=gen),
+        torch.rand(1, 6, generator=gen),
+        torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=gen),
+        torch.randn(
+            1, packing.LATENT_CHANNELS, policy.packer.predicted_latent_frames(cfg), *cfg.latent_hw, generator=gen
+        ),
+    )
+    module = _ExportableChunk(policy)
+    module(*inputs)
+    policy.config.num_inference_steps = 2
+    # A changed schedule cannot be built while tracing; the failed export must leave eager inference intact.
+    with pytest.raises(RuntimeError, match="out of date"):
+        torch.export.export(module, inputs)
+    fresh = _ExportableChunk(Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval())
+    fresh.policy.load_state_dict(policy.state_dict())
+    expected = fresh(*inputs)
+    assert torch.equal(module(*inputs), expected)
+    exported = torch.export.export(module, inputs)
+    assert torch.equal(exported.module()(*inputs), expected)
+
+
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
     cfg = droid_config()
     policy = Flux3Policy(cfg)
