@@ -26,6 +26,7 @@ import draccus
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
+from lerobot.inference.bundle import MANIFEST, Bundle, is_bundle
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
@@ -283,6 +284,8 @@ class RolloutConfig:
 
     # Policy (loaded from --policy.path via __post_init__)
     policy: PreTrainedConfig | None = None
+    # Set instead of `policy` when --policy.path is a bundle written by lerobot-export.
+    bundle: Bundle | None = field(default=None, init=False, repr=False)
 
     # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger|episodic,
     # or any name registered by a third-party package)
@@ -413,13 +416,41 @@ class RolloutConfig:
             pretrained_revision = parser.parse_arg("pretrained_revision", cli_overrides)
             if pretrained_revision is None:
                 pretrained_revision = parser.parse_arg("pretrained_revision", yaml_overrides)
-            self.policy = PreTrainedConfig.from_pretrained(
-                policy_path,
-                revision=pretrained_revision,
-                cli_overrides=policy_overrides,
-            )
-            self.policy.pretrained_path = policy_path
-        if self.policy is None and not remote:
+            if is_bundle(policy_path):
+                if (
+                    policy_overrides
+                    or not isinstance(self.inference, SyncInferenceConfig)
+                    or self.use_torch_compile
+                    or self.device is not None
+                ):
+                    raise ValueError(
+                        "A bundle runs as it was compiled: with sync inference, on the device it was "
+                        "compiled for. Drop the --policy.* overrides, --inference.type, --use_torch_compile "
+                        "and --device."
+                    )
+                self.bundle = Bundle.read(policy_path)
+                if self.planner is not None and self.bundle.manifest.task is not None:
+                    raise ValueError(
+                        "This bundle runs only the task it was exported for, so a planner cannot change it. "
+                        "Drop --planner."
+                    )
+            else:
+                try:
+                    self.policy = PreTrainedConfig.from_pretrained(
+                        policy_path,
+                        revision=pretrained_revision,
+                        cli_overrides=policy_overrides,
+                    )
+                except FileNotFoundError:
+                    if _is_hub_bundle(policy_path, pretrained_revision):
+                        raise ValueError(
+                            f"{policy_path} is a bundle on the Hugging Face Hub. Download it first, for "
+                            f"example with `hf download {policy_path} --local-dir <folder>`, and pass "
+                            "--policy.path=<folder>."
+                        ) from None
+                    raise
+                self.policy.pretrained_path = policy_path
+        if self.policy is None and self.bundle is None and not remote:
             raise ValueError("--policy.path is required for rollout")
 
         # --- Task resolution ---
@@ -437,7 +468,7 @@ class RolloutConfig:
         # Resolve device from the policy config when not explicitly set so all
         # components (policy.to, preprocessor, inference engine) use the same
         # device string instead of inconsistent fallbacks.
-        if remote:
+        if remote or self.bundle is not None:
             return
         if self.device is None or not is_torch_device_available(self.device):
             resolved = self.policy.device
@@ -451,3 +482,12 @@ class RolloutConfig:
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         return ["policy"]
+
+
+def _is_hub_bundle(repo_id: str, revision: str | None) -> bool:
+    from huggingface_hub import file_exists
+
+    try:
+        return file_exists(repo_id, MANIFEST, revision=revision)
+    except Exception:
+        return False
