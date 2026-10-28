@@ -615,8 +615,10 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         """
         Optimized autoregressive decoding for FAST tokens using KV Caching.
 
-        Greedy decoding stops once every sequence emits the end-of-action marker. The
-        returned tensor keeps its fixed shape, with positions not generated after the
+        Greedy decoding stops once every sequence emits the end-of-action marker. Under
+        torch.compile and torch.export it runs to ``max_decoding_steps``, because they
+        cannot branch on a tensor value; ``detokenize_actions`` ignores the extra tokens.
+        The returned tensor keeps its fixed shape, with positions not generated after the
         batch-wide stop left zero-filled. Stochastic decoding always runs to
         ``max_decoding_steps`` so early stopping does not change the RNG state used by
         subsequent calls.
@@ -686,7 +688,7 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         generated_action_tokens[:, 0] = next_token.squeeze(-1)
         if finished is not None:
             finished |= next_token.squeeze(-1) == end_of_action_token_id
-            if bool(finished.all()):
+            if not torch.compiler.is_compiling() and bool(finished.all()):
                 return generated_action_tokens
 
         # Track valid tokens mask (0 for pad, 1 for valid)
@@ -740,7 +742,7 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             if finished is not None:
                 finished |= next_token.squeeze(-1) == end_of_action_token_id
-                if bool(finished.all()):
+                if not torch.compiler.is_compiling() and bool(finished.all()):
                     break
 
         return generated_action_tokens

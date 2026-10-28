@@ -147,6 +147,9 @@ class Flux3Policy(PreTrainedPolicy):
         self.frozen = FrozenComponents(self._build_video_vae(config), self._build_text_encoder(config))
         self._ctx_cache: dict[str, tuple[Tensor, Tensor]] = {}
         self._compiled_dit: Callable[..., dict[str, Tensor]] | None = None
+        if config.sampler == "euler":
+            # Built here, not in the traced sampling call: a schedule made while tracing cannot be read back.
+            sampling.euler_timesteps(config.num_inference_steps, config.sampler_shift)
         self.reset()
 
     @classmethod
