@@ -249,11 +249,18 @@ class ActionChunkRecipe(ExportRecipe):
         }
         features = dataset_to_policy_features(metadata.features)
         inputs = self.policy.config.input_features or {}
-        return {
+        kept = {
             name: f
             for name, f in features.items()
             if name.startswith(f"{OBS_STR}.") and renames.get(name, name) in inputs
         }
+        missing = sorted(set(inputs) - {renames.get(name, name) for name in kept})
+        if missing:
+            raise ValueError(
+                f"The dataset gives nothing the policy reads as {missing}, even after the renames its "
+                f"preprocessor saved ({renames}). The dataset has {sorted(features)}."
+            )
+        return kept
 
     def _random_frame(self) -> dict[str, np.ndarray]:
         frame = {}
