@@ -24,7 +24,9 @@ import pytest
 import torch
 from torch import nn
 
-pytest.importorskip("transformers")
+transformers = pytest.importorskip("transformers")
+
+from packaging.version import Version  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
@@ -632,6 +634,10 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         assert decoded_tokens.shape == (1, 3)
 
 
+@pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.4"),
+    reason="transformers before 5.5.4 also scales the temporal position of still images",
+)
 def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
     # A second vision block attends by windows, so both attention splits are checked.
     backbone = make_tiny_qwen_backbone(vision_depth=2)

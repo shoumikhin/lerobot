@@ -20,7 +20,14 @@ The stock tower turns ``grid_thw``, and tensors built from it, into Python ints 
 (``.tolist()``), which ``torch.export`` cannot trace. When every batch uses the same camera grid,
 everything derived from it can be computed once, in eager, with the tower's own methods.
 ``qwen2_5_vision_forward`` then runs the tower's own submodules with that metadata and gives the
-same numbers as the stock forward, without reading any tensor value on the host.
+same numbers as the stock forward, without reading any tensor value on the host. Attention runs once
+per image or window, like the stock non-flash path, so a flash-attention backend is called per chunk
+instead of on one packed sequence.
+
+``Qwen2_5VisionGrid.build`` calls the tower's ``rot_pos_emb`` and ``get_window_index``. Transformers
+removed both in 5.17, while LeRobot pins it below 5.6. From 5.9 on, the tower accepts these
+precomputed tensors itself (``transformers.vision_utils``), which can replace this module once the
+pin moves.
 """
 
 from dataclasses import dataclass
@@ -38,6 +45,7 @@ if TYPE_CHECKING or _transformers_available:
         apply_rotary_pos_emb_vision,
         eager_attention_forward,
     )
+    from transformers.utils import torch_compilable_check
 
 
 @dataclass
@@ -45,7 +53,8 @@ class Qwen2_5VisionGrid:  # noqa: N801
     """What a Qwen2.5-VL vision tower derives from one ``grid_thw``, computed once in eager."""
 
     grid_thw: list[list[int]]
-    num_patches: int
+    device: torch.device
+    dtype: torch.dtype
     position_embeddings: tuple[Tensor, Tensor]
     window_index: Tensor
     reverse_index: Tensor
@@ -65,7 +74,8 @@ class Qwen2_5VisionGrid:  # noqa: N801
         window_index = window_index.to(emb.device)
         return cls(
             grid_thw=grid,
-            num_patches=seq_len,
+            device=visual.device,
+            dtype=visual.dtype,
             position_embeddings=(emb.cos(), emb.sin()),
             window_index=window_index,
             reverse_index=torch.argsort(window_index),
@@ -73,6 +83,28 @@ class Qwen2_5VisionGrid:  # noqa: N801
             # The stock forward drops the repeated boundaries with unique_consecutive.
             window_lengths=[b - a for a, b in pairwise(cu_window_seqlens) if b > a],
         )
+
+    @classmethod
+    def reuse_or_build(
+        cls, cache: "Qwen2_5VisionGrid | None", visual: nn.Module, grid_thw: Tensor
+    ) -> "Qwen2_5VisionGrid":
+        """Return ``cache`` if it was built for ``grid_thw`` and the tower's current device and dtype.
+
+        Otherwise build a new grid, which reads ``grid_thw`` on the host, so run one eager call before
+        ``torch.export``. Reusing reads nothing: the grid values are compared with
+        ``torch_compilable_check``, which raises in eager and is a runtime assert in an exported program.
+        """
+        if (
+            cache is None
+            or len(cache.grid_thw) != grid_thw.shape[0]
+            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+        ):
+            return cls.build(visual, grid_thw)
+        torch_compilable_check(
+            grid_thw == grid_thw.new_tensor(cache.grid_thw),
+            "The image grid differs from the one cached for precompute_grid_thw.",
+        )
+        return cache
 
 
 def _chunked_vision_attention(
@@ -124,7 +156,9 @@ def qwen2_5_image_rope_index(
 
     Text tokens count up by one. An image's tokens get ``(start, start + row, start + col)`` and move the
     next start by ``max(rows, cols)``. Padding gets 0. ``image_grid_thw`` lists every image in prompt order
-    across the batch, as Python ints, and must match the image tokens.
+    across the batch, as Python ints, and must match the image tokens. This is what transformers 4.x and
+    5.5.4+ compute; 5.4.0 to 5.5.3 also scale the temporal position of still images (a bug fixed upstream
+    in 5.5.4, transformers issue 45325), so their stock positions differ.
     """
     valid = attention_mask == 1
     image_tokens = input_ids == image_token_id

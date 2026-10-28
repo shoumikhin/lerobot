@@ -35,9 +35,11 @@ from ..chunk import ChunkPolicySpec, FeatureSpec
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoModel, AutoVideoProcessor
+    from transformers.utils import torch_compilable_check
 else:
     AutoModel = None
     AutoVideoProcessor = None
+    torch_compilable_check = None
 
 from .action_head import VLAJEPAActionHead
 from .configuration_vla_jepa import VLAJEPAConfig
@@ -176,9 +178,9 @@ class VLAJEPAModel(nn.Module):
         input_ids = qwen_inputs["input_ids"]
         attention_mask = qwen_inputs["attention_mask"]
         pixel_values = qwen_inputs["pixel_values"]
-        # Compare shapes, not grid values, so the cached path reads no tensor values back to Python.
-        if self._vision_grid is None or self._vision_grid.num_patches != pixel_values.shape[0]:
-            self._vision_grid = Qwen3VisionGrid.build(qwen.visual, qwen_inputs["image_grid_thw"])
+        self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+            self._vision_grid, qwen.visual, qwen_inputs["image_grid_thw"]
+        )
         position_ids = qwen3_image_rope_index(
             input_ids,
             attention_mask,
@@ -219,13 +221,16 @@ class VLAJEPAModel(nn.Module):
         if qwen_inputs is None:
             qwen_inputs = self.build_qwen_inputs(images, instructions)
         input_ids = qwen_inputs["input_ids"]
-        # Each sample holds `num_embodied_action_tokens_per_instruction` of them. Scoring them by how early they
-        # come lets `topk` return their positions in order with a static shape (`nonzero` gives one that
-        # depends on the data).
-        earliness = torch.arange(input_ids.shape[1], 0, -1, device=input_ids.device)
-        embodied_scores = (input_ids == self.embodied_action_token_id) * earliness
+        # Scoring the embodied action tokens by how early they come lets `topk` return their positions in order
+        # with a static shape (`nonzero` gives one that depends on the data).
+        is_embodied = input_ids == self.embodied_action_token_id
         num_embodied = self.config.num_embodied_action_tokens_per_instruction
-        embodied_positions = embodied_scores.topk(num_embodied).indices
+        torch_compilable_check(
+            is_embodied.sum(dim=1) == num_embodied,
+            f"Each sample must hold exactly {num_embodied} embodied action tokens.",
+        )
+        earliness = torch.arange(input_ids.shape[1], 0, -1, device=input_ids.device)
+        embodied_positions = (is_embodied * earliness).topk(num_embodied).indices
         action_idx = None
         if need_action_tokens:
             action_mask = torch.isin(input_ids, self._action_token_ids_t)

@@ -156,8 +156,9 @@ def test_moe_block_with_token_counts_routes_like_the_token_mask():
     def expert(size):
         return {"hidden_size": size, "intermediate_size": 32, "hidden_act": "silu"}
 
-    config = SimpleNamespace(experts=[expert(16), expert(8)], dim_inputs=(16, 8))
-    block = SparseMoeBlock(config, num_experts=2)
+    # The third expert gets no tokens, as in a WALL-X config with more experts than token types.
+    config = SimpleNamespace(experts=[expert(16), expert(8), expert(8)], dim_inputs=(16, 8, 8))
+    block = SparseMoeBlock(config, num_experts=3)
     hidden_states = torch.randn(2, 7, 16)
     token_types = torch.tensor([[0, 0, 0, 0, 1, 1, 1], [0, 0, 1, 1, 1, 0, 0]])
 

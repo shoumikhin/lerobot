@@ -930,3 +930,44 @@ def test_select_action_uses_action_queue_before_refill() -> None:
     assert first.shape == (1, 7)
     assert second.shape == (1, 7)
     assert not torch.equal(first, second)
+
+
+def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen() -> None:
+    from transformers import Qwen3VLForConditionalGeneration
+
+    from lerobot.policies.lawam.vlas.lawam import LatentWorldPolicyBackend
+    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+
+    act_token, flow_token, num_queries = 10, 11, 2
+    torch.manual_seed(0)
+    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
+    act_query, flow_query = torch.randn(2, num_queries, qwen.config.text_config.hidden_size)
+
+    def backend(precompute_grid_thw: bool) -> LatentWorldPolicyBackend:
+        backend = LatentWorldPolicyBackend.__new__(LatentWorldPolicyBackend)
+        nn.Module.__init__(backend)
+        backend.vlm = qwen
+        backend.model_cfg = SimpleNamespace(precompute_grid_thw=precompute_grid_thw)
+        backend.num_action_queries = num_queries
+        backend.vlm_to_lam = nn.Identity()
+        backend._vision_grid = None
+        return backend
+
+    prompts = image_prompts(qwen.config, suffix=(act_token,) * num_queries + (flow_token,) * num_queries)
+    inputs = {
+        "input_ids": prompts["input_ids"],
+        "attention_mask": prompts["attention_mask"],
+        "pixel_values": prompts["pixel_values"],
+        "image_grid_thw": prompts["image_grid_thw"],
+        "act_placeholder_mask": prompts["input_ids"] == act_token,
+        "flow_placeholder_mask": prompts["input_ids"] == flow_token,
+        "act_query": act_query,
+        "flow_query": flow_query,
+    }
+    stock, fixed = backend(False), backend(True)
+    with torch.no_grad():
+        expected = stock._run_vlm_stage(**inputs)
+        for _ in range(2):  # The second call reuses the cached grid.
+            actual = fixed._run_vlm_stage(**inputs)
+            torch.testing.assert_close(actual["h_vlm"], expected["h_vlm"], rtol=0, atol=0)
+            torch.testing.assert_close(actual["pred_latent"], expected["pred_latent"], rtol=0, atol=0)

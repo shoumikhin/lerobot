@@ -1392,7 +1392,7 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 action_mask.any(), "No action token found in input_ids", error_type=AssertionError
             )
             torch_compilable_check(
-                action_mask.sum() == batch_size * pred_horizon,
+                action_mask.sum(dim=1) == pred_horizon,
                 lambda: f"Expected {pred_horizon} action tokens per sample.",
             )
             torch_compilable_check(
@@ -1904,9 +1904,9 @@ class WallXPolicy(PreTrainedPolicy):
         """Vision metadata and rope positions of the fixed camera grid, computed from the first batch."""
         if batch.get("video_grid_thw") is not None:
             raise ValueError("WALL-X precompute_grid_thw supports images only.")
-        # A shape-only check, so reusing the cached grid never reads tensor values.
-        if self._vision_grid is None or self._vision_grid.num_patches != batch["pixel_values"].shape[0]:
-            self._vision_grid = Qwen2_5VisionGrid.build(self.model.visual, batch["image_grid_thw"])
+        self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+            self._vision_grid, self.model.visual, batch["image_grid_thw"]
+        )
         position_ids = qwen2_5_image_rope_index(
             batch["input_ids"],
             batch["attention_mask"],

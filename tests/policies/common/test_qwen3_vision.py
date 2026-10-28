@@ -16,74 +16,38 @@
 
 """The fixed-grid Qwen3-VL helpers must give exactly what the stock transformers model gives."""
 
+from copy import deepcopy
+
 import pytest
 import torch
 
 pytest.importorskip("transformers")
 
-from transformers import Qwen3VLConfig, Qwen3VLModel  # noqa: E402
+from transformers import Qwen3VLModel  # noqa: E402
 
 from lerobot.policies.common.qwen3_vision import (  # noqa: E402
     Qwen3VisionGrid,
     qwen3_image_rope_index,
+    qwen3_vision_forward,
     qwen3_vl_forward,
 )
-
-IMAGE_TOKEN_ID = 7
-IMAGE_GRIDS = [[1, 4, 4], [1, 4, 6]]
+from tests.policies.common.qwen3_vl_helpers import (  # noqa: E402
+    IMAGE_GRIDS,
+    IMAGE_TOKEN_ID,
+    image_prompts,
+    tiny_qwen3_vl_config,
+)
 
 
 @pytest.fixture(scope="module")
 def model():
     torch.manual_seed(0)
-    config = Qwen3VLConfig(
-        vision_config={
-            "depth": 2,
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_heads": 2,
-            "patch_size": 4,
-            "out_hidden_size": 64,
-            "num_position_embeddings": 16,
-            "deepstack_visual_indexes": [0],
-        },
-        text_config={
-            "vocab_size": 32,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 16,
-            "rope_parameters": {
-                "rope_type": "default",
-                "mrope_section": [4, 2, 2],
-                "mrope_interleaved": True,
-            },
-        },
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=IMAGE_TOKEN_ID + 1,
-    )
-    return Qwen3VLModel(config).eval()
+    return Qwen3VLModel(tiny_qwen3_vl_config()).eval()
 
 
 def _inputs(model):
-    """Two left-padded prompts of different lengths: text, image, text, image, text."""
-    merge = model.config.vision_config.spatial_merge_size
-    rows = []
-    for prefix in ([1, 2], [1, 2, 3, 4, 5]):
-        ids = list(prefix)
-        for _, h, w in IMAGE_GRIDS:
-            ids += [IMAGE_TOKEN_ID] * (h * w // merge**2) + [3]
-        rows.append(ids + [4, 5])
-    length = max(len(r) for r in rows)
-    input_ids = torch.tensor([[0] * (length - len(r)) + r for r in rows])
-    attention_mask = torch.tensor([[0] * (length - len(r)) + [1] * len(r) for r in rows])
-    grid_thw = torch.tensor(IMAGE_GRIDS * len(rows))
-    vision = model.config.vision_config
-    patch_dim = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
-    pixel_values = torch.randn(int(grid_thw.prod(-1).sum()), patch_dim)
-    return input_ids, attention_mask, pixel_values, grid_thw
+    prompts = image_prompts(model.config)
+    return tuple(prompts[k] for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"))
 
 
 def test_qwen3_vl_forward_matches_stock_model(model):
@@ -161,3 +125,57 @@ def test_qwen3_image_rope_index_matches_get_rope_index(model):
             position_ids=position_ids,
         )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_cached_grid_keeps_learned_positions_trainable(model):
+    visual = deepcopy(model.visual)
+    _, _, pixel_values, grid_thw = _inputs(model)
+    grid = Qwen3VisionGrid.build(visual, grid_thw)
+    for _ in range(2):  # A second backward fails if the grid holds an autograd graph.
+        visual.zero_grad()
+        qwen3_vision_forward(visual, pixel_values, grid)[0].square().sum().backward()
+    cached_grad = visual.pos_embed.weight.grad.clone()
+    visual.zero_grad()
+    visual(pixel_values, grid_thw=grid_thw).pooler_output.square().sum().backward()
+    torch.testing.assert_close(cached_grad, visual.pos_embed.weight.grad)
+
+    with torch.no_grad():
+        visual.pos_embed.weight.add_(1.0)
+        torch.testing.assert_close(
+            qwen3_vision_forward(visual, pixel_values, grid)[0],
+            visual(pixel_values, grid_thw=grid_thw).pooler_output,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_reused_grid_follows_dtype_changes(model):
+    visual = deepcopy(model.visual)
+    _, _, pixel_values, grid_thw = _inputs(model)
+    grid = Qwen3VisionGrid.reuse_or_build(None, visual, grid_thw)
+    visual.to(torch.bfloat16)
+    grid = Qwen3VisionGrid.reuse_or_build(grid, visual, grid_thw)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            qwen3_vision_forward(visual, pixel_values, grid)[0],
+            visual(pixel_values.bfloat16(), grid_thw=grid_thw).pooler_output,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_reused_grid_rejects_a_changed_grid(model):
+    grid_thw = torch.tensor([[1, 4, 6]])
+    grid = Qwen3VisionGrid.build(model.visual, grid_thw)
+    rotated = torch.tensor([[1, 6, 4]])
+    with pytest.raises(ValueError, match="image grid differs"):
+        Qwen3VisionGrid.reuse_or_build(grid, model.visual, rotated)
+
+    class Wrapper(torch.nn.Module):
+        def forward(self, grid_thw):
+            return Qwen3VisionGrid.reuse_or_build(grid, model.visual, grid_thw).position_embeddings[0]
+
+    program = torch.export.export(Wrapper(), (grid_thw,))
+    program.module()(grid_thw)
+    with pytest.raises(RuntimeError):
+        program.module()(rotated)

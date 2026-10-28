@@ -14,15 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run a stock transformers Qwen3-VL model on a fixed image grid.
+"""Run a transformers Qwen3-VL model on a fixed image grid.
 
-The transformers Qwen3-VL vision tower reads the image grid (`image_grid_thw`) back to Python with
-`.tolist()` to build its position embeddings and attention chunks, so `torch.export` cannot trace it.
-Its text model adds the DeepStack features through boolean-mask indexing, which leaves a shape that
-depends on tensor values in the exported graph. When every batch uses the same camera grid, everything
-derived from the grid can be computed once in eager mode (`Qwen3VisionGrid.build`), and the forward
-below reuses the stock submodules with that metadata and keeps every shape static. The numbers are the
-same as the stock forward.
+The Qwen3-VL vision tower reads the image grid (`image_grid_thw`) back to Python with `.tolist()` to build
+its position embeddings and attention chunks, so `torch.export` cannot trace it. When every batch uses the
+same camera grid, what the tower derives from the grid can be computed once in eager mode
+(`Qwen3VisionGrid.build`) and reused by the forward below, which runs the stock submodules and gives the
+same numbers as the stock forward. Attention runs once per image, like the stock non-flash path, so a
+flash-attention backend is called per image instead of on one packed sequence.
+
+`Qwen3VisionGrid.build` calls the tower's `rot_pos_emb`, which transformers removed in 5.17, while LeRobot
+pins it below 5.6. From 5.9 on, the tower accepts these precomputed tensors itself
+(`transformers.vision_utils`), which can replace this module once the pin moves.
 """
 
 from collections.abc import Callable
@@ -35,7 +38,6 @@ from torch import Tensor
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
-    from transformers.masking_utils import create_causal_mask
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLModel,
@@ -44,38 +46,102 @@ if TYPE_CHECKING or _transformers_available:
         apply_rotary_pos_emb_vision,
         eager_attention_forward,
     )
+    from transformers.utils import torch_compilable_check
 else:
-    create_causal_mask = None
     ALL_ATTENTION_FUNCTIONS = None
     Qwen3VLModel = None
     Qwen3VLVisionAttention = None
     Qwen3VLVisionModel = None
     apply_rotary_pos_emb_vision = None
     eager_attention_forward = None
+    torch_compilable_check = None
+
+
+def _bilinear_indices_and_weights(
+    grid_thw: list[list[int]], num_grid_per_side: int, merge_size: int
+) -> tuple[Tensor, Tensor]:
+    """The weight-independent part of `Qwen3VLVisionModel.fast_pos_embed_interpolate`.
+
+    Returns the four `pos_embed` rows each patch interpolates and their weights, both `(4, patches)`, in the
+    tower's patch order (frames repeated, then grouped by merge window).
+    """
+    side = num_grid_per_side
+    indices, weights = [], []
+    for t, h, w in grid_thw:
+        h_idxs = torch.linspace(0, side - 1, h)
+        w_idxs = torch.linspace(0, side - 1, w)
+        h_floor, w_floor = h_idxs.int(), w_idxs.int()
+        h_ceil, w_ceil = (h_floor + 1).clip(max=side - 1), (w_floor + 1).clip(max=side - 1)
+        dh, dw = h_idxs - h_floor, w_idxs - w_floor
+        index = torch.stack([(a[:, None] * side + b[None]).flatten() for a in (h_floor, h_ceil) for b in (w_floor, w_ceil)])
+        weight = torch.stack([(a[:, None] * b[None]).flatten() for a in (1 - dh, dh) for b in (1 - dw, dw)])
+        order = (
+            torch.arange(h * w)
+            .repeat(t)
+            .view(t, h // merge_size, merge_size, w // merge_size, merge_size)
+            .permute(0, 1, 3, 2, 4)
+            .flatten()
+        )
+        indices.append(index[:, order].long())
+        weights.append(weight[:, order])
+    return torch.cat(indices, dim=1), torch.cat(weights, dim=1)
 
 
 @dataclass
 class Qwen3VisionGrid:
-    """Everything a Qwen3-VL vision tower derives from one image grid, computed in eager mode."""
+    """Everything a Qwen3-VL vision tower derives from one image grid, computed in eager mode.
+
+    The learned position embeddings are not cached, only which rows they interpolate, so training and
+    weight updates always use the current `pos_embed`.
+    """
 
     grid_thw: list[list[int]]
-    pos_embeds: Tensor
+    device: torch.device
+    dtype: torch.dtype
+    pos_embed_indices: Tensor
+    pos_embed_weights: Tensor
     position_embeddings: tuple[Tensor, Tensor]
     chunk_lengths: list[int]
 
     @classmethod
     def build(cls, visual: "Qwen3VLVisionModel", grid_thw: Tensor) -> "Qwen3VisionGrid":
         """Compute the grid metadata exactly as `Qwen3VLVisionModel.forward` does."""
-        pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
-        rotary_pos_emb = visual.rot_pos_emb(grid_thw).reshape(pos_embeds.shape[0], -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         grid = grid_thw.tolist()
-        chunk_lengths = [h * w for t, h, w in grid for _ in range(t)]
-        return cls(grid, pos_embeds, (emb.cos(), emb.sin()), chunk_lengths)
+        indices, weights = _bilinear_indices_and_weights(grid, visual.num_grid_per_side, visual.spatial_merge_size)
+        rotary_pos_emb = visual.rot_pos_emb(grid_thw).reshape(indices.shape[1], -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        device = visual.pos_embed.weight.device
+        return cls(
+            grid_thw=grid,
+            device=visual.device,
+            dtype=visual.dtype,
+            pos_embed_indices=indices.to(device),
+            pos_embed_weights=weights.to(device),
+            position_embeddings=(emb.cos(), emb.sin()),
+            chunk_lengths=[h * w for t, h, w in grid for _ in range(t)],
+        )
 
-    @property
-    def num_patches(self) -> int:
-        return self.pos_embeds.shape[0]
+    @classmethod
+    def reuse_or_build(
+        cls, cache: "Qwen3VisionGrid | None", visual: "Qwen3VLVisionModel", grid_thw: Tensor
+    ) -> "Qwen3VisionGrid":
+        """Return `cache` if it was built for `grid_thw` and the tower's current device and dtype.
+
+        Otherwise build a new grid, which reads `grid_thw` on the host, so run one eager call before
+        `torch.export`. Reusing reads nothing: the grid values are compared with `torch_compilable_check`,
+        which raises in eager and is a runtime assert in an exported program.
+        """
+        if (
+            cache is None
+            or len(cache.grid_thw) != grid_thw.shape[0]
+            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+        ):
+            return cls.build(visual, grid_thw)
+        torch_compilable_check(
+            grid_thw == grid_thw.new_tensor(cache.grid_thw),
+            "The image grid differs from the one cached for precompute_grid_thw.",
+        )
+        return cache
 
 
 def _vision_attention(attn: "Qwen3VLVisionAttention", hidden_states: Tensor, grid: Qwen3VisionGrid) -> Tensor:
@@ -102,7 +168,9 @@ def qwen3_vision_forward(
     visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid: Qwen3VisionGrid
 ) -> tuple[Tensor, list[Tensor]]:
     """`Qwen3VLVisionModel.forward` on a precomputed grid: merged image embeddings and DeepStack features."""
-    hidden_states = visual.patch_embed(pixel_values.type(visual.dtype)) + grid.pos_embeds
+    corners = visual.pos_embed(grid.pos_embed_indices) * grid.pos_embed_weights.to(visual.pos_embed.weight.dtype)[..., None]
+    pos_embeds = corners[0] + corners[1] + corners[2] + corners[3]
+    hidden_states = visual.patch_embed(pixel_values.type(visual.dtype)) + pos_embeds
     deepstack_features = []
     for layer_num, block in enumerate(visual.blocks):
         hidden_states = hidden_states + _vision_attention(block.attn, block.norm1(hidden_states), grid)
@@ -129,41 +197,19 @@ def qwen3_vl_forward(
     `input_ids`. Returns the last hidden state.
     """
     image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid)
-    image_mask = image_mask[..., None].expand_as(inputs_embeds)
-    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
-
-    text = model.language_model
-    batch_size, seq_length = inputs_embeds.shape[:2]
-    if position_ids is None:
-        position_ids = torch.arange(seq_length, device=inputs_embeds.device).view(1, 1, -1)
-        position_ids = position_ids.expand(4, batch_size, -1)
-    text_position_ids = None
-    if position_ids.shape[0] == 4:
-        text_position_ids, position_ids = position_ids[0], position_ids[1:]
-    causal_mask = create_causal_mask(
-        config=text.config,
+    torch_compilable_check(
+        image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
+    )
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
+    )
+    return model.language_model(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=text_position_ids,
-    )
-    hidden_states = inputs_embeds
-    position_embeddings = text.rotary_emb(hidden_states, position_ids)
-    for layer_idx, decoder_layer in enumerate(text.layers):
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=causal_mask,
-            position_ids=text_position_ids,
-            past_key_values=None,
-            position_embeddings=position_embeddings,
-        )
-        if layer_idx < len(deepstack_features):
-            # DeepStack adds visual features at the image tokens; a scatter keeps the shapes static.
-            features = deepstack_features[layer_idx].to(hidden_states.dtype)
-            hidden_states = hidden_states + torch.zeros_like(hidden_states).masked_scatter(
-                image_mask, features
-            )
-    return text.norm(hidden_states)
+        position_ids=position_ids,
+        visual_pos_masks=image_mask,
+        deepstack_visual_embeds=deepstack_features,
+    ).last_hidden_state
 
 
 def qwen3_image_rope_index(
@@ -188,7 +234,7 @@ def qwen3_image_rope_index(
     offsets, advances = [], []
     for t, h, w in image_grid_thw:
         h, w = h // spatial_merge_size, w // spatial_merge_size
-        rows = torch.arange(h, device=device).repeat_interleave(w).repeat(t)
+        rows = torch.arange(h, device=device).repeat_interleave(w * t)
         cols = torch.arange(w, device=device).repeat(h * t)
         offsets.append(torch.stack([torch.zeros_like(rows), rows, cols]))
         advance = torch.zeros(t * h * w, dtype=torch.long, device=device)

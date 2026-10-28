@@ -19,8 +19,9 @@
 import pytest
 import torch
 
-pytest.importorskip("transformers")
+transformers = pytest.importorskip("transformers")
 
+from packaging.version import Version  # noqa: E402
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig  # noqa: E402
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (  # noqa: E402
     Qwen2_5_VisionTransformerPretrainedModel,
@@ -79,6 +80,10 @@ def test_vision_forward_matches_stock_and_exports(grids):
         torch.testing.assert_close(exported.module()(pixel_values), expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.4"),
+    reason="transformers before 5.5.4 also scales the temporal position of still images",
+)
 def test_image_rope_index_matches_stock():
     model = Qwen2_5_VLModel._from_config(_tiny_config())
     grids = [[1, 4, 6], [1, 4, 4], [1, 6, 2]]
@@ -105,3 +110,32 @@ def test_image_rope_index_matches_stock():
     position_ids = qwen2_5_image_rope_index(input_ids, attention_mask, grids, 2, IMAGE_TOKEN_ID)
 
     assert torch.equal(position_ids, expected)
+
+
+def _tiny_visual():
+    torch.manual_seed(0)
+    return Qwen2_5_VisionTransformerPretrainedModel._from_config(_tiny_config().vision_config).eval()
+
+
+def test_reused_grid_follows_dtype_changes():
+    visual = _tiny_visual()
+    grid_thw = torch.tensor([[1, 8, 12]])
+    pixel_values = torch.randn(96, 3 * 2 * 14 * 14)
+    grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
+    visual.to(torch.bfloat16)
+    grid = Qwen2_5VisionGrid.reuse_or_build(grid, visual, grid_thw)
+    pixel_values = pixel_values.bfloat16()
+    with torch.no_grad():
+        torch.testing.assert_close(
+            qwen2_5_vision_forward(visual, pixel_values, grid),
+            visual(pixel_values, grid_thw=grid_thw).pooler_output,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_reused_grid_rejects_a_changed_grid():
+    visual = _tiny_visual()
+    grid = Qwen2_5VisionGrid.build(visual, torch.tensor([[1, 8, 12]]))
+    with pytest.raises(ValueError, match="image grid differs"):
+        Qwen2_5VisionGrid.reuse_or_build(grid, visual, torch.tensor([[1, 12, 8]]))

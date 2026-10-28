@@ -392,9 +392,9 @@ class LatentWorldPolicyBackend(nn.Module):
         # HF transformers 4.57 Qwen3VL causal wrapper drops `hidden_states`
         # from the returned output; use the underlying multimodal model output.
         if self.model_cfg.precompute_grid_thw:
-            # Compare shapes, not grid values, so the cached path reads no tensor values back to Python.
-            if self._vision_grid is None or self._vision_grid.num_patches != pixel_values.shape[0]:
-                self._vision_grid = Qwen3VisionGrid.build(self.vlm.model.visual, image_grid_thw)
+            self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+                self._vision_grid, self.vlm.model.visual, image_grid_thw
+            )
             hidden = qwen3_vl_forward(
                 self.vlm.model,
                 inputs_embeds,

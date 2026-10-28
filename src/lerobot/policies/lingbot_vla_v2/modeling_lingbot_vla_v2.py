@@ -30,6 +30,7 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.cache_utils import Cache
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+from transformers.utils import torch_compilable_check
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
 from lerobot.policies.common.qwen3_vision import qwen3_image_rope_index
@@ -918,6 +919,11 @@ class FlowMatchingV2(FlowMatchingV1):
         rope_grid_thw = self.qwenvl_with_expert.visual_grid_thw
         if rope_grid_thw is None or len(rope_grid_thw) != flat_grid_thw.shape[0]:
             rope_grid_thw = flat_grid_thw.tolist()
+        else:
+            torch_compilable_check(
+                flat_grid_thw == flat_grid_thw.new_tensor(rope_grid_thw),
+                "The image grid differs from the one cached for precompute_grid_thw.",
+            )
         prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
             prefix_input_ids, pad_masks.long(), rope_grid_thw
         )

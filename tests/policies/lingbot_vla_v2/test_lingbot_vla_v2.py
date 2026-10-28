@@ -160,6 +160,23 @@ def test_train_and_select_action(tiny_backbone):
     assert torch.isfinite(action).all()
 
 
+def test_precompute_grid_thw_select_action_matches_default(tiny_backbone):
+    """The rope positions from the cached grid match the per-call ones, also when the cache is reused."""
+    slots = _slot_kwargs(arm=[[0, 6]], effector=[[6, 7]])
+    meta = _ds_meta(7)
+    cfg = _tiny_config(tiny_backbone, **slots)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    fixed = make_policy(_tiny_config(tiny_backbone, precompute_grid_thw=True, **slots), ds_meta=meta).eval()
+    fixed.load_state_dict(policy.state_dict())
+    preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+
+    torch.manual_seed(0)
+    expected = _select_action(policy, preprocessor, postprocessor, 7, "cpu")
+    for _ in range(2):
+        torch.manual_seed(0)
+        assert torch.equal(_select_action(fixed, preprocessor, postprocessor, 7, "cpu"), expected)
+
+
 def test_align_query_tokens(tiny_backbone, monkeypatch):
     """A tiny RoboTwin-style align recipe appends 2 x num_task_tokens query tokens to the prefix, and a
     training step on [current, future] frames adds the distillation losses (teachers stubbed: no download)."""

@@ -459,9 +459,9 @@ class Qwen3Backbone(nn.Module):
         input_ids = model_input["input_ids"]
         attention_mask = model_input["attention_mask"]
         pixel_values = model_input["pixel_values"]
-        # Compare shapes, not grid values, so the cached path reads no tensor values back to Python.
-        if self._vision_grid is None or self._vision_grid.num_patches != pixel_values.shape[0]:
-            self._vision_grid = Qwen3VisionGrid.build(qwen.visual, model_input["image_grid_thw"])
+        self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+            self._vision_grid, qwen.visual, model_input["image_grid_thw"]
+        )
         position_ids = qwen3_image_rope_index(
             input_ids,
             attention_mask,

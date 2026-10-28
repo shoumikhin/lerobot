@@ -198,7 +198,7 @@ class WallOSS05JointAttention(nn.Module):
             rows = _expert_rows(token_types, expert_index)
             if rows is None:
                 continue
-            # A mask gather returns a contiguous copy; a full-row slice must match it to give the same bits.
+            # A mask gather returns a contiguous copy; the column slice must match it to give the same bits.
             projected = projection(hidden_states[rows, :width].contiguous().to(projection.weight.dtype))
             projected = projected.unflatten(
                 -1, (self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
@@ -984,9 +984,9 @@ class WallOSS05Policy(PreTrainedPolicy):
 
     def _static_vision_grid(self, inputs: dict[str, Tensor]) -> Qwen2_5VisionGrid:
         """Vision metadata of the fixed camera grid, computed from the first batch."""
-        # A shape-only check, so reusing the cached grid never reads tensor values.
-        if self._vision_grid is None or self._vision_grid.num_patches != inputs["pixel_values"].shape[0]:
-            self._vision_grid = Qwen2_5VisionGrid.build(self.model.visual, inputs["image_grid_thw"])
+        self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+            self._vision_grid, self.model.visual, inputs["image_grid_thw"]
+        )
         return self._vision_grid
 
     @torch.no_grad()
