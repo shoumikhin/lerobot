@@ -30,6 +30,7 @@ from huggingface_hub.errors import EntryNotFoundError
 
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
+    from lerobot.export.recipe import ExportRecipe
 
 from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
@@ -285,6 +286,21 @@ def load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
         config=peft_config,
         revision=pretrained_revision,
     )
+
+
+def get_export_recipe_class(config: PreTrainedConfig) -> type[ExportRecipe]:
+    """The policy's own export recipe, from `export_<type>.py` beside its configuration, or the default one."""
+    from lerobot.export.recipe import ActionChunkRecipe
+
+    config_class = type(config)
+    module = _import_sibling_policy_module(config_class, "export")
+    if module is None:
+        return ActionChunkRecipe
+    name = config_class.__name__.removesuffix("Config") + "ExportRecipe"
+    recipe = getattr(module, name, None)
+    if recipe is None:
+        raise ValueError(f"{module.__name__} must define the export recipe {name}.")
+    return recipe
 
 
 def make_policy(
