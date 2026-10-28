@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 class ExecuTorchOpenVINOConfig(ExportBackendConfig):
     """ExecuTorch programs whose work runs through OpenVINO, Intel's compiler, on the CPU.
 
-    Needs an ExecuTorch build with its OpenVINO backend, and `pip install openvino nncf`.
+    Needs `pip install "executorch>=1.6.0,<1.7.0" openvino nncf`.
     """
 
     runtime = "executorch"
@@ -48,14 +48,14 @@ class ExecuTorchOpenVINOConfig(ExportBackendConfig):
             from executorch.exir.backend.compile_spec_schema import CompileSpec
         except ImportError as error:
             raise ImportError(
-                "The executorch_openvino backend needs ExecuTorch built with its OpenVINO backend, "
-                "and pip install openvino nncf"
+                "The executorch_openvino backend needs ExecuTorch, OpenVINO and NNCF: "
+                'pip install "executorch>=1.6.0,<1.7.0" openvino nncf'
             ) from error
 
         with torch.no_grad():
             program = torch.export.export(part.module, part.example_inputs)
         partitioner = OpenvinoPartitioner([CompileSpec("device", b"CPU")])
         edge = to_edge_transform_and_lower(program, partitioner=[partitioner])
-        # ExecuTorch's OpenVINO backend frees a separate delegate segment while OpenVINO still reads it, so a
-        # program loaded from a file crashes unless the segment stays inside the program.
+        # With OpenVINO 2026, a program whose delegate data sits in a separate segment crashes when loaded from a
+        # file, so the data stays inside the program.
         path.write_bytes(edge.to_executorch(ExecutorchBackendConfig(extract_delegate_segments=False)).buffer)
