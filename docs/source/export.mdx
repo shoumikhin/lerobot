@@ -32,6 +32,7 @@ lerobot-rollout \
 | `--backend.type`      | runs the policy on | needs                                                                    |
 | --------------------- | ------------------ | ------------------------------------------------------------------------ |
 | `executorch_tensorrt` | NVIDIA GPUs        | `pip install "lerobot[export]" "torch-tensorrt[executorch]>=2.15,<2.16"` |
+| `executorch_xnnpack`  | Arm and x86 CPUs   | `pip install "lerobot[export]"`                                          |
 
 Install them on the board that will run the policy. Torch-TensorRT must match LeRobot's PyTorch version. A TensorRT engine runs only on the kind of GPU that built it, so export on that board too. The `export` extra installs ExecuTorch 1.6; it arrives with that release.
 
