@@ -355,6 +355,87 @@ def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
     assert not robot.is_connected
 
 
+class _TwoActions(torch.nn.Module):
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return torch.stack([state, -state])
+
+
+def _export_rollout_config(monkeypatch, tmp_path, *args: str, n_motors: int = 3, **kwargs):
+    import numpy as np
+
+    from lerobot.rollout import RolloutConfig
+    from lerobot.utils.constants import OBS_STATE
+    from tests.export.torch_backend import make_bundle
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    bundle = make_bundle(tmp_path / "bundle", _TwoActions(), {OBS_STATE: np.zeros(3, np.float32)})
+    monkeypatch.setattr(sys, "argv", ["lerobot-rollout", f"--policy.path={bundle.path}", *args])
+    robot = MockRobotConfig(n_motors=n_motors, random_values=False, static_values=[0.0] * n_motors)
+    return RolloutConfig(robot=robot, **kwargs)
+
+
+def test_rollout_config_reads_an_export_bundle(monkeypatch, tmp_path):
+    cfg = _export_rollout_config(monkeypatch, tmp_path)
+    assert cfg.export is not None and cfg.export.path == tmp_path / "bundle"
+    assert cfg.policy is None and cfg.device is None
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        (["--policy.n_action_steps=1"], {}),
+        ([], {"use_torch_compile": True}),
+        ([], {"device": "cpu"}),
+    ],
+)
+def test_rollout_config_refuses_settings_an_export_bundle_cannot_follow(monkeypatch, tmp_path, args, kwargs):
+    with pytest.raises(ValueError, match="runs as it was compiled"):
+        _export_rollout_config(monkeypatch, tmp_path, *args, **kwargs)
+
+
+def test_rollout_config_refuses_rtc_for_an_export_bundle(monkeypatch, tmp_path):
+    from lerobot.inference import RTCInferenceConfig
+
+    with pytest.raises(ValueError, match="runs as it was compiled"):
+        _export_rollout_config(monkeypatch, tmp_path, inference=RTCInferenceConfig())
+
+
+def test_build_rollout_context_runs_an_export_bundle_before_connecting(monkeypatch, tmp_path):
+    import lerobot.rollout.context as rollout_context
+    from lerobot.inference.export import ExportInferenceEngine
+    from tests.mocks.mock_robot import MockRobot
+
+    cfg = _export_rollout_config(monkeypatch, tmp_path)
+    robot = MockRobot(cfg.robot)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+
+    def make_engine(*args, **kwargs):
+        assert not robot.is_connected
+        return ExportInferenceEngine(*args, **kwargs)
+
+    monkeypatch.setattr(rollout_context, "ExportInferenceEngine", make_engine)
+    try:
+        ctx = rollout_context.build_rollout_context(cfg, threading.Event())
+        assert isinstance(ctx.policy.inference, ExportInferenceEngine)
+        assert ctx.policy.policy is None and ctx.policy.preprocessor is None
+        assert ctx.data.ordered_action_keys == ["motor_1.pos", "motor_2.pos", "motor_3.pos"]
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+def test_build_rollout_context_refuses_a_robot_an_export_bundle_does_not_fit(monkeypatch, tmp_path):
+    import lerobot.rollout.context as rollout_context
+    from tests.mocks.mock_robot import MockRobot
+
+    cfg = _export_rollout_config(monkeypatch, tmp_path, n_motors=4)
+    robot = MockRobot(cfg.robot)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    with pytest.raises(ValueError, match="does not match the exported policy"):
+        rollout_context.build_rollout_context(cfg, threading.Event())
+    assert not robot.is_connected
+
+
 def test_load_pretrained_policy_passes_revision(monkeypatch):
     import lerobot.rollout.context as rollout_context
 
