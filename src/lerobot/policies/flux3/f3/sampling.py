@@ -29,6 +29,7 @@ video and action streams can use different guidance scales.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import numpy as np
@@ -66,6 +67,12 @@ def cfg_two_pass(
     return {k: pred_uc[k] + cfg_by_key[k] * (pred_c[k] - pred_uc[k]) for k in flow}
 
 
+@functools.cache
+def euler_timesteps(n_steps: int, alpha: float) -> tuple[float, ...]:
+    """The shifted Euler grid, cached so a traced sampling call reads Python floats instead of a tensor."""
+    return tuple(rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1), alpha).tolist())
+
+
 def euler(
     samples: Samples,
     predict_velocity: Callable[[Samples, float], Samples],
@@ -73,7 +80,7 @@ def euler(
     n_steps: int,
     alpha: float,
 ) -> Samples:
-    timesteps = rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1), alpha).tolist()
+    timesteps = euler_timesteps(n_steps, alpha)
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:], strict=True):
         pred = predict_velocity(samples, t_curr)
         samples = {
