@@ -72,6 +72,12 @@ if attempts:
         "lerobot.configs",
         "lerobot.policies",
         "lerobot.inference",
+<<<<<<< HEAD
+=======
+        "lerobot.inference.bundle",
+        "lerobot.processor",
+        "lerobot.utils.action_interpolator",
+>>>>>>> 783dbb731 (feat(inference): run a compiled policy bundle)
         pytest.param(
             "lerobot.scripts.lerobot_rollout",
             marks=[
