@@ -19,9 +19,10 @@
 The Qwen3-VL vision tower reads the image grid (`image_grid_thw`) back to Python with `.tolist()` to build
 its position embeddings and attention chunks, so `torch.export` cannot trace it. When every batch uses the
 same camera grid, what the tower derives from the grid can be computed once in eager mode
-(`Qwen3VisionGrid.build`) and reused by the forward below, which runs the stock submodules and gives the
-same numbers as the stock forward. Attention runs once per image, like the stock non-flash path, so a
-flash-attention backend is called per image instead of on one packed sequence.
+(`Qwen3VisionGrid.build`) and reused by the forward below. It runs the tower's own layers with a
+block loop and an attention split written out here, then the stock text model, and gives the same numbers
+as the stock forward. Attention runs once per image, like the stock non-flash path, so a flash-attention
+backend is called per image instead of on one packed sequence.
 
 `Qwen3VisionGrid.build` calls the tower's `rot_pos_emb`, which transformers removed in 5.17, while LeRobot
 pins it below 5.6. From 5.9 on, the tower accepts these precomputed tensors itself
