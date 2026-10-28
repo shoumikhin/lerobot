@@ -44,9 +44,11 @@ from .soft_transformer import SoftPromptedTransformer
 # Florence2 config and modeling depend on transformers
 if TYPE_CHECKING or _transformers_available:
     from transformers import Florence2Config, Florence2Model
+    from transformers.utils import torch_compilable_check
 else:
     Florence2Config = None
     Florence2Model = None
+    torch_compilable_check = None
 
 
 class XVLAModel(nn.Module):
@@ -165,11 +167,8 @@ class XVLAModel(nn.Module):
         batch_size, num_views = pixel_values.shape[:2]
         flat_mask = image_mask.view(-1).to(dtype=torch.bool)
         flat_images = pixel_values.flatten(0, 1)
-        num_valid = int(flat_mask.sum().item())
-        if num_valid == 0:
-            raise ValueError("At least one image view must be valid per batch.")
-
         valid_images = flat_images[flat_mask]
+        torch_compilable_check(valid_images.shape[0] > 0, "At least one image view must be valid per batch.")
         valid_feats = self.vlm.get_image_features(valid_images).pooler_output
         tokens_per_view, hidden_dim = valid_feats.shape[1:]
 
