@@ -115,6 +115,9 @@ class EO1Config(PreTrainedConfig):
     # Optional attention backend request passed through to the Qwen backbone.
     # Common values: None, "eager", "sdpa", "flash_attention_2".
     attn_implementation: str | None = None
+    # Inference only, for a fixed camera image grid: compute the vision grid metadata from the first batch and
+    # reuse it, so action sampling reads no grid values on the host (torch.export needs this).
+    precompute_grid_thw: bool = False
 
     # Training settings.
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
