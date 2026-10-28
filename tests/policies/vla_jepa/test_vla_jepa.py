@@ -272,6 +272,44 @@ def test_prepare_model_inputs_no_state_omitted(patch_vla_jepa_external_models: N
     assert "state" not in policy._prepare_model_inputs(batch)
 
 
+def _model_with_tiny_qwen(precompute_grid_thw: bool) -> VLAJEPAModel:
+    from transformers import Qwen3VLForConditionalGeneration
+
+    from tests.policies.common.qwen3_vl_helpers import tiny_qwen3_vl_config
+
+    torch.manual_seed(0)
+    model = VLAJEPAModel.__new__(VLAJEPAModel)
+    nn.Module.__init__(model)
+    model.qwen = SimpleNamespace(model=Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval())
+    model.config = SimpleNamespace(
+        precompute_grid_thw=precompute_grid_thw, num_embodied_action_tokens_per_instruction=2
+    )
+    model.embodied_action_token_id = 9
+    model._vision_grid = None
+    return model
+
+
+def test_precompute_grid_thw_matches_stock_qwen() -> None:
+    from tests.policies.common.qwen3_vl_helpers import image_prompts
+
+    stock, fixed = _model_with_tiny_qwen(False), _model_with_tiny_qwen(True)
+    qwen_inputs = image_prompts(stock.qwen.model.config)
+    with torch.no_grad():
+        expected = stock._qwen_last_decoder_hidden(qwen_inputs)
+        for _ in range(2):  # The second call reuses the cached grid.
+            torch.testing.assert_close(fixed._qwen_last_decoder_hidden(qwen_inputs), expected, rtol=0, atol=0)
+
+
+def test_encode_qwen_rejects_a_wrong_embodied_token_count() -> None:
+    from tests.policies.common.qwen3_vl_helpers import image_prompts
+
+    model = _model_with_tiny_qwen(True)
+    qwen_inputs = image_prompts(model.qwen.model.config, suffix=(9, 9))
+    qwen_inputs["input_ids"][0, -1] = 4
+    with pytest.raises(ValueError, match="embodied action tokens"):
+        model._encode_qwen([], [], need_action_tokens=False, qwen_inputs=qwen_inputs)
+
+
 # ---------------------------------------------------------------------------
 # Pretrained checkpoint
 # Hub tests (opt-in: VLA_JEPA_EXTENDED=1)
