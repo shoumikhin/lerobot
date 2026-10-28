@@ -363,8 +363,9 @@ class Natten3D(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.reshape(b, t, h, w, 3, self.num_heads, self.head_dim).unbind(4)
         if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            # PyTorch 2.13+ CUDA autocast runs rms_norm in float32; NATTEN needs q, k and v in one dtype.
+            q = self.q_norm(q).to(v.dtype)
+            k = self.k_norm(k).to(v.dtype)
         q, k = self.rope(q, k)
 
         if t == 1:
