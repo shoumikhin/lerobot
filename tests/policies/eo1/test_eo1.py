@@ -26,6 +26,9 @@ from torch import nn
 
 pytest.importorskip("transformers")
 
+import transformers
+from packaging.version import Version
+
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy
@@ -525,7 +528,7 @@ def test_training_and_generation_share_state_conditioned_prefix(query_kind, incl
     assert runtime["target_message_indices"] == [[]]
 
 
-def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+def make_tiny_qwen_backbone(vision_depth: int = 1):
     from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
     qwen_config = Qwen2_5_VLConfig(
@@ -542,7 +545,7 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
             "pad_token_id": 0,
         },
         vision_config={
-            "depth": 1,
+            "depth": vision_depth,
             "hidden_size": 32,
             "intermediate_size": 64,
             "num_heads": 4,
@@ -558,7 +561,11 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         vision_start_token_id=41,
         vision_end_token_id=42,
     )
-    backbone = Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+    return Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+
+
+def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+    backbone = make_tiny_qwen_backbone()
     monkeypatch.setattr(
         "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
         lambda *args, **kwargs: backbone,
@@ -626,3 +633,36 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         torch.testing.assert_close(full_output[:, :7], input_ids)
         torch.testing.assert_close(decoded_tokens, full_output[:, 7:])
         assert decoded_tokens.shape == (1, 3)
+
+
+@pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.4"),
+    reason="transformers before 5.5.4 also scales the temporal position of still images",
+)
+def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
+    # A second vision block attends by windows, so both attention splits are checked.
+    backbone = make_tiny_qwen_backbone(vision_depth=2)
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        lambda *args, **kwargs: backbone,
+    )
+    policy = EO1Policy(make_eo1_config())
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        OBS_STATE: torch.randn(1, STATE_DIM),
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "pixel_values": torch.randn(16, 12),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "state_token_id": STATE_TOKEN_ID,
+        "action_token_id": ACTION_TOKEN_ID,
+    }
+    torch.manual_seed(0)
+    expected = policy.predict_action_chunk(batch)
+
+    policy.config.precompute_grid_thw = True
+    for _ in range(2):  # The second call reuses the cached grid.
+        torch.manual_seed(0)
+        assert torch.equal(policy.predict_action_chunk({**batch, "action_token_start": 10}), expected)

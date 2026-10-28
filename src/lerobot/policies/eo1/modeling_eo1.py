@@ -39,6 +39,7 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_rope_index, qwen2_5_vision_forward
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
@@ -274,6 +275,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.action_time_mlp_in = nn.Linear(self.hidden_size * 2, self.hidden_size, dtype=torch.float32)
         self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
+        self._vision_grid: Qwen2_5VisionGrid | None = None
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
@@ -586,9 +588,14 @@ class EO1VisionFlowMatchingModel(nn.Module):
         *,
         state_token_id: int,
         action_token_id: int,
+        action_token_start: int | None = None,
         **kwargs,
     ) -> Tensor:
-        """Sample actions from the model."""
+        """Sample actions from the model.
+
+        `action_token_start` is where the action tokens start in the left-padded rollout prompt, as
+        `EO1QwenProcessorStep` reports it. When it is None, it is read from `input_ids`.
+        """
         if input_ids is None:
             raise ValueError("input_ids are required for EO1 action sampling.")
         if attention_mask is None:
@@ -615,18 +622,22 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         action_mask = action_placeholder_mask[..., 0]
         token_counts = action_mask.sum(dim=1)
-        if not torch.all(token_counts == chunk_size):
-            raise ValueError(
-                f"Each sample must contain exactly {chunk_size} action tokens, got {token_counts.tolist()}."
-            )
-        if action_mask.ne(action_mask[:1]).any():
-            raise ValueError(
-                "Batch inference expects all samples to share the same action token mask after left padding."
-            )
-        act_start = int(action_mask[0].to(torch.int64).argmax().item())
+        torch_compilable_check(
+            token_counts == chunk_size,
+            lambda: f"Each sample must contain exactly {chunk_size} action tokens, got {token_counts.tolist()}.",
+        )
+        torch_compilable_check(
+            action_mask.eq(action_mask[:1]),
+            "Batch inference expects all samples to share the same action token mask after left padding.",
+        )
+        act_start = action_token_start
+        if act_start is None:
+            act_start = int(action_mask[0].to(torch.int64).argmax().item())
         act_end = act_start + self.config.chunk_size
-        if not torch.all(action_mask[:, act_start:act_end]):
-            raise ValueError("Action tokens must form a contiguous chunk of length chunk_size.")
+        torch_compilable_check(
+            action_mask[:, act_start:act_end],
+            "Action tokens must form a contiguous chunk of length chunk_size.",
+        )
         act_slice = slice(act_start, act_end)
 
         # 2. Encode the fixed prefix once and cache its KV state.
@@ -634,12 +645,36 @@ class EO1VisionFlowMatchingModel(nn.Module):
         device = inputs_embeds.device
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
-        position_ids, _ = self.vlm_backbone.model.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-            mm_token_type_ids=mm_token_type_ids,
-        )
+        vlm = self.vlm_backbone.model
+        if self.config.precompute_grid_thw and pixel_values is not None:
+            self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+                self._vision_grid, vlm.visual, image_grid_thw
+            )
+            position_ids = qwen2_5_image_rope_index(
+                input_ids,
+                attention_mask,
+                self._vision_grid.grid_thw,
+                vlm.visual.spatial_merge_size,
+                vlm.config.image_token_id,
+            )
+            image_embeds = qwen2_5_vision_forward(
+                vlm.visual, pixel_values.type(vlm.visual.dtype), self._vision_grid
+            )
+            image_mask = input_ids == vlm.config.image_token_id
+            torch_compilable_check(
+                image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
+            )
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+            # The images are in `inputs_embeds` now, so the backbone call below skips its vision tower.
+            pixel_values = None
+        else:
+            position_ids, _ = vlm.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
+            )
         position_ids = position_ids.to(device)
 
         outputs = self.vlm_backbone.model(
