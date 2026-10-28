@@ -38,7 +38,11 @@ from lerobot.policies.wall_x.processor_wall_x import (  # noqa: E402
     WallXPromptProcessorStep,
     make_wall_x_pre_post_processors,
 )
-from lerobot.policies.wall_x.qwen_model import Qwen2_5_VLMoEModel, Qwen2_5_VLTextConfig  # noqa: E402
+from lerobot.policies.wall_x.qwen_model import (  # noqa: E402
+    Qwen2_5_VLMoEModel,
+    Qwen2_5_VLTextConfig,
+    SparseMoeBlock,
+)
 from lerobot.policies.wall_x.utils import get_wallx_normal_text, preprocesser_call  # noqa: E402
 from lerobot.processor import (  # noqa: E402
     RenderRuntimeMessagesStep,
@@ -146,6 +150,19 @@ def test_moe_model_captures_requested_hidden_states_and_attentions():
 
     assert len(output.hidden_states) == config.num_hidden_layers + 1
     assert len(output.attentions) == config.num_hidden_layers
+
+
+def test_moe_block_with_token_counts_routes_like_the_token_mask():
+    def expert(size):
+        return {"hidden_size": size, "intermediate_size": 32, "hidden_act": "silu"}
+
+    config = SimpleNamespace(experts=[expert(16), expert(8)], dim_inputs=(16, 8))
+    block = SparseMoeBlock(config, num_experts=2)
+    hidden_states = torch.randn(2, 7, 16)
+    token_types = torch.tensor([[0, 0, 0, 0, 1, 1, 1], [0, 0, 1, 1, 1, 0, 0]])
+
+    with torch.no_grad():
+        assert torch.equal(block(hidden_states, token_types, (4, 3)), block(hidden_states, token_types))
 
 
 def _make_unloaded_policy(**config_values):

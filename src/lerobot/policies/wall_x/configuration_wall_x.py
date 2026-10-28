@@ -90,6 +90,10 @@ class WallXConfig(PreTrainedConfig):
     # PyTorch's packed variable-length attention when the runtime supports it and
     # otherwise falls back to the native per-chunk SDPA implementation.
     vision_attn_implementation: str = "auto"
+    # Inference only, for a fixed camera image grid: compute the vision grid metadata from the first batch and
+    # reuse it, so diffusion prediction reads no grid values on the host (torch.export needs this). The vision
+    # attention then runs as with vision_attn_implementation="sdpa".
+    precompute_grid_thw: bool = False
 
     # Optional explicit external language-recipe override.
     recipe_path: str | None = None
