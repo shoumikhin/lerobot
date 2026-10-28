@@ -36,7 +36,8 @@ from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
-from .default import DatasetConfig, EMAConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
+from .default import DatasetConfig, EMAConfig, EvalConfig, PeftConfig, WandBConfig
+from .job import JobConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
@@ -486,5 +487,7 @@ class TrainPipelineConfig(HubMixin):
                     json.dump(migrated_config, f)
                     config_file = f.name
 
+        # Policies load on demand, so register the ones these overrides need before draccus builds its parser.
+        parser.load_selected_choices(cls, cli_args)
         with draccus.config_type("json"):
             return draccus.parse(cls, config_file, args=cli_args)
