@@ -296,6 +296,68 @@ class ExportRecipe(abc.ABC):
         return RunPlan()
 
 
+class ChainRecipe(ExportRecipe):
+    """A recipe that exports its policy as a chain of programs, which pass their values to each other by name.
+
+    `parts` runs each part in PyTorch to make the next part's inputs and records the part's runs in `_runs`. The
+    test case is then compared with the actions of the policy's own `predict_action_chunk`, which
+    `_policy_actions` computes.
+
+    **Attributes**:
+        - **policy_name** (`str`) -- The policy's name in messages.
+        - **text_steps** (`tuple[type, ...]`) -- The preprocessor's steps that write the prompt and tokenize it,
+          which the programs do not run, for a recipe that uses `_tensor_preprocessor`.
+    """
+
+    policy_name: str
+    text_steps: tuple[type, ...]
+    _runs: list[ProgramRun]
+
+    @abc.abstractmethod
+    def _policy_actions(self, case: TestCase) -> np.ndarray | None:
+        """The actions the policy's own `predict_action_chunk` plays for the test case's frame and noise.
+
+        `None` skips the comparison, for a policy that does not fit in memory beside the export.
+        """
+
+    def _part(
+        self,
+        name: str,
+        module: nn.Module,
+        inputs: tuple[Tensor, ...],
+        input_names: list[str],
+        output_names: list[str],
+    ) -> Part:
+        """The part, which runs once per chunk with its own names."""
+        self._runs.append(ProgramRun(name, name, input_names, output_names))
+        return Part(name, module, inputs, input_names, output_names)
+
+    def _tensor_preprocessor(self) -> PolicyProcessorPipeline:
+        """The preprocessor without `text_steps`."""
+        return replace(
+            self.preprocessor,
+            steps=[s for s in self.preprocessor.steps if not isinstance(s, self.text_steps)],
+        )
+
+    def _check_against_policy(self, case: TestCase) -> None:
+        """Refuse a test case whose actions differ from `_policy_actions` by more than the tolerance."""
+        expected = self._policy_actions(case)
+        if expected is None:
+            return
+        error = float((np.abs(case.actions - expected) / case.action_scale).max())
+        logger.info(
+            "Test case against the whole policy: largest difference %.2e (tolerance %g)",
+            error,
+            self.tolerance,
+        )
+        if not error <= self.tolerance:
+            raise ValueError(
+                f"The chained parts compute other actions than {self.policy_name}'s predict_action_chunk "
+                f"({error:.2e} > {self.tolerance} in normalized units), so they do not export this checkpoint "
+                "correctly."
+            )
+
+
 class ActionChunkRecipe(ExportRecipe):
     """The default recipe: one program that does what `lerobot-rollout` does for one action chunk.
 

@@ -3422,7 +3422,7 @@ def test_alternate_vl_dit_block_mask_needs_both_masks():
 
 
 def test_alternate_vl_dit_makes_its_masks_once_per_forward():
-    """A forward runs once per denoising step, so masks rebuilt per block cost a few percent of it on a GPU."""
+    """A forward runs once per denoising step, so masks made again per block cost a few percent on a GPU."""
     pytest.importorskip("diffusers")
     from torch.utils._python_dispatch import TorchDispatchMode
 
