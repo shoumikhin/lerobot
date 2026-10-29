@@ -122,8 +122,8 @@ def test_a_stop_during_inference_sends_nothing_after_it(tmp_path, monkeypatch):
     )
     run_chunk = bundle_rollout.BundleEngine._run_chunk
 
-    def stop_while_running(engine, frame, noise=None):
-        actions = run_chunk(engine, frame, noise)
+    def stop_while_running(engine, frame, task_values, noise=None):
+        actions = run_chunk(engine, frame, task_values, noise)
         if engine.task == "stop now":
             stop.set()
         return actions
