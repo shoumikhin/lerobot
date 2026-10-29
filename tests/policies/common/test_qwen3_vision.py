@@ -167,7 +167,7 @@ def test_cached_grid_follows_learned_position_updates(model):
     with torch.no_grad():
         # A training step changes pos_embed after the cache exists; an export must see the new weights.
         visual.pos_embed.weight.add_(1.0)
-    # An ordinary grad-enabled export of the trainable tower, after the inference-mode warm-up.
+    # An ordinary grad-enabled export of the trainable tower, after a preparation in inference mode.
     exported = _export_vision(visual, grid, pixel_values, grid_thw)(pixel_values, grid_thw)
     exported.square().sum().backward()
     torch.testing.assert_close(
