@@ -149,6 +149,49 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     assert 'pip install "torch>=99.0,<99.1" "torchvision>=9.0,<9.1" "compiler>=99.0,<99.1"' in message
 
 
+@pytest.mark.parametrize(
+    ("args", "min_torch", "error"),
+    [
+        (["--output_dir={b}"], None, "--policy.path is required"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=nan"], None, "not nan"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=inf"], None, "not inf"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=-1"], None, "not -1"),
+        (["--policy.path={checkpoint}", "--output_dir={tmp}"], None, "already exists. Pick another"),
+        (["--policy.path={checkpoint}", "--output_dir={link}"], None, "already exists. Pick another"),
+        (["--policy.path={checkpoint}", "--output_dir={b}"], "99.0", "needs PyTorch 99.0 or newer"),
+    ],
+)
+def test_export_refuses_a_command_line_before_it_traces(
+    checkpoint, tmp_path, monkeypatch, args, min_torch, error
+):
+    from lerobot.configs import parser
+    from lerobot.export.configs import ExportConfig
+
+    @parser.wrap()
+    def parse(cfg: ExportConfig) -> ExportConfig:
+        return cfg
+
+    if min_torch is not None:
+        monkeypatch.setattr("tests.export.torch_backend.TorchTestBackend.min_torch", min_torch)
+    # A link to nothing is taken as there too: the export could not rename its bundle onto it.
+    (tmp_path / "link").symlink_to(tmp_path / "nothing")
+    values = {"checkpoint": checkpoint, "b": tmp_path / "b", "tmp": tmp_path, "link": tmp_path / "link"}
+    argv = ["lerobot-export", "--backend.type=torch_test", *(arg.format(**values) for arg in args)]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(Exception) as refusal:
+        parse()
+    # draccus raises its own error from a ValueError the config's checks raise.
+    assert error in str(refusal.value.__cause__ or refusal.value)
+
+
+@pytest.mark.parametrize(("option", "value"), [("compute_units", "tpu"), ("compute_precision", "int8")])
+def test_executorch_coreml_refuses_an_unknown_option_on_any_platform(option, value):
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    with pytest.raises(ValueError, match=f"--backend.{option} must be one of"):
+        ExecuTorchCoreMLConfig(**{option: value})
+
+
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
     partial = tmp_path / "partial"
     shutil.copytree(checkpoint, partial)
@@ -665,6 +708,26 @@ needs_executorch_cuda = pytest.mark.skipif(
 )
 
 
+# ExecuTorch installs coremltools only on the Pythons it supports.
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and EXECUTORCH and is_package_available("coremltools")),
+    reason="needs ExecuTorch, PyTorch 2.15 and coremltools on macOS",
+)
+def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    # Test machines may have no GPU or Neural Engine to give.
+    ExecuTorchCoreMLConfig(compute_units="cpu_only").compile(torch.export.export(model, (x,)), path)
+    assert b"CoreMLBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
 class MaskedPositions(torch.nn.Module):
     """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
 
@@ -704,6 +767,7 @@ def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkey
 @pytest.mark.parametrize(
     ("backend", "refused", "allowed", "error"),
     [
+        ("executorch_coreml", ["linux", "win32"], "darwin", "exports only on a Mac"),
         ("executorch_openvino", ["darwin"], "linux", "does not export on a Mac"),
     ],
 )
