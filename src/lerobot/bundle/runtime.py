@@ -36,13 +36,18 @@ class Program(Protocol):
     def __call__(self, *inputs: Any) -> tuple[Any, ...]:
         """Run the program once.
 
-        Inputs are NumPy arrays or outputs of an earlier program of the same runtime. Outputs stay where the
-        program left them, for example in GPU memory, so that the next program reads them without a copy.
+        Inputs are what `place` returned, or outputs of an earlier program of the same runtime. Outputs stay
+        where the program left them, for example in GPU memory, so that the next program reads them without a
+        copy.
         """
         ...
 
     def to_numpy(self, value: Any) -> np.ndarray:
         """`value`, an output of this program, as a NumPy array in host memory."""
+        ...
+
+    def place(self, index: int, value: np.ndarray) -> Any:
+        """`value` where input `index` reads it, to pass on every run without another copy."""
         ...
 
 
