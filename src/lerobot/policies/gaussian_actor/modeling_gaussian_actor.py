@@ -654,9 +654,11 @@ class RescaleFromTanh(Transform):
 
 class TanhMultivariateNormalDiag(TransformedDistribution):
     def __init__(self, loc, scale_diag, low=None, high=None):
-        # The Cholesky factor of a diagonal covariance is its square root; passing it directly avoids a
-        # factorization (and its validation check) that torch.export cannot trace.
-        base_dist = MultivariateNormal(loc, scale_tril=torch.diag_embed(scale_diag.sqrt()))
+        # The Cholesky factor of a diagonal covariance is its square root. Passing it skips the factorization
+        # and its validation check, which torch.export cannot trace. Like the factorization under autocast,
+        # it is computed in at least float32.
+        variance = scale_diag.to(torch.promote_types(scale_diag.dtype, torch.float32))
+        base_dist = MultivariateNormal(loc, scale_tril=torch.diag_embed(variance.sqrt()))
 
         transforms = [TanhTransform(cache_size=1)]
 
