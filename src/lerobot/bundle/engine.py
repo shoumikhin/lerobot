@@ -33,6 +33,7 @@ from lerobot.utils.constants import ACTION
 
 from .manifest import NOISE, Bundle, BundleManifest
 from .runtime import Program, load_program, prepare_runtime
+from .target import check_runtime_versions, check_target
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,8 @@ class BundleEngine:
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
         _check_dataflow(manifest, [*self._frame_spec, *self._constants], manifest.noise_shape is not None)
+        check_target(manifest.target)
+        check_runtime_versions(manifest.runtime_versions)
         prepare_runtime(manifest.runtime, manifest.runtime_imports)
         # Several runs of one program, such as the steps of a sampler, share it.
         loaded: dict[tuple[str, str | None], Program] = {}
