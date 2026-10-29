@@ -73,6 +73,13 @@ if attempts:
         "lerobot.policies",
         "lerobot.inference",
         pytest.param(
+            "lerobot.datasets",
+            marks=[
+                pytest.mark.dataset,
+                pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
+            ],
+        ),
+        pytest.param(
             "lerobot.scripts.lerobot_rollout",
             marks=[
                 pytest.mark.dataset,
