@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import fnmatch
+import inspect
 import json
 import logging
 import shutil
@@ -515,6 +516,11 @@ def test_dm05_relative_actions_use_generation_state_for_training_and_inference(t
         atol=2e-6,
         rtol=0,
     )
+
+
+def test_dm05_names_its_starting_noise_argument():
+    """Callers find the starting noise by its parameter name, as on the other flow and diffusion policies."""
+    assert "noise" in inspect.signature(DM05Policy.predict_action_chunk).parameters
 
 
 def test_dm05_action_dim_mask_and_fixed_noise_cover_training_and_inference():
