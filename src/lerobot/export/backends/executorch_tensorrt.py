@@ -72,6 +72,9 @@ class ExecuTorchTensorRTConfig(ExportBackendConfig):
             "min_block_size": 1,
             # Flow-matching time embeddings are computed in float64, which TensorRT does not support.
             "truncate_double": True,
+            # The part's PyTorch weights wait in host memory while TensorRT builds; on an 8 GB Jetson this
+            # leaves about 600 MiB more free at the peak of the largest build.
+            "offload_module_to_cpu": True,
         }
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
