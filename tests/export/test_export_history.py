@@ -18,6 +18,8 @@ Each bundle is played next to the PyTorch policy in `lerobot-rollout`'s engines,
 same random draws, for more ticks than one chunk, so both the history and the noise are exercised.
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -101,6 +103,39 @@ def vqbet_checkpoint(path) -> None:
     _save(config, stats, path)
 
 
+def diffusion_checkpoint(path, **sampler) -> None:
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+    config = DiffusionConfig(
+        input_features={
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *FRAME)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        n_obs_steps=3,
+        horizon=8,
+        n_action_steps=4,
+        drop_n_last_frames=2,
+        crop_shape=CROP,
+        pretrained_backbone_weights=None,
+        use_group_norm=True,
+        spatial_softmax_num_keypoints=8,
+        down_dims=(16, 32),
+        kernel_size=3,
+        n_groups=4,
+        diffusion_step_embed_dim=16,
+        num_train_timesteps=10,
+        device="cpu",
+        **sampler,
+    )
+    stats = {
+        IMAGE: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
+        OBS_STATE: _min_max(2),
+        ACTION: _min_max(2),
+    }
+    _save(config, stats, path)
+
+
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
     get_policy_class(config.type)(config).save_pretrained(path)
@@ -108,7 +143,30 @@ def _save(config, stats, path) -> None:
         processor.save_pretrained(path)
 
 
-CHECKPOINTS = {"vqbet": vqbet_checkpoint}
+@dataclass
+class Checkpoint:
+    """A tiny checkpoint that `save` writes into a folder, and the `programs` its bundle holds, if checked."""
+
+    save: Callable[[Path], object]
+    programs: list[str] | None = None
+    marks: tuple[pytest.MarkDecorator, ...] = ()
+
+
+# Diffusion Policy and Multi-Task DiT sample with the schedulers of diffusers, an optional package.
+DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="diffusers not installed")
+CHECKPOINTS = {
+    "vqbet": Checkpoint(vqbet_checkpoint),
+    "diffusion": Checkpoint(
+        diffusion_checkpoint, programs=["actions", "encoder", "step"], marks=(DIFFUSERS,)
+    ),
+    "diffusion_ddim": Checkpoint(
+        lambda path: diffusion_checkpoint(
+            path, noise_scheduler_type="DDIM", prediction_type="sample", num_inference_steps=5
+        ),
+        programs=["actions", "encoder", "step"],
+        marks=(DIFFUSERS,),
+    ),
+}
 
 
 def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
@@ -153,11 +211,15 @@ def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
 
 @pytest.mark.parametrize(
     ("name", "backend"),
-    [pytest.param(name, backend, marks=BACKENDS[backend]) for name in CHECKPOINTS for backend in BACKENDS],
+    [
+        pytest.param(name, backend, marks=[*checkpoint.marks, *BACKENDS[backend]])
+        for name, checkpoint in CHECKPOINTS.items()
+        for backend in BACKENDS
+    ],
 )
 def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp_path, monkeypatch):
-    path = tmp_path / "checkpoint"
-    CHECKPOINTS[name](path)
+    checkpoint, path = CHECKPOINTS[name], tmp_path / "checkpoint"
+    checkpoint.save(path)
     use_plugins(monkeypatch, "torch_backend")
     export([f"--backend.type={backend}", f"--policy.path={path}", f"--output_dir={tmp_path / 'b'}"])
     bundle = Bundle.read(tmp_path / "b")
@@ -166,8 +228,30 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
         # test case, made with the recorded noise, is the comparison.
         assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
         return
+    if checkpoint.programs is not None:
+        assert sorted(bundle.manifest.programs) == checkpoint.programs
     # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
     assert max(play(path, bundle, monkeypatch)) <= bundle.manifest.tolerance
+
+
+@DIFFUSERS
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ({"variance_type": "fixed_large"}, "fixed_small"),
+        ({"thresholding": True}, "thresholding True"),
+        ({"prediction_type": "v_prediction"}, "'v_prediction'"),
+    ],
+)
+def test_a_schedule_the_step_cannot_compute_is_refused(change, error):
+    from diffusers import DDPMScheduler
+
+    from lerobot.policies.common.export_denoising import scheduler_schedule
+
+    scheduler = DDPMScheduler(num_train_timesteps=10, **change)
+    scheduler.set_timesteps(10)
+    with pytest.raises(ValueError, match=error):
+        scheduler_schedule(scheduler)
 
 
 # In normalized action units: how far a chain of parts drifted from its policy on a Jetson Thor GPU, and ten
