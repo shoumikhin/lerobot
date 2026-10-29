@@ -14,7 +14,12 @@
 
 """The engine that runs a bundle, on bundles of small modules run by the test runtime."""
 
+import contextlib
+import importlib.machinery
+import importlib.util
 import json
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -22,7 +27,8 @@ import torch
 from safetensors.numpy import load_file, save_file
 from torch import Tensor, nn
 
-from lerobot.inference.bundle import MANIFEST, Bundle, BundleInferenceEngine
+from lerobot.inference.bundle import MANIFEST, RUNTIMES, Bundle, BundleInferenceEngine, Runtime
+from lerobot.inference.bundle.executorch import chunk_scope
 from lerobot.inference.bundle.manifest import NOISE, TEST_CASE
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle
@@ -271,6 +277,80 @@ def test_engine_places_a_frame_value_once_per_chunk(tmp_path, monkeypatch):
         engine.get_action(dict(FRAME))
     # The one constant a program reads, at load; then the state once for the load check and once per chunk.
     assert placed == [(1,), (3,), (3,), (3,)]
+
+
+def test_engine_runs_each_chunk_in_the_scope_its_runtime_makes(tmp_path, monkeypatch):
+    """The copies, runs and download of a chunk all happen in it, such as on one CUDA stream."""
+    from tests.export import torch_backend
+
+    program = torch_backend.TorchProgram
+    depth, scoped, events = [0], [], []
+
+    @contextlib.contextmanager
+    def scope():
+        depth[0] += 1
+        yield
+        depth[0] -= 1
+
+    def make_scope(programs):
+        scoped.append(len(programs))
+        return scope
+
+    monkeypatch.setitem(RUNTIMES, "torch_test", Runtime(program, chunk_scope=make_scope))
+    for name in ("__call__", "place", "to_numpy"):
+        method = getattr(program, name)
+        monkeypatch.setattr(
+            program, name, lambda self, *a, m=method, n=name: events.append((n, depth[0])) or m(self, *a)
+        )
+    engine = BundleInferenceEngine(_repeat_bundle(tmp_path, ("scaled", "factor_1")))
+    engine.get_action({OBS_STATE: np.ones(3, np.float32)})
+    # Made once, for the two loaded programs. Two constants placed at load, then the load check and one chunk.
+    assert scoped == [2]
+    assert {depth for _, depth in events} == {1}
+    assert [name for name, _ in events].count("place") == 2 + 2
+    assert [name for name, _ in events].count("__call__") == 2 * 3
+
+
+def _fake_cuda_module(monkeypatch):
+    """An `executorch.runtime.cuda` that records the streams it makes and the ones it runs on."""
+    made, used = [], []
+    cuda = types.ModuleType("executorch.runtime.cuda")
+    cuda.__spec__ = importlib.machinery.ModuleSpec(cuda.__name__, None)
+    cuda.Stream = lambda device=None: made.append(device) or f"stream on {device}"
+    cuda.stream = contextlib.contextmanager(lambda stream: (yield used.append(stream)))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setitem(sys.modules, cuda.__name__, cuda)
+    return made, used
+
+
+def _program(*cuda_devices):
+    return types.SimpleNamespace(cuda_devices=set(cuda_devices))
+
+
+def test_executorch_runs_programs_on_the_gpu_on_one_stream(monkeypatch):
+    made, used = _fake_cuda_module(monkeypatch)
+    scope = chunk_scope([_program(), _program(0)])
+    for _ in range(2):
+        with scope():
+            pass
+    assert made == [0] and used == ["stream on 0"] * 2
+    monkeypatch.setitem(sys.modules, "executorch.runtime.cuda", None)
+    assert chunk_scope([_program(0)]) is contextlib.nullcontext
+
+
+@pytest.mark.parametrize("devices", [(1,), (0, 1)])
+def test_executorch_makes_no_stream_off_gpu_0(monkeypatch, devices):
+    """ExecuTorch refuses to select a stream on another GPU, so those programs run as before."""
+    made, _ = _fake_cuda_module(monkeypatch)
+    assert chunk_scope([_program(), *(_program(device) for device in devices)]) is contextlib.nullcontext
+    assert made == []
+
+
+def test_executorch_leaves_programs_on_the_cpu_alone(monkeypatch):
+    made, _ = _fake_cuda_module(monkeypatch)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: pytest.fail(f"looked for {name}"))
+    assert chunk_scope([_program(), _program()]) is contextlib.nullcontext
+    assert made == []
 
 
 def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):

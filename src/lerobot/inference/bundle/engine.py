@@ -31,7 +31,7 @@ from lerobot.utils.constants import ACTION
 
 from ..base import InferenceEngine
 from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
-from .runtime import Program, load_program, prepare_runtime
+from .runtime import Program, chunk_scope, load_program, prepare_runtime
 from .task_tokens import TaskTokens
 
 logger = logging.getLogger(__name__)
@@ -103,15 +103,17 @@ class BundleInferenceEngine(InferenceEngine):
                     manifest.runtime, bundle.path / spec.file, _data_file(bundle, spec.data)
                 )
         self._programs = [(spec, loaded[spec.file, spec.data]) for spec in manifest.programs]
+        self._chunk_scope = chunk_scope(manifest.runtime, list(loaded.values()))
         # Each program gets the constants once, where it reads them, rather than a copy on every chunk.
-        self._placed = [
-            {
-                index: program.place(index, self._constants[name])
-                for index, name in enumerate(spec.inputs)
-                if name in self._constants
-            }
-            for spec, program in self._programs
-        ]
+        with self._chunk_scope():
+            self._placed = [
+                {
+                    index: program.place(index, self._constants[name])
+                    for index, name in enumerate(spec.inputs)
+                    if name in self._constants
+                }
+                for spec, program in self._programs
+            ]
         self._check(case, noise, expected, manifest.tolerance)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
@@ -150,18 +152,19 @@ class BundleInferenceEngine(InferenceEngine):
             values[NOISE] = (
                 np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
             )
-        for (spec, program), placed in zip(self._programs, self._placed, strict=True):
-            inputs = []
-            for index, name in enumerate(spec.inputs):
-                if index in placed:
-                    inputs.append(placed[index])
-                    continue
-                if isinstance(values[name], np.ndarray):
-                    # Placed once per chunk; a later program that reads it on the same device gets this copy.
-                    values[name] = program.place(index, values[name])
-                inputs.append(values[name])
-            values.update(zip(spec.outputs, program(*inputs), strict=True))
-        actions = self._programs[-1][1].to_numpy(values[ACTION])
+        with self._chunk_scope():
+            for (spec, program), placed in zip(self._programs, self._placed, strict=True):
+                inputs = []
+                for index, name in enumerate(spec.inputs):
+                    if index in placed:
+                        inputs.append(placed[index])
+                        continue
+                    if isinstance(values[name], np.ndarray):
+                        # Placed once per chunk; a later program on the same device reuses this copy.
+                        values[name] = program.place(index, values[name])
+                    inputs.append(values[name])
+                values.update(zip(spec.outputs, program(*inputs), strict=True))
+            actions = self._programs[-1][1].to_numpy(values[ACTION])
         if not np.isfinite(actions).all():
             raise RuntimeError("The exported policy returned NaN or infinite actions; they were not sent.")
         return actions

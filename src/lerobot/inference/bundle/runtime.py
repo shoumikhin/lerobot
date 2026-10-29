@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -57,13 +58,22 @@ class Runtime:
             Loads a program file, with its data file if the manifest names one.
         prepare (`Callable[[], None]`, *optional*):
             Runs once before the manifest's `runtime_imports` are imported.
+        chunk_scope (`Callable[[Sequence[Program]], Callable[[], AbstractContextManager]]`, *optional*):
+            Given a bundle's programs, as `load` returned them, returns a function that makes the context
+            the engine copies values for them and runs them in, such as one GPU stream for all of them. By
+            default none.
     """
 
     load: Callable[[Path, Path | None], Program]
     prepare: Callable[[], None] = lambda: None
+    chunk_scope: Callable[[Sequence[Any]], Callable[[], AbstractContextManager[Any]]] = (
+        lambda programs: nullcontext
+    )
 
 
-RUNTIMES: dict[str, Runtime] = {"executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare)}
+RUNTIMES: dict[str, Runtime] = {
+    "executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare, executorch.chunk_scope)
+}
 """Runtimes by name. A module a manifest names in `runtime_imports` may add one."""
 
 
@@ -80,6 +90,11 @@ def prepare_runtime(runtime: str, modules: Sequence[str]) -> None:
                 "the export guide says for the backend that wrote the bundle: "
                 "https://huggingface.co/docs/lerobot/export"
             ) from error
+
+
+def chunk_scope(runtime: str, programs: Sequence[Program]) -> Callable[[], AbstractContextManager[Any]]:
+    """The function that makes the context to copy values for `programs` and run them in, by their runtime."""
+    return RUNTIMES[runtime].chunk_scope(programs)
 
 
 def load_program(runtime: str, path: Path, data: Path | None = None) -> Program:

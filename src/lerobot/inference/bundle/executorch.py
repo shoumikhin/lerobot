@@ -17,7 +17,11 @@
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import os
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +66,10 @@ class ExecuTorchProgram:
             raise RuntimeError(f"ExecuTorch could not load {path.name}: {error}") from error
         meta = self._method.metadata
         self._devices = [meta.input_tensor_meta(i).device() for i in range(meta.num_inputs())]
+        outputs = [meta.output_tensor_meta(i).device() for i in range(meta.num_outputs())]
+        self.cuda_devices = {
+            int(device.removeprefix("cuda:")) for device in (*self._devices, *outputs) if device != "cpu"
+        }
 
     def __call__(self, *inputs: Any) -> tuple[Any, ...]:
         """Run the program; its outputs stay where it writes them."""
@@ -88,3 +96,18 @@ class ExecuTorchProgram:
         if device == "cpu":
             return value
         return self._from_host(value, int(device.removeprefix("cuda:")))
+
+
+def chunk_scope(programs: Sequence[ExecuTorchProgram]) -> Callable[[], AbstractContextManager[Any]]:
+    """One CUDA stream for every copy and run, if the programs' inputs or outputs are on GPU 0 only.
+
+    The CUDA and TensorRT delegates then queue their work on that stream rather than each on its own.
+    ExecuTorch selects a stream on CUDA device 0 only, so programs on another GPU, and programs under an
+    ExecuTorch that has no `executorch.runtime.cuda`, run as before.
+    """
+    devices = set().union(*(program.cuda_devices for program in programs))
+    if devices != {0} or importlib.util.find_spec("executorch.runtime.cuda") is None:
+        return nullcontext
+    from executorch.runtime import cuda
+
+    return functools.partial(cuda.stream, cuda.Stream(0))
