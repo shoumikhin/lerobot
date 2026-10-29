@@ -178,3 +178,49 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
     _edit(bundle, **change)
     with pytest.raises(ValueError, match=error):
         Bundle.read(bundle.path)
+
+
+class Scale(nn.Module):
+    def forward(self, x: Tensor, factor: Tensor) -> Tensor:
+        return x * factor
+
+
+def _repeat_bundle(tmp_path, chunk_inputs=("scaled", "chunk_factor")):
+    """`Chunk`, then one `Scale` program run twice with factors from the constants."""
+    bundle = make_bundle(tmp_path / "bundle", Chunk(), FRAME)
+    torch.export.save(
+        torch.export.export(Scale(), (torch.ones(3, 3), torch.ones(1))), bundle.path / "scale.pt2"
+    )
+    save_file(
+        {"factor_0": np.array([2.0], np.float32), "factor_1": np.array([0.5], np.float32)},
+        bundle.path / "constants.safetensors",
+    )
+    model = {"name": "model", "file": "model.pt2", "inputs": [OBS_STATE], "outputs": ["chunk"], "data": None}
+    runs = [
+        {"name": "scale_0", "file": "scale.pt2", "inputs": ["chunk", "factor_0"], "outputs": ["scaled"]},
+        {"name": "scale_1", "file": "scale.pt2", "inputs": list(chunk_inputs), "outputs": [ACTION]},
+    ]
+    _edit(
+        bundle, programs=[model, *({**run, "data": None} for run in runs)], constants="constants.safetensors"
+    )
+    return Bundle.read(bundle.path)
+
+
+def test_engine_runs_a_program_several_times_with_constants(tmp_path, monkeypatch):
+    from tests.export import torch_backend
+
+    loads = []
+    init = torch_backend.TorchProgram.__init__
+    monkeypatch.setattr(
+        torch_backend.TorchProgram,
+        "__init__",
+        lambda self, path, data=None: loads.append(path.name) or init(self, path, data),
+    )
+    engine = BundleInferenceEngine(_repeat_bundle(tmp_path, ("scaled", "factor_1")))
+    assert loads == ["model.pt2", "scale.pt2"]
+    np.testing.assert_array_equal(engine.get_action({OBS_STATE: np.ones(3, np.float32)}), [1, 1, 1])
+
+
+def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):
+    with pytest.raises(ValueError, match=r"'scale_1' reads \['chunk_factor'\]"):
+        BundleInferenceEngine(_repeat_bundle(tmp_path))
