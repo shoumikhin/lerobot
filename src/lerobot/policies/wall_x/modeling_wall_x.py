@@ -2027,6 +2027,9 @@ class WallXPolicy(PreTrainedPolicy):
 
         `noise` is the optional starting sample of the diffusion mode, shape
         `(batch_size, chunk_size, max_action_dim)`. It is not used by the fast mode.
+
+        The diffusion mode can be exported with `torch.export` under `torch.no_grad()` after an eager call inside
+        `prepare_image_grid()`; with grad enabled, transformers' causal mask code does not trace.
         """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
