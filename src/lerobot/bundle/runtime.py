@@ -43,6 +43,10 @@ class Program(Protocol):
         """`value`, an output of this program, as a NumPy array in host memory."""
         ...
 
+    def place(self, index: int, value: np.ndarray) -> Any:
+        """`value` where input `index` reads it, to pass on every run without another copy."""
+        ...
+
 
 @dataclass(frozen=True)
 class Runtime:
