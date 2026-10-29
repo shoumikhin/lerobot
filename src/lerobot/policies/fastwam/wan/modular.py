@@ -2084,6 +2084,9 @@ class FastWAM(torch.nn.Module):
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError("`infer_action` requires `video_attention_mask_mode='first_frame_causal'`.")
 
+        if noise is None and torch.compiler.is_exporting():
+            # An exported program keeps one generator whose state carries over between calls.
+            raise ValueError("Pass noise to export FastWAM; its sampling noise must be an input.")
         input_image, _, _ = self._normalize_infer_input_image(input_image)
         proprio = self._normalize_infer_proprio(proprio)
         latents_action = self._make_action_latents(action_horizon, seed, rand_device, noise=noise)
