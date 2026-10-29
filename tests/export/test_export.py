@@ -22,11 +22,10 @@ import pytest
 import torch
 from safetensors.numpy import load_file
 
-import tests.export.torch_backend  # noqa: F401  # registers the test backend
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import Bundle
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export import worker
+from lerobot.export import configs, worker
 from lerobot.export.bundle import POLICY_CONFIG
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
@@ -35,6 +34,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
 
 IMAGE = "observation.images.front"
@@ -156,6 +156,22 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
     else:
         with pytest.raises(RuntimeError, match="failed its check"):
             run_export(*args)
+
+
+@pytest.mark.parametrize(("min_torch", "refused"), [("2.0", False), ("99.0", True)])
+def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch, min_torch, refused):
+    monkeypatch.setattr(TorchTestBackend, "min_torch", min_torch)
+    monkeypatch.setattr(TorchTestBackend, "packages", ("compiler>=99.0,<99.1",))
+    monkeypatch.setitem(configs.EXPORT_TORCH_PINS, "99.0", ("torch>=99.0,<99.1", "torchvision>=9.0,<9.1"))
+    if not refused:
+        TorchTestBackend().check_torch()
+        return
+    with pytest.raises(ValueError) as refusal:
+        TorchTestBackend().check_torch()
+    message = str(refusal.value)
+    assert "needs PyTorch 99.0 or newer to export" in message
+    assert "printf 'torch>=99.0,<99.1\\ntorchvision>=9.0,<9.1\\n' > torch-overrides.txt" in message
+    assert 'uv pip install --override torch-overrides.txt lerobot "compiler>=99.0,<99.1"' in message
 
 
 @pytest.mark.parametrize("tolerance", ["nan", "inf", "-1"])
