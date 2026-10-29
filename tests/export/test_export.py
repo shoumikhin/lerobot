@@ -323,3 +323,18 @@ def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
     subprocess.run([sys.executable, "-c", script, *args], check=True)
     assert_plays_like_pytorch(checkpoint, Bundle.read(tmp_path / "b"), IMAGE)
     assert sorted(path.name for path in tmp_path.iterdir()) == ["b"]
+
+
+def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path):
+    """ACT exported to act on the older of its last two frames: the bundle's own check sees the order."""
+    run_export(
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        imports=[*IMPORTS, "tests.export.history_recipe"],
+    )
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.history == {IMAGE: 2, OBS_STATE: 2}
+    case = load_file(bundle.path / bundle.manifest.test)
+    assert case[IMAGE].shape == (2, 32, 32, 3) and case[OBS_STATE].shape == (2, 3)
+    engine = BundleInferenceEngine(bundle)
+    engine.check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])

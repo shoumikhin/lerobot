@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from lerobot.inference import FeatureSpec
+from lerobot.inference.bundle.manifest import MANIFEST
 from lerobot.policies import RTCConfig
 from lerobot.remote_inference import ExecutionConfig, LanguageConfig, ModelConfig, ServerConfig
 from lerobot.remote_inference.deployment import load_deployment
@@ -206,6 +207,14 @@ def test_remote_rollout_plays_a_bundle_served_without_torch(tmp_path, runtime):
 def test_bundle_refuses_settings_that_change_the_policy(numpy_bundle, kwargs, message):
     with pytest.raises(ValueError, match=message):
         load_deployment(server_config(numpy_bundle, **kwargs))
+
+
+def test_bundle_refuses_a_frame_history(numpy_bundle):
+    manifest = json.loads((numpy_bundle / MANIFEST).read_text())
+    manifest["history"] = {"observation.state": 2}
+    (numpy_bundle / MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="past control ticks"):
+        load_deployment(server_config(numpy_bundle))
 
 
 def test_bundle_refuses_features_it_does_not_take(numpy_bundle):

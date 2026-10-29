@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from safetensors.numpy import load_file
@@ -41,8 +41,9 @@ class BundleInferenceEngine(InferenceEngine):
     """Inline inference with a bundle: one run of its programs per action chunk.
 
     It plays the chunk one action per call, as [`SyncInferenceEngine`] plays the PyTorch policy's action
-    queue. Before it runs, it replays the bundle's test case and refuses to start if the actions differ
-    from the ones PyTorch computed by more than the bundle's tolerance.
+    queue, and keeps the past frames of a bundle with `history` the way the policy's own queues keep them.
+    Before it runs, it replays the bundle's test case and refuses to start if the actions differ from the ones
+    PyTorch computed by more than the bundle's tolerance.
 
     Args:
         bundle (`Bundle`):
@@ -87,9 +88,26 @@ class BundleInferenceEngine(InferenceEngine):
                 "The bundle's test case holds no valid expected actions: finite numbers shaped "
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
-        self._frame_spec = {name: value.shape for name, value in case.items()}
+        frames = [case]
+        if manifest.history:
+            ticks = {value.shape[0] if value.ndim else 0 for value in case.values()}
+            if len(ticks) != 1 or 0 in ticks:
+                raise ValueError(
+                    "The bundle keeps a frame history, but its test case does not hold the same number of "
+                    "frames for each key. Export the policy again."
+                )
+            frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
+        self._frame_spec = {name: value.shape for name, value in frames[-1].items()}
+        if unknown := sorted(set(manifest.history) - set(self._frame_spec)):
+            raise ValueError(
+                f"The bundle keeps the history of {unknown}, which its frame does not hold. Export the policy "
+                "again."
+            )
         self.chunk_length = expected.shape[0]
         """The number of actions one run of the programs returns."""
+        self._history: dict[str, deque[np.ndarray]] = {
+            name: deque(maxlen=size) for name, size in manifest.history.items()
+        }
         given = [
             *self._frame_spec,
             *self._constants,
@@ -114,7 +132,7 @@ class BundleInferenceEngine(InferenceEngine):
             }
             for spec, program in self._programs
         ]
-        self._check(case, noise, expected, manifest.tolerance)
+        self._check(frames, noise, expected, manifest.tolerance)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_robot(self, observation_shapes: Mapping[str, tuple[int, ...]], action_names: list[str]) -> None:
@@ -145,8 +163,14 @@ class BundleInferenceEngine(InferenceEngine):
     def run_chunk(
         self, frame: Mapping[str, np.ndarray], task: str, noise: np.ndarray | None = None
     ) -> np.ndarray:
-        """Run the programs once on `frame`, keyed by the bundle's names, and return the chunk of actions."""
-        values: dict[str, Any] = {name: frame[name] for name in self._frame_spec}
+        """Run the programs once on `frame`, keyed by the bundle's names, and return the chunk of actions.
+
+        Values the bundle keeps a history of come from the frames already observed, not from `frame`.
+        """
+        values: dict[str, Any] = {
+            name: np.stack(self._history[name]) if name in self._history else frame[name]
+            for name in self._frame_spec
+        }
         if self._task_tokens is not None:
             values[TASK_EMBEDDINGS], values[TASK_LENGTH] = self._task_tokens(task)
         if self._noise_shape is not None:
@@ -169,8 +193,24 @@ class BundleInferenceEngine(InferenceEngine):
             raise RuntimeError("The exported policy returned NaN or infinite actions; they were not sent.")
         return actions
 
-    def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self.run_chunk(frame, self._fixed_task or "", noise)
+    def _observe(self, frame: Mapping[str, np.ndarray]) -> None:
+        """Keep the frame's values that the programs read with their past ones, as `populate_queues` does."""
+        for name, frames in self._history.items():
+            # A copy, since a robot may write its next frame into the same array.
+            value = np.array(frame[name])
+            if frames:
+                frames.append(value)
+            else:
+                frames.extend([value] * cast(int, frames.maxlen))
+
+    def _check(
+        self, frames: list[dict], noise: np.ndarray | None, expected: np.ndarray, tolerance: float
+    ) -> None:
+        for frame in frames:
+            self._observe(frame)
+        actual = self.run_chunk(frames[-1], self._fixed_task or "", noise)
+        for history in self._history.values():
+            history.clear()
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -232,8 +272,10 @@ class BundleInferenceEngine(InferenceEngine):
         """No background resources to stop."""
 
     def reset(self) -> None:
-        """Drop the queued actions and any pending task change."""
+        """Drop the queued actions, the past frames and any pending task change."""
         self._actions.clear()
+        for frames in self._history.values():
+            frames.clear()
         self._discard_task_change()
 
     def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
@@ -243,13 +285,11 @@ class BundleInferenceEngine(InferenceEngine):
         task, task_changed = self._take_task()
         if task_changed:
             self._actions.clear()
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
         if not self._actions:
             start = time.perf_counter()
-            self._actions.extend(
-                self.run_chunk(
-                    {self._rename.get(name, name): value for name, value in obs_frame.items()}, task
-                )
-            )
+            self._actions.extend(self.run_chunk(frame, task))
             end = time.perf_counter()
             self.inference_times.append((end, end - start))
         self._set_dispatched_task(task)

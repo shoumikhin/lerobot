@@ -132,8 +132,14 @@ def _load_bundle(cfg: ServerConfig, path: Path, action_feature: FeatureSpec) -> 
         )
     if cfg.language.enabled:
         raise ValueError("A bundle holds no text model. Serve the checkpoint for language.enabled.")
+    bundle = Bundle.read(path)
+    if bundle.manifest.history:
+        raise ValueError(
+            "This bundle reads the frames of past control ticks, but a server sees one frame per chunk. "
+            "Run it with lerobot-rollout."
+        )
     runner = BundleRunner(
-        BundleInferenceEngine(Bundle.read(path)),
+        BundleInferenceEngine(bundle),
         action_interval=1 / cfg.execution.action_fps,
         features=tuple(cfg.features),
         action_feature=action_feature,
