@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 else:
     __getattr__, __dir__ = lazy_exports(__name__, {"PolicyAction": "torch.Tensor"})
 
+# Re-exported: robots and teleoperators import them from `lerobot.hardware_types`, which loads without PyTorch.
+from lerobot.hardware_types import RobotAction as RobotAction, RobotObservation as RobotObservation
+
 
 @final
 class TransitionKey:
@@ -46,9 +49,7 @@ class TransitionKey:
     COMPLEMENTARY_DATA: Final[Literal["complementary_data"]] = "complementary_data"
 
 
-RobotAction = dict[str, Any]
 EnvAction: TypeAlias = np.ndarray  # noqa: UP040
-RobotObservation = dict[str, Any]
 BatchType = dict[str, Any]
 
 
