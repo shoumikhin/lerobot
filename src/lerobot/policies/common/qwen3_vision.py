@@ -29,14 +29,21 @@ from torch import Tensor
 
 from lerobot.utils.import_utils import _transformers_available
 
-from .qwen_vision import FixedImageGrid, cumulative_lengths
+from .qwen_vision import FixedImageGrid, cumulative_lengths, vision_block_forward
 
 if TYPE_CHECKING or _transformers_available:
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel, Qwen3VLVisionModel
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLModel,
+        Qwen3VLVisionModel,
+        apply_rotary_pos_emb_vision,
+        eager_attention_forward,
+    )
     from transformers.utils import torch_compilable_check
 else:
     Qwen3VLModel = None
     Qwen3VLVisionModel = None
+    apply_rotary_pos_emb_vision = None
+    eager_attention_forward = None
     torch_compilable_check = None
 
 
@@ -116,7 +123,15 @@ def qwen3_vision_forward(
     cu_seqlens = cumulative_lengths(grid.chunk_lengths, hidden_states.device)
     deepstack_features = []
     for layer_num, block in enumerate(visual.blocks):
-        hidden_states = block(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=grid.position_embeddings)
+        hidden_states = vision_block_forward(
+            block,
+            hidden_states,
+            grid.position_embeddings,
+            cu_seqlens,
+            grid.chunk_lengths,
+            apply_rotary_pos_emb_vision,
+            eager_attention_forward,
+        )
         if layer_num in visual.deepstack_visual_indexes:
             merger = visual.deepstack_merger_list[visual.deepstack_visual_indexes.index(layer_num)]
             deepstack_features.append(merger(hidden_states))

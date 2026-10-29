@@ -174,7 +174,9 @@ def test_gradient_checkpointing_reruns_every_block(model):
     visual = deepcopy(model.visual)
     _, _, pixel_values, grid_thw = _inputs(model)
     grid = Qwen3VisionGrid.build(visual, grid_thw)
-    calls = count_block_calls_with_checkpointing(visual, lambda: qwen3_vision_forward(visual, pixel_values, grid)[0])
+    calls = count_block_calls_with_checkpointing(
+        visual, lambda: qwen3_vision_forward(visual, pixel_values, grid)[0]
+    )
     assert calls == 2 * len(visual.blocks)
 
 

@@ -57,7 +57,9 @@ class _Root(nn.Module):
         return self.run(self.visual)
 
 
-def run_with_sharded_blocks(tmp_path: Path, visual: nn.Module, forward: Callable[[nn.Module], Tensor]) -> Tensor:
+def run_with_sharded_blocks(
+    tmp_path: Path, visual: nn.Module, forward: Callable[[nn.Module], Tensor]
+) -> Tensor:
     """Run `forward(visual)` and its backward with FSDP2 on one CPU rank, every vision block its own unit.
 
     This is how LeRobot's FSDP training wraps these towers: the blocks are wrap units under a root module.

@@ -21,16 +21,17 @@ The stock towers turn the image grid (`image_grid_thw`) into Python ints on ever
 grid can be computed once in eager mode and reused. `FixedImageGrid` holds that cache and decides when it
 can be reused; the tower-specific subclasses live in `qwen2_5_vision.py` and `qwen3_vision.py`.
 
-The vision blocks are still called as modules, so FSDP hooks and gradient checkpointing work as in the
-stock forward. Their cumulative sequence lengths are rebuilt on every call with `torch.tensor` from cached
-Python ints: under `torch.export` such a tensor is a constant, so the stock attention can still read it
-back with `.tolist()`.
+In eager mode the vision blocks are called as modules, so FSDP hooks and gradient checkpointing run as in
+the stock forward. Their attention reads the chunk lengths back from `cu_seqlens`, which `torch.export`
+cannot do, so under export `vision_block_forward` replays each block from its submodules with the lengths
+as Python ints.
 
 The grid checks use transformers' `torch_compilable_check`, so `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns
 them off like every other check of that kind. In an exported program a failed check keeps the assert but
 loses the message.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -40,8 +41,10 @@ from torch import Tensor, nn
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from transformers.utils import torch_compilable_check
 else:
+    ALL_ATTENTION_FUNCTIONS = None
     torch_compilable_check = None
 
 
@@ -102,12 +105,54 @@ class FixedImageGrid:
 
 
 def cumulative_lengths(lengths: list[int], device: torch.device) -> Tensor:
-    """`cu_seqlens` for a vision block, built from Python ints so it is a constant under `torch.export`."""
+    """The `cu_seqlens` a vision block takes for attention chunks of `lengths` tokens."""
     total, cumulative = 0, [0]
     for length in lengths:
         total += length
         cumulative.append(total)
     return torch.tensor(cumulative, dtype=torch.int32, device=device)
+
+
+def vision_block_forward(
+    block: nn.Module,
+    hidden_states: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+    cu_seqlens: Tensor,
+    lengths: list[int],
+    apply_rotary_pos_emb_vision: Callable,
+    eager_attention_forward: Callable,
+) -> Tensor:
+    """Run one Qwen-VL vision block whose attention runs once per chunk of `lengths` tokens.
+
+    `cu_seqlens` must be `cumulative_lengths(lengths)`. The last two arguments come from the tower's
+    transformers modeling module.
+    """
+    if not torch.compiler.is_exporting():
+        return block(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+    # The non-flash path of the stock vision attention, split by Python ints. An exported program has no
+    # FSDP hooks or gradient checkpointing for this to skip.
+    attn, seq_length = block.attn, hidden_states.shape[0]
+    query, key, value = (
+        attn.qkv(block.norm1(hidden_states))
+        .reshape(seq_length, 3, attn.num_heads, -1)
+        .permute(1, 0, 2, 3)
+        .unbind(0)
+    )
+    query, key = apply_rotary_pos_emb_vision(query, key, *position_embeddings)
+    query, key, value = (state.transpose(0, 1).unsqueeze(0) for state in (query, key, value))
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        attn.config._attn_implementation, eager_attention_forward
+    )
+    outputs = [
+        attention_interface(
+            attn, q, k, v, attention_mask=None, scaling=attn.scaling, dropout=0.0, is_causal=False
+        )[0]
+        for q, k, v in zip(
+            *(torch.split(state, lengths, dim=2) for state in (query, key, value)), strict=True
+        )
+    ]
+    hidden_states = hidden_states + attn.proj(torch.cat(outputs, dim=1).reshape(seq_length, -1).contiguous())
+    return hidden_states + block.mlp(block.norm2(hidden_states))
 
 
 def qwen_image_rope_index(
