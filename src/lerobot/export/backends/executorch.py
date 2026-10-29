@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from ..configs import ExportBackendConfig
 
 if TYPE_CHECKING:
+    from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
     from executorch.exir import ExecutorchBackendConfig
 
 EXECUTORCH = "executorch>=1.6.0,<1.7.0"
@@ -48,4 +49,17 @@ def gpu_memory_config() -> ExecutorchBackendConfig:
         ),
         enable_non_cpu_memory_planning=True,
         memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
+    )
+
+
+def cuda_partitioner(name: str) -> CudaPartitioner:
+    """Hand ExecuTorch's CUDA backend what it takes of the part `name`, its weights file named after the part."""
+    from executorch.backends.cuda.cuda_backend import CudaBackend
+    from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
+
+    return CudaPartitioner(
+        [
+            CudaBackend.generate_method_name_compile_spec("forward"),
+            CudaBackend.generate_data_name_compile_spec(name),
+        ]
     )
