@@ -427,6 +427,24 @@ def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not (EXECUTORCH and is_package_available("openvino") and is_package_available("nncf")),
+    reason="needs ExecuTorch, PyTorch 2.15 and OpenVINO: pip install openvino nncf",
+)
+def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchOpenVINOConfig().compile(torch.export.export(model, (x,)), path)
+    assert b"OpenvinoBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
 def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
     """Only the steps import PyTorch, so what one step used is freed before the next starts."""
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}"]
