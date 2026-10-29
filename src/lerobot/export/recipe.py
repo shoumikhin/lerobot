@@ -454,25 +454,44 @@ class ActionChunkRecipe(ExportRecipe):
             self.task,
             self._steps,
         )
-        frame, noise = random_frame(self._features, self._generator), self._random_noise()
-        for case_frame, case_noise, expected in (
-            (self._case.frame, self._case.noise, self._case.actions),
-            (frame, noise, self._reference(frame, noise)),
-        ):
-            with torch.no_grad():
-                actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
-            if not np.array_equal(actions, expected):
-                raise ValueError(
-                    f"The {self.policy.config.type} policy computes something else as one module than it "
-                    "does in lerobot-rollout, for example because a preprocessor step reads the frame in "
-                    "Python. It needs its own export recipe."
-                )
+        self._check_chain(module)
         inputs = [*self._features, *([NOISE] if self._noise_shape else [])]
-        yield Part("model", module, self._inputs(self._case.frame, self._case.noise), inputs, [ACTION])
+        yield Part(
+            "model",
+            module,
+            self._inputs(self._case.frame, self._case.noise),
+            inputs,
+            module.postprocess.outputs,
+        )
 
     def test_case(self) -> TestCase:
         """The random frame and noise, and the actions PyTorch computes for them as `lerobot-rollout` does."""
         return self._case
+
+    def _check_chain(self, run: Callable[..., Tensor]) -> None:
+        """Refuse a program, or a chain of parts, whose actions differ from the ones lerobot-rollout plays.
+
+        `run` runs the program or the chain on the program's inputs. It is checked on the test case and on another
+        random frame.
+        """
+        frame, noise = random_frame(self._features, self._generator), self._random_noise()
+        pipelines = action_pipelines(self.postprocessor)
+        for case_frame, case_noise, expected in (
+            (self._case.frame, self._case.noise, [self._case.actions, self._case.continuous_actions]),
+            (frame, noise, [self._reference(frame, noise, pipeline) for pipeline in pipelines]),
+        ):
+            with torch.no_grad():
+                outputs = run(*self._inputs(case_frame, case_noise))
+            outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+            actions, continuous = (*(output.cpu().numpy() for output in outputs), None)[:2]
+            if not np.array_equal(actions, expected[0]) or (
+                continuous is not None and not np.array_equal(continuous, expected[1])
+            ):
+                raise ValueError(
+                    f"The {self.policy.config.type} policy computes something else as exported programs than "
+                    "it does in lerobot-rollout, for example because a preprocessor step reads the frame in "
+                    "Python, so it cannot be exported this way."
+                )
 
     def predict_chunk(self, policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
         """The `[1, chunk, action]` chunk the policy predicts for a preprocessed batch, as rollout gets it.
@@ -768,30 +787,6 @@ def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str
     return renames
 
 
-def split_absolute_step(
-    postprocessor: PolicyProcessorPipeline, action_dim: int
-) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
-    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
-
-    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
-    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
-    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
-    """
-    steps = list(postprocessor.steps)
-    index = next(
-        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
-    )
-    if index is None:
-        return postprocessor, None
-    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
-        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
-    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
-    if relative_step is None:
-        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
-    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
-    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
-
-
 # The names of what `action_pipelines` compute, in order: the actions to play, then those without the thresholds.
 ACTION_OUTPUTS = (ACTION, CONTINUOUS_ACTIONS)
 
@@ -861,22 +856,42 @@ class PostprocessedActions(nn.Module):
         """`chunk` is `[1, steps, width]`; each output is `[steps, action]` in float32."""
         played = tuple(pipeline(chunk)[0].float() for pipeline in self.pipelines)
         return played if len(played) > 1 else played[0]
+def split_absolute_step(
+    postprocessor: PolicyProcessorPipeline, action_dim: int
+) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
+    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
+
+    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
+    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
+    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
+    """
+    steps = list(postprocessor.steps)
+    index = next(
+        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
+    )
+    if index is None:
+        return postprocessor, None
+    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
+        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
+    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
+    if relative_step is None:
+        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
+    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
+    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
 
 
 class ChunkActions(nn.Module):
-    """The denoised actions in, the actions to play out, in robot units, and those without thresholds if any.
+    """The denoised actions in, the actions to play out, in robot units.
 
     A policy trained on actions relative to the state turns them back around the robot's state. The policy's
     postprocessor adds the state its preprocessor cached in Python, which a program would hold as a constant,
-    so this module adds the state it takes as an input instead. `outputs` names what it returns, in order.
+    so this module adds the state it takes as an input instead.
     """
 
     def __init__(self, postprocessor: PolicyProcessorPipeline, execution_steps: int, action_dim: int):
         """Play the first `execution_steps` actions of `action_dim` each through `postprocessor`."""
         super().__init__()
-        postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
-        self.pipelines = action_pipelines(postprocessor)
-        self.outputs = list(ACTION_OUTPUTS[: len(self.pipelines)])
+        self.postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
         self.execution_steps = execution_steps
         self.action_dim = action_dim
 
@@ -885,15 +900,13 @@ class ChunkActions(nn.Module):
         """Whether the module takes the robot's state, for a policy trained on actions relative to it."""
         return self.mask is not None
 
-    def forward(self, actions: Tensor, *state: Tensor) -> Tensor | tuple[Tensor, ...]:
+    def forward(self, actions: Tensor, *state: Tensor) -> Tensor:
         """The actions, and the robot's state for a policy trained on actions relative to it."""
-        chunk = actions[None, : self.execution_steps, : self.action_dim]
-        played = [pipeline(chunk) for pipeline in self.pipelines]
+        actions = self.postprocessor(actions[None, : self.execution_steps, : self.action_dim])
         if self.mask is not None:
             (anchor,) = state
-            played = [to_absolute_actions(a, anchor[None], self.mask) for a in played]
-        outputs = tuple(a[0].float() for a in played)
-        return outputs if len(outputs) > 1 else outputs[0]
+            actions = to_absolute_actions(actions, anchor[None], self.mask)
+        return actions[0].float()
 
 
 def robot_features(
