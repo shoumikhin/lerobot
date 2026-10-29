@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A recipe that runs ACT as a chain, which tests make ACT's recipe.
+"""A recipe that runs ACT as a chain. Importing this module makes it ACT's recipe, as an `export_act.py` would.
 
 `prepare` converts the frame and runs the preprocessor, `model` runs ACT and the postprocessor, and `scale`
 runs twice, multiplying by `FACTOR` and then by its inverse, both read from the bundle's constants. So the
 chain plays the policy's actions through a repeated program.
 """
 
+import sys
 from collections.abc import Iterator
 
 import numpy as np
@@ -101,3 +102,7 @@ class ACTChainRecipe(ActionChunkRecipe):
                 "factor_1": np.array([1 / self.FACTOR], np.float32),
             },
         )
+
+
+ACTExportRecipe = ACTChainRecipe
+sys.modules["lerobot.policies.act.export_act"] = sys.modules[__name__]

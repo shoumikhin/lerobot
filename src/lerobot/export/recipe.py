@@ -190,7 +190,7 @@ class ExportRecipe(abc.ABC):
 
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:
-        """Yield the parts in the order they run. `lerobot-export` compiles and drops each before the next."""
+        """Yield the parts in the order they run. `lerobot-export` traces and frees each before the next."""
 
     @abc.abstractmethod
     def test_case(self) -> TestCase:
