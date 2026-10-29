@@ -29,8 +29,8 @@ from safetensors.numpy import load_file
 from lerobot.utils.constants import ACTION
 
 from ..base import InferenceEngine
-from .manifest import NOISE, Bundle
-from .runtime import load_program, prepare_runtime
+from .manifest import NOISE, Bundle, BundleManifest
+from .runtime import Program, load_program, prepare_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +59,7 @@ class BundleInferenceEngine(InferenceEngine):
         if error := self._task_error(task):
             raise ValueError(error)
         super().__init__(task=task)
-        prepare_runtime(manifest.runtime, manifest.runtime_imports)
-        self._programs = [
-            (spec, load_program(manifest.runtime, bundle.path / spec.file, _data_file(bundle, spec.data)))
-            for spec in manifest.programs
-        ]
+        self._constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
         self._action_names = manifest.action_names
         self._scale = np.asarray(manifest.action_scale, dtype=np.float32)
@@ -84,6 +80,16 @@ class BundleInferenceEngine(InferenceEngine):
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
+        _check_dataflow(manifest, [*self._frame_spec, *self._constants], manifest.noise_shape is not None)
+        prepare_runtime(manifest.runtime, manifest.runtime_imports)
+        # Several runs of one program, such as the steps of a sampler, share it.
+        loaded: dict[tuple[str, str | None], Program] = {}
+        for spec in manifest.programs:
+            if (spec.file, spec.data) not in loaded:
+                loaded[spec.file, spec.data] = load_program(
+                    manifest.runtime, bundle.path / spec.file, _data_file(bundle, spec.data)
+                )
+        self._programs = [(spec, loaded[spec.file, spec.data]) for spec in manifest.programs]
         self._check(case, noise, expected, manifest.tolerance)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
@@ -113,7 +119,7 @@ class BundleInferenceEngine(InferenceEngine):
             )
 
     def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
-        values: dict[str, Any] = {name: frame[name] for name in self._frame_spec}
+        values: dict[str, Any] = {**self._constants, **{name: frame[name] for name in self._frame_spec}}
         if self._noise_shape is not None:
             values[NOISE] = (
                 np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
@@ -201,3 +207,20 @@ class BundleInferenceEngine(InferenceEngine):
 
 def _data_file(bundle: Bundle, name: str | None) -> Path | None:
     return None if name is None else bundle.path / name
+
+
+def _check_dataflow(manifest: BundleManifest, given: list[str], noise: bool) -> None:
+    """Refuse a bundle whose programs read a value that nothing gives them, before any program loads."""
+    available = {*given, *([NOISE] if noise else [])}
+    for spec in manifest.programs:
+        missing = [name for name in spec.inputs if name not in available]
+        if missing:
+            raise ValueError(
+                f"The bundle's program run {spec.name!r} reads {missing}, which neither the frame, the noise, "
+                "the constants nor an earlier program gives. Export the policy again."
+            )
+        available.update(spec.outputs)
+    if ACTION not in manifest.programs[-1].outputs:
+        raise ValueError(
+            f"The bundle's last program run, {manifest.programs[-1].name!r}, gives no {ACTION!r}."
+        )

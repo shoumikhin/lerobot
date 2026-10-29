@@ -26,22 +26,24 @@ from typing import Any
 MANIFEST = "export.json"
 FORMAT_VERSION = 1
 TEST_CASE = "test.safetensors"
+CONSTANTS = "constants.safetensors"
 # The test case and the programs name the starting noise of a sampling policy this way.
 NOISE = "noise"
 
 
 @dataclass
 class ProgramSpec:
-    """One compiled program of a bundle. Programs connect to each other by the names of their values.
+    """One run of a compiled program. Programs connect to each other by the names of their values.
 
     Args:
         name (`str`):
-            The program's name, such as `model`.
+            The name of this run, such as `model` or `step_3`.
         file (`str`):
-            The program's file, relative to the bundle folder.
+            The program's file, relative to the bundle folder. Several runs may name one file, which is
+            loaded once.
         inputs (`list[str]`):
             The names of its inputs, in order: keys of the robot's frame such as `observation.state`,
-            `noise`, or outputs of an earlier program.
+            `noise`, constants, or outputs of an earlier program.
         outputs (`list[str]`):
             The names of its outputs, in order. The last program outputs `action`.
         data (`str`, *optional*):
@@ -71,7 +73,9 @@ class BundleManifest:
             Python modules to import before the programs load, such as one that registers a compiler's
             kernels with the runtime.
         programs (`list[ProgramSpec]`):
-            The programs, in the order they run.
+            The program runs, in order.
+        constants (`str`, *optional*):
+            A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none.
@@ -93,6 +97,7 @@ class BundleManifest:
     runtime: str
     runtime_imports: list[str] = field(default_factory=list)
     programs: list[ProgramSpec]
+    constants: str | None = None
     noise_shape: list[int] | None = None
     task: str | None = None
     action_names: list[str] | None = None
@@ -110,6 +115,9 @@ class BundleManifest:
             raise ValueError("The manifest names a different number of actions than it scales.")
         if not self.programs:
             raise ValueError("The manifest lists no program.")
+        names = [program.name for program in self.programs]
+        if len(set(names)) != len(names):
+            raise ValueError(f"The manifest names a program run twice: {names}.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleManifest:
