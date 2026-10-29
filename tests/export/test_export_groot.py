@@ -255,7 +255,7 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(exported):
                 preprocessor(observation), noise=torch.from_numpy(noise)[None]
             )
             expected = postprocessor(chunk)[0].numpy()
-        actual = engine._run_chunk(frame, task, noise)
+        actual = engine.run_chunk(frame, task, noise)
         np.testing.assert_allclose(actual / engine._scale, expected / engine._scale, atol=1e-3)
 
 
