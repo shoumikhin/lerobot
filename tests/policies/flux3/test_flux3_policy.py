@@ -685,6 +685,64 @@ def test_policy_single_layout_relative_actions_and_cfg_one(fake_vae):
     assert torch.isfinite(loss) and info["n_valid_windows"] == 2
 
 
+def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
+    policy = Flux3Policy(single_config(sampler="cosmos_unipc", num_inference_steps=1)).eval()
+    policy.config.sampler = "euler"
+    gen = torch.Generator().manual_seed(2)
+    obs = {
+        "observation.images.top": torch.rand(1, 3, 64, 96, generator=gen),
+        OBS_STATE: torch.rand(1, 6, generator=gen),
+        "task": ["stack the cubes"],
+    }
+
+    def velocity(samples, t):  # a stand-in for the DiT
+        return {"x": samples["x"] * float(t)}
+
+    class EulerSampler(nn.Module):
+        def forward(self, x):
+            return sampling.euler({"x": x}, velocity, timesteps=policy._euler_timesteps())["x"]
+
+    sampler, x = EulerSampler(), torch.randn(4)
+    # A freshly built policy exports without an eager prediction first.
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+    policy.predict_action_chunk(obs)
+    policy.config.num_inference_steps = 2
+    with pytest.raises(RuntimeError, match="out of date"):
+        torch.export.export(sampler, (x,))
+    fresh = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    fresh.load_state_dict(policy.state_dict())
+    assert torch.equal(policy.predict_action_chunk(obs), fresh.predict_action_chunk(obs))
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+
+
+def test_exported_policy_takes_its_noise_as_inputs_and_matches_eager_on_every_call(fake_vae):
+    policy = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    cfg, gen = policy.config, torch.Generator().manual_seed(3)
+    images, state = torch.rand(1, 3, 64, 96, generator=gen), torch.rand(1, 6, generator=gen)
+    n_pred = policy.packer.predicted_latent_frames(cfg)
+
+    def draw_noise():
+        return {
+            "noise": torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=gen),
+            "video_noise": torch.randn(1, packing.LATENT_CHANNELS, n_pred, *cfg.latent_hw, generator=gen),
+        }
+
+    class Predict(nn.Module):
+        def forward(self, images, state, noise=None, video_noise=None):
+            batch = {"observation.images.top": images, OBS_STATE: state, "task": ["stack the cubes"]}
+            return policy.predict_action_chunk(batch, noise=noise, video_noise=video_noise)
+
+    model, noise = Predict(), draw_noise()
+    expected = model(images, state, **noise)
+    with pytest.raises(ValueError, match="noise and video_noise"):
+        torch.export.export(model, (images, state))
+    exported = torch.export.export(model, (images, state), kwargs=noise).module()
+    assert torch.equal(exported(images, state, **noise), expected)
+    assert torch.equal(exported(images, state, **noise), expected)
+    other = draw_noise()
+    assert torch.equal(exported(images, state, **other), model(images, state, **other))
+
+
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
     cfg = droid_config()
     policy = Flux3Policy(cfg)
