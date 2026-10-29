@@ -88,12 +88,27 @@ def _needs_gpu(item) -> bool:
     return any(NEEDS_GPU_REASON.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif"))
 
 
+# No CI job installs ExecuTorch yet, so the tests that run it skip there; `-m executorch` selects them for a job that
+# installs it. The mark is added to tests skipped without ExecuTorch; a test that skips at run time marks itself.
+NEEDS_EXECUTORCH_REASON = re.compile(r"executorch", re.IGNORECASE)
+
+
+def _needs_executorch(item) -> bool:
+    return any(
+        NEEDS_EXECUTORCH_REASON.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif")
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "base: Fast Tests base tier (added to tests without a tier mark)")
     for mark in TIER_MARKS:
         config.addinivalue_line("markers", f"{mark}: Fast Tests tier that installs the `{mark}` extra")
     config.addinivalue_line(
         "markers", "gpu: run by the GPU Tests job (added to policy tests and `require_cuda` tests)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "executorch: needs ExecuTorch, which no CI job installs yet (added to tests skipped without it)",
     )
 
 
@@ -104,6 +119,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.base)
         if _needs_gpu(item):
             item.add_marker(pytest.mark.gpu)
+        if _needs_executorch(item):
+            item.add_marker(pytest.mark.executorch)
 
 
 @pytest.hookimpl(hookwrapper=True)
