@@ -32,7 +32,17 @@ from typing import Any, cast
 import draccus
 import torch
 
-from lerobot.bundle.manifest import CONSTANTS, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.manifest import (
+    CONSTANTS,
+    EMBEDDINGS,
+    KNOWN_TASKS,
+    TOKENIZER,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+    TaskTokens,
+)
 from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
@@ -78,6 +88,7 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             del part, program
         plan = recipe.plan()
         test_case = recipe.test_case()
+        task_tokens = plan.task_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
@@ -85,6 +96,11 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             programs=programs,
             runs=runs if plan.runs is None else plan.runs,
             constants=CONSTANTS if plan.constants else None,
+            task_tokens=None
+            if task_tokens is None
+            else TaskTokens(
+                task_tokens.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, task_tokens.max_tokens
+            ),
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
             task=recipe.task,
             action_names=getattr(recipe.config, "action_feature_names", None),
@@ -93,7 +109,7 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             target=cfg.backend.target(),
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
         )
-        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants)
+        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         shutil.rmtree(traced, ignore_errors=True)

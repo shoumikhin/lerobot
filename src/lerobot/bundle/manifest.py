@@ -31,6 +31,15 @@ CONSTANTS = "constants.safetensors"
 POLICY_CONFIG = "policy_config.json"
 # The test case and the programs name the starting noise of a sampling policy this way.
 NOISE = "noise"
+# The programs of a policy that reads its task take it as these two values (see `TaskTokens`).
+TASK_EMBEDDINGS = "task_embeddings"
+TASK_LENGTH = "task_length"
+# The files of `task_tokens`, as the export writes them.
+TOKENIZER = "tokenizer.json"
+EMBEDDINGS = "token_embeddings.safetensors"
+KNOWN_TASKS = "known_tasks.json"
+# The ops of `TaskTokens.prompt_ops`; `lerobot.bundle.task_tokens` implements them.
+PROMPT_OPS = frozenset({"strip", "lower", "replace", "keep", "default", "template"})
 
 
 @dataclass
@@ -73,6 +82,38 @@ class ProgramRun:
 
 
 @dataclass
+class TaskTokens:
+    """How the task becomes the `task_embeddings` and `task_length` values the programs take.
+
+    The task text is cleaned and placed in the prompt by `prompt_ops`, the tokenizer splits it into token
+    ids, and each id picks its row of the embedding table. The rows are padded with zeros to `max_tokens`,
+    and `task_length` counts the real ones.
+
+    Args:
+        prompt_ops (`list[list[str]]`):
+            The ops that make the prompt text from the task, in order, each a name and its arguments:
+            `["strip"]`, `["lower"]`, `["replace", old, new]`, `["keep", kind, ...]` (keeps the characters of
+            each kind: `alnum`, `space`, or one literal character), `["default", text]` (for an empty
+            task), and `["template", "... {task} ..."]`.
+        tokenizer (`str`):
+            The tokenizer file, in the format of the `tokenizers` library.
+        embeddings (`str`):
+            A safetensors file holding one tensor, the token embedding table, in float32 or bfloat16.
+        known_tasks (`str`):
+            A JSON file mapping each task known at export to its token ids, so those tasks never load the
+            tokenizer.
+        max_tokens (`int`):
+            The most tokens the programs take.
+    """
+
+    prompt_ops: list[list[str]]
+    tokenizer: str
+    embeddings: str
+    known_tasks: str
+    max_tokens: int
+
+
+@dataclass
 class Target:
     """The GPU a bundle's programs were built on, when they run only on that kind of GPU.
 
@@ -110,6 +151,9 @@ class BundleManifest:
             The runs of the programs, in order.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
+        task_tokens (`TaskTokens`, *optional*):
+            How the task becomes the programs' `task_embeddings` and `task_length`. A bundle with it can run
+            any task; one without it runs only `task`.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none.
@@ -139,6 +183,7 @@ class BundleManifest:
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
     constants: str | None = None
+    task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
     task: str | None = None
     action_names: list[str] | None = None
@@ -181,6 +226,7 @@ class BundleManifest:
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
         target = data.get("target")
+        task_tokens = data.get("task_tokens")
         # A key added later can change how the programs run, so a reader that does not know it stops.
         unknown = (
             sorted(set(data) - {f.name for f in fields(cls)})
@@ -189,6 +235,8 @@ class BundleManifest:
             )
             + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
             + sorted(set(target or {}) - {f.name for f in fields(Target)})
+            + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokens)})
+            + sorted({op[0] for op in (task_tokens or {}).get("prompt_ops", [])} - PROMPT_OPS)
         )
         if unknown:
             raise ValueError(
@@ -200,6 +248,7 @@ class BundleManifest:
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
                 "target": None if target is None else Target(**target),
+                "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
             }
         )
 
