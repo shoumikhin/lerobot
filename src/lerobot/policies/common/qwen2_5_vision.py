@@ -43,6 +43,23 @@ else:
     eager_attention_forward = None
 
 
+def qwen2_5_image_temporal_scale(model: nn.Module) -> int:
+    """The `image_temporal_scale` of `qwen_image_rope_index` that the installed `model.get_rope_index` uses.
+
+    It asks `get_rope_index` for the positions of one text token and one image token on tiny CPU tensors.
+    """
+    merge = model.config.vision_config.spatial_merge_size
+    input_ids = torch.tensor([[0, model.config.image_token_id]])
+    positions, _ = model.get_rope_index(
+        input_ids,
+        mm_token_type_ids=input_ids.new_tensor([[0, 1]]),
+        image_grid_thw=input_ids.new_tensor([[1, merge, merge]]),
+        attention_mask=torch.ones_like(input_ids),
+    )
+    # The image starts at position 1, so its temporal position is the scale itself.
+    return int(positions[0, 0, 1])
+
+
 @dataclass
 class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
     """What a Qwen2.5-VL vision tower derives from one image grid, as its stock forward computes it."""
@@ -76,15 +93,8 @@ class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
         )
 
 
-def qwen2_5_vision_forward(
-    visual: nn.Module, pixel_values: Tensor, grid_thw: Tensor, grid: Qwen2_5VisionGrid
-) -> Tensor:
-    """Return `visual(pixel_values, grid_thw).pooler_output`; under `torch.export`, computed from `grid` alone.
-
-    `grid` must be the cache of `grid_thw` (see `Qwen2_5VisionGrid.reuse_or_build`).
-    """
-    if not torch.compiler.is_exporting():
-        return visual(pixel_values, grid_thw=grid_thw).pooler_output
+def qwen2_5_vision_forward(visual: nn.Module, pixel_values: Tensor, grid: Qwen2_5VisionGrid) -> Tensor:
+    """`visual(pixel_values, grid_thw).pooler_output` for the prepared `grid`, traceable by `torch.export`."""
     hidden_states = visual.patch_embed(pixel_values)
     seq_len, unit = hidden_states.shape[0], visual.spatial_merge_unit
     hidden_states = hidden_states.reshape(seq_len // unit, unit, -1)[grid.window_index].reshape(seq_len, -1)

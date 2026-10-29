@@ -65,7 +65,7 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, qwen_image_rope_index
+from ..common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -1125,9 +1125,9 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             re_generate (bool, optional): Whether to use sampling for regeneration
             noise (torch.Tensor, optional): Starting sample for diffusion mode, shape
                 (batch_size, pred_horizon, action_dim). Drawn from a standard normal when None.
-            vision_grid (Qwen2_5VisionGrid, optional): The cache of ``image_grid_thw`` from
-                ``Qwen2_5VisionGrid.reuse_or_build``; under ``torch.export`` the vision tower then runs without
-                reading ``image_grid_thw`` on the host
+            vision_grid (Qwen2_5VisionGrid, optional): The prepared cache of ``image_grid_thw`` (see
+                ``FixedImageGrid.track``), passed under ``torch.export``: the vision tower then runs from it, with
+                SDPA attention, without reading ``image_grid_thw`` on the host
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -1168,9 +1168,7 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 if vision_grid is None:
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
-                    image_embeds = qwen2_5_vision_forward(
-                        self.visual, pixel_values, image_grid_thw, vision_grid
-                    )
+                    image_embeds = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
 
@@ -1919,18 +1917,10 @@ class WallXPolicy(PreTrainedPolicy):
             inputs["rope_deltas"] = rope_deltas
         return inputs
 
-    def _cached_vision_grid(self, batch: BatchFeature) -> Qwen2_5VisionGrid:
-        """Vision metadata of the batch's camera grid, rebuilt in eager mode when the grid changes."""
+    def _static_grid_inputs(self, batch: BatchFeature, vision_grid: Qwen2_5VisionGrid) -> dict[str, Any]:
+        """Vision metadata and rope positions of the prepared camera grid, for `torch.export`."""
         if batch.get("video_grid_thw") is not None:
-            raise ValueError("WALL-X precompute_grid_thw supports images only.")
-        vision_grid = self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
-            self._vision_grid, self.model.visual, batch["image_grid_thw"]
-        )
-        return vision_grid
-
-    def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
-        """Vision metadata and rope positions of the cached camera grid, for `torch.export`."""
-        vision_grid = self._cached_vision_grid(batch)
+            raise ValueError("WALL-X exports image inputs only.")
         position_ids = qwen_image_rope_index(
             batch["input_ids"],
             batch["attention_mask"],
@@ -2049,12 +2039,11 @@ class WallXPolicy(PreTrainedPolicy):
         action_dim = self.config.output_features[ACTION].shape[0]
 
         if self.config.prediction_mode == "diffusion":
-            # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before; it only keeps
-            # the cache current for a later export.
-            if self.config.precompute_grid_thw and torch.compiler.is_exporting():
-                batch.update(self._static_grid_inputs(batch))
-            elif self.config.precompute_grid_thw:
-                self._cached_vision_grid(batch)
+            vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
+                self._vision_grid, self.model.visual, batch["image_grid_thw"]
+            )
+            if vision_grid is not None and is_exporting():
+                batch.update(self._static_grid_inputs(batch, vision_grid))
             output = self.model(
                 **batch,
                 action_dim=self.config.max_action_dim,

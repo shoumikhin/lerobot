@@ -18,21 +18,27 @@
 
 The stock towers turn the image grid (`image_grid_thw`) into Python ints on every call, which
 `torch.export` cannot trace. When every batch uses the same camera grid, what a tower derives from the
-grid can be computed once in eager mode and reused. `FixedImageGrid` holds that cache and decides when it
-can be reused; the tower-specific subclasses live in `qwen2_5_vision.py` and `qwen3_vision.py`.
+grid can be computed once in eager mode and reused by the exported program. `FixedImageGrid` holds that
+cache; the tower-specific subclasses live in `qwen2_5_vision.py` and `qwen3_vision.py`.
 
-Only an exported program needs the cache. In eager mode the policies keep their stock calls, so FSDP and
-gradient checkpointing see exactly the stock module calls, and the cache is only built, and rebuilt
-whenever the grid, device or dtype changes, for a later `torch.export`. Under export, `replay_vision_block`
-runs each vision block from its submodules with the attention chunk lengths as Python ints, because the
-stock attention reads them back from a tensor.
+The cache is prepared explicitly, by one eager call on the export inputs inside `prepare_image_grid()`:
+
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch)
+    program = torch.export.export(module, args, strict=False)
+
+Outside that block the policies run their stock code and neither read nor cache the grid. Under export,
+`replay_vision_block` runs each vision block from its submodules with the attention chunk lengths as
+Python ints, because the stock attention reads them back from a tensor.
 
 Under export the cached grid is checked with transformers' `torch_compilable_check`, a runtime assert in
 the program that `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off like every other check of that kind; a
 failed assert loses its message. `check_input` is for a policy's own input checks: always on in eager mode.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
@@ -48,14 +54,40 @@ else:
     ALL_ATTENTION_FUNCTIONS = None
     torch_compilable_check = None
 
+_preparing_image_grid: ContextVar[bool] = ContextVar("preparing_image_grid", default=False)
+
+
+@contextmanager
+def prepare_image_grid() -> Iterator[None]:
+    """Cache, in the eager calls inside this block, the image grid metadata that `torch.export` needs.
+
+    Run the policy once on the export inputs, on the export device and dtype, inside the block; then export.
+    """
+    token = _preparing_image_grid.set(True)
+    try:
+        yield
+    finally:
+        _preparing_image_grid.reset(token)
+
+
+def is_exporting() -> bool:
+    """Whether non-strict `torch.export` is tracing."""
+    # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
+    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
+
+
+def is_preparing_image_grid() -> bool:
+    """Whether an eager call runs inside `prepare_image_grid()`."""
+    return _preparing_image_grid.get() and not is_exporting()
+
 
 @dataclass
 class FixedImageGrid:
     """What a vision tower derives from one image grid, built in eager mode.
 
     Subclasses add the tower's metadata and implement `_from_grid`. Only weight-independent tensors are
-    cached, built outside inference mode, so the cache never holds stale weights and works for inference
-    and training alike.
+    cached, built outside inference mode, so the cache never holds stale weights and an export can trace a
+    trainable tower.
     """
 
     grid_thw: list[list[int]]
@@ -69,54 +101,53 @@ class FixedImageGrid:
     @classmethod
     def build(cls, visual: nn.Module, grid_thw: Tensor) -> Self:
         """Compute the metadata of `grid_thw` for `visual`; this reads the grid on the host."""
-        # A cache built during prediction runs in inference mode, but it must hold normal tensors: inference
-        # tensors cannot be saved for backward when a later export traces a trainable tower.
+        # Preparation usually runs a prediction in inference mode, but the cache must hold normal tensors:
+        # inference tensors cannot be saved for backward when the export traces a trainable tower.
         with torch.inference_mode(False), torch.no_grad():
             return cls._from_grid(visual, grid_thw.tolist())
 
     @classmethod
-    def reuse_or_build(cls, cache: Self | None, visual: nn.Module, grid_thw: Tensor) -> Self:
-        """Return the cache for `grid_thw` on the tower's device and dtype.
+    def track(cls, cache: Self | None, visual: nn.Module, grid_thw: Tensor) -> Self | None:
+        """Return the cache a policy keeps for `grid_thw`.
 
-        In eager mode this reads `grid_thw` on the host and builds a new cache whenever the grid, the device or
-        the dtype changed. Under `torch.export` the grid cannot be read, so the cache must already fit: the
-        image count, device and dtype are checked while tracing, and the grid values by a runtime assert in the
-        program. So the last eager call before export must use the export inputs, on the export device and
-        dtype.
+        Inside `prepare_image_grid()` an eager call builds it, and rebuilds it whenever the grid, the device or
+        the dtype changed. Under `torch.export` the grid cannot be read, so the prepared cache must fit: the
+        image count, device and dtype are checked while tracing, and the grid values by a runtime assert in
+        the program. Otherwise the cache is returned as it is and the grid is not read.
         """
-        if not torch.compiler.is_exporting():
-            if (
-                cache is None
-                or (cache.device, cache.dtype) != (visual.device, visual.dtype)
-                or cache.grid_thw != grid_thw.tolist()
-            ):
-                return cls.build(visual, grid_thw)
-            return cache
-        if cache is None:
-            problem = "no image grid is cached"
-        elif len(cache.grid_thw) != grid_thw.shape[0]:
-            problem = (
-                f"the cached grid has {len(cache.grid_thw)} images but the export inputs have "
-                f"{grid_thw.shape[0]} (another batch size or camera count)"
+        if is_exporting():
+            if cache is None:
+                problem = "no image grid was prepared"
+            elif len(cache.grid_thw) != grid_thw.shape[0]:
+                problem = (
+                    f"the prepared grid has {len(cache.grid_thw)} images but the export inputs have "
+                    f"{grid_thw.shape[0]} (another batch size or camera count)"
+                )
+            elif (cache.device, cache.dtype) != (visual.device, visual.dtype):
+                problem = (
+                    f"the grid was prepared for {cache.device} {cache.dtype}, but the tower is now on "
+                    f"{visual.device} {visual.dtype}"
+                )
+            else:
+                cache.check(grid_thw)
+                return cache
+            raise RuntimeError(
+                f"Cannot export on a fixed image grid: {problem}. Run the policy once on the export inputs "
+                "inside `prepare_image_grid()` before torch.export."
             )
-        elif (cache.device, cache.dtype) != (visual.device, visual.dtype):
-            problem = (
-                f"the cached grid was built for {cache.device} {cache.dtype}, but the tower is now on "
-                f"{visual.device} {visual.dtype}"
-            )
-        else:
-            cache.check(grid_thw)
-            return cache
-        raise RuntimeError(
-            f"precompute_grid_thw cannot export: {problem}. The last eager call before torch.export must use "
-            "the export inputs."
-        )
+        if is_preparing_image_grid() and (
+            cache is None
+            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+            or cache.grid_thw != grid_thw.tolist()
+        ):
+            return cls.build(visual, grid_thw)
+        return cache
 
     def check(self, grid_thw: Tensor) -> None:
         """Assert in an exported program that `grid_thw` equals the cached grid."""
         torch_compilable_check(
             grid_thw == grid_thw.new_tensor(self.grid_thw),
-            "The image grid differs from the one cached for precompute_grid_thw.",
+            "The image grid differs from the one prepared for torch.export.",
         )
 
 
@@ -178,16 +209,19 @@ def qwen_image_rope_index(
     image_grid_thw: list[list[int]],
     spatial_merge_size: int,
     image_token_id: int,
+    image_temporal_scale: int = 1,
 ) -> Tensor:
     """The 3D rope positions of Qwen2.5-VL and Qwen3-VL `get_rope_index` for images, with tensor ops only.
 
-    Text tokens count up by one. An image's tokens get `(start, start + row, start + col)` and move the
+    Text tokens count up by one. An image's tokens get `(start * image_temporal_scale, start + row,
+    start + col)` and move the
     next start by `max(rows, cols)`. Padding gets 0. `image_grid_thw` lists the (t, h, w) grid of every
     image block in `input_ids`, in order, as Python ints, including blocks hidden by `attention_mask`.
     Only still images (t == 1) are supported, as the image processors produce them; video grids raise.
 
-    This is what transformers 4.x and 5.5.4+ compute. For Qwen2.5-VL, 5.4.0 to 5.5.3 also scale the
-    temporal position of still images (a bug fixed upstream in 5.5.4), so their stock positions differ.
+    For Qwen2.5-VL, transformers 5.4.0 to 5.5.3 multiply the temporal position of an image's start by
+    `tokens_per_second` (fixed upstream in 5.5.4); `image_temporal_scale` reproduces that, and its default of
+    1 matches transformers 4.x, 5.5.4 and later, and Qwen3-VL.
     """
     if any(t != 1 for t, _, _ in image_grid_thw):
         raise ValueError(f"qwen_image_rope_index supports still images only (t == 1), got {image_grid_thw}.")
@@ -211,6 +245,7 @@ def qwen_image_rope_index(
 
     steps = torch.ones_like(input_ids).masked_scatter(is_image, advances) * valid
     start = steps.cumsum(dim=1) - steps
-    position_ids = start.unsqueeze(0).expand(3, -1, -1)
+    temporal = torch.where(is_image, start * image_temporal_scale, start)
+    position_ids = torch.stack([temporal, start, start])
     image_offsets = torch.zeros_like(position_ids).masked_scatter(is_image.expand_as(position_ids), offsets)
     return (position_ids + image_offsets).masked_fill(~valid, 0)

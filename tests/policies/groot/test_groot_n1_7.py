@@ -57,7 +57,6 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
-from tests.policies.common.fixed_grid_checks import requires_gloo
 
 
 def _groot_features(
@@ -221,84 +220,57 @@ def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypa
         )
 
 
-def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch):
-    pytest.importorskip("transformers")
-
+def _tiny_n1_7_backbone(monkeypatch):
     from transformers import Qwen3VLForConditionalGeneration
-    from transformers.feature_extraction_utils import BatchFeature
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
-    from tests.policies.common.fixed_grid_checks import count_grid_builds
-    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+    from tests.policies.common.qwen3_vl_helpers import tiny_qwen3_vl_config
 
     torch.manual_seed(0)
     qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
     monkeypatch.setattr(
         groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
     )
-    batch = BatchFeature(image_prompts(qwen.config))
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, tune_visual=True, precompute_grid_thw=precompute)
-        for precompute in (False, True)
-    )
-
-    builds = count_grid_builds(monkeypatch)
-    for _ in range(2):  # The second step reuses the cached grid, and backward must still reach pos_embed.
-        for backbone in (stock, fixed):
-            backbone.zero_grad()
-        expected = stock(batch)["backbone_features"]
-        expected.square().sum().backward()
-        actual = fixed(batch)["backbone_features"]
-        actual.square().sum().backward()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        torch.testing.assert_close(fixed.visual.pos_embed.weight.grad, stock.visual.pos_embed.weight.grad)
-    assert len(builds) == 1
+    return groot_n1_7.Qwen3Backbone(select_layer=2).eval()
 
 
-def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(monkeypatch):
+def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monkeypatch):
     pytest.importorskip("transformers")
 
-    from transformers import Qwen3VLForConditionalGeneration
     from transformers.feature_extraction_utils import BatchFeature
 
-    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
     from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
-    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts, tiny_qwen3_vl_config
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts
 
-    torch.manual_seed(0)
-    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
-    monkeypatch.setattr(
-        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
-    )
-    prompts = image_prompts(qwen.config)
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, precompute_grid_thw=precompute).eval()
-        for precompute in (False, True)
-    )
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
     positions = []
 
     def record_positions(module, args, kwargs):
         positions.append(kwargs["position_ids"])
 
-    for backbone in (stock, fixed):
-        backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
-    with torch.no_grad():
-        expected = stock(BatchFeature(prompts))["backbone_features"]
-    with pytest.raises(ValueError, match="images only"):
-        fixed(BatchFeature({**prompts, "pixel_values_videos": prompts["pixel_values"]}))
-
-    builds = count_grid_builds(monkeypatch)
-    keys = sorted(prompts)
+    backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
 
     class Backbone(torch.nn.Module):
-        def forward(self, *tensors):
-            return fixed(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
+        def __init__(self, keys):
+            super().__init__()
+            self.keys = keys
 
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(self.keys, tensors, strict=True))))["backbone_features"]
+
+    keys = sorted(prompts)
+    inputs = tuple(prompts[key] for key in keys)
+    builds = count_grid_builds(monkeypatch)
     with torch.no_grad():
-        positions.clear()
-        assert torch.equal(Backbone()(*(prompts[key] for key in keys)), expected)
-        exported = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False)
-        torch.testing.assert_close(exported.module()(*(prompts[key] for key in keys)), expected)
+        expected = backbone(BatchFeature(prompts))["backbone_features"]
+        with prepare_image_grid():
+            assert torch.equal(Backbone(keys)(*inputs), expected)
+        exported = torch.export.export(Backbone(keys), inputs, strict=False)
+        torch.testing.assert_close(exported.module()(*inputs), expected)
+        with pytest.raises(ValueError, match="image inputs only"):
+            torch.export.export(Backbone([*keys, "pixel_values_videos"]), (*inputs, prompts["pixel_values"]), strict=False)
     # The stock path adds the legacy text row as a fourth row; the exported path must pass the same.
     assert positions[0].shape[0] == 4
     assert positions[-1].shape == positions[0].shape
@@ -306,39 +278,24 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
 
 
-@requires_gloo
-def test_n1_7_backbone_precompute_grid_thw_keeps_a_whole_qwen_fsdp_wrap(monkeypatch, tmp_path):
+def test_n1_7_backbone_refuses_to_prepare_hidden_images_of_different_sizes(monkeypatch):
     pytest.importorskip("transformers")
 
-    from transformers import Qwen3VLForConditionalGeneration
     from transformers.feature_extraction_utils import BatchFeature
 
-    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
-    from tests.policies.common.fixed_grid_checks import run_with_fsdp
-    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
+    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID, image_prompts
 
-    torch.manual_seed(0)
-    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
-    monkeypatch.setattr(
-        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
-    )
-    batch = BatchFeature(image_prompts(qwen.config))
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, tune_visual=True, precompute_grid_thw=precompute)
-        for precompute in (False, True)
-    )
-    expected = stock(batch)["backbone_features"].detach()
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
+    first_image_tokens = int(prompts["image_grid_thw"][0].prod()) // backbone.visual.spatial_merge_size**2
+    first_image = (prompts["input_ids"][0] == IMAGE_TOKEN_ID).nonzero()[:first_image_tokens, 0]
+    prompts["attention_mask"][0, first_image] = 0
 
-    # The whole Qwen model as one FSDP2 unit (an `fsdp.wrap_modules` override): its parameters are only gathered
-    # when the model itself is called.
-    actual = run_with_fsdp(
-        tmp_path,
-        fixed,
-        lambda backbone: backbone(batch)["backbone_features"],
-        lambda backbone: [backbone.model],
-        reshard_after_forward=False,
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with torch.no_grad():
+        backbone(BatchFeature(prompts))
+        with prepare_image_grid(), pytest.raises(ValueError, match="hides image tokens"):
+            backbone(BatchFeature(prompts))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):
@@ -2731,13 +2688,7 @@ def test_groot_policy_selects_n1_7_model_class(monkeypatch):
     policy = GrootPolicy(_groot_config())
 
     assert called["pretrained_model_name_or_path"] == GROOT_N1_7_BASE_MODEL
-    assert called["precompute_grid_thw"] is False
     assert isinstance(policy._groot_model, _DummyGrootModel)
-
-    config = _groot_config()
-    config.precompute_grid_thw = True
-    GrootPolicy(config)
-    assert called["precompute_grid_thw"] is True
 
 
 def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):

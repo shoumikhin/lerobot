@@ -32,7 +32,7 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
-from lerobot.policies.common.qwen_vision import check_input, qwen_image_rope_index
+from lerobot.policies.common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import populate_queues
@@ -951,7 +951,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 "qwen3vl_use_vision_boundaries=False supports at most one visible camera per sample.",
             )
         cached_grid_thw = self.qwenvl_with_expert.visual_grid_thw
-        if torch.compiler.is_exporting() and cached_grid_thw is not None:
+        if is_exporting() and cached_grid_thw is not None:
             # Export cannot read the grid on the host, so the grid cached with the vision metadata stands in.
             check_input(
                 flat_grid_thw == flat_grid_thw.new_tensor(cached_grid_thw),

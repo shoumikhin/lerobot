@@ -566,9 +566,6 @@ def test_native_config_uses_padded_lawam_action_space() -> None:
     assert policy_cfg.flow_cfg.state_dim == 32
     assert policy_cfg.action_horizon == 4
     assert policy_cfg.effective_action_horizon == 4
-    assert policy_cfg.precompute_grid_thw is False
-    cfg.precompute_grid_thw = True
-    assert _build_native_policy_config(cfg).precompute_grid_thw is True
 
 
 def test_lam_constructs_without_checkpoint_or_pretrained_dino() -> None:
@@ -661,10 +658,12 @@ def test_natural_time_grid_uses_dataset_frequency() -> None:
     assert torch.allclose(grid, torch.tensor([[0.0, 0.05, 0.1], [0.0, 0.04, 0.08]]))
 
 
-@pytest.mark.parametrize("bad_hz", [0.0, float("nan")])
-def test_natural_time_grid_rejects_a_frequency_that_is_not_positive(bad_hz) -> None:
+def test_natural_time_grid_rejects_a_frequency_that_is_not_a_number() -> None:
     with pytest.raises(ValueError, match=r"got hz\[1\]="):
-        build_time_grid(hz=torch.tensor([20.0, bad_hz]), seq_len=3)
+        build_time_grid(hz=torch.tensor([20.0, float("nan")]), seq_len=3)
+    # Zero was rejected before, with the same message.
+    with pytest.raises(ValueError, match=r"got hz\[1\]="):
+        build_time_grid(hz=torch.tensor([20.0, 0.0]), seq_len=3)
 
 
 def test_dataset_sampling_uses_the_configured_action_horizon() -> None:
@@ -960,10 +959,9 @@ def _vlm_stage_setup(act_token: int = 10, flow_token: int = 11, num_queries: int
     qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
     act_query, flow_query = torch.randn(2, num_queries, qwen.config.text_config.hidden_size)
 
-    def backend(precompute_grid_thw: bool):
+    def backend():
         return _bare_backend(
             vlm=qwen,
-            model_cfg=SimpleNamespace(precompute_grid_thw=precompute_grid_thw),
             num_action_queries=num_queries,
             vlm_to_lam=nn.Identity(),
             _vision_grid=None,
@@ -986,13 +984,14 @@ def _vlm_stage_setup(act_token: int = 10, flow_token: int = 11, num_queries: int
     return qwen, backend, inputs
 
 
-def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> None:
+def test_prepared_vlm_stage_exports_and_matches_stock_qwen(monkeypatch) -> None:
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
     from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
     from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK
 
     qwen, backend, inputs = _vlm_stage_setup()
     num_queries = inputs["act_query"].shape[0]
-    stock, fixed = backend(False), backend(True)
+    stock, fixed = backend(), backend()
     with torch.no_grad():
         expected = stock._run_vlm_stage(**inputs)
     action_hidden = expected["h_vlm"][inputs["act_placeholder_mask"]].view(2, num_queries, -1)
@@ -1010,10 +1009,11 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> N
             output = fixed._run_vlm_stage(**dict(zip(keys, tensors, strict=True)))
             return output["h_vlm"], output["pred_latent"]
 
-    with torch.no_grad():
-        for _ in range(2):  # The second call reuses the cached grid.
+    with torch.no_grad(), prepare_image_grid():
+        for _ in range(2):  # The second call reuses the prepared grid.
             actual = VLMStage()(*(inputs[key] for key in keys))
             torch.testing.assert_close(actual, (expected["h_vlm"], action_hidden), rtol=0, atol=0)
+    with torch.no_grad():
         # Eager positions are 0, 1, 2, ... as in the exported program only while no call with `input_ids`
         # (or `generate`) has cached rope deltas on the model; LaWAM makes no such call.
         assert qwen.model.rope_deltas is None
@@ -1023,20 +1023,16 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> N
         )
     assert len(builds) == 1
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
-    # The exported program keeps the query checks: a sample without action placeholders is rejected.
+    # The query checks: a sample without action placeholders is rejected by the exported program, and in eager
+    # mode even with the switch that turns off the transformers checks.
     malformed = {**inputs, "act_placeholder_mask": inputs["act_placeholder_mask"].clone()}
     malformed["act_placeholder_mask"][1] = False
     with torch.no_grad(), pytest.raises(RuntimeError):
         exported.module()(*(malformed[key] for key in keys))
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with torch.no_grad(), pytest.raises(ValueError, match="act_query placeholder count mismatch"):
+        stock._run_vlm_stage(**malformed)
     # Each sample's placeholders hold the queries in order, wherever the sample put its tokens.
     for name in ("act", "flow"):
         filled = text_inputs[0][inputs[f"{name}_placeholder_mask"]]
         assert torch.equal(filled, inputs[f"{name}_query"].repeat(2, 1))
-
-
-def test_query_checks_stay_on_without_precompute_grid_thw(monkeypatch) -> None:
-    _, backend, inputs = _vlm_stage_setup()
-    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
-    inputs["act_placeholder_mask"][1] = False
-    with torch.no_grad(), pytest.raises(ValueError, match="act_query placeholder count mismatch"):
-        backend(False)._run_vlm_stage(**inputs)

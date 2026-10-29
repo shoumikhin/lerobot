@@ -27,7 +27,7 @@ import torch.nn.functional as functional
 from torch import Tensor, nn
 
 from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from lerobot.policies.common.qwen_vision import check_input, qwen_image_rope_index
+from lerobot.policies.common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -525,7 +525,7 @@ class WallOSS05Model(nn.Module):
         if vision_grid is None:
             image_embeddings = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
         else:
-            image_embeddings = qwen2_5_vision_forward(self.visual, pixel_values, image_grid_thw, vision_grid)
+            image_embeddings = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
         image_embeddings = image_embeddings.to(embeddings)
         image_mask = (input_ids == int(self.config.image_token_id)).unsqueeze(-1)
         expected = image_mask.sum()
@@ -978,22 +978,15 @@ class WallOSS05Policy(PreTrainedPolicy):
             metrics["text_loss"] = float(text_loss.detach())
         return loss, metrics
 
-    def _static_vision_grid(self, inputs: dict[str, Tensor]) -> Qwen2_5VisionGrid:
-        """Vision metadata of the camera grid for `torch.export`, rebuilt in eager mode when the grid changes."""
-        self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
-            self._vision_grid, self.model.visual, inputs["image_grid_thw"]
-        )
-        return self._vision_grid
-
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """`noise` is the optional starting sample, shape `(batch_size, chunk_size, max_action_dim)`."""
         inputs = self._pretokenized_inputs(batch)
-        if self.config.precompute_grid_thw:
-            vision_grid = self._static_vision_grid(inputs)
-            # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before.
-            if torch.compiler.is_exporting():
-                inputs["vision_grid"] = vision_grid
+        vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
+            self._vision_grid, self.model.visual, inputs["image_grid_thw"]
+        )
+        if is_exporting():
+            inputs["vision_grid"] = vision_grid
         output = self.model.generate_flow_action(
             action_horizon=self.config.chunk_size,
             action_dim=self.config.max_action_dim,

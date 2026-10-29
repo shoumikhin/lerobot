@@ -30,13 +30,8 @@ from lerobot.policies.common.qwen3_vision import (  # noqa: E402
     qwen3_vision_forward,
     qwen3_vl_forward,
 )
-from lerobot.policies.common.qwen_vision import qwen_image_rope_index  # noqa: E402
-from tests.policies.common.fixed_grid_checks import (  # noqa: E402
-    count_block_calls_with_checkpointing,
-    data_dependent_nodes,
-    requires_gloo,
-    run_with_fsdp,
-)
+from lerobot.policies.common.qwen_vision import prepare_image_grid, qwen_image_rope_index  # noqa: E402
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes  # noqa: E402
 from tests.policies.common.qwen3_vl_helpers import (  # noqa: E402
     IMAGE_GRIDS,
     IMAGE_TOKEN_ID,
@@ -64,7 +59,7 @@ class VisionProgram(torch.nn.Module):
         self.visual, self.grid = visual, grid
 
     def forward(self, pixel_values, grid_thw):
-        return qwen3_vision_forward(self.visual, pixel_values, grid_thw, self.grid)[0]
+        return qwen3_vision_forward(self.visual, pixel_values, self.grid)[0]
 
 
 def _export_vision(visual, grid, pixel_values, grid_thw):
@@ -83,17 +78,13 @@ def test_qwen3_vl_forward_matches_stock_model(model):
             pixel_values=pixel_values,
             image_grid_thw=grid_thw,
         ).last_hidden_state
-        actual = qwen3_vl_forward(
-            model, inputs_embeds, attention_mask, pixel_values, grid_thw, grid, image_mask
-        )
+        actual = qwen3_vl_forward(model, inputs_embeds, attention_mask, pixel_values, grid, image_mask)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     class Wrapper(torch.nn.Module):
         def forward(self, inputs_embeds, attention_mask, pixel_values, grid_thw, image_mask):
-            cached = Qwen3VisionGrid.reuse_or_build(grid, model.visual, grid_thw)
-            return qwen3_vl_forward(
-                model, inputs_embeds, attention_mask, pixel_values, grid_thw, cached, image_mask
-            )
+            cached = Qwen3VisionGrid.track(grid, model.visual, grid_thw)
+            return qwen3_vl_forward(model, inputs_embeds, attention_mask, pixel_values, cached, image_mask)
 
     args = (inputs_embeds, attention_mask, pixel_values, grid_thw, image_mask)
     with torch.no_grad():
@@ -114,7 +105,7 @@ def test_qwen3_vl_forward_rejects_a_wrong_image_token_count(model):
     grid = Qwen3VisionGrid.build(model.visual, grid_thw)
     inputs_embeds = model.get_input_embeddings()(input_ids)
     with torch.no_grad(), pytest.raises(ValueError, match="Image features and image tokens do not match"):
-        qwen3_vl_forward(model, inputs_embeds, attention_mask, pixel_values, grid_thw, grid, image_mask)
+        qwen3_vl_forward(model, inputs_embeds, attention_mask, pixel_values, grid, image_mask)
 
 
 def test_image_rope_index_matches_get_rope_index(model):
@@ -161,7 +152,6 @@ def test_image_rope_index_matches_get_rope_index(model):
             inputs_embeds,
             attention_mask,
             pixel_values,
-            grid_thw,
             grid,
             input_ids == IMAGE_TOKEN_ID,
             position_ids=position_ids,
@@ -188,9 +178,10 @@ def test_cached_grid_follows_learned_position_updates(model):
 def test_reused_grid_follows_dtype_changes(model):
     visual = deepcopy(model.visual)
     _, _, pixel_values, grid_thw = _inputs(model)
-    grid = Qwen3VisionGrid.reuse_or_build(None, visual, grid_thw)
-    visual.to(torch.bfloat16)
-    grid = Qwen3VisionGrid.reuse_or_build(grid, visual, grid_thw)
+    with prepare_image_grid():
+        grid = Qwen3VisionGrid.track(None, visual, grid_thw)
+        visual.to(torch.bfloat16)
+        grid = Qwen3VisionGrid.track(grid, visual, grid_thw)
     with torch.no_grad():
         torch.testing.assert_close(
             _export_vision(visual, grid, pixel_values, grid_thw)(pixel_values, grid_thw),
@@ -198,30 +189,3 @@ def test_reused_grid_follows_dtype_changes(model):
             rtol=0,
             atol=0,
         )
-
-
-def test_gradient_checkpointing_reruns_every_block(model):
-    visual = deepcopy(model.visual)
-    _, _, pixel_values, grid_thw = _inputs(model)
-    grid = Qwen3VisionGrid.build(visual, grid_thw)
-    calls = count_block_calls_with_checkpointing(
-        visual, lambda: qwen3_vision_forward(visual, pixel_values, grid_thw, grid)[0]
-    )
-    assert calls == 2 * len(visual.blocks)
-
-
-@requires_gloo
-@pytest.mark.parametrize("whole_tower", [False, True], ids=["block-units", "tower-unit"])
-def test_vision_forward_runs_with_fsdp2(model, tmp_path, whole_tower):
-    visual = deepcopy(model.visual).train()
-    _, _, pixel_values, grid_thw = _inputs(model)
-    expected = visual(pixel_values, grid_thw=grid_thw).pooler_output.detach()
-
-    def forward(visual):
-        grid = Qwen3VisionGrid.reuse_or_build(None, visual, grid_thw)
-        return qwen3_vision_forward(visual, pixel_values, grid_thw, grid)[0]
-
-    actual = run_with_fsdp(
-        tmp_path, deepcopy(visual), forward, lambda tower: [tower] if whole_tower else list(tower.blocks)
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

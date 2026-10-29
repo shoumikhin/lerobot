@@ -112,15 +112,12 @@ class Qwen3VisionGrid(FixedImageGrid):
 
 
 def qwen3_vision_forward(
-    visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid_thw: Tensor, grid: Qwen3VisionGrid
+    visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid: Qwen3VisionGrid
 ) -> tuple[Tensor, list[Tensor]]:
     """The merged image embeddings and DeepStack features of `visual(pixel_values, grid_thw)`.
 
-    Under `torch.export` they are computed from `grid` alone, which must be the cache of `grid_thw`.
+    They are computed from `grid`, the prepared cache of `grid_thw`, so that `torch.export` can trace them.
     """
-    if not torch.compiler.is_exporting():
-        output = visual(pixel_values, grid_thw=grid_thw)
-        return output.pooler_output, output.deepstack_features
     weights = grid.pos_embed_weights.to(visual.pos_embed.weight.dtype)
     corners = visual.pos_embed(grid.pos_embed_indices) * weights[..., None]
     pos_embeds = corners[0] + corners[1] + corners[2] + corners[3]
@@ -146,18 +143,17 @@ def qwen3_vl_forward(
     inputs_embeds: Tensor,
     attention_mask: Tensor | None,
     pixel_values: Tensor,
-    grid_thw: Tensor,
     grid: Qwen3VisionGrid,
     image_mask: Tensor,
     position_ids: Tensor | None = None,
 ) -> Tensor:
-    """`Qwen3VLModel.forward` for images and no cache; under `torch.export`, on the cached `grid`.
+    """`Qwen3VLModel.forward` for images and no cache, on the prepared `grid`, traceable by `torch.export`.
 
     `image_mask` is True at the image placeholder tokens. `position_ids` are the 3D positions from
     `qwen_image_rope_index`; when None, positions are 0, 1, 2, ... as in the stock forward without
     `input_ids`. Returns the last hidden state.
     """
-    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid_thw, grid)
+    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid)
     check_input(image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match.")
     inputs_embeds = inputs_embeds.masked_scatter(
         image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
