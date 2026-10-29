@@ -75,7 +75,11 @@ class ExecuTorchProgram:
 
     def _place(self, value: Any, device: str) -> Any:
         if not isinstance(value, np.ndarray):
-            return value
+            if value.device == device:
+                return value
+            # The runtime hands a program whatever memory an input is in, so an output of another
+            # program on another device is copied through the host first.
+            value = self.to_numpy(value)
         value = np.ascontiguousarray(value)
         if device == "cpu":
             return value
