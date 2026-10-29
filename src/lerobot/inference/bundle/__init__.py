@@ -21,7 +21,7 @@ it. This package runs the programs without importing PyTorch.
 """
 
 from .engine import BundleInferenceEngine
-from .manifest import FORMAT_VERSION, MANIFEST, Bundle, BundleManifest, ProgramSpec, is_bundle
+from .manifest import FORMAT_VERSION, MANIFEST, Bundle, BundleManifest, ProgramSpec, TaskTokensSpec, is_bundle
 from .runtime import RUNTIMES, Program, Runtime, load_program
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "Program",
     "ProgramSpec",
     "Runtime",
+    "TaskTokensSpec",
     "is_bundle",
     "load_program",
 ]

@@ -22,6 +22,7 @@ import logging
 from collections.abc import Iterator
 from copy import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -123,6 +124,32 @@ class ProgramCall:
 
 
 @dataclass
+class TaskPrompt:
+    """How a policy's task becomes the `task_embeddings` and `task_length` its parts take.
+
+    The bundle runs any task this way, without PyTorch: see `lerobot.inference.bundle.TaskTokensSpec`.
+
+    Args:
+        text (`list[list[str]]`):
+            The ops that make the prompt text from the task, as `TaskTokensSpec.text` describes.
+        tokenizer (`Path`):
+            The policy's tokenizer file, in the format of the `tokenizers` library, copied as it is.
+        table (`Tensor`):
+            The token embedding table, `[vocabulary, width]`, in float32 or bfloat16.
+        known (`dict[str, list[int]]`):
+            The token ids of the prompt of each task known at export, such as the dataset's tasks.
+        max_tokens (`int`):
+            The most tokens the parts take.
+    """
+
+    text: list[list[str]]
+    tokenizer: Path
+    table: Tensor
+    known: dict[str, list[int]]
+    max_tokens: int
+
+
+@dataclass
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
@@ -132,10 +159,14 @@ class RunPlan:
             part once, in the order it was yielded, with its own names.
         constants (`dict[str, np.ndarray]`):
             Named arrays the runs can read, such as each step's timestep.
+        task_prompt (`TaskPrompt`, *optional*):
+            How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
+            reads it.
     """
 
     calls: list[ProgramCall] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
+    task_prompt: TaskPrompt | None = None
 
 
 class ExportRecipe(abc.ABC):
