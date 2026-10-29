@@ -86,12 +86,27 @@ POLICY_TESTS = Path(__file__).parent / "policies"
 NEEDS_GPU_REASON = re.compile(r"cuda|gpu|accelerator", re.IGNORECASE)
 
 
+def _skips_for(item, reason: re.Pattern) -> bool:
+    return any(reason.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif"))
+
+
 def _needs_gpu(item) -> bool:
     if item.path.is_relative_to(POLICY_TESTS) or getattr(
         getattr(item, "function", None), "requires_cuda", False
     ):
         return True
-    return any(NEEDS_GPU_REASON.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif"))
+    return _skips_for(item, NEEDS_GPU_REASON)
+
+
+# No CI job installs ExecuTorch yet, so the tests that run it skip there; `-m executorch` selects them for a job that
+# installs it. The mark is added to tests skipped without ExecuTorch; a test that skips at run time marks itself.
+NEEDS_EXECUTORCH_REASON = re.compile(r"executorch", re.IGNORECASE)
+# The mark each kind of skip needs, so that a run-time skip without it fails.
+SKIP_MARKS = {"gpu": (NEEDS_GPU_REASON, "CUDA"), "executorch": (NEEDS_EXECUTORCH_REASON, "ExecuTorch")}
+
+
+def _needs_executorch(item) -> bool:
+    return _skips_for(item, NEEDS_EXECUTORCH_REASON)
 
 
 def _write_libero_config(config) -> None:
@@ -122,6 +137,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "gpu: run by the GPU Tests job (added to policy tests and `require_cuda` tests)"
     )
+    config.addinivalue_line(
+        "markers",
+        "executorch: needs ExecuTorch, which no CI job installs yet (added to tests skipped without it)",
+    )
     _write_libero_config(config)
 
 
@@ -132,19 +151,25 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.base)
         if _needs_gpu(item):
             item.add_marker(pytest.mark.gpu)
+        if _needs_executorch(item):
+            item.add_marker(pytest.mark.executorch)
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
-    if report.skipped and isinstance(report.longrepr, tuple) and item.get_closest_marker("gpu") is None:
-        reason = report.longrepr[2]
-        if NEEDS_GPU_REASON.search(reason):
+    if not (report.skipped and isinstance(report.longrepr, tuple)):
+        return
+    reason = report.longrepr[2]
+    for mark, (pattern, what) in SKIP_MARKS.items():
+        if item.get_closest_marker(mark) is None and pattern.search(reason):
             report.outcome = "failed"
             report.longrepr = (
-                f"{item.nodeid} skips without CUDA ({reason}) but is not marked `gpu`: add `@pytest.mark.gpu`"
+                f"{item.nodeid} skips without {what} ({reason}) but is not marked `{mark}`: "
+                f"add `@pytest.mark.{mark}`"
             )
+            return
 
 
 def pytest_collection_finish():
