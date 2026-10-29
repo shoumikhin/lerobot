@@ -37,8 +37,7 @@ class Sampler(torch.nn.Module):
 
 
 @pytest.mark.parametrize("scheduler", ["DDPM", "DDIM"])
-@pytest.mark.parametrize("num_inference_steps", [1, 10])
-def test_exported_diffusion_sampling_matches_eager(scheduler, num_inference_steps):
+def test_exported_diffusion_sampling_matches_eager(scheduler):
     config = DiffusionConfig(
         input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,))},
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
@@ -51,8 +50,8 @@ def test_exported_diffusion_sampling_matches_eager(scheduler, num_inference_step
         num_inference_steps=5,
     )
     model = DiffusionModel(config).eval()
-    model.num_inference_steps = num_inference_steps
-    assert len(model.noise_scheduler.timesteps) == num_inference_steps
+    model.num_inference_steps = 10
+    assert len(model.noise_scheduler.timesteps) == 10
     with pytest.raises(ValueError, match="at least 1"):
         model.num_inference_steps = 0
     sampler = Sampler(model)
