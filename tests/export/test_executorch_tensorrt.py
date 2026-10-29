@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The executorch_tensorrt backend, on a GPU."""
+"""The executorch_tensorrt backend: TensorRT takes what it can, and ExecuTorch's CUDA backend the rest."""
 
 import subprocess
 import sys
@@ -51,6 +51,17 @@ assert "torch" not in sys.modules
 """
 
 
+class ErfinvModel(nn.Module):
+    """TensorRT has no converter for `erfinv`, so another backend has to run it."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.linspace(0.1, 0.9, 64))
+
+    def forward(self, x):
+        return torch.cos(torch.erfinv(torch.tanh(x) * self.scale))
+
+
 def run_without_torch(program, data, x, tmp_path):
     """The program's output for `x`, loaded with its data file in a process without PyTorch."""
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
@@ -70,6 +81,58 @@ def run_without_torch(program, data, x, tmp_path):
         check=True,
     )
     return np.load(tmp_path / "y.npy")
+
+
+def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
+    from executorch.exir._serialize._program import deserialize_pte_binary
+
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    model = ErfinvModel().cuda().eval()
+    x = torch.randn(8, 64, device="cuda")
+    with torch.no_grad():
+        program = torch.export.export(model, (x,))
+        expected = model(x).cpu().numpy()
+
+    data = ExecuTorchTensorRTConfig().compile(program, tmp_path / "model.pte")
+
+    pte = deserialize_pte_binary((tmp_path / "model.pte").read_bytes()).program
+    delegates = {delegate.id for plan in pte.execution_plan for delegate in plan.delegates}
+    operators = [operator.name for plan in pte.execution_plan for operator in plan.operators]
+    assert delegates == {"TensorRTBackend", "CudaBackend"}
+    assert not any("erfinv" in name for name in operators), operators
+    actual = run_without_torch(tmp_path / "model.pte", data, x, tmp_path)
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+class Buckets(nn.Module):
+    """Bucket boundaries that the CUDA backend reads, so they go into that backend's data file."""
+
+    def __init__(self, low: float, high: float):
+        super().__init__()
+        self.boundaries = nn.Parameter(torch.linspace(low, high, 64))
+
+    def forward(self, x):
+        return torch.bucketize(x, self.boundaries).float()
+
+
+def test_parts_in_one_folder_keep_their_own_weights(tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    x = torch.randn(8, 64, device="cuda")
+    backend = ExecuTorchTensorRTConfig()
+    parts = {}
+    for name, low, high in (("first", -1.0, 1.0), ("second", -2.0, 0.0)):
+        model = Buckets(low, high).cuda().eval()
+        with torch.no_grad():
+            program = torch.export.export(model, (x,))
+            expected = model(x).cpu().numpy()
+        parts[name] = (backend.compile(program, tmp_path / f"{name}.pte"), expected)
+    for name, (data, expected) in parts.items():
+        np.testing.assert_array_equal(
+            run_without_torch(tmp_path / f"{name}.pte", data, x, tmp_path), expected
+        )
+    assert sorted(data.name for data, _ in parts.values()) == ["first.ptd", "second.ptd"]
 
 
 def test_float32_math_stays_float32(tmp_path):
