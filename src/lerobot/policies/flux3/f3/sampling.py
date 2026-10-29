@@ -29,7 +29,7 @@ video and action streams can use different guidance scales.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
@@ -66,14 +66,17 @@ def cfg_two_pass(
     return {k: pred_uc[k] + cfg_by_key[k] * (pred_c[k] - pred_uc[k]) for k in flow}
 
 
+def euler_timesteps(n_steps: int, alpha: float) -> list[float]:
+    """The shifted Euler grid as Python floats, the form ``euler`` takes."""
+    return rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1, device="cpu"), alpha).tolist()
+
+
 def euler(
     samples: Samples,
     predict_velocity: Callable[[Samples, float], Samples],
     *,
-    n_steps: int,
-    alpha: float,
+    timesteps: Sequence[float],
 ) -> Samples:
-    timesteps = rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1), alpha).tolist()
     for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:], strict=True):
         pred = predict_velocity(samples, t_curr)
         samples = {
@@ -85,14 +88,15 @@ def euler(
 
 def cosmos_unipc_schedule(
     n_steps: int, shift: float, num_train_timesteps: int = 1000
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, list[int]]:
     """Cosmos' FlowUniPCMultistepScheduler grid: float sigmas for the solver, integer ticks for the model."""
     if n_steps < 1:
         raise ValueError(f"n_steps must be >= 1, got {n_steps}")
     sigma_max = np.float32(1.0 - 1.0 / num_train_timesteps).item()
     sigmas_np = np.linspace(sigma_max, 0.0, n_steps + 1).copy()[:-1]
     sigmas_np = shift * sigmas_np / (1.0 + (shift - 1.0) * sigmas_np)
-    model_timesteps = torch.from_numpy((sigmas_np * num_train_timesteps).astype(np.int64))
+    # Python ints, because torch.export cannot read a number back out of a tensor while it traces.
+    model_timesteps = (sigmas_np * num_train_timesteps).astype(np.int64).tolist()
     sigmas = torch.from_numpy(np.concatenate([sigmas_np, [0.0]]).astype(np.float32))
     return sigmas, model_timesteps
 
@@ -133,7 +137,7 @@ def _require_history(entry: Samples | None) -> Samples:
 
 def cosmos_unipc_order2(
     samples: Samples,
-    predict_velocity: Callable[[Samples, Tensor], Samples],
+    predict_velocity: Callable[[Samples, int], Samples],
     *,
     n_steps: int,
     shift: float,
