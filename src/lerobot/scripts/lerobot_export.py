@@ -53,33 +53,12 @@ logger = logging.getLogger(__name__)
 
 
 def compile_bundle(cfg: ExportConfig, folder: Path) -> None:
-    """Compile the policy's parts into `folder` and write the rest of the bundle there."""
+    """Compile the recipe's parts into `folder` and write the rest of the bundle there."""
     from lerobot.export.bundle import write_bundle
-    from lerobot.export.recipe import make_recipe
+    from lerobot.export.recipe import recipe_class
     from lerobot.inference.bundle import BundleManifest, ProgramSpec
-    from lerobot.policies.factory import load_pretrained_policy, make_pre_post_processors
 
-    config = cast(PreTrainedConfig, cfg.policy)
-    # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
-    config.device = "cpu"
-    # How the policy runs, not how it trained, decides what compiles it.
-    if hasattr(config, "compile_model"):
-        config.compile_model = False
-    policy = load_pretrained_policy(config)
-    if hasattr(policy, "merge_and_unload"):
-        # A PEFT adapter: compile the base weights with the adapter folded in.
-        policy = policy.merge_and_unload()
-    policy.eval()
-    config.device = cfg.backend.device
-    overrides = {"device_processor": {"device": config.device}}
-    preprocessor, postprocessor = make_pre_post_processors(
-        config,
-        pretrained_path=config.pretrained_path,
-        pretrained_revision=config.pretrained_revision,
-        preprocessor_overrides=overrides,
-        postprocessor_overrides=overrides,
-    )
-    recipe = make_recipe(policy, preprocessor, postprocessor, cfg)
+    recipe = recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
     programs = []
     for part in recipe.parts():
         file = f"{part.name}{cfg.backend.file_suffix}"

@@ -24,7 +24,7 @@ from torch import Tensor
 
 import lerobot.export.recipe as recipe_module
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export.recipe import ActionChunkRecipe, make_recipe
+from lerobot.export.recipe import ActionChunkRecipe, recipe_class
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -154,9 +154,13 @@ def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
     assert recipe._robot_frame_shapes() == {IMAGE: (32, 32, 3), OBS_STATE: (3,)}
 
 
-def test_make_recipe_names_the_class_a_policy_recipe_module_lacks(monkeypatch):
+def test_a_policy_without_an_export_module_gets_the_one_program_recipe():
+    assert recipe_class(act_config()) is ActionChunkRecipe
+
+
+def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
     monkeypatch.setattr(
         recipe_module, "_import_sibling_policy_module", lambda *args: SimpleNamespace(__name__="export_act")
     )
     with pytest.raises(ValueError, match="export_act must define the export recipe ACTExportRecipe"):
-        make_recipe(ACTPolicy(act_config()), None, None, export_config())
+        recipe_class(act_config())
