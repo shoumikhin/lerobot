@@ -16,14 +16,17 @@
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from draccus.utils import ParsingError
+from safetensors.numpy import load_file
 
 import tests.export.torch_backend  # noqa: F401  # registers the test backend
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.export import recipe as recipe_module
 from lerobot.export.bundle import POLICY_CONFIG
 from lerobot.inference.bundle import Bundle, BundleInferenceEngine
 from lerobot.inference.sync import SyncInferenceEngine
@@ -33,6 +36,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+from tests.export.chain_recipe import ACTChainRecipe
 
 IMAGE = "observation.images.front"
 
@@ -72,9 +76,9 @@ def checkpoint(tmp_path_factory):
     return path
 
 
-def run_export(*args: str) -> None:
+def run_export(*args: str, backend: str = "torch_test") -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(sys, "argv", ["lerobot-export", "--backend.type=torch_test", *args])
+        monkeypatch.setattr(sys, "argv", ["lerobot-export", f"--backend.type={backend}", *args])
         export()
 
 
@@ -96,10 +100,13 @@ def assert_plays_like_pytorch(checkpoint, bundle: Bundle, image: str) -> None:
         image: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
         OBS_STATE: rng.random(3, dtype=np.float32),
     }
+    scale = np.asarray(bundle.manifest.action_scale, dtype=np.float32)
     for _ in range(policy.config.n_action_steps + 1):
-        np.testing.assert_allclose(
-            engine.get_action(dict(frame)), reference.get_action(dict(frame)).numpy(), atol=1e-5
-        )
+        expected = reference.get_action(dict(frame)).numpy()
+        # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked
+        # with, in normalized action units, as the engine does.
+        drift = float((np.abs(engine.get_action(dict(frame)) - expected) / scale).max())
+        assert drift <= bundle.manifest.tolerance, drift
 
 
 def test_bundle_plays_the_actions_of_the_pytorch_policy(checkpoint, bundle):
@@ -173,3 +180,27 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
     )
     with pytest.raises(RuntimeError, match="crashed with SIGSEGV"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+
+
+BACKENDS = ["torch_test"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported as a chain whose last part runs twice, reading its factor from the constants."""
+    module = SimpleNamespace(__name__="export_act", ACTExportRecipe=ACTChainRecipe)
+    monkeypatch.setattr(recipe_module, "_import_sibling_policy_module", lambda *args: module)
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    bundle = Bundle.read(tmp_path / "b")
+    assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
+    programs = bundle.manifest.programs
+    suffix = programs[0].file.rsplit(".", 1)[1]
+    assert [p.file for p in programs] == [
+        f"prepare.{suffix}",
+        f"model.{suffix}",
+        f"scale.{suffix}",
+        f"scale.{suffix}",
+    ]
+    assert [p.name for p in programs] == ["prepare", "model", "scale_0", "scale_1"]
+    constants = load_file(bundle.path / bundle.manifest.constants)
+    np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
