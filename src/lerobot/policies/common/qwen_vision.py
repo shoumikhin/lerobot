@@ -81,18 +81,19 @@ class FixedImageGrid:
         program. Run one eager call with the same inputs before export, and again after moving or casting the
         model.
         """
-        fits = (
-            cache is not None
-            and len(cache.grid_thw) == grid_thw.shape[0]
-            and (cache.device, cache.dtype) == (visual.device, visual.dtype)
-        )
+        if (
+            cache is None
+            or len(cache.grid_thw) != grid_thw.shape[0]
+            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+        ):
+            if torch.compiler.is_exporting():
+                raise RuntimeError(
+                    "precompute_grid_thw has no image grid cached for this model, device and dtype. Run one "
+                    "eager call with the same inputs before torch.export."
+                )
+            return cls.build(visual, grid_thw)
         if not torch.compiler.is_exporting():
-            return cache if fits and cache.grid_thw == grid_thw.tolist() else cls.build(visual, grid_thw)
-        if not fits:
-            raise RuntimeError(
-                "precompute_grid_thw has no image grid cached for this model, device and dtype. Run one "
-                "eager call with the same inputs before torch.export."
-            )
+            return cache if cache.grid_thw == grid_thw.tolist() else cls.build(visual, grid_thw)
         cache.check(grid_thw)
         return cache
 

@@ -90,15 +90,20 @@ def test_qwen3_vl_forward_matches_stock_model(model):
 
     class Wrapper(torch.nn.Module):
         def forward(self, inputs_embeds, attention_mask, pixel_values, grid_thw, image_mask):
+            cached = Qwen3VisionGrid.reuse_or_build(grid, model.visual, grid_thw)
             return qwen3_vl_forward(
-                model, inputs_embeds, attention_mask, pixel_values, grid_thw, grid, image_mask
+                model, inputs_embeds, attention_mask, pixel_values, grid_thw, cached, image_mask
             )
 
     args = (inputs_embeds, attention_mask, pixel_values, grid_thw, image_mask)
     with torch.no_grad():
         program = torch.export.export(Wrapper(), args, strict=False)
         torch.testing.assert_close(program.module()(*args), expected)
-    # DeepStack included: the stock text model would add its features with boolean-mask indexing.
+        # Same image and token counts, other shape: the exported program's grid check rejects it.
+        changed = grid_thw.clone()
+        changed[1, 1:] = changed[1, 1:].flip(0)
+        with pytest.raises(RuntimeError):
+            program.module()(inputs_embeds, attention_mask, pixel_values, changed, image_mask)
     assert data_dependent_nodes(program, skip_functions=STOCK_DEEPSTACK) == []
 
 
