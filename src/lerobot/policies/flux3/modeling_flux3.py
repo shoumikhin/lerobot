@@ -402,13 +402,16 @@ class Flux3Policy(PreTrainedPolicy):
         """Text context ``(1, L, ctx_dim)`` in the DiT dtype plus its position ids, cached per caption."""
         hit = self._ctx_cache.get(caption)
         if hit is None or hit[0].device != device:
-            if len(self._ctx_cache) > 256:
-                self._ctx_cache.clear()
             ctx = text_context(
                 self.frozen.text_encoder, caption, device, fixed_length=self.config.text_fixed_length
             )
-            self._ctx_cache[caption] = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
-        return self._ctx_cache[caption]
+            hit = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
+            # Tensors traced by torch.export are not real, so they must not be served to later eager calls.
+            if not torch.compiler.is_exporting():
+                if len(self._ctx_cache) > 256:
+                    self._ctx_cache.clear()
+                self._ctx_cache[caption] = hit
+        return hit
 
     def _euler_timesteps(self) -> list[float]:
         """The Euler grid for the current settings, rebuilt outside tracing because a traced one cannot be read."""
