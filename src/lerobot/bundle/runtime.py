@@ -25,6 +25,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from lerobot.utils.import_utils import register_third_party_plugins
+
 from . import executorch
 
 
@@ -52,7 +54,8 @@ class Runtime:
         load (`Callable[[Path, Path | None], Program]`):
             Loads a program file, with its data file if the manifest names one.
         prepare (`Callable[[], None]`, *optional*):
-            Runs once before the manifest's `runtime_imports` are imported.
+            Runs before the programs load, and before the manifest's `runtime_imports` import when the
+            runtime is registered before them. It may run more than once.
     """
 
     load: Callable[[Path, Path | None], Program]
@@ -60,12 +63,30 @@ class Runtime:
 
 
 RUNTIMES: dict[str, Runtime] = {"executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare)}
-"""Runtimes by name. A module a manifest names in `runtime_imports` may add one."""
+"""The runtimes by name: the ones LeRobot has, and the ones packages added with `register_runtime`."""
+
+
+def register_runtime(name: str, runtime: Runtime) -> None:
+    """Add a runtime, from an installed package named `lerobot_runtime_*` or a module a manifest imports.
+
+    Registering must not load the runtime's native code: that waits for `prepare` and `load`.
+    """
+    if name in RUNTIMES:
+        raise ValueError(f"A runtime named {name!r} is already registered.")
+    RUNTIMES[name] = runtime
 
 
 def prepare_runtime(runtime: str, modules: Sequence[str]) -> Runtime:
-    """Get the runtime named `runtime` ready, import the modules a bundle needs, and return the runtime."""
-    if runtime in RUNTIMES:
+    """Get the runtime named `runtime` ready, import the modules a bundle needs, and return the runtime.
+
+    The runtime prepares before the modules import, since a module may load native code that reads what
+    `prepare` set. A runtime LeRobot does not have is looked for in the installed `lerobot_runtime_*`
+    packages; one that a module registers instead prepares once the modules are imported.
+    """
+    if runtime not in RUNTIMES:
+        register_third_party_plugins(kinds=("runtime",))
+    prepared = runtime in RUNTIMES
+    if prepared:
         RUNTIMES[runtime].prepare()
     for module in modules:
         try:
@@ -77,5 +98,10 @@ def prepare_runtime(runtime: str, modules: Sequence[str]) -> Runtime:
                 "https://huggingface.co/docs/lerobot/export"
             ) from error
     if runtime not in RUNTIMES:
-        raise ValueError(f"Unknown runtime {runtime!r}; this version of LeRobot runs {sorted(RUNTIMES)}.")
+        raise ValueError(
+            f"Unknown runtime {runtime!r}; this version of LeRobot runs {sorted(RUNTIMES)}. An installed "
+            "package named lerobot_runtime_* can add one."
+        )
+    if not prepared:
+        RUNTIMES[runtime].prepare()
     return RUNTIMES[runtime]
