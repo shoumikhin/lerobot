@@ -213,6 +213,15 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
         raise AssertionError("prefix positions must not read the image grid on the host")
 
     monkeypatch.setattr(Qwen3VLModel, "get_rope_index", stock_rope_index)
+    visual = fixed.model.qwenvl_with_expert.qwenvl.model.visual
+    grid_builds = []
+    build_grid = visual.preprcess_grid_thw
+
+    def recorded_build(*args, **kwargs):
+        grid_builds.append(args or kwargs)
+        return build_grid(*args, **kwargs)
+
+    monkeypatch.setattr(visual, "preprcess_grid_thw", recorded_build)
     keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
 
     class PredictActionChunk(torch.nn.Module):
@@ -224,6 +233,7 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
             assert torch.equal(PredictActionChunk()(noise, *(batch[key] for key in keys)), expected)
         exported = torch.export.export(PredictActionChunk(), (noise, *(batch[key] for key in keys)))
         torch.testing.assert_close(exported.module()(noise, *(batch[key] for key in keys)), expected)
+    assert len(grid_builds) == 1
     assert data_dependent_nodes(exported) == []
 
     core = fixed.model.qwenvl_with_expert

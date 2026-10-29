@@ -299,10 +299,12 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
 
     # The diffusion loop runs under no_grad, as predict_action_chunk runs it.
     with torch.no_grad():
+        torch.manual_seed(0)
+        assert torch.equal(Predict()(*(batch[key] for key in keys)), expected)
         program = torch.export.export(Predict(), tuple(batch[key] for key in keys))
         torch.manual_seed(0)
         torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
-    assert builds == []  # the export reused the grid cached by the eager call
+    assert builds == []  # the eager call and the export reused the cached grid
     # Boolean-mask writes and reads of the action and proprioception tokens would make shapes data-dependent.
     assert data_dependent_nodes(program) == []
 

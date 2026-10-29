@@ -227,6 +227,7 @@ def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch)
     from transformers.feature_extraction_utils import BatchFeature
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from tests.policies.common.fixed_grid_checks import count_grid_builds
     from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
 
     torch.manual_seed(0)
@@ -240,6 +241,7 @@ def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch)
         for precompute in (False, True)
     )
 
+    builds = count_grid_builds(monkeypatch)
     for _ in range(2):  # The second step reuses the cached grid, and backward must still reach pos_embed.
         for backbone in (stock, fixed):
             backbone.zero_grad()
@@ -249,6 +251,7 @@ def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch)
         actual.square().sum().backward()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(fixed.visual.pos_embed.weight.grad, stock.visual.pos_embed.weight.grad)
+    assert len(builds) == 1
 
 
 def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(monkeypatch):
