@@ -486,11 +486,11 @@ class Qwen3Backbone(nn.Module):
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
         qwen = getattr(self.model, "model", self.model)
-        self._vision_grid = Qwen3VisionGrid.track(
+        grid = self._vision_grid = Qwen3VisionGrid.track(
             self._vision_grid, qwen.visual, model_input["image_grid_thw"]
         )
-        if is_preparing_image_grid() or is_exporting():
-            self._vision_grid.check_visible_images(
+        if grid is not None and (is_preparing_image_grid() or is_exporting()):
+            grid.check_visible_images(
                 model_input["input_ids"], model_input["attention_mask"], qwen.config.image_token_id
             )
         if not is_exporting():

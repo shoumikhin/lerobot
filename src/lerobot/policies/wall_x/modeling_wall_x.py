@@ -2045,7 +2045,7 @@ class WallXPolicy(PreTrainedPolicy):
             vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
                 self._vision_grid, self.model.visual, batch["image_grid_thw"]
             )
-            if is_preparing_image_grid() or is_exporting():
+            if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
                 vision_grid.check_visible_images(
                     batch["input_ids"], batch["attention_mask"], self.model.config.image_token_id
                 )

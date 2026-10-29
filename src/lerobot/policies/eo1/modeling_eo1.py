@@ -661,11 +661,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
         if pixel_values is not None:
-            self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
+            grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
             if is_preparing_image_grid():
                 self._rope_temporal_scale()
-            if is_preparing_image_grid() or is_exporting():
-                self._vision_grid.check_visible_images(input_ids, attention_mask, vlm.config.image_token_id)
+            if grid is not None and (is_preparing_image_grid() or is_exporting()):
+                grid.check_visible_images(input_ids, attention_mask, vlm.config.image_token_id)
         vision_grid = self._vision_grid
         if vision_grid is not None and pixel_values is not None and is_exporting():
             position_ids = qwen_image_rope_index(
