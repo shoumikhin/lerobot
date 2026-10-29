@@ -2028,7 +2028,8 @@ class WallXPolicy(PreTrainedPolicy):
         `(batch_size, chunk_size, max_action_dim)`. It is not used by the fast mode.
 
         The diffusion mode can be exported with `torch.export` under `torch.no_grad()` after an eager call inside
-        `prepare_image_grid()`; with grad enabled, transformers' causal mask code does not trace.
+        `prepare_image_grid()`. With grad enabled, export fails with a `SpecViolationError`: it wraps this method's
+        `no_grad` region, and transformers' vmap-based mask functions inside it do not survive that.
         """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
