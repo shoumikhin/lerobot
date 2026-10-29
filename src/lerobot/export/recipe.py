@@ -21,7 +21,7 @@ import inspect
 import logging
 from collections.abc import Iterator
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -104,6 +104,40 @@ class TestCase:
     action_scale: np.ndarray
 
 
+@dataclass
+class ProgramCall:
+    """One run of a compiled part, with the names its inputs and outputs take in this run.
+
+    Args:
+        part (`str`):
+            The name of the part to run.
+        inputs (`list[str]`):
+            The names of the values it reads, in the order of the part's inputs.
+        outputs (`list[str]`):
+            The names of the values it writes, in the order of the part's outputs.
+    """
+
+    part: str
+    inputs: list[str]
+    outputs: list[str]
+
+
+@dataclass
+class RunPlan:
+    """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
+
+    Args:
+        calls (`list[ProgramCall]`, *optional*):
+            The runs in order. A part may run several times, for example a denoising step. `None` runs each
+            part once, in the order it was yielded, with its own names.
+        constants (`dict[str, np.ndarray]`):
+            Named arrays the runs can read, such as each step's timestep.
+    """
+
+    calls: list[ProgramCall] | None = None
+    constants: dict[str, np.ndarray] = field(default_factory=dict)
+
+
 class ExportRecipe(abc.ABC):
     """Knows one kind of policy, never a compiler: turns it into parts and makes the test case.
 
@@ -161,6 +195,10 @@ class ExportRecipe(abc.ABC):
     @abc.abstractmethod
     def test_case(self) -> TestCase:
         """The frame, noise and actions the bundle's programs must reproduce."""
+
+    def plan(self) -> RunPlan:
+        """How the compiled parts run, asked once `parts` is used up. By default each part runs once."""
+        return RunPlan()
 
 
 class ActionChunkRecipe(ExportRecipe):
