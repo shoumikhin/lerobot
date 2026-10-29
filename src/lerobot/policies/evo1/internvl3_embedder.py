@@ -151,9 +151,10 @@ class InternVL3Embedder(nn.Module):
             rope_parameters.get("rope_type") == "dynamic"
             and max_text_length <= text_config.max_position_embeddings
         ):
+            # Only "factor" belongs to dynamic RoPE; keep the rest, such as partial_rotary_factor.
             text_config.rope_parameters = {
+                **{k: v for k, v in rope_parameters.items() if k != "factor"},
                 "rope_type": "default",
-                "rope_theta": rope_parameters["rope_theta"],
             }
 
         self.model = AutoModel.from_pretrained(
