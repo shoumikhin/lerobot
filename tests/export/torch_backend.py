@@ -49,6 +49,9 @@ class TorchProgram:
     def to_numpy(self, value: Tensor) -> np.ndarray:
         return value.numpy()
 
+    def place(self, index: int, value: np.ndarray) -> Tensor:
+        return torch.as_tensor(value)
+
 
 RUNTIMES["torch_test"] = Runtime(TorchProgram)
 
