@@ -12,19 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write the files of a bundle that the trace step makes: the test case, the constants and the policy config."""
+"""Write the files of a bundle that the trace step makes, beside its programs and manifest."""
 
 from __future__ import annotations
+
+import json
+import shutil
 
 import numpy as np
 from huggingface_hub.constants import CONFIG_NAME
 from safetensors.numpy import save_file
+from safetensors.torch import save_file as save_torch_file
 
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION
 
-from .recipe import TestCase
+from .recipe import TaskTokenData, TestCase
 
 
 def write_bundle(
@@ -32,8 +36,9 @@ def write_bundle(
     test_case: TestCase,
     config: PreTrainedConfig,
     constants: dict[str, np.ndarray] | None = None,
+    task_tokens: TaskTokenData | None = None,
 ) -> None:
-    """Write the test case, the constants and the policy config under the names the bundle's manifest gives.
+    """Write the test case, the constants, the task's files and the policy config into the bundle folder.
 
     Args:
         bundle (`Bundle`):
@@ -44,6 +49,9 @@ def write_bundle(
             The policy config, naming the frame the programs take.
         constants (`dict[str, np.ndarray]`, *optional*):
             Named arrays the programs read, written to the file the manifest names in `constants`.
+        task_tokens (`TaskTokenData`, *optional*):
+            The tokenizer, embedding table and known tasks, written to the files the manifest names in
+            `task_tokens`.
     """
     folder, manifest = bundle.path, bundle.manifest
     case = {**test_case.frame, ACTION: test_case.actions}
@@ -58,5 +66,12 @@ def write_bundle(
             {name: np.ascontiguousarray(value) for name, value in (constants or {}).items()},
             folder / manifest.constants,
         )
+    if manifest.task_tokens is not None and task_tokens is not None:
+        shutil.copyfile(task_tokens.tokenizer, folder / manifest.task_tokens.tokenizer)
+        save_torch_file(
+            {"embeddings": task_tokens.embeddings.detach().cpu().contiguous()},
+            folder / manifest.task_tokens.embeddings,
+        )
+        (folder / manifest.task_tokens.known_tasks).write_text(json.dumps(task_tokens.known_tasks))
     config.save_pretrained(folder)
     (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)
