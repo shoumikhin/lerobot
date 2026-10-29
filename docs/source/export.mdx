@@ -66,7 +66,7 @@ Pass the bundle folder as `--policy.path`. A bundle on the Hub must be downloade
 
 A bundle runs as it was compiled, so `lerobot-rollout` refuses `--policy.*` overrides, `--device`, `--inference.type` and `--use_torch_compile` with it, and `--planner` with a bundle that holds a task.
 
-`lerobot-rollout` itself still imports PyTorch. The package that runs bundles, `lerobot.inference.bundle`, does not.
+`lerobot-rollout` runs a bundle without importing PyTorch, so the process holds no PyTorch memory. Strategies that record a dataset are the exception: LeRobot's dataset writer still uses PyTorch.
 
 ## The bundle
 
