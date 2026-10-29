@@ -920,14 +920,6 @@ def test_precompute_grid_thw_prediction_matches_stock_and_exports(monkeypatch):
         assert torch.equal(policy.predict_action_chunk(batch), expected)
     assert len(builds) == 1
     assert contiguous and all(contiguous)
-    with pytest.raises(ValueError, match="image grid differs"):
-        policy.model.generate_flow_action(
-            **{**batch, "image_grid_thw": torch.tensor([[1, 2, 2]] * 3 + [[1, 4, 1]])},
-            action_horizon=2,
-            action_dim=26,
-            num_inference_timesteps=10,
-            vision_grid=policy._vision_grid,
-        )
 
     keys = sorted(batch)
 

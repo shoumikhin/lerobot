@@ -178,37 +178,39 @@ def _precompute_policies(tiny_backbone, cameras, vision_boundaries):
 
 @pytest.mark.parametrize("cameras", [(CAMERA,), (CAMERA, WRIST)], ids=["one-camera", "two-cameras"])
 def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbone, monkeypatch, cameras):
-    """Prefix positions come from the image grid ints; with the grid cached, prediction exports."""
+    """Eager prediction keeps transformers' prefix positions; with the grid cached, prediction exports."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 
     from tests.policies.common.fixed_grid_checks import data_dependent_nodes
 
+    stock_rope_index, eager_rope_calls = Qwen3VLModel.get_rope_index, []
+
+    def counted_rope_index(self, *args, **kwargs):
+        assert not torch.compiler.is_exporting(), "exported prefix positions must not use get_rope_index"
+        eager_rope_calls.append(1)
+        return stock_rope_index(self, *args, **kwargs)
+
+    monkeypatch.setattr(Qwen3VLModel, "get_rope_index", counted_rope_index)
     policy, fixed, batch, noise = _precompute_policies(tiny_backbone, cameras, vision_boundaries=True)
     core = policy.model.qwenvl_with_expert
     build_prefix_position_ids, prefixes = core.build_prefix_position_ids, []
 
-    def recorded(input_ids, attention_mask, image_grid_thw, **kwargs):
-        positions = build_prefix_position_ids(input_ids, attention_mask, image_grid_thw, **kwargs)
-        prefixes.append((input_ids, attention_mask, image_grid_thw, positions))
+    def recorded(input_ids, attention_mask, **kwargs):
+        positions = build_prefix_position_ids(input_ids, attention_mask, **kwargs)
+        prefixes.append((input_ids, attention_mask, positions))
         return positions
 
     monkeypatch.setattr(core, "build_prefix_position_ids", recorded)
     # The sampler updates its noise in place, so every call gets its own copy.
     with torch.no_grad():
         expected = policy.predict_action_chunk(batch, noise=noise.clone()).clone()
-    input_ids, attention_mask, grid, positions = prefixes[0]
-    stock, _ = core.qwenvl.model.get_rope_index(
-        input_ids=input_ids,
-        mm_token_type_ids=(input_ids == core.qwenvl.config.image_token_id).int(),
-        image_grid_thw=torch.tensor(grid),
-        attention_mask=attention_mask,
-    )
-    assert torch.equal(positions, stock.masked_fill(attention_mask == 0, 1))
+    calls_per_prediction = len(eager_rope_calls)
+    assert calls_per_prediction > 0
+    # The positions export uses, computed from the grid ints of every camera, match transformers'.
+    input_ids, attention_mask, positions = prefixes[0]
+    every_grid = batch["image_grid_thw"].reshape(-1, 3).tolist()
+    assert torch.equal(core.build_fixed_grid_position_ids(input_ids, attention_mask, every_grid), positions)
 
-    def stock_rope_index(*args, **kwargs):
-        raise AssertionError("prefix positions must not use get_rope_index")
-
-    monkeypatch.setattr(Qwen3VLModel, "get_rope_index", stock_rope_index)
     visual = fixed.model.qwenvl_with_expert.qwenvl.model.visual
     grid_builds = []
     build_grid = visual.preprcess_grid_thw
@@ -230,6 +232,8 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
     with torch.no_grad():
         for _ in range(2):  # The second call reuses the cached grid.
             assert torch.equal(run(PredictActionChunk(), batch), expected)
+        # Eager calls with the option on keep transformers' positions.
+        assert len(eager_rope_calls) == 3 * calls_per_prediction
         exported = torch.export.export(
             PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
         )

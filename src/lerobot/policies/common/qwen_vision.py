@@ -81,24 +81,36 @@ class FixedImageGrid:
         In eager mode this reads `grid_thw` on the host and builds a new cache whenever the grid, the device or
         the dtype changed. Under `torch.export` the grid cannot be read, so the cache must already fit: the
         image count, device and dtype are checked while tracing, and the grid values by a runtime assert in the
-        program. Run one eager call with the same inputs before export, and again after moving or casting the
-        model.
+        program. So the last eager call before export must use the export inputs, on the export device and
+        dtype.
         """
-        if (
-            cache is None
-            or len(cache.grid_thw) != grid_thw.shape[0]
-            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
-        ):
-            if torch.compiler.is_exporting():
-                raise RuntimeError(
-                    "precompute_grid_thw has no image grid cached for this model, device and dtype. Run one "
-                    "eager call with the same inputs before torch.export."
-                )
-            return cls.build(visual, grid_thw)
         if not torch.compiler.is_exporting():
-            return cache if cache.grid_thw == grid_thw.tolist() else cls.build(visual, grid_thw)
-        cache.check(grid_thw)
-        return cache
+            if (
+                cache is None
+                or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+                or cache.grid_thw != grid_thw.tolist()
+            ):
+                return cls.build(visual, grid_thw)
+            return cache
+        if cache is None:
+            problem = "no image grid is cached"
+        elif len(cache.grid_thw) != grid_thw.shape[0]:
+            problem = (
+                f"the cached grid has {len(cache.grid_thw)} images but the export inputs have "
+                f"{grid_thw.shape[0]} (another batch size or camera count)"
+            )
+        elif (cache.device, cache.dtype) != (visual.device, visual.dtype):
+            problem = (
+                f"the cached grid was built for {cache.device} {cache.dtype}, but the tower is now on "
+                f"{visual.device} {visual.dtype}"
+            )
+        else:
+            cache.check(grid_thw)
+            return cache
+        raise RuntimeError(
+            f"precompute_grid_thw cannot export: {problem}. The last eager call before torch.export must use "
+            "the export inputs."
+        )
 
     def check(self, grid_thw: Tensor) -> None:
         """Assert in an exported program that `grid_thw` equals the cached grid."""

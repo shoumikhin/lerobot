@@ -525,7 +525,6 @@ class WallOSS05Model(nn.Module):
         if vision_grid is None:
             image_embeddings = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
         else:
-            vision_grid.check(image_grid_thw)
             image_embeddings = qwen2_5_vision_forward(self.visual, pixel_values, image_grid_thw, vision_grid)
         image_embeddings = image_embeddings.to(embeddings)
         image_mask = (input_ids == int(self.config.image_token_id)).unsqueeze(-1)

@@ -286,15 +286,44 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         emb = self.embed_language_tokens(token).to(dtype=dtype)
         return emb.view(1, 1, 1, -1).expand(batch, count, 1, -1)
 
-    def build_prefix_position_ids(self, input_ids, attention_mask, image_grid_thw: list[list[int]]):
+    def build_prefix_position_ids(self, input_ids, attention_mask, image_grid_thw=None, video_grid_thw=None):
+        # transformers>=5.5 externalized modality detection: get_rope_index now takes an
+        # explicit ``mm_token_type_ids`` (0=text, 1=image, 2=video) instead of matching
+        # the placeholder token ids internally. Reconstruct it from the vision token ids.
+        vlm_cfg = self.qwenvl.config
+        image_token_id = getattr(vlm_cfg, "image_token_id", None)
+        video_token_id = getattr(vlm_cfg, "video_token_id", None)
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        if image_token_id is not None:
+            mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
+        position_ids, _ = self.qwenvl.model.get_rope_index(
+            input_ids=input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+        return self._pad_positions_as_trained(position_ids, attention_mask)
+
+    def build_fixed_grid_position_ids(self, input_ids, attention_mask, grid_thw: list[list[int]]):
+        """`build_prefix_position_ids` for `torch.export`, which cannot read the image grid on the host.
+
+        `grid_thw` is the grid of every camera as Python ints, including cameras hidden by `attention_mask`.
+        """
         vlm_cfg = self.qwenvl.config
         position_ids = qwen_image_rope_index(
             input_ids,
             attention_mask,
-            image_grid_thw,
+            grid_thw,
             vlm_cfg.vision_config.spatial_merge_size,
             vlm_cfg.image_token_id,
         )
+        return self._pad_positions_as_trained(position_ids, attention_mask)
+
+    @staticmethod
+    def _pad_positions_as_trained(position_ids, attention_mask):
         # transformers 4.57 (which the 6B checkpoint was trained under) filled masked
         # (padding) rope positions with 1; transformers 5.5 fills them with 0. Restore the
         # 4.57 convention so cached-prefix rope matches the trained weights exactly.
@@ -928,12 +957,20 @@ class FlowMatchingV2(FlowMatchingV1):
                 flat_grid_thw == flat_grid_thw.new_tensor(cached_grid_thw),
                 "The image grid differs from the one cached for precompute_grid_thw.",
             )
-            rope_grid_thw = cached_grid_thw
+            prefix_position_ids = self.qwenvl_with_expert.build_fixed_grid_position_ids(
+                prefix_input_ids, pad_masks.long(), cached_grid_thw
+            )
         else:
-            rope_grid_thw = flat_grid_thw.tolist()
-        prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
-            prefix_input_ids, pad_masks.long(), rope_grid_thw
-        )
+            flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
+            rope_grid_thw = flat_grid_thw[flat_img_masks]
+            if rope_grid_thw.numel() == 0:
+                rope_grid_thw = flat_grid_thw[:1]
+            prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
+                prefix_input_ids,
+                pad_masks.long(),
+                image_grid_thw=rope_grid_thw,
+                video_grid_thw=None,
+            )
         # Dense (capture-safe) deepstack layout: zero-masked per-camera embeds
         # laid out over the full prefix length instead of bool-filtered rows.
         # _apply_deepstack then does a plain shape-static add; the old filtered
@@ -1624,8 +1661,9 @@ class FlowMatchingV2(FlowMatchingV1):
 
         if self.config.use_cudagraph_prefix_full:
             # Vision tower as its own graph (grid metadata cached on `core`); the embed
-            # glue (language embed / masks / mrope ids / dense deepstack) stays eager,
-            # it is light. The 36-layer KV fill graph below is unchanged.
+            # glue (language embed / masks / mrope ids / dense deepstack) stays eager —
+            # it is light and get_rope_index's data-dependent host syncs cannot be
+            # captured. The 36-layer KV fill graph below is unchanged.
             flat_grid_thw = (
                 einops.rearrange(image_grid_thw, "b n d -> (b n) d")
                 if image_grid_thw.ndim == 3

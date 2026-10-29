@@ -283,10 +283,6 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
 
     torch.manual_seed(0)
     assert torch.equal(model.predict(**batch, **settings, **static)["predict_action"], expected)
-    with pytest.raises(ValueError, match="image grid differs"):
-        model.predict(
-            **{**batch, "image_grid_thw": torch.tensor([[1, 4, 2], [1, 2, 4]])}, **settings, **static
-        )
 
     builds = count_grid_builds(monkeypatch)
     keys = sorted(batch)
@@ -312,6 +308,39 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
     malformed["input_ids"][:, 2] = 7
     with torch.no_grad(), pytest.raises(RuntimeError):
         program.module()(*(malformed[key] for key in keys))
+
+
+def test_eager_prediction_with_precompute_grid_thw_only_refreshes_the_grid(monkeypatch):
+    visual = _tiny_diffusion_model().visual
+    batch = _diffusion_batch(3)
+    calls = []
+
+    class Model:
+        def __init__(self):
+            self.visual = visual
+
+        def __call__(self, **inputs):
+            calls.append(inputs)
+            return {"predict_action": torch.zeros(2, 3, 3)}
+
+    def no_rope_positions(*args, **kwargs):
+        raise AssertionError(
+            "eager prediction discards the fixed-grid rope positions, so it must not build them"
+        )
+
+    monkeypatch.setattr("lerobot.policies.wall_x.modeling_wall_x.qwen_image_rope_index", no_rope_positions)
+    policy = _make_unloaded_policy(
+        precompute_grid_thw=True,
+        prediction_mode="diffusion",
+        max_action_dim=3,
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
+    )
+    policy._queues = {}
+    policy._vision_grid = None
+    policy.model = Model()
+    policy.predict_action_chunk(batch)
+    assert "vision_grid" not in calls[0] and "position_ids" not in calls[0]
+    assert policy._vision_grid.grid_thw == batch["image_grid_thw"].tolist()
 
 
 def test_diffusion_checks_stay_on_without_precompute_grid_thw(monkeypatch):

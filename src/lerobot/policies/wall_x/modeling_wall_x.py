@@ -1121,8 +1121,9 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             dof_mask (torch.FloatTensor, optional): Degrees of freedom mask
             agent_pos_mask (torch.FloatTensor, optional): Agent position mask
             re_generate (bool, optional): Whether to use sampling for regeneration
-            vision_grid (Qwen2_5VisionGrid, optional): Precomputed metadata of a fixed image grid; when given,
-                the vision tower runs without reading ``image_grid_thw`` on the host
+            vision_grid (Qwen2_5VisionGrid, optional): The cache of ``image_grid_thw`` from
+                ``Qwen2_5VisionGrid.reuse_or_build``; under ``torch.export`` the vision tower then runs without
+                reading ``image_grid_thw`` on the host
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -1163,7 +1164,6 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 if vision_grid is None:
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
-                    vision_grid.check(image_grid_thw)
                     image_embeds = qwen2_5_vision_forward(
                         self.visual, pixel_values, image_grid_thw, vision_grid
                     )
@@ -1913,26 +1913,28 @@ class WallXPolicy(PreTrainedPolicy):
             inputs["rope_deltas"] = rope_deltas
         return inputs
 
-    def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
-        """Vision metadata and rope positions of the camera grid for `torch.export`.
-
-        The metadata is rebuilt in eager mode when the grid changes.
-        """
+    def _cached_vision_grid(self, batch: BatchFeature) -> Qwen2_5VisionGrid:
+        """Vision metadata of the batch's camera grid, rebuilt in eager mode when the grid changes."""
         if batch.get("video_grid_thw") is not None:
             raise ValueError("WALL-X precompute_grid_thw supports images only.")
         self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
             self._vision_grid, self.model.visual, batch["image_grid_thw"]
         )
+        return self._vision_grid
+
+    def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
+        """Vision metadata and rope positions of the cached camera grid, for `torch.export`."""
+        vision_grid = self._cached_vision_grid(batch)
         position_ids = qwen_image_rope_index(
             batch["input_ids"],
             batch["attention_mask"],
-            self._vision_grid.grid_thw,
+            vision_grid.grid_thw,
             self.model.config.vision_config.spatial_merge_size,
             self.model.config.image_token_id,
         )
         # WALL-X's own get_rope_index puts padding at position 1.
         position_ids = position_ids.masked_fill(batch["attention_mask"] == 0, 1)
-        return {"vision_grid": self._vision_grid, "position_ids": position_ids}
+        return {"vision_grid": vision_grid, "position_ids": position_ids}
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """
@@ -2037,11 +2039,12 @@ class WallXPolicy(PreTrainedPolicy):
         action_dim = self.config.output_features[ACTION].shape[0]
 
         if self.config.prediction_mode == "diffusion":
-            if self.config.precompute_grid_thw:
-                grid_inputs = self._static_grid_inputs(batch)
-                # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before.
-                if torch.compiler.is_exporting():
-                    batch.update(grid_inputs)
+            # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before; it only keeps
+            # the cache current for a later export.
+            if self.config.precompute_grid_thw and torch.compiler.is_exporting():
+                batch.update(self._static_grid_inputs(batch))
+            elif self.config.precompute_grid_thw:
+                self._cached_vision_grid(batch)
             output = self.model(
                 **batch,
                 action_dim=self.config.max_action_dim,

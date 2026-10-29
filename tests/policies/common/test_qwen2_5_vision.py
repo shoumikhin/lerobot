@@ -98,13 +98,25 @@ def test_vision_forward_matches_stock_and_exports(grids):
     assert data_dependent_nodes(exported) == []
 
 
-def test_export_without_a_fitting_cached_grid_asks_for_an_eager_call():
+def test_export_without_a_fitting_cached_grid_names_the_mismatch():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
-    two_images = Qwen2_5VisionGrid.build(visual, torch.tensor(GRID * 2))
-    for cache in (None, two_images):
-        with pytest.raises(RuntimeError, match="Run one eager call"):
-            torch.export.export(FixedGridVision(visual, cache), (_pixels(grid_thw), grid_thw), strict=False)
+    one_image = Qwen2_5VisionGrid.build(visual, grid_thw)
+    cases = {
+        "no image grid is cached": (visual, None),
+        "the cached grid has 2 images but the export inputs have 1": (
+            visual,
+            Qwen2_5VisionGrid.build(visual, torch.tensor(GRID * 2)),
+        ),
+        "was built for cpu torch.float32, but the tower is now on cpu torch.bfloat16": (
+            deepcopy(visual).to(torch.bfloat16),
+            one_image,
+        ),
+    }
+    for problem, (tower, cache) in cases.items():
+        pixel_values = _pixels(grid_thw).to(tower.dtype)
+        with pytest.raises(RuntimeError, match=f"{problem}.*The last eager call before torch.export"):
+            torch.export.export(FixedGridVision(tower, cache), (pixel_values, grid_thw), strict=False)
 
 
 @pytest.mark.parametrize("disable_checks", [False, True], ids=["checks-on", "checks-off"])
