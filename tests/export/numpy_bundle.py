@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bundles run by a NumPy runtime, without PyTorch.
+"""Bundles run by a NumPy runtime, and a mock robot that records what it is told, all without PyTorch.
 
 The runtime is not ExecuTorch, so the tests that use it show that running a bundle assumes no particular
 runtime. A bundle names this module in its `runtime_imports`, which registers the runtime.
 """
 
+import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -25,16 +27,23 @@ from safetensors.numpy import save_file
 
 from lerobot.bundle.manifest import (
     DECODED_ACTIONS,
+    EMBEDDINGS,
     GENERATED_TOKENS,
+    KNOWN_TASKS,
+    TASK_LENGTH,
     TEST_CASE,
+    TOKENIZER,
     ActionTokens,
     Bundle,
     BundleManifest,
     ProgramFiles,
     ProgramRun,
+    TaskTokens,
 )
 from lerobot.bundle.runtime import Runtime, register_runtime
+from lerobot.robots import RobotConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tests.mocks.mock_robot import MockRobot, MockRobotConfig
 
 RUNTIME = "numpy"
 
@@ -109,3 +118,67 @@ def make_token_bundle(
     )
     Bundle(path, manifest).write()
     return path
+
+
+def make_task_bundle(path: Path, known_tasks: dict[str, list[int]], n_motors: int = 3) -> Path:
+    """A bundle that takes any task, whose chunk is the task's token count, then twice that, for each motor.
+
+    It was exported for the first of `known_tasks`, and holds no tokenizer, so it runs only those tasks.
+    """
+    path.mkdir(parents=True)
+    scale = np.array([[1.0], [2.0]], np.float32) * np.ones(n_motors, np.float32)
+    np.save(path / "model.npy", scale)
+    task, ids = next(iter(known_tasks.items()))
+    save_file({OBS_STATE: np.zeros(n_motors, np.float32), ACTION: len(ids) * scale}, path / TEST_CASE)
+    rows = max(i for ids in known_tasks.values() for i in ids) + 1
+    save_file({"embeddings": np.zeros((rows, 1), np.float32)}, path / EMBEDDINGS)
+    (path / KNOWN_TASKS).write_text(json.dumps(known_tasks))
+    manifest = BundleManifest(
+        backend="numpy",
+        runtime=RUNTIME,
+        runtime_imports=[__name__],
+        programs={"model": ProgramFiles("model.npy")},
+        runs=[ProgramRun("model", "model", [TASK_LENGTH, OBS_STATE], [ACTION])],
+        task_tokens=TaskTokens([], TOKENIZER, EMBEDDINGS, KNOWN_TASKS, 8),
+        task=task,
+        action_scale=[1.0] * n_motors,
+        tolerance=1e-6,
+    )
+    Bundle(path, manifest).write()
+    return path
+
+
+@RobotConfig.register_subclass("recording_robot")
+@dataclass
+class RecordingRobotConfig(MockRobotConfig):
+    # A JSON-lines file of what happens to the robot: connect, each action sent, disconnect.
+    log: str = ""
+    random_values: bool = False
+
+
+class RecordingRobot(MockRobot):
+    """A mock robot that writes what it is told to `config.log`."""
+
+    config_class = RecordingRobotConfig
+    name = "recording_robot"
+
+    def _log(self, event: str, value: object = None) -> None:
+        with open(self.config.log, "a") as log:
+            log.write(json.dumps([event, value]) + "\n")
+
+    def connect(self, calibrate: bool = True) -> None:
+        super().connect(calibrate)
+        self._log("connect")
+
+    def send_action(self, action):
+        self._log("action", action)
+        return super().send_action(action)
+
+    def disconnect(self) -> None:
+        super().disconnect()
+        self._log("disconnect")
+
+
+def read_log(path: Path) -> list[list]:
+    """The events a `RecordingRobot` wrote, if any."""
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
