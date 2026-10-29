@@ -386,6 +386,14 @@ def test_export_keeps_the_packed_varlen_vision_attention():
         torch.testing.assert_close(
             program.module()(noise.clone(), *(batch[key] for key in keys)), expected, rtol=0, atol=0
         )
+    # The exported vision tower runs the same packed varlen kernel as eager, not an SDPA stand-in.
+    targets = {
+        str(node.target)
+        for module in program.graph_module.modules()
+        if hasattr(module, "graph")
+        for node in module.graph.nodes
+    }
+    assert any("varlen_attn" in target for target in targets)
 
 
 def test_eager_diffusion_prediction_builds_no_rope_positions(monkeypatch):
