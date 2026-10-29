@@ -445,8 +445,9 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
-            if self.precompute_grid_thw and torch.compiler.is_exporting():
-                self._qwen_on_fixed_grid(model_input)
+            grid = self._vision_grid
+            if grid is not None and self.precompute_grid_thw and torch.compiler.is_exporting():
+                self._qwen_on_fixed_grid(model_input, grid)
                 return captured["features"]
             outputs = self.model(**model_input, output_hidden_states=True)
         finally:
@@ -454,7 +455,7 @@ class Qwen3Backbone(nn.Module):
 
         return captured.get("features", outputs.hidden_states[-1])
 
-    def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor]) -> None:
+    def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid) -> None:
         """Run `Qwen3VLModel` under `torch.export` on the cached grid metadata."""
         qwen = getattr(self.model, "model", self.model)
         input_ids = model_input["input_ids"]
@@ -463,7 +464,7 @@ class Qwen3Backbone(nn.Module):
         position_ids = qwen_image_rope_index(
             input_ids,
             attention_mask,
-            self._vision_grid.grid_thw,
+            grid.grid_thw,
             qwen.visual.spatial_merge_size,
             qwen.config.image_token_id,
         )
@@ -475,7 +476,7 @@ class Qwen3Backbone(nn.Module):
             attention_mask,
             pixel_values,
             model_input["image_grid_thw"],
-            self._vision_grid,
+            grid,
             image_mask=input_ids == qwen.config.image_token_id,
             position_ids=position_ids,
         )

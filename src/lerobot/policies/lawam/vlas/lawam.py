@@ -391,19 +391,20 @@ class LatentWorldPolicyBackend(nn.Module):
         # HF transformers 4.57 Qwen3VL causal wrapper drops `hidden_states`
         # from the returned output; use the underlying multimodal model output.
         vlm_out = None
+        vision_grid = None
         if self.model_cfg.precompute_grid_thw:
-            self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+            vision_grid = self._vision_grid = Qwen3VisionGrid.reuse_or_build(
                 self._vision_grid, self.vlm.model.visual, image_grid_thw
             )
         # Eager mode keeps the stock call, so FSDP and checkpointing hooks on the Qwen model run as before.
-        if self.model_cfg.precompute_grid_thw and torch.compiler.is_exporting():
+        if vision_grid is not None and torch.compiler.is_exporting():
             hidden = qwen3_vl_forward(
                 self.vlm.model,
                 inputs_embeds,
                 attention_mask,
                 pixel_values,
                 image_grid_thw,
-                self._vision_grid,
+                vision_grid,
                 image_mask=input_ids == self.vlm.config.image_token_id,
             )
         else:
