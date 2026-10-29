@@ -180,7 +180,9 @@ def _make_unloaded_policy(**config_values):
     return policy
 
 
-def _tiny_diffusion_model(bfloat16: bool = True) -> Qwen2_5_VLMoEForAction:
+def _tiny_diffusion_model(
+    bfloat16: bool = True, vision_attn_implementation: str = "sdpa"
+) -> Qwen2_5_VLMoEForAction:
     def expert(size):
         return {"hidden_size": size, "intermediate_size": 2 * size, "hidden_act": "silu"}
 
@@ -221,7 +223,9 @@ def _tiny_diffusion_model(bfloat16: bool = True) -> Qwen2_5_VLMoEForAction:
     token_ids = {"<|action|>": 31, "<|propri|>": 32}
     processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=token_ids.__getitem__))
     torch.manual_seed(0)
-    model = Qwen2_5_VLMoEForAction(config, processor=processor, vision_attn_implementation="sdpa").eval()
+    model = Qwen2_5_VLMoEForAction(
+        config, processor=processor, vision_attn_implementation=vision_attn_implementation
+    ).eval()
     if bfloat16:
         model.to_bfloat16_for_selected_params()
     return model
@@ -355,6 +359,33 @@ def test_export_refuses_a_hidden_image_of_another_size():
         program.module()(noise.clone(), *(batch[key] for key in keys))
         with pytest.raises(RuntimeError):
             program.module()(noise.clone(), *(hidden[key] for key in keys))
+
+
+@require_cuda
+@pytest.mark.skipif(
+    version.parse(torch.__version__) < version.parse("2.10.0"),
+    reason="WALL-X's packed varlen vision attention needs PyTorch 2.10",
+)
+def test_export_keeps_the_packed_varlen_vision_attention():
+    model = _tiny_diffusion_model(vision_attn_implementation="auto").to("cuda")
+    policy = _diffusion_policy(model)
+    batch = {key: value.cuda() for key, value in _diffusion_batch(3).items()}
+    noise = torch.randn(2, 3, 3, device="cuda")
+    with prepare_image_grid():
+        expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    if {block.attn._resolved_backend for block in model.visual.blocks} != {"varlen"}:
+        pytest.skip("this GPU runs WALL-X vision attention on SDPA")
+    keys = sorted(batch)
+
+    class Predict(torch.nn.Module):
+        def forward(self, noise, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
+
+    with torch.no_grad():
+        program = torch.export.export(Predict(), (noise.clone(), *(batch[key] for key in keys)), strict=False)
+        torch.testing.assert_close(
+            program.module()(noise.clone(), *(batch[key] for key in keys)), expected, rtol=0, atol=0
+        )
 
 
 def test_eager_diffusion_prediction_builds_no_rope_positions(monkeypatch):
