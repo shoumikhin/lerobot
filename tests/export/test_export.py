@@ -346,6 +346,13 @@ BACKENDS = [
         "executorch_xnnpack",
         marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
     ),
+    pytest.param(
+        "executorch_cuda",
+        marks=pytest.mark.skipif(
+            not (EXECUTORCH and torch.cuda.is_available()),
+            reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+        ),
+    ),
 ]
 
 
@@ -420,6 +427,43 @@ def test_lower_folds_what_a_program_computes_from_constants(monkeypatch):
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
 
 
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
+    """Indexing with a boolean mask makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    model = MaskedPositions().eval()
+    x = torch.randn(8, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchCUDAConfig().compile(torch.export.export(model, (x,)), path)
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_names_no_data_file_for_a_program_without_one(tmp_path):
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    path = tmp_path / "actions.pte"
+    # No weights and nothing for the GPU to compute, so ExecuTorch writes no data file.
+    program = torch.export.export(torch.nn.Identity(), (torch.randn(4, 3, device="cuda"),))
+    assert ExecuTorchCUDAConfig().compile(program, path) is None
+    assert path.is_file() and not path.with_suffix(".ptd").exists()
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 import tempfile
@@ -429,10 +473,25 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-@pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
-def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
-    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "executorch_xnnpack",
+            marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
+        ),
+        pytest.param(
+            "executorch_cuda",
+            marks=pytest.mark.skipif(
+                not (EXECUTORCH and torch.cuda.is_available()),
+                reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+            ),
+        ),
+    ],
+)
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
+    """The bundle check loads the programs, on the CPU or the GPU, and replays the test case, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
     assert_runs_without_torch(
         """
         import runpy
