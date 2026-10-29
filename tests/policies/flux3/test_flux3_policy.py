@@ -780,10 +780,11 @@ def test_torch_compile_keeps_the_text_context_cache(fake_vae):
         "task": ["stack the cubes"],
     }
     eager = policy.predict_action_chunk(obs)
+    captions = set(policy._ctx_cache)
     policy._ctx_cache.clear()
     compiled = torch.compile(policy.predict_action_chunk, backend="eager")
     assert torch.equal(compiled(obs), eager)
-    assert len(policy._ctx_cache) == 1
+    assert captions and set(policy._ctx_cache) == captions
 
 
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
