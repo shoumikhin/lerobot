@@ -32,7 +32,14 @@ from typing import Any, cast
 import draccus
 import torch
 
-from lerobot.bundle.manifest import NOISE, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.manifest import (
+    NOISE,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+    TaskTokens,
+)
 from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
@@ -148,6 +155,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
             programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
             runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
+        task_tokens = plan.task_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
@@ -155,6 +163,9 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runtime_options=cfg.backend.runtime_options,
             programs=programs,
             runs=runs,
+            task_tokens=None
+            if task_tokens is None
+            else TaskTokens(task_tokens.prompt_ops, task_tokens.max_tokens),
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
             task=recipe.task,
             action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
@@ -164,7 +175,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
             exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
         )
-        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants)
+        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         shutil.rmtree(traced, ignore_errors=True)

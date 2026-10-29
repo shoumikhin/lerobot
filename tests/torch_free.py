@@ -31,6 +31,11 @@ if sys.platform == "linux":
 """
 
 
+def checking_torch_unloaded(code: str) -> str:
+    """`code` that fails if it loaded PyTorch, for a child process that the code under test starts."""
+    return code + _CHECK_UNLOADED
+
+
 def assert_runs_without_torch(code: str, *args: str) -> None:
     """Run `code` in a fresh interpreter with PyTorch installed; it must not load PyTorch.
 

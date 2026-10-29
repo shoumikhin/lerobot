@@ -35,13 +35,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import TorchProgram, make_bundle, record_places
 
 FRAME = {OBS_STATE: np.array([1.0, 2.0, 3.0], np.float32)}
-TASK_TOKENS = {
-    "prompt_ops": [],
-    "tokenizer": "tokenizer.json",
-    "embeddings": "embeddings.safetensors",
-    "known_tasks": "known_tasks.json",
-    "max_tokens": 4,
-}
 ACTION_TOKENS = {
     "tokenizer": "fast.json",
     "clean_up_spaces": False,
@@ -531,6 +524,8 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ({"runtime_versions": None}, "runtime_versions"),
         ({"runtime_versions": {"executorch": 1.6}}, "runtime_versions"),
         ({"exact_runtime_modules": "tensorrt"}, "exact_runtime_modules"),
+        ({"task_tokens": {"prompt_ops": ["strip"]}}, "task_tokens"),
+        ({"task_tokens": {"prompt_ops": [[]]}}, "task_tokens"),
     ],
 )
 def test_bundle_refuses_a_manifest_in_a_form_it_does_not_read(tmp_path, change, wrong):
