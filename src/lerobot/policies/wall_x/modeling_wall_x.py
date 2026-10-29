@@ -64,6 +64,8 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
+from ..common.qwen_vision import check_input, qwen_image_rope_index
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -1080,6 +1082,7 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
         agent_pos_mask: torch.FloatTensor | None = None,
         generation_prompt_ids: torch.LongTensor | None = None,
         re_generate: bool = False,
+        vision_grid: Qwen2_5VisionGrid | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
@@ -1118,6 +1121,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             dof_mask (torch.FloatTensor, optional): Degrees of freedom mask
             agent_pos_mask (torch.FloatTensor, optional): Agent position mask
             re_generate (bool, optional): Whether to use sampling for regeneration
+            vision_grid (Qwen2_5VisionGrid, optional): Precomputed metadata of a fixed image grid; when given,
+                the vision tower runs without reading ``image_grid_thw`` on the host
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -1155,15 +1160,21 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             # Process image embeddings
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
-                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+                if vision_grid is None:
+                    image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+                else:
+                    vision_grid.check(image_grid_thw)
+                    image_embeds = qwen2_5_vision_forward(
+                        self.visual, pixel_values, image_grid_thw, vision_grid
+                    )
+                n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
 
                 # Validate image token and feature count match
-                if n_image_tokens != n_image_features:
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
+                check_input(
+                    n_image_tokens == n_image_features,
+                    lambda: f"Image features and image tokens do not match: tokens: {int(n_image_tokens)}, features {n_image_features}",
+                )
 
                 mask = input_ids == self.config.image_token_id
                 mask_unsqueezed = mask.unsqueeze(-1)
@@ -1206,7 +1217,10 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 )
                 proprioception_mask = input_ids == self.action_token_id_set["propri_token_id"]
                 proprio_embed = proprio_embed.to(torch.bfloat16)
-                inputs_embeds[proprioception_mask] = proprio_embed.reshape(-1, inputs_embeds.shape[-1])
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    proprioception_mask.unsqueeze(-1).expand_as(inputs_embeds),
+                    proprio_embed.reshape(-1, inputs_embeds.shape[-1]).to(inputs_embeds.dtype),
+                )
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -1376,6 +1390,27 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             noisy_action = sample_noise((batch_size, pred_horizon, action_dim), inputs_embeds.device)
             dof_mask = dof_mask.to(inputs_embeds.device).to(torch.float32)
 
+            action_mask = input_ids == self.action_token_id_set["action_token_id"]
+            check_input(
+                action_mask.any(),
+                "No action token found in input_ids",
+                error_type=AssertionError,
+            )
+            check_input(
+                action_mask.sum(dim=1) == pred_horizon,
+                lambda: f"Expected {pred_horizon} action tokens per sample.",
+            )
+            check_input(
+                (moe_token_types == action_mask).all(),
+                "moe_token_types must mark exactly the action tokens.",
+            )
+            # Every sample routes its prompt to expert 0 and its action tokens to expert 1.
+            moe_token_counts = (input_ids.shape[1] - pred_horizon, pred_horizon)
+            # The action tokens of each sample, in order, gathered with a static shape.
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+            action_positions = torch.where(action_mask, positions, input_ids.shape[1])
+            action_positions = action_positions.topk(pred_horizon, dim=1, largest=False).indices
+
             def step(noisy_action, timestep):
                 """
                 Single denoising step for diffusion process.
@@ -1387,9 +1422,6 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 Returns:
                     torch.Tensor: Predicted clean action
                 """
-                action_mask = input_ids == self.action_token_id_set["action_token_id"]
-                assert action_mask.any(), "No action token found in input_ids"
-
                 action_embed = self.action_preprocessor.step(
                     timestep=timestep, noisy_action=noisy_action, dof_mask=dof_mask
                 )
@@ -1398,9 +1430,9 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 # Ensure action_embed has the correct dtype and device before assignment
                 action_embed = action_embed.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
 
-                # Create temporary copy of embeddings (clone preserves dtype)
-                temp_inputs_embeds = inputs_embeds.clone()
-                temp_inputs_embeds[action_mask] = action_embed
+                temp_inputs_embeds = inputs_embeds.masked_scatter(
+                    action_mask.unsqueeze(-1).expand_as(inputs_embeds), action_embed
+                )
 
                 # Forward pass through transformer
                 transformer_outputs = self.model(
@@ -1414,12 +1446,14 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     output_attentions=False,
                     output_hidden_states=False,
                     return_dict=True,
+                    moe_token_counts=moe_token_counts,
                 )
 
                 # Extract action predictions from hidden states
                 hidden_states = transformer_outputs.last_hidden_state
-                action_mask = input_ids == self.action_token_id_set["action_token_id"]
-                action_hidden_states = hidden_states[action_mask].to(torch.float32)
+                action_hidden_states = hidden_states.gather(
+                    1, action_positions.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+                ).to(torch.float32)
                 pred = self.action_preprocessor.action_proj_back(action_hidden_states)
                 return pred.reshape(batch_size, pred_horizon, action_dim)
 
@@ -1814,6 +1848,7 @@ class WallXPolicy(PreTrainedPolicy):
         )
         self.model.to(config.device)
         self.model.to_bfloat16_for_selected_params()
+        self._vision_grid: Qwen2_5VisionGrid | None = None
 
         self.reset()
 
@@ -1870,6 +1905,24 @@ class WallXPolicy(PreTrainedPolicy):
             inputs["position_ids"] = position_ids
             inputs["rope_deltas"] = rope_deltas
         return inputs
+
+    def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
+        """Vision metadata and rope positions of the fixed camera grid, computed from the first batch."""
+        if batch.get("video_grid_thw") is not None:
+            raise ValueError("WALL-X precompute_grid_thw supports images only.")
+        self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+            self._vision_grid, self.model.visual, batch["image_grid_thw"]
+        )
+        position_ids = qwen_image_rope_index(
+            batch["input_ids"],
+            batch["attention_mask"],
+            self._vision_grid.grid_thw,
+            self.model.config.vision_config.spatial_merge_size,
+            self.model.config.image_token_id,
+        )
+        # WALL-X's own get_rope_index puts padding at position 1.
+        position_ids = position_ids.masked_fill(batch["attention_mask"] == 0, 1)
+        return {"vision_grid": self._vision_grid, "position_ids": position_ids}
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """
@@ -1974,6 +2027,8 @@ class WallXPolicy(PreTrainedPolicy):
         action_dim = self.config.output_features[ACTION].shape[0]
 
         if self.config.prediction_mode == "diffusion":
+            if self.config.precompute_grid_thw:
+                batch.update(self._static_grid_inputs(batch))
             output = self.model(
                 **batch,
                 action_dim=self.config.max_action_dim,
