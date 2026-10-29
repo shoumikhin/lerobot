@@ -133,7 +133,8 @@ class ExportConfig:
     # The bundle folder to write. It must not exist yet. Defaults to
     # `outputs/export/<policy type>_<backend type>`.
     output_dir: Path | None = None
-    # The task, for a policy that reads one. Its bundle then runs only this task.
+    # The task, for a policy that reads one. The bundle's test case runs it, and so does the bundle by default;
+    # a bundle without task tokens runs only this task.
     task: str = ""
     # The dataset the policy was trained on. The bundle then takes the robot's frame from the dataset's
     # observations, through the renames the preprocessor saved, and the dataset's first task when `task` is
@@ -143,6 +144,9 @@ class ExportConfig:
     # policy's normalized action units (robot units divided by the spread of each action in the training
     # data). Defaults to the recipe's.
     tolerance: float | None = None
+    # For a policy that reads its task, the most tokens a task may take in the bundle. Defaults to the
+    # recipe's, which fits the tasks known at export.
+    max_task_tokens: int | None = None
     # Seeds the random test case.
     seed: int = 1000
 
@@ -161,6 +165,8 @@ class ExportConfig:
             )
         if self.policy is None or self.policy.pretrained_path is None:
             raise ValueError("--policy.path is required: the trained policy to export.")
+        if self.max_task_tokens is not None and self.max_task_tokens < 1:
+            raise ValueError(f"--max_task_tokens must be at least 1, not {self.max_task_tokens}.")
         if self.tolerance is not None and not (math.isfinite(self.tolerance) and self.tolerance >= 0):
             raise ValueError(f"--tolerance must be a finite number of at least 0, not {self.tolerance}.")
         if self.output_dir is None:
