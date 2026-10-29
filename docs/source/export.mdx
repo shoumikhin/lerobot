@@ -1,0 +1,372 @@
+# Compiled Policies (lerobot-export)
+
+A trained policy normally runs in PyTorch. PyTorch is flexible, but on a small robot computer it can be too slow. `lerobot-export` solves this: it compiles a trained policy once, ahead of time, into a folder called a **bundle**. `lerobot-rollout` then runs the bundle in place of the checkpoint.
+
+A bundle is useful because:
+
+- **It is fast.** A compiler such as NVIDIA TensorRT tunes the policy's math for one chip.
+- **It runs no policy code.** The robot process runs the compiled programs instead of the PyTorch policy.
+- **It checks itself.** The bundle carries a test frame. It is replayed at export and again before the robot moves.
+
+```
+             lerobot-export                  lerobot-rollout
+checkpoint ─────────────────> bundle folder ──────────────────> robot
+           (compile, check)                  (check, then run)
+```
+
+## Install
+
+You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs), and the compiler of the **backend** you choose. Install them on the machine that will run the policy.
+
+| `--backend.type`      | Runs the policy on            | Install                                                                           |
+| --------------------- | ----------------------------- | --------------------------------------------------------------------------------- |
+| `executorch_tensorrt` | NVIDIA GPUs, including Jetson | `pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"` |
+
+- LeRobot has no `export` extra yet, so install these packages yourself.
+- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. LeRobot itself still pins an older PyTorch, while the ExecuTorch 1.6 package pins `torch==2.15.0`, so install them in a second environment that overrides LeRobot's pin, for example with [uv](https://docs.astral.sh/uv/):
+
+  ```bash
+  printf 'torch>=2.15,<2.16\ntorchvision>=0.29.2,<0.30\n' > torch-overrides.txt
+  uv pip install --override torch-overrides.txt lerobot "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"
+  ```
+
+  The override replaces every PyTorch pin, also those of the packages after `lerobot`. So pin them to PyTorch 2.15 by hand, as above, or uv can pick a Torch-TensorRT made for an older PyTorch. torchvision is overridden too, because LeRobot also pins it below the release that installs with PyTorch 2.15. With an older PyTorch, `lerobot-export` stops before it starts and prints these commands for its backend.
+
+- **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
+- Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
+- TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
+- `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so the export machine needs the CUDA compiler `nvcc` on its `PATH`.
+
+<Tip warning={true}>
+
+ExecuTorch 1.6 and the ExecuTorch support of Torch-TensorRT 2.15 are new. If `pip` cannot find them, install nightly builds from the [PyTorch nightly index](https://download.pytorch.org/whl/nightly/).
+
+</Tip>
+
+## Quick start with ACT
+
+This example takes an [ACT](./act) policy trained for an SO-101 arm with one front camera.
+
+### 1. Export
+
+```bash
+lerobot-export \
+    --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \
+    --backend.type=executorch_tensorrt
+```
+
+The export runs in three steps, each in its own process:
+
+1. It **traces** the policy: it runs the policy once and records every math operation into a graph.
+2. It **compiles** that graph for the backend.
+3. It **checks** the result against PyTorch.
+
+The last lines look like this:
+
+```
+INFO ... Tracing model
+INFO ... Compiling model with executorch_tensorrt
+INFO ... Checking the bundle
+INFO ... Bundle test case: largest difference 5.40e-06 (tolerance 2e-05)
+INFO ... Wrote outputs/export/act_executorch_tensorrt
+```
+
+The bundle is a plain folder:
+
+```
+outputs/export/act_executorch_tensorrt/
+  export.json         the manifest: which programs to run, and how
+  model.pte           the compiled program
+  test.safetensors    a test frame and the actions PyTorch computed for it
+  policy_config.json  the policy's config, kept as a record
+```
+
+A program can also have a second file beside it, its data file. It holds the weights of the program's part that runs on ExecuTorch's CUDA backend.
+
+### 2. Check the bundle (optional)
+
+If you exported on another machine, check the bundle on the robot computer first. This loads the programs and replays the test frame. It does not touch the robot:
+
+```bash
+python -m lerobot.bundle outputs/export/act_executorch_tensorrt
+```
+
+### 3. Run it on the robot
+
+Pass the bundle folder as `--bundle.path` in place of `--policy.path`. The robot options are the same as for a checkpoint:
+
+```bash
+lerobot-rollout \
+    --bundle.path=outputs/export/act_executorch_tensorrt \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --duration=30
+```
+
+Before the robot connects, `lerobot-rollout` loads the programs, replays the test frame, and checks that the robot matches what the bundle takes:
+
+```
+INFO ... Loading the bundle from 'outputs/export/act_executorch_tensorrt'...
+INFO ... Bundle test case: largest difference 5.40e-06 (tolerance 2e-05)
+INFO ... Bundle loaded from outputs/export/act_executorch_tensorrt (backend executorch_tensorrt)
+```
+
+Then the robot moves, as with any policy. While it runs, an action that is NaN or infinite stops the run before it reaches the motors. After Ctrl-C or `--duration`, the robot returns to where it started (turn this off with `--return_to_initial_position=false`) and disconnects. After an error it is not moved again.
+
+`lerobot-rollout --bundle.path=<folder> --help` lists its options: `--bundle.path`, `--robot.*`, `--fps`, `--duration`, `--interpolation_multiplier`, `--task`, `--rename_map`, `--return_to_initial_position`, and `--config_path` for a file that holds them. Give `--bundle.path` on the command line even then, because in the file alone it does not select this mode. It runs the base strategy only, because it imports no PyTorch. Every `--strategy.*` option, recording (`--dataset.*`), teleoperation (`--teleop.*`), `--inference.*`, `--planner`, `--interactive` and `--display_data` need PyTorch, so they are refused, and so are `--policy.*`, `--device` and `--use_torch_compile`, since a bundle runs exactly as it was compiled. Of the installed plugins, robots and cameras load, and a runtime when the bundle names one LeRobot does not have; other plugins may import PyTorch. `--robot.discover_packages_path` loads a robot plugin from a module, as in `lerobot-rollout`. The Unitree G1 is not available in this mode, because its config needs PyTorch.
+
+### Options
+
+| Flag                       | What it does                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `--policy.path`            | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                             |
+| `--backend.type`           | The compiler, from the table above.                                                                                                  |
+| `--output_dir`             | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                 |
+| `--task`                   | The task, for a policy that reads one, such as SmolVLA. See [Tasks](#tasks).                                                         |
+| `--dataset.repo_id`        | The dataset the policy was trained on. The export takes the robot's frame from it, and its first task if `--task` is empty.          |
+| `--tolerance`              | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                        |
+| `--seed`                   | Seeds the random test frame. Defaults to `1000`.                                                                                     |
+| `--backend.workspace_size` | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                      |
+
+With the default recipe, a checkpoint trained with a PEFT adapter (a small set of extra weights, such as LoRA) is exported with the adapter merged into the base weights.
+
+A bundle on the Hub must be downloaded first, for example with `hf download <repo> --local-dir <folder>`. A bundle passed to `lerobot-rollout` as `--policy.path` is refused with a pointer to `--bundle.path`.
+
+## How it works
+
+### Recipe and backend
+
+Two pieces do the work, and each one knows only one thing:
+
+- A **recipe** knows the policy. It cuts the policy into one or more **parts**, gives example inputs for each, and makes the test case.
+- A **backend** knows the compiler. It turns one traced part into one program file, for example an ExecuTorch `.pte` file that runs on TensorRT.
+
+```
+EXPORT                                                          RUN
+checkpoint -> recipe -> parts -> backend -> bundle folder -> runtime -> lerobot-rollout
+              knows the policy    knows the compiler           loads the program files
+```
+
+So any recipe can be paired with any backend. Whether a given policy compiles still depends on the compiler: see [Supported policies and backends](#supported-policies-and-backends).
+
+### One recipe per policy
+
+`lerobot-export` uses the policy's own recipe when it has one. Otherwise it uses the **default recipe**. The default recipe makes a single program that does everything `lerobot-rollout` does for one chunk of actions: it converts the camera images, runs the saved preprocessor, runs the policy, and runs the saved postprocessor. The program returns actions in robot units.
+
+The default recipe fits a policy that:
+
+- predicts a chunk of actions from the current frame only,
+- draws at most one random starting noise, and
+- gives the same chunk twice for the same frame and noise.
+
+For any other policy, it stops with the reason. For example, ACT with temporal ensembling (which mixes several past chunks) cannot be exported this way.
+
+### The bundle is the contract
+
+The bundle holds everything `lerobot-rollout` needs, and nothing else. No policy code runs on the robot. Here is the manifest of the ACT bundle above. Your values, such as `action_scale`, will differ:
+
+```json
+{
+  "format_version": 1,
+  "backend": "executorch_tensorrt",
+  "runtime": "executorch",
+  "runtime_imports": ["torch_tensorrt_executorch_runtime"],
+  "programs": {
+    "model": { "file": "model.pte", "data": null }
+  },
+  "runs": [
+    {
+      "name": "model",
+      "program": "model",
+      "inputs": ["observation.images.front", "observation.state"],
+      "outputs": ["action"]
+    }
+  ],
+  "constants": null,
+  "noise_shape": null,
+  "task": null,
+  "action_names": null,
+  "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
+  "tolerance": 2e-5,
+  "target": {
+    "device": "cuda",
+    "gpu": "NVIDIA H100",
+    "compute_capability": "9.0"
+  },
+  "runtime_versions": {
+    "executorch": "1.6.0",
+    "tensorrt": "11.4.0.106",
+    "torch_tensorrt_executorch_runtime": "2.15.0"
+  },
+  "test_case": "test.safetensors"
+}
+```
+
+- `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
+- `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
+- `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
+- `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
+- `target` is the GPU the programs were built on, when they run only on that kind of GPU, as a TensorRT engine does. `runtime_versions` are the versions of the Python modules the programs need to load.
+
+A version of LeRobot refuses a bundle whose format or keys it does not know, and says whether to upgrade LeRobot or to export again.
+
+### Built-in checks
+
+The export makes a random test frame and records the actions PyTorch computes for it. Then:
+
+- **At export**, the finished bundle replays the test frame in a fresh process, the same way `lerobot-rollout` will. If the actions differ too much from PyTorch's, nothing is written.
+- **At load**, `lerobot-rollout` replays the test frame again, before the robot connects. It also checks the robot's cameras and state (after `--rename_map`), the number of joints, and the joint names when the policy recorded them. Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module only gets a warning), or if its programs read a value that nothing gives. While the robot runs, every chunk must have the right shape and be finite before it is used.
+
+The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. Change it with `--tolerance`.
+
+<Tip>
+
+float32 is the default because it matches PyTorch most closely. A big policy, such as pi0, exports faster and runs faster in bfloat16. Add `--policy.dtype=bfloat16` to `lerobot-export`, and the check then uses the bfloat16 tolerance.
+
+</Tip>
+
+### Several programs in one bundle
+
+A recipe can cut one chunk into several programs. They run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. One program file can also run several times, each time reading other values from a `constants.safetensors` file, for example the time value of each step of a denoising loop. Each part is traced, saved and freed before the next, and compiled in a process of its own, so the memory goes back to the system between steps.
+
+### Tasks
+
+A vision-language-action policy reads a task such as "pick up the cube". A compiled program cannot run the policy's tokenizer (the code that splits text into word pieces), so the default recipe stores the task inside the program. Give it with `--task="pick up the cube"`, or let the export take the first task of `--dataset.repo_id`. The bundle then runs only that task.
+
+### PyTorch at export and at run time
+
+- The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the trace and compile processes, which give their memory back when they end.
+- `lerobot-rollout --bundle.path=<folder>` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads robots, cameras and runtimes only, since other plugins may import PyTorch.
+
+## Supported policies and backends
+
+This table lists what has been tested:
+
+- **Yes**: the policy ran through `lerobot-export`, and its bundle passed the built-in check against PyTorch.
+- **Program**: the policy's compiled chunk program matched PyTorch in a separate test, but the full `lerobot-export` flow has not been tested yet. Run the export to confirm it for your checkpoint.
+- **No**: tested, and it does not work yet.
+- **-**: not tested.
+
+| Policy      | Recipe  | TensorRT                                |
+| ----------- | ------- | --------------------------------------- |
+| ACT         | default | Yes (data center GPU, Jetson Orin Nano) |
+| SmolVLA     | default | Yes (data center GPU, Jetson Orin Nano) |
+| pi0         | default | Yes (data center GPU)                   |
+| FineART VLA | default | Program                                 |
+
+- The ACT result on an x86 computer used PyTorch 2.15 with development builds of ExecuTorch 1.6 and Torch-TensorRT 2.15. The other results used development builds of PyTorch 2.16, ExecuTorch and Torch-TensorRT.
+
+These policies also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes their vision model compute the layout of image patches once, instead of on every call: EO-1, WALL-X, Wall-OSS 0.5, LaWAM, LingBot-VLA v2 and VLA-JEPA. The option assumes that the camera layout does not change while the robot runs.
+
+Some policies do not fit the default recipe and would each need their own recipe:
+
+- Diffusion Policy, Multi-task DiT, VQ-BeT and TD-MPC read past frames or prepare their steps one at a time.
+- pi0-FAST turns its output tokens into actions with Python code that cannot be compiled.
+- The Gaussian actor predicts no chunk of actions.
+
+Other policies have not been tested with `lerobot-export`.
+
+## Troubleshooting
+
+**`outputs/export/... already exists. Pick another --output_dir.`**
+The export never overwrites a bundle. Delete the old folder, or pass `--output_dir`.
+
+**`The executorch_tensorrt backend needs PyTorch 2.15 or newer to export, but PyTorch 2.11.0 is installed.`**
+This environment has LeRobot's own PyTorch. Export from a second environment with PyTorch 2.15, as the message and [Install](#install) show.
+
+**`The executorch_tensorrt backend needs: pip install ...`**, or at run time, **`This bundle needs the Python module 'torch_tensorrt_executorch_runtime' to load its programs.`**
+The backend's packages are missing on this machine. Install them as shown in [Install](#install).
+
+**`The exported policy does not reproduce its test case (... > 2e-05). Export it again on this device.`**
+The compiled actions differ from PyTorch's by more than the tolerance. With TensorRT, this usually means the bundle was built on another GPU model: export on the board that runs it. Raise `--tolerance` only if you know the difference does not matter for your task.
+
+**`The robot does not match the exported policy, which takes observation.images.front (480, 640, 3) (the robot gives None).`**
+The robot's cameras or joints differ from the ones the policy was trained with. Give the cameras the same names and sizes, or map the names with `--rename_map`, for example `--rename_map='{"observation.images.wrist": "observation.images.front"}'`.
+
+**`This exported policy runs only the task it was exported for, ...`**
+A bundle runs only its task: export again with the new `--task`.
+
+**`This act checkpoint cannot be exported: ...`**
+The default recipe does not fit this policy, and the message says why. Change the setting it names if your policy works without it, or write a recipe for the policy (see below).
+
+## Add a recipe or a backend
+
+### A recipe
+
+A recipe lives beside the policy's configuration, in `src/lerobot/policies/<type>/export_<type>.py`. Its class name is the policy's config class name with `ExportRecipe` in place of `Config`: `PI05Config` gets `PI05ExportRecipe`. `lerobot-export` finds it on its own.
+
+```python
+from collections.abc import Iterator
+
+from lerobot.export.recipe import ExportRecipe, Part, TestCase
+
+
+class MyPolicyExportRecipe(ExportRecipe):
+    def parts(self) -> Iterator[Part]:
+        # Yield the parts in the order they run. Each one is traced, saved and freed before the next;
+        # the parts are compiled afterwards, each in a process of its own.
+        yield Part(
+            name="model",
+            module=MyChunkModule(self.policy, self.preprocessor, self.postprocessor),
+            example_inputs=(image, state),
+            inputs=["observation.images.front", "observation.state"],
+            outputs=["action"],
+        )
+
+    def test_case(self) -> TestCase:
+        # A frame as the robot sends it, and the actions PyTorch computes for it.
+        return TestCase(frame=frame, noise=None, actions=actions, action_scale=action_scale)
+```
+
+Two optional methods cover bigger policies:
+
+- `load` (a class method) builds the recipe from the export configuration. Override it to load each part's weights only when that part is traced.
+- `plan()` returns a `RunPlan`, which can hold:
+  - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree;
+  - `constants`: named arrays the runs read, such as time values.
+
+`tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants.
+
+### A backend
+
+A backend is one config class, registered under its `--backend.type` name. It compiles one part, already traced by `torch.export`, into one program file. An installed package named `lerobot_backend_<name>` adds a backend when imported, the way `lerobot_runtime_<name>` adds a runtime (below). A backend whose programs ExecuTorch loads builds on `ExecuTorchConfig`, which sets the runtime, the file suffix and the PyTorch the compiler needs:
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+from torch.export import ExportedProgram
+
+from lerobot.export.backends.executorch import EXECUTORCH, ExecuTorchConfig
+from lerobot.export.configs import ExportBackendConfig
+
+
+@ExportBackendConfig.register_subclass("executorch_mychip")
+@dataclass
+class ExecuTorchMyChipConfig(ExecuTorchConfig):
+    device = "cpu"  # where the programs run; the parts are traced and compiled there too
+    runtime_imports = ("mychip_executorch",)  # modules that register the chip with the runtime, if any
+    runtime_modules = ("executorch", "mychip_executorch")  # modules whose versions the bundle records
+    packages = (EXECUTORCH, "mychip-executorch")  # what to install beside LeRobot to export
+
+    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
+        from executorch.exir import to_edge_transform_and_lower
+        from mychip_executorch import MyChipPartitioner
+
+        edge = to_edge_transform_and_lower(program, partitioner=[MyChipPartitioner()])
+        path.write_bytes(edge.to_executorch().buffer)
+        return None  # or a data file written beside `path`, such as separate weights
+```
+
+A backend whose `device` is `cuda` records the GPU it builds on in the bundle's `target`, since its programs then run only on that kind of GPU. LeRobot's own backends live in `src/lerobot/export/backends/`.
+
+A backend with a new file format, such as ONNX, also needs a **runtime**: a class that loads one program file and runs it on NumPy arrays (see `Program` in `lerobot.bundle.runtime`). An installed package named `lerobot_runtime_<name>` adds it when imported:
+
+```python
+from lerobot.bundle.runtime import Runtime, register_runtime
+
+register_runtime("onnxruntime", Runtime(load=OnnxProgram))
+```
+
+`lerobot-rollout --bundle.path=<folder>` imports such packages only when a bundle names a runtime LeRobot does not have. Nothing in LeRobot changes, and a runtime must not import PyTorch.
