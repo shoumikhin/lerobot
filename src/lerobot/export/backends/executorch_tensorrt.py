@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import EXECUTORCH, ExecuTorchConfig, gpu_memory_config
+from .executorch import EXECUTORCH, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -32,8 +32,9 @@ if TYPE_CHECKING:
 class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     """ExecuTorch programs whose work runs on the GPU through TensorRT, NVIDIA's compiler.
 
-    A TensorRT engine runs only on the GPU model that built it, so export on the kind of board that will run
-    the policy.
+    An operator TensorRT does not take runs on the GPU too, compiled by ExecuTorch's CUDA backend, which needs
+    the CUDA compiler (`nvcc`) at export. A TensorRT engine runs only on the GPU model that built it, so export
+    on the kind of board that will run the policy.
 
     Args:
         workspace_size (`int`, *optional*):
@@ -48,8 +49,11 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
 
     workspace_size: int | None = None
 
-    def compile(self, program: ExportedProgram, path: Path) -> None:
-        """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program."""
+    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
+        """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
+
+        Returns the weights file of the CUDA backend's part, if it has one.
+        """
         import torch_tensorrt
 
         options = {
@@ -71,5 +75,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # Tracing the compiled module again would drop the engines it holds.
             retrace=False,
             use_cuda_graphs=True,
+            # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
+            partitioners=[cuda_partitioner(path.stem)],
             backend_config=gpu_memory_config(),
         )
+        data = path.with_suffix(".ptd")
+        return data if data.exists() else None
