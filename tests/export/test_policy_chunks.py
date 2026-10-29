@@ -16,6 +16,7 @@
 backend: for a new frame and task, the bundle plays the chunk that the PyTorch policy predicts from the same
 noise."""
 
+import importlib.util
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -34,10 +35,14 @@ from lerobot.export.recipe import random_frame  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.factory import get_policy_class  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
-from tests.export import tiny_pi05  # noqa: E402
+from tests.export import tiny_groot, tiny_pi05  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
 
 TASK = "pick up the cube"
+GROOT_EXTRAS = pytest.mark.skipif(
+    not all(importlib.util.find_spec(name) for name in ("diffusers", "cv2")),
+    reason="GR00T needs diffusers and OpenCV",
+)
 
 
 @dataclass
@@ -45,16 +50,18 @@ class Chain:
     """A tiny checkpoint that `save` writes into a folder, and how its export runs and plays.
 
     `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. The bundle is
-    exported with the first of `tasks` and plays each of them. `programs` are its program files, and `lora`
-    the modules of a PEFT adapter for it.
+    exported with the first of `tasks` and `args`, and plays each of them. `programs` are its program files,
+    and `lora` the modules of a PEFT adapter for it.
     """
 
     save: Callable[[Path, pytest.MonkeyPatch], Path]
     tasks: tuple[str, ...]
     programs: list[str]
+    args: tuple[str, ...] = ()
     plugins: tuple[str, ...] = ()
     tiny: Callable[[pytest.MonkeyPatch], None] | None = None
     lora: list[str] | None = None
+    marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
 def save_pi05(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Path]:
@@ -73,19 +80,41 @@ PI05 = Chain(
     tiny=tiny_pi05.use_tiny_pi05,
     lora=["action_out_proj"],
 )
+GROOT = Chain(
+    lambda folder, patch: tiny_groot.save_checkpoint(folder, "torchvision"),
+    # A task the export never saw.
+    tasks=(tiny_groot.TASK, "stop then pick up the cube"),
+    programs=["actions", "keys_values", "language_model_0", "language_model_1", "step_0", "step_1", "vision"],
+    # On this random tiny GR00T the chained parts and the whole policy differ by up to 3.7e-05 on a busy CPU,
+    # as float32 sums run in another order, which is over the 2e-05 default for real checkpoints.
+    args=("--tolerance=1e-4",),
+    lora=["q_proj"],
+    marks=(GROOT_EXTRAS,),
+)
 CHAINS = {
     "pi05_absolute": PI05,
     "pi05_relative": replace(PI05, save=save_pi05(relative_actions=True), lora=None),
+    "groot_albumentations": replace(
+        GROOT, save=lambda folder, patch: tiny_groot.save_checkpoint(folder, "albumentations"), lora=None
+    ),
+    "groot_torchvision": GROOT,
 }
 
 
 def run_export(chain: Chain, checkpoint: Path, output_dir: Path, patch: pytest.MonkeyPatch) -> None:
     use_plugins(patch, "torch_backend", *chain.plugins)
-    args = [f"--policy.path={checkpoint}", f"--output_dir={output_dir}", f"--task={chain.tasks[0]}"]
+    args = [
+        f"--policy.path={checkpoint}",
+        f"--output_dir={output_dir}",
+        f"--task={chain.tasks[0]}",
+        *chain.args,
+    ]
     export(["--backend.type=torch_test", *args])
 
 
-@pytest.fixture(scope="module", params=list(CHAINS))
+@pytest.fixture(
+    scope="module", params=[pytest.param(name, marks=chain.marks) for name, chain in CHAINS.items()]
+)
 def exported(request, tmp_path_factory):
     chain, folder = CHAINS[request.param], tmp_path_factory.mktemp(request.param)
     with pytest.MonkeyPatch.context() as patch:
@@ -127,7 +156,9 @@ def test_the_bundle_plays_the_chunk_the_policy_predicts(exported, monkeypatch):
     assert sorted(bundle.manifest.programs) == chain.programs
 
 
-@pytest.mark.parametrize("name", [name for name, chain in CHAINS.items() if chain.lora])
+@pytest.mark.parametrize(
+    "name", [pytest.param(name, marks=chain.marks) for name, chain in CHAINS.items() if chain.lora]
+)
 def test_the_export_refuses_a_peft_adapter(name, tmp_path, monkeypatch, capfd):
     peft = pytest.importorskip("peft")
     chain = CHAINS[name]
