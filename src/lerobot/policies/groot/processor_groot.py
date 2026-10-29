@@ -17,7 +17,7 @@
 import logging
 import random
 from copy import copy, deepcopy
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -2419,6 +2419,11 @@ class GrootN17ActionDecodeStep(ProcessorStep):
         )
         return new_transition
 
+    def without_threshold(self) -> "GrootN17ActionDecodeStep":
+        """The step without the LIBERO decode transform, for `lerobot-export`'s check (see `action_pipelines`)."""
+        libero = self.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
+        return replace(self, action_decode_transform=None) if libero else self
+
     def transform_features(self, features):
         return features
 
@@ -2496,6 +2501,11 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
 
         transition[TransitionKey.ACTION] = action
         return transition
+
+    def without_threshold(self) -> "GrootActionUnpackUnnormalizeStep":
+        """The step with the LIBERO gripper not binarized, for `lerobot-export`'s check (see `action_pipelines`)."""
+        binarized = self.libero_gripper_action and self.libero_gripper_binarize
+        return replace(self, libero_gripper_binarize=False) if binarized else self
 
     def transform_features(self, features):
         return features
