@@ -129,28 +129,27 @@ def test_compiled_action_inference_matches_eager(offline_components, monkeypatch
     torch.testing.assert_close(compiled, eager)
 
 
-def test_exported_fasterwam_takes_its_noise_as_an_input_and_matches_eager_on_every_call(offline_components):
+def test_exported_fasterwam_takes_noise_as_an_input_and_matches_eager(offline_components):
     torch.manual_seed(1234)
     policy = FastWAMPolicy(tiny_config(dtype=torch.float32, **DOT_FLAGS)).eval()
     batch = training_batch()
     del batch["action"]
 
     class Predict(nn.Module):
-        def forward(self, image, state, context, context_mask, noise=None):
-            obs = {"observation.images.image": image, "observation.state": state}
-            return policy.predict_action_chunk({**obs, "context": context, "context_mask": context_mask}, noise=noise)
+        def forward(self, *inputs, noise=None):
+            return policy.predict_action_chunk(dict(zip(batch, inputs, strict=True)), noise=noise)
 
     model, inputs = Predict(), tuple(batch.values())
     noise = torch.randn(1, 8, 3)
     with torch.no_grad():
-        expected = model(*inputs, noise)
+        expected = model(*inputs, noise=noise)
         with pytest.raises(ValueError, match="Pass noise"):
             torch.export.export(model, inputs)
-        exported = torch.export.export(model, (*inputs, noise)).module()
-        assert torch.equal(exported(*inputs, noise), expected)
-        assert torch.equal(exported(*inputs, noise), expected)
+        exported = torch.export.export(model, inputs, kwargs={"noise": noise}).module()
+        assert torch.equal(exported(*inputs, noise=noise), expected)
+        assert torch.equal(exported(*inputs, noise=noise), expected)
         other = torch.randn(1, 8, 3)
-        assert torch.equal(exported(*inputs, other), model(*inputs, other))
+        assert torch.equal(exported(*inputs, noise=other), model(*inputs, noise=other))
 
 
 def test_encode_prompt_zeroes_padding_on_either_side():
