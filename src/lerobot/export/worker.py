@@ -35,7 +35,15 @@ from typing import Any, cast
 import draccus
 import torch
 
-from lerobot.bundle.manifest import CONSTANTS, BundleManifest, ProgramSpec
+from lerobot.bundle.manifest import (
+    CONSTANTS,
+    EMBEDDINGS,
+    KNOWN_TASKS,
+    TOKENIZER,
+    BundleManifest,
+    ProgramSpec,
+    TaskTokens,
+)
 from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.utils import init_logging, register_third_party_plugins
@@ -93,6 +101,12 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             seen[call.part] += 1
             programs.append(ProgramSpec(name, files[call.part], call.inputs, call.outputs))
         test_case = recipe.test_case()
+        prompt = plan.task_tokens
+        task_tokens = (
+            None
+            if prompt is None
+            else TaskTokens(prompt.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, prompt.max_tokens)
+        )
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
@@ -101,13 +115,14 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
             programs=programs,
             constants=CONSTANTS if plan.constants else None,
+            task_tokens=task_tokens,
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
             task=recipe.task,
             action_names=getattr(recipe.config, "action_feature_names", None),
             action_scale=test_case.action_scale.tolist(),
             tolerance=recipe.tolerance,
         )
-        write_bundle(folder, manifest, test_case, recipe.config, plan.constants)
+        write_bundle(folder, manifest, test_case, recipe.config, plan.constants, prompt)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         shutil.rmtree(traced, ignore_errors=True)
