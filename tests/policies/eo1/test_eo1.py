@@ -37,6 +37,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from lerobot.processor.converters import create_transition
 from lerobot.utils.constants import ACTION, OBS_STATE, QUERY_KIND, QUERY_TEXT
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
 
 HIDDEN_SIZE = 8
 STATE_DIM = 4
@@ -661,18 +662,13 @@ def test_rollout_processor_reports_where_the_action_tokens_start(monkeypatch):
     assert processed["complementary_data"]["action_token_start"] == 4
 
 
-@pytest.mark.skipif(
-    Version(transformers.__version__) < Version("5.5.4"),
-    reason="transformers before 5.5.4 also scales the temporal position of still images",
-)
-def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
+def _sampling_policy_and_batch(monkeypatch):
     # A second vision block attends by windows, so both attention splits are checked.
     backbone = make_tiny_qwen_backbone(vision_depth=2)
     monkeypatch.setattr(
         "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
         lambda *args, **kwargs: backbone,
     )
-    policy = EO1Policy(make_eo1_config())
     action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
     input_ids = torch.tensor([[0, 1, 41, 40, 40, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
     batch = {
@@ -685,18 +681,35 @@ def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
         "state_token_id": STATE_TOKEN_ID,
         "action_token_id": ACTION_TOKEN_ID,
     }
+    return EO1Policy(make_eo1_config()), batch
+
+
+def test_sampling_checks_stay_on_without_precompute_grid_thw(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    batch["input_ids"] = batch["input_ids"].clone()
+    batch["input_ids"][0, -2] = 2
+    # That switch only turns off the checks of the export option.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with pytest.raises(ValueError, match="exactly 3 action tokens"):
+        policy.predict_action_chunk(batch)
+
+
+@pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.4"),
+    reason="transformers before 5.5.4 also scales the temporal position of still images",
+)
+def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
     torch.manual_seed(0)
     expected = policy.predict_action_chunk(batch)
 
-    def stock_vision_tower(*args, **kwargs):
-        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
-
-    monkeypatch.setattr(backbone.model.visual, "forward", stock_vision_tower)
+    builds = count_grid_builds(monkeypatch)
     policy.config.precompute_grid_thw = True
     batch["action_token_start"] = 10
     for _ in range(2):  # The second call reuses the cached grid.
         torch.manual_seed(0)
         assert torch.equal(policy.predict_action_chunk(batch), expected)
+    assert len(builds) == 1
 
     keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
 
@@ -705,6 +718,8 @@ def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
             return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
 
     with torch.no_grad():
-        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys)).module()
+        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys))
     torch.manual_seed(0)
-    torch.testing.assert_close(program(*(batch[key] for key in keys)), expected)
+    torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
+    assert len(builds) == 1
+    assert data_dependent_nodes(program) == []

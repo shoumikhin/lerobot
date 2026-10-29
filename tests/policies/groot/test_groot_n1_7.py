@@ -258,6 +258,7 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
     from transformers.feature_extraction_utils import BatchFeature
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
     from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
 
     torch.manual_seed(0)
@@ -282,10 +283,7 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
     with pytest.raises(ValueError, match="images only"):
         fixed(BatchFeature({**prompts, "pixel_values_videos": prompts["pixel_values"]}))
 
-    def stock_vision_tower(*args, **kwargs):
-        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
-
-    monkeypatch.setattr(fixed.visual, "forward", stock_vision_tower)
+    builds = count_grid_builds(monkeypatch)
     keys = sorted(prompts)
 
     class Backbone(torch.nn.Module):
@@ -299,8 +297,10 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
         # The stock path adds the legacy text row as a fourth row; the cached path must pass the same.
         assert positions[0].shape[0] == 4
         assert torch.equal(positions[1], positions[0])
-        program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys)).module()
-        torch.testing.assert_close(program(*(prompts[key] for key in keys)), expected)
+        exported = torch.export.export(Backbone(), tuple(prompts[key] for key in keys))
+        torch.testing.assert_close(exported.module()(*(prompts[key] for key in keys)), expected)
+    assert len(builds) == 1
+    assert data_dependent_nodes(exported) == []
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

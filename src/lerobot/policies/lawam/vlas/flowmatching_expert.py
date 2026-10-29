@@ -15,7 +15,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
-from transformers.utils import torch_compilable_check
+
+from lerobot.policies.common.qwen_vision import check_input
 
 from .cross_attention_dit import AlternateVLDiT, DiT
 
@@ -60,7 +61,7 @@ def build_time_grid(
         bad_idx = int(torch.nonzero(hz_f <= 0, as_tuple=False)[0].item())
         return f"`hz` must be > 0 for all samples, got hz[{bad_idx}]={float(hz_f[bad_idx])}."
 
-    torch_compilable_check(hz_f > 0, nonpositive_hz)
+    check_input(hz_f > 0, nonpositive_hz)
 
     token_idx = torch.arange(int(seq_len), dtype=torch.float32, device=device).unsqueeze(0).expand(bsz, -1)
     return token_idx / hz_f.unsqueeze(1)

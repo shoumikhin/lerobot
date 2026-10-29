@@ -171,6 +171,8 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
     """Prefix positions come from the image grid ints; with the grid cached, prediction exports."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes
+
     slots = _slot_kwargs(arm=[[0, 6]], effector=[[6, 7]])
     meta = _ds_meta(7, cameras)
     settings = {"qwen3vl_use_vision_boundaries": vision_boundaries, **slots}
@@ -220,8 +222,14 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
     with torch.no_grad():
         for _ in range(2):  # The second call reuses the cached grid.
             assert torch.equal(PredictActionChunk()(noise, *(batch[key] for key in keys)), expected)
-        program = torch.export.export(PredictActionChunk(), (noise, *(batch[key] for key in keys))).module()
-        torch.testing.assert_close(program(noise, *(batch[key] for key in keys)), expected)
+        exported = torch.export.export(PredictActionChunk(), (noise, *(batch[key] for key in keys)))
+        torch.testing.assert_close(exported.module()(noise, *(batch[key] for key in keys)), expected)
+    assert data_dependent_nodes(exported) == []
+
+    core = fixed.model.qwenvl_with_expert
+    core.visual_grid_thw = [[t, h + 2, w] for t, h, w in core.visual_grid_thw]
+    with torch.no_grad(), pytest.raises(ValueError, match="all batches must use the same image sizes"):
+        fixed.predict_action_chunk(batch, noise=noise)
 
 
 def test_align_query_tokens(tiny_backbone, monkeypatch):

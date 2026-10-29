@@ -65,7 +65,7 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import qwen_image_rope_index
+from ..common.qwen_vision import check_input, qwen_image_rope_index
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -80,7 +80,7 @@ if TYPE_CHECKING or _wallx_deps_available:
         Qwen2_5_VisionTransformerPretrainedModel,
         Qwen2_5_VLForConditionalGeneration,
     )
-    from transformers.utils import cached_file, is_torchdynamo_compiling, torch_compilable_check
+    from transformers.utils import cached_file, is_torchdynamo_compiling
 
     from .qwen_model import (
         Qwen2_5_VLACausalLMOutputWithPast,
@@ -98,7 +98,6 @@ else:
     Qwen2_5_VLForConditionalGeneration = nn.Module
     cached_file = None
     is_torchdynamo_compiling = None
-    torch_compilable_check = None
     Qwen2_5_VisionTransformerPretrainedModel = None
     Qwen2_5_VLACausalLMOutputWithPast = None
     Qwen2_5_VLMoEModel = None
@@ -1165,12 +1164,14 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
                     vision_grid.check(image_grid_thw)
-                    image_embeds = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
+                    image_embeds = qwen2_5_vision_forward(
+                        self.visual, pixel_values, image_grid_thw, vision_grid
+                    )
                 n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
 
                 # Validate image token and feature count match
-                torch_compilable_check(
+                check_input(
                     n_image_tokens == n_image_features,
                     lambda: f"Image features and image tokens do not match: tokens: {int(n_image_tokens)}, features {n_image_features}",
                 )
@@ -1390,15 +1391,18 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             dof_mask = dof_mask.to(inputs_embeds.device).to(torch.float32)
 
             action_mask = input_ids == self.action_token_id_set["action_token_id"]
-            torch_compilable_check(
-                action_mask.any(), "No action token found in input_ids", error_type=AssertionError
+            check_input(
+                action_mask.any(),
+                "No action token found in input_ids",
+                error_type=AssertionError,
             )
-            torch_compilable_check(
+            check_input(
                 action_mask.sum(dim=1) == pred_horizon,
                 lambda: f"Expected {pred_horizon} action tokens per sample.",
             )
-            torch_compilable_check(
-                (moe_token_types == action_mask).all(), "moe_token_types must mark exactly the action tokens."
+            check_input(
+                (moe_token_types == action_mask).all(),
+                "moe_token_types must mark exactly the action tokens.",
             )
             # Every sample routes its prompt to expert 0 and its action tokens to expert 1.
             moe_token_counts = (input_ids.shape[1] - pred_horizon, pred_horizon)

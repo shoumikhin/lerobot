@@ -35,8 +35,9 @@ from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vi
 from lerobot.policies.common.qwen_vision import qwen_image_rope_index  # noqa: E402
 from tests.policies.common.fixed_grid_checks import (  # noqa: E402
     count_block_calls_with_checkpointing,
+    data_dependent_nodes,
     requires_gloo,
-    run_with_sharded_blocks,
+    run_with_fsdp,
 )
 
 IMAGE_TOKEN_ID = 99
@@ -78,7 +79,7 @@ class FixedGridVision(torch.nn.Module):
 
     def forward(self, pixel_values, grid_thw):
         grid = Qwen2_5VisionGrid.reuse_or_build(self.grid, self.visual, grid_thw)
-        return qwen2_5_vision_forward(self.visual, pixel_values, grid)
+        return qwen2_5_vision_forward(self.visual, pixel_values, grid_thw, grid)
 
 
 # Two images of 18x18 patches (as 224 px cameras give) have uneven attention windows; the
@@ -94,6 +95,7 @@ def test_vision_forward_matches_stock_and_exports(grids):
         exported = torch.export.export(model, (pixel_values, grid_thw))
         torch.testing.assert_close(model(pixel_values, grid_thw), expected, rtol=0, atol=0)
         torch.testing.assert_close(exported.module()(pixel_values, grid_thw), expected, rtol=0, atol=0)
+    assert data_dependent_nodes(exported) == []
 
 
 def test_export_without_a_cached_grid_asks_for_an_eager_call():
@@ -157,8 +159,9 @@ def test_reused_grid_follows_dtype_changes():
     grid = Qwen2_5VisionGrid.reuse_or_build(grid, visual, grid_thw)
     pixel_values = pixel_values.bfloat16()
     with torch.no_grad():
+        program = torch.export.export(FixedGridVision(visual, grid), (pixel_values, grid_thw)).module()
         torch.testing.assert_close(
-            qwen2_5_vision_forward(visual, pixel_values, grid),
+            program(pixel_values, grid_thw),
             visual(pixel_values, grid_thw=grid_thw).pooler_output,
             rtol=0,
             atol=0,
@@ -171,9 +174,10 @@ def test_grid_built_in_inference_mode_can_train():
     pixel_values = _pixels(grid_thw)
     with torch.inference_mode():
         grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
-        qwen2_5_vision_forward(visual, pixel_values, grid)
     visual.train()
-    qwen2_5_vision_forward(visual, pixel_values, grid).square().sum().backward()
+    # The cache feeds the exported computation, which is what would save its tensors for backward.
+    program = torch.export.export(FixedGridVision(visual, grid), (pixel_values, grid_thw)).module()
+    program(pixel_values, grid_thw).square().sum().backward()
     cached_grad = visual.patch_embed.proj.weight.grad.clone()
     visual.zero_grad()
     visual(pixel_values, grid_thw=grid_thw).pooler_output.square().sum().backward()
@@ -186,13 +190,14 @@ def test_gradient_checkpointing_reruns_every_block():
     pixel_values = _pixels(grid_thw)
     grid = Qwen2_5VisionGrid.build(visual, grid_thw)
     calls = count_block_calls_with_checkpointing(
-        visual, lambda: qwen2_5_vision_forward(visual, pixel_values, grid)
+        visual, lambda: qwen2_5_vision_forward(visual, pixel_values, grid_thw, grid)
     )
     assert calls == 2 * len(visual.blocks)
 
 
 @requires_gloo
-def test_vision_forward_runs_with_fsdp2_sharded_blocks(tmp_path):
+@pytest.mark.parametrize("whole_tower", [False, True], ids=["block-units", "tower-unit"])
+def test_vision_forward_runs_with_fsdp2(tmp_path, whole_tower):
     visual = _tiny_visual().train()
     grid_thw = torch.tensor(GRID)
     pixel_values = _pixels(grid_thw)
@@ -200,7 +205,7 @@ def test_vision_forward_runs_with_fsdp2_sharded_blocks(tmp_path):
 
     def forward(visual):
         grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
-        return qwen2_5_vision_forward(visual, pixel_values, grid)
+        return qwen2_5_vision_forward(visual, pixel_values, grid_thw, grid)
 
-    actual = run_with_sharded_blocks(tmp_path, deepcopy(visual), forward)
+    actual = run_with_fsdp(tmp_path, deepcopy(visual), forward, whole_tower=whole_tower)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

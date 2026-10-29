@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared pieces for running transformers Qwen-VL vision towers on a fixed image grid.
+"""Shared pieces for running transformers Qwen-VL vision towers under `torch.export` on a fixed image grid.
 
 The stock towers turn the image grid (`image_grid_thw`) into Python ints on every call, which
 `torch.export` cannot trace. When every batch uses the same camera grid, what a tower derives from the
 grid can be computed once in eager mode and reused. `FixedImageGrid` holds that cache and decides when it
 can be reused; the tower-specific subclasses live in `qwen2_5_vision.py` and `qwen3_vision.py`.
 
-In eager mode the vision blocks are called as modules, so FSDP hooks and gradient checkpointing run as in
-the stock forward. Their attention reads the chunk lengths back from `cu_seqlens`, which `torch.export`
-cannot do, so under export `vision_block_forward` replays each block from its submodules with the lengths
-as Python ints.
+Only an exported program needs the cache. In eager mode the helpers call the stock tower module, so FSDP
+and gradient checkpointing see exactly the stock module calls; the eager call also builds the cache that a
+later `torch.export` uses. Under export, `replay_vision_block` runs each vision block from its submodules
+with the attention chunk lengths as Python ints, because the stock attention reads them back from a tensor.
 
 The grid checks use transformers' `torch_compilable_check`, so `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns
 them off like every other check of that kind. In an exported program a failed check keeps the assert but
-loses the message.
+loses the message. `check_input` is for a policy's own input checks: always on in eager mode.
 """
 
 from collections.abc import Callable
@@ -75,10 +75,11 @@ class FixedImageGrid:
 
     @classmethod
     def reuse_or_build(cls, cache: Self | None, visual: nn.Module, grid_thw: Tensor) -> Self:
-        """Return `cache` if it was built for `grid_thw` and the tower's current device and dtype.
+        """Return `cache` if it was built for this number of images and the tower's device and dtype.
 
-        Otherwise build a new grid. Building reads `grid_thw` on the host, so it cannot happen inside
-        `torch.export`: run one eager call first, and again after moving or casting the model.
+        A cache with a different grid of the same shape raises an error. Without a fitting cache a new grid
+        is built, which reads `grid_thw` on the host; under `torch.export` that raises instead, so run one
+        eager call first, and again after moving or casting the model.
         """
         if (
             cache is None
@@ -102,33 +103,34 @@ class FixedImageGrid:
         )
 
 
-def cumulative_lengths(lengths: list[int], device: torch.device) -> Tensor:
-    """The `cu_seqlens` a vision block takes for attention chunks of `lengths` tokens."""
-    total, cumulative = 0, [0]
-    for length in lengths:
-        total += length
-        cumulative.append(total)
-    return torch.tensor(cumulative, dtype=torch.int32, device=device)
+def check_input(
+    condition: Tensor | bool, message: str | Callable[[], str], error_type: type[Exception] = ValueError
+) -> None:
+    """Raise `error_type` with `message` unless `condition` holds (for every element of a tensor).
+
+    In eager mode this is a plain check that always raises, as these input checks were before. While
+    `torch.export` or `torch.compile` traces, it is `torch_compilable_check`, a runtime assert in the program
+    (which `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off).
+    """
+    if torch.compiler.is_compiling() or torch.compiler.is_exporting():
+        torch_compilable_check(condition, message, error_type=error_type)
+    elif not bool(torch.as_tensor(condition).all()):
+        raise error_type(message() if callable(message) else message)
 
 
-def vision_block_forward(
+def replay_vision_block(
     block: nn.Module,
     hidden_states: Tensor,
     position_embeddings: tuple[Tensor, Tensor],
-    cu_seqlens: Tensor,
     lengths: list[int],
     apply_rotary_pos_emb_vision: Callable,
     eager_attention_forward: Callable,
 ) -> Tensor:
-    """Run one Qwen-VL vision block whose attention runs once per chunk of `lengths` tokens.
+    """Under `torch.export`, what a Qwen-VL vision block computes when its attention runs per chunk of `lengths`.
 
-    `cu_seqlens` must be `cumulative_lengths(lengths)`. The last two arguments come from the tower's
-    transformers modeling module.
+    This is the block forward with the non-flash path of the stock vision attention, split by Python ints
+    instead of `cu_seqlens`. The last two arguments come from the tower's transformers modeling module.
     """
-    if not torch.compiler.is_exporting():
-        return block(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
-    # The non-flash path of the stock vision attention, split by Python ints. An exported program has no
-    # FSDP hooks or gradient checkpointing for this to skip.
     attn, seq_length = block.attn, hidden_states.shape[0]
     query, key, value = (
         attn.qkv(block.norm1(hidden_states))

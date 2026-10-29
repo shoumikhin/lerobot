@@ -479,6 +479,7 @@ class Qwen3Backbone(nn.Module):
             qwen.get_input_embeddings()(input_ids),
             attention_mask,
             pixel_values,
+            model_input["image_grid_thw"],
             self._vision_grid,
             image_mask=input_ids == qwen.config.image_token_id,
             position_ids=position_ids,

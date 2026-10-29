@@ -15,8 +15,9 @@
 # limitations under the License.
 """Checks shared by the fixed-grid Qwen-VL vision tests.
 
-The fixed-grid forwards must call every vision block as a module, like the stock towers, so that FSDP2
-hooks on a sharded block and gradient checkpointing still run.
+In eager mode the fixed-grid helpers must call the stock tower module, so FSDP2 hooks on a sharded tower or
+block and gradient checkpointing still run. Under export their programs must not depend on tensor values
+for any shape.
 """
 
 from collections.abc import Callable
@@ -24,8 +25,12 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import torch
 import torch.distributed as dist
 from torch import Tensor, nn
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+
+from lerobot.policies.common.qwen_vision import FixedImageGrid
 
 requires_gloo = pytest.mark.skipif(
     not (dist.is_available() and dist.is_gloo_available()), reason="needs torch.distributed with gloo"
@@ -57,12 +62,13 @@ class _Root(nn.Module):
         return self.run(self.visual)
 
 
-def run_with_sharded_blocks(
-    tmp_path: Path, visual: nn.Module, forward: Callable[[nn.Module], Tensor]
+def run_with_fsdp(
+    tmp_path: Path, visual: nn.Module, forward: Callable[[nn.Module], Tensor], *, whole_tower: bool
 ) -> Tensor:
-    """Run `forward(visual)` and its backward with FSDP2 on one CPU rank, every vision block its own unit.
+    """Run `forward(visual)` and its backward with FSDP2 on one CPU rank, and return the output.
 
-    This is how LeRobot's FSDP training wraps these towers: the blocks are wrap units under a root module.
+    The tower sits under a root module, as in LeRobot's FSDP training. Every vision block is its own wrap unit
+    (the policies' default), or with `whole_tower` the tower is one unit (an `fsdp.wrap_modules` override).
     """
     # Imported here because builds without torch.distributed cannot import them.
     from torch.distributed.device_mesh import init_device_mesh
@@ -78,11 +84,48 @@ def run_with_sharded_blocks(
     )
     try:
         mesh = init_device_mesh("cpu", (1,))
-        for block in visual.blocks:
-            fully_shard(block, mesh=mesh)
+        for unit in [visual] if whole_tower else visual.blocks:
+            fully_shard(unit, mesh=mesh)
         fully_shard(root, mesh=mesh)
         output = root()
         output.square().sum().backward()
         return output.detach()
     finally:
         dist.destroy_process_group()
+
+
+def count_grid_builds(monkeypatch: pytest.MonkeyPatch) -> list[type]:
+    """Record every `FixedImageGrid.build`, so a test can check that later calls reuse the cache."""
+    builds: list[type] = []
+    build = FixedImageGrid.build.__func__
+
+    def counted(cls, visual, grid_thw):
+        builds.append(cls)
+        return build(cls, visual, grid_thw)
+
+    monkeypatch.setattr(FixedImageGrid, "build", classmethod(counted))
+    return builds
+
+
+def data_dependent_nodes(program: torch.export.ExportedProgram) -> list[str]:
+    """Nodes whose output shape depends on tensor values: `nonzero`, boolean-mask indexing, unbacked sizes.
+
+    Runtime asserts (`torch_compilable_check`) read values too, but only to raise, so they are not listed.
+    """
+    found = []
+    for node in program.graph.nodes:
+        if node.op != "call_function":
+            continue
+        name = str(node.target)
+        indices = node.args[1] if name.startswith(("aten.index.", "aten.index_put")) else []
+        values = [getattr(index, "meta", {}).get("val") for index in indices or []]
+        if any(isinstance(v, torch.Tensor) and v.dtype == torch.bool for v in values):
+            found.append(f"{name} with a boolean mask")
+        elif "nonzero" in name or "masked_select" in name:
+            found.append(name)
+        else:
+            value = node.meta.get("val")
+            for tensor in value if isinstance(value, (list, tuple)) else [value]:
+                if isinstance(tensor, torch.Tensor) and free_unbacked_symbols(tensor.shape):
+                    found.append(f"{name} with a data-dependent shape")
+    return found

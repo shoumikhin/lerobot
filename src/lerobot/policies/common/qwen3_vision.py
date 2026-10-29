@@ -17,8 +17,7 @@
 """Run a transformers Qwen3-VL model on one fixed image grid (see `qwen_vision.py`).
 
 `Qwen3VisionGrid` calls the tower's `rot_pos_emb`, which transformers removed in 5.17, while LeRobot pins
-it below 5.6. From 5.9 on, the tower accepts these precomputed tensors itself (`transformers.vision_utils`),
-which can replace this module once the pin moves.
+it below 5.6, so this module needs updating before the pin moves past 5.16.
 """
 
 from dataclasses import dataclass
@@ -29,7 +28,7 @@ from torch import Tensor
 
 from lerobot.utils.import_utils import _transformers_available
 
-from .qwen_vision import FixedImageGrid, cumulative_lengths, vision_block_forward
+from .qwen_vision import FixedImageGrid, check_input, replay_vision_block
 
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -38,13 +37,11 @@ if TYPE_CHECKING or _transformers_available:
         apply_rotary_pos_emb_vision,
         eager_attention_forward,
     )
-    from transformers.utils import torch_compilable_check
 else:
     Qwen3VLModel = None
     Qwen3VLVisionModel = None
     apply_rotary_pos_emb_vision = None
     eager_attention_forward = None
-    torch_compilable_check = None
 
 
 def _bilinear_indices_and_weights(
@@ -113,21 +110,25 @@ class Qwen3VisionGrid(FixedImageGrid):
 
 
 def qwen3_vision_forward(
-    visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid: Qwen3VisionGrid
+    visual: "Qwen3VLVisionModel", pixel_values: Tensor, grid_thw: Tensor, grid: Qwen3VisionGrid
 ) -> tuple[Tensor, list[Tensor]]:
-    """`Qwen3VLVisionModel.forward` on a precomputed grid: merged image embeddings and DeepStack features."""
+    """The merged image embeddings and DeepStack features of `visual(pixel_values, grid_thw)`.
+
+    Under `torch.export` they are computed from `grid` alone, which must be the cache of `grid_thw`.
+    """
+    if not torch.compiler.is_exporting():
+        output = visual(pixel_values, grid_thw=grid_thw)
+        return output.pooler_output, output.deepstack_features
     weights = grid.pos_embed_weights.to(visual.pos_embed.weight.dtype)
     corners = visual.pos_embed(grid.pos_embed_indices) * weights[..., None]
     pos_embeds = corners[0] + corners[1] + corners[2] + corners[3]
     hidden_states = visual.patch_embed(pixel_values.type(visual.dtype)) + pos_embeds
-    cu_seqlens = cumulative_lengths(grid.chunk_lengths, hidden_states.device)
     deepstack_features = []
     for layer_num, block in enumerate(visual.blocks):
-        hidden_states = vision_block_forward(
+        hidden_states = replay_vision_block(
             block,
             hidden_states,
             grid.position_embeddings,
-            cu_seqlens,
             grid.chunk_lengths,
             apply_rotary_pos_emb_vision,
             eager_attention_forward,
@@ -143,27 +144,43 @@ def qwen3_vl_forward(
     inputs_embeds: Tensor,
     attention_mask: Tensor | None,
     pixel_values: Tensor,
+    grid_thw: Tensor,
     grid: Qwen3VisionGrid,
     image_mask: Tensor,
     position_ids: Tensor | None = None,
 ) -> Tensor:
-    """`Qwen3VLModel.forward` for images and no cache, on a precomputed grid.
+    """`Qwen3VLModel.forward` for images and no cache; under `torch.export`, on the cached `grid`.
 
     `image_mask` is True at the image placeholder tokens. `position_ids` are the 3D positions from
     `qwen_image_rope_index`; when None, positions are 0, 1, 2, ... as in the stock forward without
     `input_ids`. Returns the last hidden state.
     """
-    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid)
-    torch_compilable_check(
-        image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
-    )
-    inputs_embeds = inputs_embeds.masked_scatter(
-        image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
-    )
-    return model.language_model(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        visual_pos_masks=image_mask,
-        deepstack_visual_embeds=deepstack_features,
-    ).last_hidden_state
+    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid_thw, grid)
+    check_input(image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match.")
+    visual_pos_masks = image_mask
+    image_mask = image_mask[..., None].expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+    text_inputs = {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    if not torch.compiler.is_exporting():
+        return model.language_model(
+            **text_inputs, visual_pos_masks=visual_pos_masks, deepstack_visual_embeds=deepstack_features
+        ).last_hidden_state
+    # The stock text model adds the DeepStack features with boolean-mask indexing, which makes exported
+    # shapes depend on the data. Adding them scattered into zeros after the same layers gives the same values.
+    dense_features = [
+        torch.zeros_like(inputs_embeds, dtype=features.dtype).masked_scatter(image_mask, features)
+        for features in deepstack_features
+    ]
+    handles = [
+        layer.register_forward_hook(lambda module, args, output, add=add: output + add.to(output.dtype))
+        for layer, add in zip(model.language_model.layers, dense_features, strict=False)
+    ]
+    try:
+        return model.language_model(**text_inputs).last_hidden_state
+    finally:
+        for handle in handles:
+            handle.remove()

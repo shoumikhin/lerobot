@@ -27,7 +27,7 @@ import torch.nn.functional as functional
 from torch import Tensor, nn
 
 from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from lerobot.policies.common.qwen_vision import qwen_image_rope_index
+from lerobot.policies.common.qwen_vision import check_input, qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -41,7 +41,6 @@ if TYPE_CHECKING or _transformers_available:
         apply_multimodal_rotary_pos_emb,
         repeat_kv,
     )
-    from transformers.utils import torch_compilable_check
 
 from .configuration_wall_oss_05 import WallOSS05Config
 from .processor_wall_oss_05 import (
@@ -527,11 +526,11 @@ class WallOSS05Model(nn.Module):
             image_embeddings = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
         else:
             vision_grid.check(image_grid_thw)
-            image_embeddings = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
+            image_embeddings = qwen2_5_vision_forward(self.visual, pixel_values, image_grid_thw, vision_grid)
         image_embeddings = image_embeddings.to(embeddings)
         image_mask = (input_ids == int(self.config.image_token_id)).unsqueeze(-1)
         expected = image_mask.sum()
-        torch_compilable_check(
+        check_input(
             expected == image_embeddings.shape[0],
             lambda: f"Image token/features mismatch: {int(expected)} tokens and {image_embeddings.shape[0]} features.",
         )
@@ -784,13 +783,13 @@ class WallOSS05Model(nn.Module):
         times = self.action_preprocessor.inference_times(num_inference_timesteps, input_ids.device)
         prefix_length = input_ids.shape[1] - action_horizon
         is_action = input_ids == self.action_token_id
-        torch_compilable_check(
+        check_input(
             prefix_length >= 1 and is_action[:, prefix_length:].all() & ~is_action[:, :prefix_length].any(),
             "Flow inputs must end with exactly action_horizon contiguous action tokens.",
         )
         # The prefix then uses expert 0 and the action tokens expert 1, so each decoder call below takes one
         # expert id instead of a per-token mask.
-        torch_compilable_check(
+        check_input(
             (moe_token_types.long() == is_action.long()).all(),
             "moe_token_types must mark exactly the action tokens.",
         )

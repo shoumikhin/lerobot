@@ -20,10 +20,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.utils import torch_compilable_check
 
 from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
+from lerobot.policies.common.qwen_vision import check_input
 from lerobot.policies.lawam.lam_core.core.lam_model import build_latent_action_model
 from lerobot.policies.lawam.latent_world.processor_utils import (
     build_latent_world_processor_spec,
@@ -343,7 +342,7 @@ class LatentWorldPolicyBackend(nn.Module):
         bsz = int(inputs_embeds.shape[0])
         expected = int(bsz * num_queries)
         per_sample = placeholder_mask.sum(dim=1)
-        torch_compilable_check(
+        check_input(
             per_sample.sum() == expected,
             lambda: f"[LatentWorldPolicyBackend] {name} placeholder count mismatch: got={int(per_sample.sum())}, expected={expected}",
         )
@@ -352,7 +351,7 @@ class LatentWorldPolicyBackend(nn.Module):
             b = int(torch.nonzero(per_sample != int(num_queries))[0])
             return f"[LatentWorldPolicyBackend] {name} placeholder count mismatch for sample {b}: got={int(per_sample[b])}, expected={num_queries}"
 
-        torch_compilable_check(per_sample == int(num_queries), per_sample_mismatch)
+        check_input(per_sample == int(num_queries), per_sample_mismatch)
 
         # Fills the placeholders in row-major order, which repeats the queries once per sample.
         inputs_embeds.masked_scatter_(placeholder_mask.unsqueeze(-1), queries.repeat(bsz, 1))
@@ -391,6 +390,7 @@ class LatentWorldPolicyBackend(nn.Module):
 
         # HF transformers 4.57 Qwen3VL causal wrapper drops `hidden_states`
         # from the returned output; use the underlying multimodal model output.
+        vlm_out = None
         if self.model_cfg.precompute_grid_thw:
             self._vision_grid = Qwen3VisionGrid.reuse_or_build(
                 self._vision_grid, self.vlm.model.visual, image_grid_thw
@@ -400,10 +400,10 @@ class LatentWorldPolicyBackend(nn.Module):
                 inputs_embeds,
                 attention_mask,
                 pixel_values,
+                image_grid_thw,
                 self._vision_grid,
                 image_mask=input_ids == self.vlm.config.image_token_id,
             )
-            vlm_out = BaseModelOutputWithPast(last_hidden_state=hidden)
         else:
             vlm_out = self.vlm.model(
                 inputs_embeds=inputs_embeds,
@@ -411,19 +411,19 @@ class LatentWorldPolicyBackend(nn.Module):
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
             )
-        if vlm_out is None:
-            raise RuntimeError(
-                "[LatentWorldPolicyBackend] Qwen3VL base model forward returned None; "
-                "expected `last_hidden_state`."
-            )
-        hidden = getattr(vlm_out, "last_hidden_state", None)
-        if hidden is None:
-            output_keys = list(vlm_out.keys()) if hasattr(vlm_out, "keys") else None
-            raise RuntimeError(
-                "[LatentWorldPolicyBackend] Qwen3VL base model output does not expose "
-                "`last_hidden_state`. "
-                f"output_type={type(vlm_out).__name__}, output_keys={output_keys}."
-            )
+            if vlm_out is None:
+                raise RuntimeError(
+                    "[LatentWorldPolicyBackend] Qwen3VL base model forward returned None; "
+                    "expected `last_hidden_state`."
+                )
+            hidden = getattr(vlm_out, "last_hidden_state", None)
+            if hidden is None:
+                output_keys = list(vlm_out.keys()) if hasattr(vlm_out, "keys") else None
+                raise RuntimeError(
+                    "[LatentWorldPolicyBackend] Qwen3VL base model output does not expose "
+                    "`last_hidden_state`. "
+                    f"output_type={type(vlm_out).__name__}, output_keys={output_keys}."
+                )
         bsz = int(hidden.shape[0])
         q = int(self.num_action_queries)
         # `_inject_queries` checked that every sample has exactly q action placeholders. The j-th one

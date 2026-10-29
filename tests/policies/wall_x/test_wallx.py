@@ -53,6 +53,7 @@ from lerobot.processor import (  # noqa: E402
 )
 from lerobot.utils.constants import MESSAGES_RENDERED, QUERY_KIND, QUERY_TEXT  # noqa: E402
 from lerobot.utils.random_utils import set_seed  # noqa: E402
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes  # noqa: E402
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
 
 
@@ -280,10 +281,6 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
     with pytest.raises(ValueError, match="images only"):
         policy._static_grid_inputs({**batch, "video_grid_thw": batch["image_grid_thw"]})
 
-    def stock_vision_tower(*args, **kwargs):
-        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
-
-    monkeypatch.setattr(model.visual, "forward", stock_vision_tower)
     torch.manual_seed(0)
     assert torch.equal(model.predict(**batch, **settings, **static)["predict_action"], expected)
     with pytest.raises(ValueError, match="image grid differs"):
@@ -291,18 +288,36 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
             **{**batch, "image_grid_thw": torch.tensor([[1, 4, 2], [1, 2, 4]])}, **settings, **static
         )
 
+    builds = count_grid_builds(monkeypatch)
     keys = sorted(batch)
 
     class Predict(torch.nn.Module):
         def forward(self, *tensors):
             inputs = dict(zip(keys, tensors, strict=True))
-            return model.predict(**inputs, **settings, **static)["predict_action"]
+            inputs.update(policy._static_grid_inputs(inputs))
+            return model.predict(**inputs, **settings)["predict_action"]
 
     # The diffusion loop runs under no_grad, as predict_action_chunk runs it.
     with torch.no_grad():
-        program = torch.export.export(Predict(), tuple(batch[key] for key in keys)).module()
+        program = torch.export.export(Predict(), tuple(batch[key] for key in keys))
         torch.manual_seed(0)
-        torch.testing.assert_close(program(*(batch[key] for key in keys)), expected)
+        torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
+    assert builds == []  # the export reused the grid cached by the eager call
+    # Boolean-mask writes and reads of the action and proprioception tokens would make shapes data-dependent.
+    assert data_dependent_nodes(program) == []
+
+
+def test_diffusion_checks_stay_on_without_precompute_grid_thw(monkeypatch):
+    model = _tiny_diffusion_model()
+    batch = _diffusion_batch(3)
+    batch["input_ids"] = batch["input_ids"].clone()
+    batch["input_ids"][:, 2] = 7  # one image token fewer than image features
+    # That switch only turns off the checks of the export option.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with pytest.raises(ValueError, match="Image features and image tokens do not match"):
+        model.predict(
+            **batch, predict_mode="diffusion", pred_horizon=3, action_dim=3, num_inference_timesteps=2
+        )
 
 
 def _model_inputs() -> dict[str, torch.Tensor]:

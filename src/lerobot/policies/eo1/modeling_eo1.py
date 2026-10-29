@@ -40,7 +40,7 @@ from ..common.flow_matching import (
     sample_time_beta,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import qwen_image_rope_index
+from ..common.qwen_vision import check_input, qwen_image_rope_index
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
@@ -354,7 +354,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         if state_features is not None:
             torch_compilable_check(
-                inputs_embeds[special_state_mask].numel() == state_features.numel(),
+                special_state_mask.sum() == state_features.numel(),
                 f"State features and state tokens do not match, tokens: {n_state_tokens}, features: {state_features.shape[0]}",
             )
 
@@ -364,7 +364,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         if action_features is not None:
             torch_compilable_check(
-                inputs_embeds[special_action_mask].numel() == action_features.numel(),
+                special_action_mask.sum() == action_features.numel(),
                 f"Action features and action tokens do not match, tokens: {n_action_tokens}, features: {action_features.shape[0]}",
             )
 
@@ -623,11 +623,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         action_mask = action_placeholder_mask[..., 0]
         token_counts = action_mask.sum(dim=1)
-        torch_compilable_check(
+        check_input(
             token_counts == chunk_size,
             lambda: f"Each sample must contain exactly {chunk_size} action tokens, got {token_counts.tolist()}.",
         )
-        torch_compilable_check(
+        check_input(
             action_mask.eq(action_mask[:1]),
             "Batch inference expects all samples to share the same action token mask after left padding.",
         )
@@ -635,7 +635,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         if act_start is None:
             act_start = int(action_mask[0].to(torch.int64).argmax().item())
         act_end = act_start + self.config.chunk_size
-        torch_compilable_check(
+        check_input(
             action_mask[:, act_start:act_end],
             "Action tokens must form a contiguous chunk of length chunk_size.",
         )
@@ -659,10 +659,10 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 vlm.config.image_token_id,
             )
             image_embeds = qwen2_5_vision_forward(
-                vlm.visual, pixel_values.type(vlm.visual.dtype), self._vision_grid
+                vlm.visual, pixel_values.type(vlm.visual.dtype), image_grid_thw, self._vision_grid
             )
             image_mask = input_ids == vlm.config.image_token_id
-            torch_compilable_check(
+            check_input(
                 image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
             )
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
