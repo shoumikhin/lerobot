@@ -99,7 +99,7 @@ class BundleRolloutConfig:
     duration: float = 0.0
     # Robot commands sent per action of the bundle, interpolated in between.
     interpolation_multiplier: int = 1
-    # The task, for a bundle that reads one. A bundle exported for one task runs only that task.
+    # The task, for a bundle that reads one. A bundle without task tokens runs only the task it was exported for.
     task: str = ""
     # Renames the robot's observation keys to the names the bundle takes.
     rename_map: dict[str, str] = field(default_factory=dict)
