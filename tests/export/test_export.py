@@ -285,3 +285,26 @@ def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
     subprocess.run([sys.executable, "-c", script, *args], check=True)
     assert_plays_like_pytorch(checkpoint, Bundle.read(tmp_path / "b"), IMAGE)
     assert sorted(path.name for path in tmp_path.iterdir()) == ["b"]
+
+
+class _MixedPrecision(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return (x @ self.weight).float()
+
+
+def test_a_traced_part_keeps_no_autocast_region(tmp_path):
+    from torch._higher_order_ops.wrap import wrap_with_autocast
+
+    from lerobot.export.recipe import Part
+
+    module, x = _MixedPrecision(), torch.randn(2, 4)
+    program = worker.export_part(Part("model", module, (x,), ["x"], [ACTION]))
+    assert not any(node.target is wrap_with_autocast for node in program.graph.nodes)
+    torch.export.save(program, tmp_path / "model.pt2")
+    with torch.no_grad():
+        assert torch.equal(torch.export.load(tmp_path / "model.pt2").module()(x), module(x))
