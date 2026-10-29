@@ -34,7 +34,9 @@ def test_drivers_and_loop_helpers_load_without_torch():
         from lerobot.utils import ActionInterpolator, get_safe_torch_device, init_logging
         from lerobot.utils.cycle_timer import CycleTimer
         from lerobot.utils.process import ProcessSignalHandler
+        from lerobot.utils.robot_utils import policy_features, return_to_position
 
-        make_robot_from_config(SO101FollowerConfig(port="/dev/null"))
+        robot = make_robot_from_config(SO101FollowerConfig(port="/dev/null"))
+        policy_features(robot, None)
         """
     )
