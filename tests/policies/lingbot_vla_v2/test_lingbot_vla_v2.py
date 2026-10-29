@@ -189,9 +189,10 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
     core = policy.model.qwenvl_with_expert
     build_prefix_position_ids, prefixes = core.build_prefix_position_ids, []
 
-    def recorded(*args):
-        prefixes.append((*args, build_prefix_position_ids(*args)))
-        return prefixes[-1][-1]
+    def recorded(input_ids, attention_mask, image_grid_thw, **kwargs):
+        positions = build_prefix_position_ids(input_ids, attention_mask, image_grid_thw, **kwargs)
+        prefixes.append((input_ids, attention_mask, image_grid_thw, positions))
+        return positions
 
     monkeypatch.setattr(core, "build_prefix_position_ids", recorded)
     with torch.no_grad():
