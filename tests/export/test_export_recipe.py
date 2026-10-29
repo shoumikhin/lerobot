@@ -15,6 +15,7 @@
 
 """The default export recipe, on a tiny ACT built in memory."""
 
+import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,7 @@ import pytest
 import torch
 from torch import Tensor
 
+import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export.recipe import ActionChunkRecipe, frame_shapes, robot_features
@@ -157,6 +159,26 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
         f"{IMAGE}_hwc": PolicyFeature(type=FeatureType.VISUAL, shape=(24, 32, 3)),
     }
     assert frame_shapes(features) == {IMAGE: (24, 32, 3), f"{IMAGE}_hwc": (24, 32, 3)}
+
+
+def too_big_to_compare(tmp_path, monkeypatch):
+    """A 6.15 GB checkpoint (a sparse file) on a machine with 6.1 GB of memory."""
+    model_file = tmp_path / "model.safetensors"
+    with open(model_file, "wb") as f:
+        f.truncate(6_150_000_000)
+    pages = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 1_489_258}
+    monkeypatch.setattr(recipe_module.os, "sysconf", pages.__getitem__)
+    return model_file
+
+
+def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(tmp_path, monkeypatch, caplog):
+    model_file = too_big_to_compare(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
+    assert (
+        "Skipped the comparison with the whole pi0.5 policy: it needs about 12.3 GB, 6.1 GB free. The bundle's "
+        "own check against its test case still runs." in caplog.text
+    )
 
 
 def test_a_policy_without_an_export_module_gets_the_one_program_recipe():

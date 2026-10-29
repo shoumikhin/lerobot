@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import inspect
 import logging
+import os
 from collections.abc import Callable, Iterator
 from copy import copy
 from dataclasses import dataclass, field
@@ -539,6 +540,29 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
     # A joint that never moved in the training data has almost no spread, and float32 rounding of its
     # value would then read as a large difference.
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
+
+
+def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
+    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it.
+
+    When it does not, logs that the comparison is skipped; the bundle's own check of its test case still runs.
+    """
+    size = model_file.stat().st_size
+    if device.type == "cuda":
+        available = torch.cuda.mem_get_info(device)[0]
+    else:
+        available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    # Room for the activations and for what the export already holds.
+    if 2 * size <= available:
+        return True
+    logger.warning(
+        "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB free. The bundle's "
+        "own check against its test case still runs.",
+        policy_name,
+        2 * size / 1e9,
+        available / 1e9,
+    )
+    return False
 
 
 def load_policy(
