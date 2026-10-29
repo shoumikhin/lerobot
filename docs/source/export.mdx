@@ -47,6 +47,8 @@ The bundle goes to `outputs/export/<policy type>_<backend>`, or to `--output_dir
 
 Before it writes the bundle, the export replays the test case through the compiled programs, the same way `lerobot-rollout` will. If the actions differ from PyTorch's by more than the tolerance, it writes nothing. The difference is measured in the policy's normalized action units: each action's difference is divided by its spread in the training data, taken from the saved postprocessor. So the same tolerance means the same thing on every robot. It is 0.05 for a float32 policy and 0.25 for a bfloat16 one, or `--tolerance`.
 
+`lerobot-export` itself never imports PyTorch. It traces the policy's parts in one process, compiles each part in a process of its own, and checks the bundle in another. Each process gives its memory back when it ends, so a policy too large to compile all at once can still export on a small board, one part at a time.
+
 Some policies need more:
 
 - **A policy that reads the task**, such as SmolVLA or pi0, holds the task inside its program, because a program cannot split text into tokens. Give it with `--task="pick up the cube"`. The bundle then runs only that task. A task given with `--task` is always kept.
