@@ -14,8 +14,8 @@
 
 """Periodic rollout health logs, sampled on the control thread.
 
-They import PyTorch only to read the memory of a CUDA device, so a control loop that runs a policy without
-PyTorch shares them with `lerobot-rollout`.
+They import PyTorch only to read the memory of a CUDA device, so `lerobot-rollout --bundle.path`, which runs
+a policy without PyTorch, shares them with the PyTorch mode.
 """
 
 from __future__ import annotations

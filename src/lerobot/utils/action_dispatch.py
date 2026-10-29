@@ -21,8 +21,9 @@ more immediately before the actuator write. A denial clears interpolation, appli
 the caller's local hold when one is configured and acknowledges it, so a worker can
 proceed or a terminal fault can reach shutdown.
 
-These helpers import neither PyTorch nor the inference package, so a control loop
-that runs a policy without PyTorch shares them with ``lerobot-rollout``.
+These helpers import neither PyTorch nor the inference package, so
+``lerobot-rollout --bundle.path``, which runs a policy without PyTorch, shares them
+with the PyTorch mode.
 :mod:`lerobot.inference.dispatch` wraps them for engines that return PyTorch
 policy outputs.
 """
