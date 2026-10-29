@@ -184,6 +184,24 @@ def test_reused_grid_follows_dtype_changes():
         )
 
 
+def test_grid_built_in_inference_mode_can_train():
+    visual = _tiny_visual()
+    grid_thw = torch.tensor(GRID)
+    pixel_values = _pixels(grid_thw)
+    with torch.inference_mode():
+        grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
+    visual.train()
+    # The cache feeds the exported computation, which is what would save its tensors for backward.
+    program = torch.export.export(
+        FixedGridVision(visual, grid), (pixel_values, grid_thw), strict=False
+    ).module()
+    program(pixel_values, grid_thw).square().sum().backward()
+    cached_grad = visual.patch_embed.proj.weight.grad.clone()
+    visual.zero_grad()
+    visual(pixel_values, grid_thw=grid_thw).pooler_output.square().sum().backward()
+    torch.testing.assert_close(cached_grad, visual.patch_embed.proj.weight.grad, rtol=0, atol=0)
+
+
 def test_gradient_checkpointing_reruns_every_block():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)

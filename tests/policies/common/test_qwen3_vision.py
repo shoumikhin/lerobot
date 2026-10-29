@@ -177,12 +177,12 @@ def test_cached_grid_follows_learned_position_updates(model):
     with torch.no_grad():
         # A training step changes pos_embed after the cache exists; an export must see the new weights.
         visual.pos_embed.weight.add_(1.0)
-        torch.testing.assert_close(
-            _export_vision(visual, grid, pixel_values, grid_thw)(pixel_values, grid_thw),
-            visual(pixel_values, grid_thw=grid_thw).pooler_output,
-            rtol=0,
-            atol=0,
-        )
+    # An ordinary grad-enabled export of the trainable tower, after the inference-mode warm-up.
+    exported = _export_vision(visual, grid, pixel_values, grid_thw)(pixel_values, grid_thw)
+    exported.square().sum().backward()
+    torch.testing.assert_close(
+        exported, visual(pixel_values, grid_thw=grid_thw).pooler_output, rtol=0, atol=0
+    )
 
 
 def test_reused_grid_follows_dtype_changes(model):

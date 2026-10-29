@@ -54,7 +54,8 @@ class FixedImageGrid:
     """What a vision tower derives from one image grid, built in eager mode.
 
     Subclasses add the tower's metadata and implement `_from_grid`. Only weight-independent tensors are
-    cached, so the cache never holds stale weights.
+    cached, built outside inference mode, so the cache never holds stale weights and works for inference
+    and training alike.
     """
 
     grid_thw: list[list[int]]
@@ -68,7 +69,9 @@ class FixedImageGrid:
     @classmethod
     def build(cls, visual: nn.Module, grid_thw: Tensor) -> Self:
         """Compute the metadata of `grid_thw` for `visual`; this reads the grid on the host."""
-        with torch.no_grad():
+        # A cache built during prediction runs in inference mode, but it must hold normal tensors: inference
+        # tensors cannot be saved for backward when a later export traces a trainable tower.
+        with torch.inference_mode(False), torch.no_grad():
             return cls._from_grid(visual, grid_thw.tolist())
 
     @classmethod

@@ -1216,6 +1216,13 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     agent_pos_mask,
                 )
                 proprioception_mask = input_ids == self.action_token_id_set["propri_token_id"]
+                # masked_scatter would silently drop extra state rows, so check every sample's state tokens.
+                tokens_per_sample = proprio_embed.shape[1:-1].numel()
+                check_input(
+                    proprioception_mask.sum(dim=1) == tokens_per_sample,
+                    f"Proprioception features and state tokens do not match: each sample needs "
+                    f"{tokens_per_sample} state tokens.",
+                )
                 proprio_embed = proprio_embed.to(torch.bfloat16)
                 inputs_embeds = inputs_embeds.masked_scatter(
                     proprioception_mask.unsqueeze(-1).expand_as(inputs_embeds),

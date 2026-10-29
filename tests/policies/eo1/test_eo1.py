@@ -712,7 +712,6 @@ requires_transformers_5_5_4 = pytest.mark.skipif(
 )
 
 
-@requires_transformers_5_5_4
 def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
     torch.manual_seed(0)
@@ -726,6 +725,10 @@ def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
         assert torch.equal(policy.predict_action_chunk(batch), expected)
     assert len(builds) == 1
 
+    if Version(transformers.__version__).release < (5, 5, 4):
+        with pytest.raises(RuntimeError, match="needs transformers 5.5.4 or later"):
+            _export_sampling(policy, batch)
+        return
     program, run = _export_sampling(policy, batch)
     torch.manual_seed(0)
     torch.testing.assert_close(run(batch), expected)
@@ -737,6 +740,17 @@ def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
     # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
     with torch.no_grad(), pytest.raises(RuntimeError):
         run(malformed)
+
+
+def test_precompute_grid_thw_export_refuses_transformers_before_5_5_4(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    policy.config.precompute_grid_thw = True
+    batch["action_token_start"] = 10
+    policy.predict_action_chunk(batch)
+    monkeypatch.setattr(transformers, "__version__", "5.5.3")
+    policy.predict_action_chunk(batch)  # eager mode runs the stock code on every version
+    with pytest.raises(RuntimeError, match="needs transformers 5.5.4 or later, found 5.5.3"):
+        _export_sampling(policy, batch)
 
 
 @requires_transformers_5_5_4

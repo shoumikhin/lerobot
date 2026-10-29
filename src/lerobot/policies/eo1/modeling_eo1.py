@@ -22,6 +22,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import packaging.version
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
@@ -47,10 +48,12 @@ from .configuration_eo1 import EO1Config
 from .processor_eo1 import EO1_SPECIAL_TOKENS
 
 if TYPE_CHECKING or _transformers_available:
+    import transformers
     from transformers.activations import ACT2FN
     from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
     from transformers.utils import torch_compilable_check
 else:
+    transformers = None
     ACT2FN = None
     Qwen2_5_VLForConditionalGeneration = None
     Qwen2_5_VLProcessor = None
@@ -654,6 +657,15 @@ class EO1VisionFlowMatchingModel(nn.Module):
             )
         # Eager mode keeps the stock calls, so FSDP and checkpointing hooks on the backbone run as before.
         if vision_grid is not None and pixel_values is not None and torch.compiler.is_exporting():
+            installed = transformers.__version__
+            # 5.4.0 to 5.5.3 scale the temporal rope position of still images in `get_rope_index`, which eager
+            # mode calls; the exported positions follow 5.5.4 and later, so they would not match.
+            if packaging.version.Version(installed).release < (5, 5, 4):
+                raise RuntimeError(
+                    f"Exporting EO-1 with precompute_grid_thw needs transformers 5.5.4 or later, found {installed}: "
+                    "earlier releases place still images at other temporal rope positions, so the exported "
+                    "program would not match eager mode."
+                )
             position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,

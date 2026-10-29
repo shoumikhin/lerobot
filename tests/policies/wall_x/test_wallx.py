@@ -327,6 +327,18 @@ def test_diffusion_checks_stay_on_without_precompute_grid_thw(monkeypatch):
         )
 
 
+def test_diffusion_rejects_a_sample_without_its_state_token():
+    model = _tiny_diffusion_model()
+    batch = _diffusion_batch(3)
+    batch["input_ids"] = batch["input_ids"].clone()
+    assert batch["input_ids"][0, 6] == 32
+    batch["input_ids"][0, 6] = 7  # sample 0 loses its state token; its state must not go to sample 1
+    with pytest.raises(ValueError, match="Proprioception features and state tokens do not match"):
+        model.predict(
+            **batch, predict_mode="diffusion", pred_horizon=3, action_dim=3, num_inference_timesteps=2
+        )
+
+
 def _model_inputs() -> dict[str, torch.Tensor]:
     return {
         "input_ids": torch.tensor([[1, 2, 3]]),
