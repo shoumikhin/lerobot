@@ -43,6 +43,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..chunk import ChunkPolicySpec
+from ..common.openpi_checkpoint import _parameters_on_meta
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
@@ -224,6 +225,81 @@ class GrootPolicy(PreTrainedPolicy):
         return model
 
     @staticmethod
+    def _find_base_config_path(model_id: str, config: GrootConfig, **hub_kwargs: Any) -> str | None:
+        """The fine-tuned checkpoint's copies of the base model config files, or the base model itself."""
+        if os.path.isdir(model_id):
+            checkpoint_dir = model_id
+        else:
+            checkpoint_dir = snapshot_download(
+                repo_id=model_id, allow_patterns=f"{_BASE_CONFIG_DIR}/*", **hub_kwargs
+            )
+        copies = os.path.join(checkpoint_dir, _BASE_CONFIG_DIR)
+        # Checkpoints saved before these copies existed read the files from the base model.
+        return copies if os.path.isfile(os.path.join(copies, CONFIG_NAME)) else config.base_model_path
+
+    @classmethod
+    def load_checkpoint_modules(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        config: GrootConfig,
+        modules: list[str],
+        *,
+        revision: str | None = None,
+    ) -> T:
+        """Build the policy without weights and load only the weights of `modules` from a fine-tuned checkpoint.
+
+        For exporting one part of a policy too large for the machine's memory. GR00T is built from its config
+        with its parameters on the meta device, so no base weights are downloaded or read. Only the listed
+        submodules, like `_groot_model.action_head`, get real tensors, read one at a time, in the dtype the
+        regular load gives them. Every other submodule holding parameters is replaced by None, so code that
+        reaches one fails instead of reading random weights. Raises if a listed submodule has a parameter the
+        checkpoint does not hold. Returns the policy in evaluation mode on `config.device`.
+        """
+        require_package("transformers", extra="groot")
+        model_id = str(pretrained_name_or_path)
+        if os.path.isdir(model_id):
+            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+        else:
+            model_file = hf_hub_download(
+                repo_id=model_id, filename=SAFETENSORS_SINGLE_FILE, revision=revision
+            )
+        base_config_path = cls._find_base_config_path(model_id, config, revision=revision)
+        with _parameters_on_meta():
+            model = GR00TN17(
+                GR00TN17Config.from_pretrained(base_config_path, **cls._groot_config_overrides(config)),
+                load_backbone_weights=False,
+            )
+        policy = cls(config, _groot_model=model, _base_config_path=base_config_path)
+        prefixes = tuple(f"{name}." for name in modules)
+        lm_head, embedding = (f"_groot_model.{name}" for name in _TIED_WEIGHT_NAMES)
+        tied = {lm_head: embedding, embedding: lm_head}
+        targets = policy.state_dict(keep_vars=True)
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            keys = set(checkpoint.keys())
+            sources = {}
+            for name in targets:
+                key = name if name in keys else tied.get(name)
+                if name.startswith(prefixes) and key in keys:
+                    sources[name] = key
+            # As the regular load: a float32 policy casts every weight to float32, else each keeps the file's.
+            # A CPU copy first, because a device copy straight from the memory-mapped file can keep its pages.
+            tensors = {
+                name: checkpoint.get_tensor(key)
+                .to(dtype=torch.float32 if config.dtype == torch.float32 else None, copy=True)
+                .to(config.device)
+                for name, key in sources.items()
+            }
+        policy.load_state_dict(tensors, strict=False, assign=True)
+        for name in modules:
+            missing = [p for p, param in policy.get_submodule(name).named_parameters() if param.is_meta]
+            if missing:
+                raise KeyError(f"{model_file} does not hold {name}.{missing[0]} and {len(missing) - 1} more")
+        policy.eval()
+        _drop_unloaded(policy)
+        # Buffers built from the config, like rotary tables, are not in the checkpoint and are still on the CPU.
+        return policy.to(config.device)
+
+    @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, Any]]:
         forbidden_name_patterns = [
             r"bias",
@@ -371,22 +447,14 @@ class GrootPolicy(PreTrainedPolicy):
                         revision=revision,
                         **kwargs,
                     )
-                if os.path.isdir(model_id):
-                    checkpoint_dir = model_id
-                else:
-                    checkpoint_dir = snapshot_download(
-                        repo_id=model_id,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        proxies=proxies,
-                        token=token,
-                        local_files_only=local_files_only,
-                        allow_patterns=f"{_BASE_CONFIG_DIR}/*",
-                    )
-                copies = os.path.join(checkpoint_dir, _BASE_CONFIG_DIR)
-                # Checkpoints saved before these copies existed read the files from the base model.
-                base_config_path = (
-                    copies if os.path.isfile(os.path.join(copies, CONFIG_NAME)) else config.base_model_path
+                base_config_path = cls._find_base_config_path(
+                    model_id,
+                    config,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
                 )
                 groot_model = cls._build_groot_model_from_checkpoint(config, model_file, base_config_path)
                 if groot_model is not None:
@@ -730,3 +798,13 @@ class GrootPolicy(PreTrainedPolicy):
             actions = self.predict_action_chunk(batch, noise=noise)
             self._action_queue.extend(actions[:, : self._action_queue_steps].transpose(0, 1))
         return self._action_queue.popleft()
+
+
+def _drop_unloaded(module: torch.nn.Module) -> None:
+    """Replace each submodule whose parameters are all still on the meta device by None."""
+    for name, child in list(module.named_children()):
+        parameters = list(child.parameters())
+        if parameters and all(parameter.is_meta for parameter in parameters):
+            setattr(module, name, None)
+        else:
+            _drop_unloaded(child)
