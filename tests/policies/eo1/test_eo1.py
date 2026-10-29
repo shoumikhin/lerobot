@@ -26,13 +26,18 @@ from torch import nn
 
 pytest.importorskip("transformers")
 
+import transformers
+from packaging.version import Version
+
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy
-from lerobot.policies.eo1.processor_eo1 import make_eo1_pre_post_processors
+from lerobot.policies.eo1.processor_eo1 import EO1QwenProcessorStep, make_eo1_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
+from lerobot.processor.converters import create_transition
 from lerobot.utils.constants import ACTION, OBS_STATE, QUERY_KIND, QUERY_TEXT
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
 
 HIDDEN_SIZE = 8
 STATE_DIM = 4
@@ -525,7 +530,7 @@ def test_training_and_generation_share_state_conditioned_prefix(query_kind, incl
     assert runtime["target_message_indices"] == [[]]
 
 
-def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+def make_tiny_qwen_backbone(vision_depth: int = 1):
     from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
     qwen_config = Qwen2_5_VLConfig(
@@ -542,7 +547,7 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
             "pad_token_id": 0,
         },
         vision_config={
-            "depth": 1,
+            "depth": vision_depth,
             "hidden_size": 32,
             "intermediate_size": 64,
             "num_heads": 4,
@@ -558,7 +563,11 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         vision_start_token_id=41,
         vision_end_token_id=42,
     )
-    backbone = Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+    return Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+
+
+def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+    backbone = make_tiny_qwen_backbone()
     monkeypatch.setattr(
         "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
         lambda *args, **kwargs: backbone,
@@ -626,3 +635,91 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         torch.testing.assert_close(full_output[:, :7], input_ids)
         torch.testing.assert_close(decoded_tokens, full_output[:, 7:])
         assert decoded_tokens.shape == (1, 3)
+
+
+def test_rollout_processor_reports_where_the_action_tokens_start(monkeypatch):
+    class LeftPaddedProcessor(DummyTextProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["processor_kwargs"]["padding_side"] == "left"
+            prompt = [1, STATE_TOKEN_ID, *[ACTION_TOKEN_ID] * CHUNK_SIZE, 2]
+            input_ids = torch.tensor([[0, 0, *prompt], [1, 1, *prompt]])
+            return {
+                "input_ids": input_ids,
+                "attention_mask": input_ids.ne(0).long(),
+                "pixel_values": torch.zeros(2, 3, 2, 2),
+                "image_grid_thw": torch.ones(2, 3, dtype=torch.long),
+                "mm_token_type_ids": torch.zeros_like(input_ids),
+            }
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: LeftPaddedProcessor(),
+    )
+    step = EO1QwenProcessorStep()
+    messages = [[{"role": "user", "content": "clear the table"}]] * 2
+    processed = step(create_transition(complementary_data={"messages": messages}))
+
+    assert processed["complementary_data"]["action_token_start"] == 4
+
+
+def _sampling_policy_and_batch(monkeypatch):
+    # A second vision block attends by windows, so both attention splits are checked.
+    backbone = make_tiny_qwen_backbone(vision_depth=2)
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        lambda *args, **kwargs: backbone,
+    )
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        OBS_STATE: torch.randn(1, STATE_DIM),
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "pixel_values": torch.randn(16, 12),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "state_token_id": STATE_TOKEN_ID,
+        "action_token_id": ACTION_TOKEN_ID,
+    }
+    return EO1Policy(make_eo1_config()), batch
+
+
+def test_sampling_checks_stay_on_without_precompute_grid_thw(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    batch["input_ids"] = batch["input_ids"].clone()
+    batch["input_ids"][0, -2] = 2
+    # That switch only turns off the checks of the export option.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with pytest.raises(ValueError, match="exactly 3 action tokens"):
+        policy.predict_action_chunk(batch)
+
+
+@pytest.mark.skipif(
+    Version(transformers.__version__) < Version("5.5.4"),
+    reason="transformers before 5.5.4 also scales the temporal position of still images",
+)
+def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    torch.manual_seed(0)
+    expected = policy.predict_action_chunk(batch)
+
+    builds = count_grid_builds(monkeypatch)
+    policy.config.precompute_grid_thw = True
+    batch["action_token_start"] = 10
+    for _ in range(2):  # The second call reuses the cached grid.
+        torch.manual_seed(0)
+        assert torch.equal(policy.predict_action_chunk(batch), expected)
+    assert len(builds) == 1
+
+    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    class SampleActions(nn.Module):
+        def forward(self, *tensors):
+            return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
+
+    with torch.no_grad():
+        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys))
+    torch.manual_seed(0)
+    torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
+    assert len(builds) == 1
+    assert data_dependent_nodes(program) == []
