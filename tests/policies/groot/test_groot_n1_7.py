@@ -270,7 +270,9 @@ def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monke
         exported = torch.export.export(Backbone(keys), inputs, strict=False)
         torch.testing.assert_close(exported.module()(*inputs), expected)
         with pytest.raises(ValueError, match="image inputs only"):
-            torch.export.export(Backbone([*keys, "pixel_values_videos"]), (*inputs, prompts["pixel_values"]), strict=False)
+            torch.export.export(
+                Backbone([*keys, "pixel_values_videos"]), (*inputs, prompts["pixel_values"]), strict=False
+            )
     # The stock path adds the legacy text row as a fourth row; the exported path must pass the same.
     assert positions[0].shape[0] == 4
     assert positions[-1].shape == positions[0].shape
@@ -284,18 +286,29 @@ def test_n1_7_backbone_refuses_to_prepare_hidden_images_of_different_sizes(monke
     from transformers.feature_extraction_utils import BatchFeature
 
     from lerobot.policies.common.qwen_vision import prepare_image_grid
-    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID, image_prompts
+    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID
 
     backbone = _tiny_n1_7_backbone(monkeypatch)
-    prompts = image_prompts(backbone.model.config)
-    first_image_tokens = int(prompts["image_grid_thw"][0].prod()) // backbone.visual.spatial_merge_size**2
-    first_image = (prompts["input_ids"][0] == IMAGE_TOKEN_ID).nonzero()[:first_image_tokens, 0]
-    prompts["attention_mask"][0, first_image] = 0
+    # Two images with the same token count but different shapes, the first one hidden by the attention mask: eager
+    # `get_rope_index` lays the visible second image out on the first grid.
+    image = [IMAGE_TOKEN_ID] * 6
+    input_ids = torch.tensor([[1, 2, *image, 3, *image, 3, 4, 5]])
+    attention_mask = torch.ones_like(input_ids)
+    attention_mask[0, 2:8] = 0
+    prompts = BatchFeature(
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "mm_token_type_ids": (input_ids == IMAGE_TOKEN_ID).int(),
+            "pixel_values": torch.randn(48, 96),
+            "image_grid_thw": torch.tensor([[1, 4, 6], [1, 6, 4]]),
+        }
+    )
 
     with torch.no_grad():
-        backbone(BatchFeature(prompts))
+        backbone(prompts)
         with prepare_image_grid(), pytest.raises(ValueError, match="hides image tokens"):
-            backbone(BatchFeature(prompts))
+            backbone(prompts)
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

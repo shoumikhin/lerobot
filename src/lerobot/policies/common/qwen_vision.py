@@ -214,10 +214,10 @@ def qwen_image_rope_index(
     """The 3D rope positions of Qwen2.5-VL and Qwen3-VL `get_rope_index` for images, with tensor ops only.
 
     Text tokens count up by one. An image's tokens get `(start * image_temporal_scale, start + row,
-    start + col)` and move the
-    next start by `max(rows, cols)`. Padding gets 0. `image_grid_thw` lists the (t, h, w) grid of every
-    image block in `input_ids`, in order, as Python ints, including blocks hidden by `attention_mask`.
-    Only still images (t == 1) are supported, as the image processors produce them; video grids raise.
+    start + col)` and move the next start by `max(rows, cols)`. Padding gets 0. `image_grid_thw` lists the
+    (t, h, w) grid of every image block in `input_ids`, in order, as Python ints, including blocks hidden by
+    `attention_mask`. Only still images (t == 1) are supported, as the image processors produce them; video
+    grids raise.
 
     For Qwen2.5-VL, transformers 5.4.0 to 5.5.3 multiply the temporal position of an image's start by
     `tokens_per_second` (fixed upstream in 5.5.4); `image_temporal_scale` reproduces that, and its default of

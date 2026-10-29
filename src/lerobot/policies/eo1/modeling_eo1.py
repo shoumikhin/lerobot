@@ -40,7 +40,7 @@ from ..common.flow_matching import (
     sample_time_beta,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_temporal_scale, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
+from ..common.qwen_vision import check_input, is_exporting, is_preparing_image_grid, qwen_image_rope_index
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
@@ -288,7 +288,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         return self.vlm_backbone.get_input_embeddings()
 
     def _rope_temporal_scale(self) -> int:
-        """The still-image temporal scale of the installed `get_rope_index`, probed once in eager mode."""
+        """The still-image temporal scale of the installed `get_rope_index`, probed once while preparing an export."""
         if self._image_temporal_scale is None:
             self._image_temporal_scale = qwen2_5_image_temporal_scale(self.vlm_backbone.model)
         return self._image_temporal_scale
@@ -662,7 +662,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         vlm = self.vlm_backbone.model
         if pixel_values is not None:
             self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
-            if self._vision_grid is not None:
+            if is_preparing_image_grid():
                 self._rope_temporal_scale()
         vision_grid = self._vision_grid
         if vision_grid is not None and pixel_values is not None and is_exporting():
