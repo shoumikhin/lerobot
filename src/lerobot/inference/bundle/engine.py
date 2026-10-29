@@ -21,6 +21,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -29,8 +30,9 @@ from safetensors.numpy import load_file
 from lerobot.utils.constants import ACTION
 
 from ..base import InferenceEngine
-from .manifest import NOISE, Bundle, BundleManifest
+from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
 from .runtime import Program, load_program, prepare_runtime
+from .task_tokens import TaskTokens
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,8 @@ class BundleInferenceEngine(InferenceEngine):
         bundle (`Bundle`):
             The bundle to run.
         task (`str`, *optional*, defaults to `""`):
-            The task. A bundle exported for one task runs only that task, which is also the default.
+            The task, by default the one the bundle was exported for. A bundle without `task_tokens` runs
+            only that task.
         rename_map (`dict[str, str]`, *optional*):
             Renames the keys of the robot's frame to the names the bundle's programs take.
     """
@@ -55,10 +58,15 @@ class BundleInferenceEngine(InferenceEngine):
         """Load the bundle's programs and check them against its test case."""
         manifest = bundle.manifest
         self._fixed_task = manifest.task
+        self._task_tokens = (
+            None if manifest.task_tokens is None else TaskTokens(bundle.path, manifest.task_tokens)
+        )
         task = task or self._fixed_task or ""
         if error := self._task_error(task):
             raise ValueError(error)
         super().__init__(task=task)
+        # Makes the version check and the change in `set_task` one step.
+        self._task_change_lock = Lock()
         self._constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
         self._action_names = manifest.action_names
@@ -80,7 +88,12 @@ class BundleInferenceEngine(InferenceEngine):
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
-        _check_dataflow(manifest, [*self._frame_spec, *self._constants], manifest.noise_shape is not None)
+        given = [
+            *self._frame_spec,
+            *self._constants,
+            *([TASK_EMBEDDINGS, TASK_LENGTH] if self._task_tokens else []),
+        ]
+        _check_dataflow(manifest, given, manifest.noise_shape is not None)
         prepare_runtime(manifest.runtime, manifest.runtime_imports)
         # Several runs of one program, such as the steps of a sampler, share it.
         loaded: dict[tuple[str, str | None], Program] = {}
@@ -118,8 +131,12 @@ class BundleInferenceEngine(InferenceEngine):
                 f"The robot does not match the exported policy, which takes {'; '.join(problems)}.{hint}"
             )
 
-    def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
+    def _run_chunk(
+        self, frame: Mapping[str, np.ndarray], task: str, noise: np.ndarray | None = None
+    ) -> np.ndarray:
         values: dict[str, Any] = {**self._constants, **{name: frame[name] for name in self._frame_spec}}
+        if self._task_tokens is not None:
+            values[TASK_EMBEDDINGS], values[TASK_LENGTH] = self._task_tokens(task)
         if self._noise_shape is not None:
             values[NOISE] = (
                 np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
@@ -132,7 +149,7 @@ class BundleInferenceEngine(InferenceEngine):
         return actions
 
     def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self._run_chunk(frame, noise)
+        actual = self._run_chunk(frame, self._fixed_task or "", noise)
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -147,6 +164,8 @@ class BundleInferenceEngine(InferenceEngine):
             )
 
     def _task_error(self, task: str) -> str | None:
+        if self._task_tokens is not None:
+            return self._task_tokens.error(task)
         if self._fixed_task is not None and task != self._fixed_task:
             return (
                 f"This exported policy runs only the task it was exported for, {self._fixed_task!r}, "
@@ -166,11 +185,20 @@ class BundleInferenceEngine(InferenceEngine):
         return super().text_input_error(text, instruction=instruction)
 
     def set_task(self, task: str) -> bool:
-        """Change the task, unless the bundle was exported for another one."""
-        if error := self._task_error(task):
-            logger.warning("Instruction rejected: %s", error)
-            return False
-        return super().set_task(task)
+        """Change the task, unless the programs cannot take it.
+
+        A new task is tokenized here, before any lock, so the control loop keeps running meanwhile. A change
+        requested while it was tokenized wins over this one.
+        """
+        version = self.task_version
+        error = self._task_error(task)
+        with self._task_change_lock:
+            if self.task_version != version:
+                return False
+            if error:
+                logger.warning("Instruction rejected: %s", error)
+                return False
+            return super().set_task(task)
 
     def dispatch_allowed(self) -> bool:
         """Hold the robot while an external planner answers; inline inference has no worker to pause."""
@@ -197,7 +225,9 @@ class BundleInferenceEngine(InferenceEngine):
         if not self._actions:
             start = time.perf_counter()
             self._actions.extend(
-                self._run_chunk({self._rename.get(name, name): value for name, value in obs_frame.items()})
+                self._run_chunk(
+                    {self._rename.get(name, name): value for name, value in obs_frame.items()}, task
+                )
             )
             end = time.perf_counter()
             self.inference_times.append((end, end - start))
