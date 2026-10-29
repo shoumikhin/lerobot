@@ -29,7 +29,7 @@ from safetensors.numpy import save_file
 from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
-from lerobot.bundle.runtime import RUNTIMES, Runtime
+from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.utils.constants import ACTION
 
 # File name prefixes of the constants torch.export.load unpickles instead of reading as tensors.
@@ -61,7 +61,7 @@ class TorchProgram:
         return value.numpy()
 
 
-RUNTIMES["torch_test"] = Runtime(TorchProgram)
+register_runtime("torch_test", Runtime(TorchProgram))
 
 
 def make_bundle(

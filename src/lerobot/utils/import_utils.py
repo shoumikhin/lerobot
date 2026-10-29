@@ -250,8 +250,9 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy"]
-PLUGIN_KINDS: tuple[PluginKind, ...] = get_args(PluginKind)
+PluginKind = Literal["robot", "camera", "teleoperator", "policy", "env", "strategy", "runtime"]
+# What a command loads unless it names its kinds; a bundle runtime loads only for the bundle that names it.
+PLUGIN_KINDS: tuple[PluginKind, ...] = ("robot", "camera", "teleoperator", "policy", "env", "strategy")
 DEVICE_PLUGIN_KINDS: tuple[PluginKind, ...] = ("robot", "camera", "teleoperator")
 # A sim robot (`--robot.type=sim`) takes its env from the EnvConfig registry when the command line is
 # parsed, so the commands that accept one also import env plugins.
@@ -268,16 +269,16 @@ def register_third_party_plugins(kinds: Iterable[PluginKind] = PLUGIN_KINDS) -> 
 
     Args:
         kinds (`Iterable[PluginKind]`, *optional*, defaults to `('robot', 'camera', 'teleoperator', 'policy', 'env', 'strategy')`):
-            The plugin kinds to import, from `PLUGIN_KINDS`. Pass only the kinds the command uses, so
+            The plugin kinds to import, from `PluginKind`. Pass only the kinds the command uses, so
             plugins of other kinds cannot slow it down or log unrelated import errors.
 
     Raises:
-        ValueError: If `kinds` names a kind that is not in `PLUGIN_KINDS`.
+        ValueError: If `kinds` names a kind that is not a `PluginKind`.
     """
     kinds = tuple(kinds)
-    unknown = set(kinds) - set(PLUGIN_KINDS)
+    unknown = set(kinds) - set(get_args(PluginKind))
     if unknown:
-        raise ValueError(f"Unknown plugin kinds {sorted(unknown)}, expected some of {PLUGIN_KINDS}.")
+        raise ValueError(f"Unknown plugin kinds {sorted(unknown)}, expected some of {get_args(PluginKind)}.")
     prefixes = tuple(f"lerobot_{kind}_" for kind in kinds)
     imported: list[str] = []
     failed: list[str] = []
