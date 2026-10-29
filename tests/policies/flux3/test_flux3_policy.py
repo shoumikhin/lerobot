@@ -744,7 +744,9 @@ def test_exported_policy_takes_its_noise_as_inputs_and_leaves_eager_inference_in
     class Predict(nn.Module):
         def __init__(self, policy, task="stack the cubes"):
             super().__init__()
-            self.policy, self.task = policy, task
+            # Kept outside the module tree, so export does not roll back the policy's Python state afterwards.
+            object.__setattr__(self, "policy", policy)
+            self.task = task
 
         def forward(self, images, state, noise=None, video_noise=None):
             batch = {"observation.images.top": images, OBS_STATE: state, "task": [self.task]}
