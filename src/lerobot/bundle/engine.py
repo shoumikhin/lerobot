@@ -77,6 +77,11 @@ class BundleEngine:
         self._noise_shape = manifest.noise_shape
         self._action_names = manifest.action_names
         self._scale = np.asarray(manifest.action_scale, dtype=np.float32)
+        if not (np.isfinite(self._scale) & (self._scale > 0)).all():
+            raise ValueError(
+                f"The bundle's action scale {manifest.action_scale} does not fit in 32-bit floats above 0. "
+                "Export the policy again."
+            )
         self._rename = rename_map or {}
         self._actions: deque[np.ndarray] = deque()
         case = load_file(bundle.path / manifest.test)
@@ -93,8 +98,16 @@ class BundleEngine:
                 "The bundle's test case holds no valid expected actions: finite numbers shaped "
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
+        expected_noise = None if manifest.noise_shape is None else tuple(manifest.noise_shape)
+        if (None if noise is None else noise.shape) != expected_noise:
+            raise ValueError(
+                f"The bundle's test case holds noise shaped {None if noise is None else noise.shape}, but its "
+                f"programs take noise shaped {expected_noise}. Export the policy again."
+            )
         self._frame_spec = {name: value.shape for name, value in case.items()}
-        _check_dataflow(manifest, [*self._frame_spec, *self._constants], manifest.noise_shape is not None)
+        _check_dataflow(
+            manifest, list(self._frame_spec), list(self._constants), manifest.noise_shape is not None
+        )
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions)
         prepare_runtime(manifest.runtime, manifest.runtime_imports)
@@ -127,7 +140,13 @@ class BundleEngine:
             action_names (`list[str]`):
                 The robot's action components, in the order the actions are sent.
         """
-        shapes = {self._rename.get(name, name): tuple(shape) for name, shape in observation_shapes.items()}
+        renamed = [self._rename.get(name, name) for name in observation_shapes]
+        if collisions := sorted({name for name in renamed if renamed.count(name) > 1}):
+            raise ValueError(
+                f"--rename_map gives several of the robot's observations the name {collisions}; each name "
+                "must come from one observation."
+            )
+        shapes = dict(zip(renamed, map(tuple, observation_shapes.values()), strict=True))
         problems = [
             f"{name} {shape} (the robot gives {shapes.get(name)})"
             for name, shape in self._frame_spec.items()
@@ -161,6 +180,11 @@ class BundleEngine:
                 inputs.append(values[name])
             values.update(zip(spec.outputs, program(*inputs), strict=True))
         actions = self._programs[-1][1].to_numpy(values[ACTION])
+        if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] != len(self._scale):
+            raise RuntimeError(
+                f"The exported policy returned actions shaped {actions.shape}, not [steps, {len(self._scale)}]; "
+                "they were not sent."
+            )
         if not np.isfinite(actions).all():
             raise RuntimeError("The exported policy returned NaN or infinite actions; they were not sent.")
         return actions
@@ -174,7 +198,7 @@ class BundleEngine:
             )
         error = float((np.abs(actual - expected) / self._scale).max())
         logger.info("Bundle test case: largest difference %.2e (tolerance %g)", error, tolerance)
-        if error > tolerance:
+        if not np.isfinite(error) or error > tolerance:
             raise RuntimeError(
                 f"The exported policy does not reproduce its test case ({error:.2e} > {tolerance}). "
                 "Export it again on this device."
@@ -217,10 +241,17 @@ def _data_file(bundle: Bundle, name: str | None) -> Path | None:
     return None if name is None else bundle.path / name
 
 
-def _check_dataflow(manifest: BundleManifest, given: list[str], noise: bool) -> None:
-    """Refuse a bundle whose programs read a value that nothing gives them, before any program loads."""
-    available = {*given, *([NOISE] if noise else [])}
+def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[str], noise: bool) -> None:
+    """Refuse a bundle whose programs read a value that nothing gives them, before any program loads.
+
+    A program may not write a constant either: each program reads the constants placed once, at load.
+    """
+    available = {*frame, *constants, *([NOISE] if noise else [])}
     for spec in manifest.programs:
+        if shadowed := sorted(set(spec.outputs) & set(constants)):
+            raise ValueError(
+                f"The bundle's program run {spec.name!r} writes the constants {shadowed}. Export the policy again."
+            )
         missing = [name for name in spec.inputs if name not in available]
         if missing:
             raise ValueError(

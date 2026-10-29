@@ -284,3 +284,40 @@ def test_engine_places_a_frame_value_once_per_chunk(tmp_path, monkeypatch):
 def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):
     with pytest.raises(ValueError, match=r"'scale_1' reads \['chunk_factor'\]"):
         BundleEngine(_repeat_bundle(tmp_path))
+
+
+def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
+    engine = BundleEngine(make_bundle(tmp_path / "bundle", Chunk(), FRAME))
+    program = engine._programs[-1][1]
+    monkeypatch.setattr(program, "to_numpy", lambda value: np.ones((3, 2), np.float32))
+    with pytest.raises(RuntimeError, match=r"shaped \(3, 2\), not \[steps, 3\]"):
+        engine.get_action(FRAME)
+
+
+def test_engine_refuses_a_test_case_noise_of_another_shape(tmp_path):
+    bundle = make_bundle(tmp_path / "bundle", NoisyChunk(), FRAME, noise_shape=(3, 3))
+    _edit_test_case(bundle, **{NOISE: np.zeros((1, 3), np.float32)})
+    with pytest.raises(ValueError, match=r"noise shaped \(1, 3\).*\(3, 3\)"):
+        BundleEngine(bundle)
+
+
+def test_engine_refuses_an_action_scale_that_float32_rounds_to_zero(tmp_path):
+    bundle = make_bundle(tmp_path / "bundle", Chunk(), FRAME)
+    _edit(bundle, action_scale=[1e-100, 1.0, 1.0])
+    with pytest.raises(ValueError, match="does not fit in 32-bit floats"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_rename_that_merges_two_observations(tmp_path):
+    engine = BundleEngine(make_bundle(tmp_path / "bundle", Chunk(), FRAME), rename_map={"a": OBS_STATE})
+    with pytest.raises(ValueError, match="several of the robot's observations"):
+        engine.check_robot({"a": (3,), OBS_STATE: (3,)}, ["a", "b", "c"])
+
+
+def test_engine_refuses_a_program_that_writes_a_constant(tmp_path):
+    bundle = _repeat_bundle(tmp_path)
+    manifest = bundle.manifest.to_dict()
+    manifest["programs"][1]["outputs"] = ["factor_1"]
+    _edit(bundle, programs=manifest["programs"])
+    with pytest.raises(ValueError, match=r"writes the constants \['factor_1'\]"):
+        BundleEngine(Bundle.read(bundle.path))
