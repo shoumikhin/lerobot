@@ -14,4 +14,10 @@
 
 """The compilers `lerobot-export` can use. Importing this package registers them with `--backend.type`."""
 
-from . import executorch_cuda, executorch_openvino, executorch_tensorrt, executorch_xnnpack  # noqa: F401
+from . import (  # noqa: F401
+    executorch_coreml,
+    executorch_cuda,
+    executorch_openvino,
+    executorch_tensorrt,
+    executorch_xnnpack,
+)
