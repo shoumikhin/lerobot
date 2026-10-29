@@ -17,7 +17,7 @@
 """Build a policy with its parameters on the meta device, and load a checkpoint straight into them."""
 
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 
 import torch
@@ -162,3 +162,73 @@ def load_complete_checkpoint(
     else:
         print("All keys loaded successfully!")
     return policy
+
+
+def load_checkpoint_modules(
+    policy_cls: type[T], model_file: str, config: PreTrainedConfig, modules: list[str], **kwargs
+) -> T:
+    """Build `policy_cls` on the meta device and load only the weights of `modules` from `model_file`.
+
+    For exporting one part of a policy too large for the machine's memory: only the listed submodules, like
+    `model.paligemma_with_expert.gemma_expert`, get real tensors, read from the file, as `load_modules` says.
+    The file's keys go through the policy's own key fixes, and each weight takes the dtype the constructor
+    gave it. The same promises as `load_complete_checkpoint` apply.
+    """
+    if not vars(policy_cls).get("_supports_meta_load", False):
+        raise ValueError(f"{policy_cls.__name__} does not support loading on the meta device.")
+    prefixes = tuple(f"{name}." for name in modules)
+    with parameters_on_meta():
+        policy = policy_cls(config, **kwargs)
+    targets = policy.state_dict(keep_vars=True)
+    sources = {}
+    with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+        # A file key gives zero, one or two model names (lm_head is also copied), and the last one wins, as in
+        # a full load.
+        for key in checkpoint.offset_keys() if hasattr(checkpoint, "offset_keys") else checkpoint.keys():
+            for name in policy._fix_pytorch_state_dict_keys({key: torch.empty(0, device="meta")}, config):
+                name = name if name.startswith("model.") else f"model.{name}"
+                if name.startswith(prefixes) and name in targets:
+                    sources[name] = (key, targets[name].dtype)
+    return load_modules(policy, model_file, modules, sources, config.device)
+
+
+def load_modules(
+    policy: T,
+    model_file: str,
+    modules: list[str],
+    sources: Mapping[str, tuple[str, torch.dtype | None]],
+    device: str | None,
+) -> T:
+    """Fill the `modules` of `policy`, built under `parameters_on_meta`, from `model_file`, and drop the rest.
+
+    `sources` maps each name in the policy's state dict to its key in the file and the dtype to load it in,
+    `None` keeping the file's. Every other submodule holding parameters is replaced by None, as the policy
+    already does for modules it never runs, so code that reaches one fails instead of reading random weights,
+    and an export of one part holds only its own weights. Raises if a listed submodule has a parameter the file
+    does not hold. Returns the policy in evaluation mode, as from `from_pretrained`, since a policy's own
+    `train` may reach a module that is now None, and on `device`.
+    """
+    with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+        # A CPU copy first, because a device copy straight from the memory-mapped file can keep its pages.
+        tensors = {
+            name: checkpoint.get_tensor(key).to(dtype=dtype, copy=True).to(device)
+            for name, (key, dtype) in sources.items()
+        }
+    policy.load_state_dict(tensors, strict=False, assign=True)
+    for name in modules:
+        missing = [p for p, param in policy.get_submodule(name).named_parameters() if param.is_meta]
+        if missing:
+            raise KeyError(f"{model_file} does not hold {name}.{missing[0]} and {len(missing) - 1} more")
+    policy.eval()
+    _drop_unloaded(policy)
+    # Buffers the constructor computed, like rotary tables, are not in the checkpoint and are still on the CPU.
+    return policy.to(device)
+
+
+def _drop_unloaded(module: nn.Module) -> None:
+    for name, child in list(module.named_children()):
+        parameters = list(child.parameters())
+        if parameters and all(parameter.is_meta for parameter in parameters):
+            setattr(module, name, None)
+        else:
+            _drop_unloaded(child)
