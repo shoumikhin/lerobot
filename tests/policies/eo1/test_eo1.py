@@ -719,7 +719,7 @@ def test_prepared_sampling_exports_and_matches_eager(monkeypatch):
     assert len(builds) == 1
     # The exported positions follow the installed transformers' still-image convention, probed once.
     program, run = _export_sampling(policy, batch, noise)
-    torch.testing.assert_close(run(batch), expected)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
     assert len(builds) == 1 and len(probes) == 1
     assert data_dependent_nodes(program) == []
     # The prompt checks: one action token fewer is rejected by the exported program, and in eager mode
