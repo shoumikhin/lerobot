@@ -134,3 +134,20 @@ def test_parts_in_one_folder_keep_their_own_weights(tmp_path):
             run_without_torch(tmp_path / f"{name}.pte", data, x, tmp_path), expected
         )
     assert sorted(data.name for data, _ in parts.values()) == ["first.ptd", "second.ptd"]
+
+
+def test_float32_math_stays_float32(tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    # Wide enough products that TF32's 10-bit mantissa errs by about 1e-3, a hundred times float32's.
+    model = nn.Sequential(nn.Linear(1024, 1024), nn.Linear(1024, 1024)).cuda().eval()
+    x = torch.randn(64, 1024, device="cuda")
+    with torch.no_grad():
+        program = torch.export.export(model, (x,))
+        expected = model(x).cpu().numpy()
+
+    data = ExecuTorchTensorRTConfig().compile(program, tmp_path / "model.pte")
+
+    np.testing.assert_allclose(
+        run_without_torch(tmp_path / "model.pte", data, x, tmp_path), expected, atol=2e-5
+    )

@@ -75,6 +75,9 @@ class ExecuTorchTensorRTConfig(ExportBackendConfig):
             # The part's PyTorch weights wait in host memory while TensorRT builds; on an 8 GB Jetson this
             # leaves about 600 MiB more free at the peak of the largest build.
             "offload_module_to_cpu": True,
+            # Float32 math stays float32, as in PyTorch. TensorRT's default TF32 moved ACT's actions by up to
+            # 5e-3 of their spread, a thousand times the float32 rounding.
+            "disable_tf32": True,
         }
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
