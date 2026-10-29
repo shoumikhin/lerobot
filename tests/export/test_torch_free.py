@@ -23,6 +23,7 @@ BUNDLE_MODULES = [
     "lerobot.bundle.runtime",
     "lerobot.bundle.executorch",
     "lerobot.bundle.engine",
+    "lerobot.bundle.task_tokens",
 ]
 
 
