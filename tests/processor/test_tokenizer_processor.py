@@ -18,6 +18,7 @@
 Tests for the TokenizerProcessorStep class.
 """
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -132,6 +133,54 @@ def test_action_tokenizer_can_reject_truncated_sequences():
 
     with pytest.raises(ValueError, match="max_action_tokens=4"):
         processor._tokenize_action(torch.zeros(1, 2, 1))
+
+
+_ACTION_PROCESSOR_SOURCE = """
+from transformers import ProcessorMixin
+
+
+class TinyActionProcessor(ProcessorMixin):
+    attributes = ["bpe_tokenizer"]
+    bpe_tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, bpe_tokenizer, scale=10):
+        self.scale = scale
+        super().__init__(bpe_tokenizer)
+"""
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_loads_a_processor_saved_by_transformers_4(tmp_path, monkeypatch):
+    """Transformers 4 kept the BPE tokenizer of a FAST-like processor at the top of the folder."""
+    import transformers.dynamic_module_utils as dynamic_modules
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    from lerobot.processor.tokenizer_processor import _load_action_tokenizer
+
+    monkeypatch.setattr(dynamic_modules, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    folder = tmp_path / "fast"
+    folder.mkdir()
+    tokenizer = Tokenizer(models.WordLevel({"a": 0, "b": 1, "[UNK]": 2}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(str(folder / "tokenizer.json"))
+    auto_map = {"AutoProcessor": "processing_tiny.TinyActionProcessor"}
+    (folder / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "PreTrainedTokenizerFast", "auto_map": auto_map})
+    )
+    (folder / "processor_config.json").write_text(
+        json.dumps({"processor_class": "TinyActionProcessor", "auto_map": auto_map, "scale": 7})
+    )
+    (folder / "processing_tiny.py").write_text(_ACTION_PROCESSOR_SOURCE)
+
+    processor = _load_action_tokenizer(str(folder), trust_remote_code=True)
+
+    assert processor.scale == 7
+    assert processor.bpe_tokenizer.encode("b a", add_special_tokens=False) == [1, 0]
+    # A checkpoint saves the processor it loaded; that copy must load again.
+    processor.save_pretrained(tmp_path / "saved")
+    saved = _load_action_tokenizer(str(tmp_path / "saved"), trust_remote_code=True)
+    assert saved.scale == 7
+    assert saved.bpe_tokenizer.encode("b a", add_special_tokens=False) == [1, 0]
 
 
 @pytest.fixture
