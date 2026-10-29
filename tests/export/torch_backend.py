@@ -66,17 +66,27 @@ def make_bundle(
     action_names: list[str] | None = None,
     data: str | None = None,
     expected_offset: float = 0.0,
+    history: dict[str, int] | None = None,
 ) -> Bundle:
     """Write a one-program bundle of `module`, whose test case expects its actions plus `expected_offset`.
 
     With `noise_shape`, the program takes a starting noise after the frame. With `data`, the program names
-    a data file of that name, written beside it.
+    a data file of that name, written beside it. With `history`, each value of `frame` holds the frames of
+    several ticks, and the program takes the last frames of the keys `history` names, as the policies' queues
+    keep them: the first frame repeated until the queue is full.
     """
     folder.mkdir(parents=True)
     case = dict(frame)
+    values = {}
+    for name, value in frame.items():
+        if size := (history or {}).get(name):
+            value = np.stack([value[0]] * max(size - len(value), 0) + list(value[-size:]))
+        elif history:
+            value = value[-1]
+        values[name] = value
     if noise_shape is not None:
-        case[NOISE] = np.random.default_rng(0).standard_normal(noise_shape).astype(np.float32)
-    inputs = tuple(torch.from_numpy(x) for x in case.values())
+        case[NOISE] = values[NOISE] = np.random.default_rng(0).standard_normal(noise_shape).astype(np.float32)
+    inputs = tuple(torch.from_numpy(x) for x in values.values())
     torch.export.save(torch.export.export(module, inputs), folder / "model.pt2")
     if data is not None:
         (folder / data).write_bytes(b"")
@@ -89,6 +99,7 @@ def make_bundle(
         runtime_imports=["tests.export.torch_backend"],
         programs=[ProgramSpec("model", "model.pt2", list(case), [ACTION], data)],
         noise_shape=None if noise_shape is None else list(noise_shape),
+        history=history or {},
         task=task,
         action_names=action_names,
         action_scale=[1.0] * actions.shape[-1],

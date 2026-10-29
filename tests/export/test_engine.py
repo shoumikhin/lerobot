@@ -276,3 +276,66 @@ def test_engine_places_a_frame_value_once_per_chunk(tmp_path, monkeypatch):
 def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):
     with pytest.raises(ValueError, match=r"'scale_1' reads \['chunk_factor'\]"):
         BundleInferenceEngine(_repeat_bundle(tmp_path))
+
+
+class History(nn.Module):
+    """The chunk is the program's history of the state: one action per state it remembers, oldest first."""
+
+    def forward(self, states: Tensor, *others: Tensor) -> Tensor:
+        return states * 1
+
+
+# Two ticks, fewer than the three states the program remembers, so the check replays the first-frame fill too.
+TICKS = {OBS_STATE: np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], np.float32)}
+
+
+def _states(*values: float) -> list[np.ndarray]:
+    return [np.full(3, value, np.float32) for value in values]
+
+
+def test_engine_gives_the_programs_the_frames_of_past_ticks(tmp_path):
+    engine = BundleInferenceEngine(make_bundle(tmp_path / "bundle", History(), TICKS, history={OBS_STATE: 3}))
+    engine.check_robot({OBS_STATE: (3,)}, ["a", "b", "c"])
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(10, 11, 12, 13, 14, 15, 16)]
+    # A chunk at tick 0, from the first state repeated, and at tick 3, from the states of ticks 1 to 3.
+    np.testing.assert_array_equal(np.stack(actions), _states(10, 10, 10, 11, 12, 13, 14))
+
+
+def test_engine_starts_the_history_again_after_a_reset(tmp_path):
+    engine = BundleInferenceEngine(make_bundle(tmp_path / "bundle", History(), TICKS, history={OBS_STATE: 3}))
+    for state in _states(10, 11):
+        engine.get_action({OBS_STATE: state})
+    engine.reset()
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(20, 21, 22)]
+    np.testing.assert_array_equal(np.stack(actions), _states(20, 20, 20))
+
+
+def test_engine_keeps_a_copy_of_each_past_frame(tmp_path):
+    engine = BundleInferenceEngine(make_bundle(tmp_path / "bundle", History(), TICKS, history={OBS_STATE: 2}))
+    state = np.full(3, 10.0, np.float32)
+    for value in (10.0, 11.0, 12.0):
+        state[:] = value
+        action = engine.get_action({OBS_STATE: state})
+    np.testing.assert_array_equal(action, [11.0, 11.0, 11.0])
+
+
+@pytest.mark.parametrize("history", [{OBS_STATE: 0}, {OBS_STATE: -1}, {OBS_STATE: 2.0}, {OBS_STATE: True}])
+def test_bundle_refuses_a_history_that_keeps_no_whole_frames(tmp_path, history):
+    bundle = make_bundle(tmp_path / "bundle", History(), TICKS, history={OBS_STATE: 3})
+    _edit(bundle, history=history)
+    with pytest.raises(ValueError, match="whole number of frames above 0"):
+        Bundle.read(bundle.path)
+
+
+def test_engine_refuses_a_history_of_what_the_frame_does_not_hold(tmp_path):
+    bundle = make_bundle(tmp_path / "bundle", History(), TICKS, history={OBS_STATE: 3})
+    _edit(bundle, history={OBS_STATE: 3, "observation.environment_state": 3})
+    with pytest.raises(ValueError, match=r"history of \['observation.environment_state'\]"):
+        BundleInferenceEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_test_case_with_uneven_ticks(tmp_path):
+    frame = {**TICKS, "observation.environment_state": np.ones((3, 2), np.float32)}
+    bundle = make_bundle(tmp_path / "bundle", History(), frame, history={OBS_STATE: 3})
+    with pytest.raises(ValueError, match="same number of frames for each key"):
+        BundleInferenceEngine(bundle)
