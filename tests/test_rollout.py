@@ -301,8 +301,8 @@ def test_build_rollout_context_uses_resolved_device(
         )
         return processor, PolicyProcessorPipeline(steps=[])
 
-    monkeypatch.setattr(rollout_context, "load_pretrained_policy", load_policy)
-    monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
+    monkeypatch.setattr("lerobot.policies.factory.load_pretrained_policy", load_policy)
+    monkeypatch.setattr("lerobot.policies.factory.make_pre_post_processors", make_processors)
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
 
     try:
@@ -345,15 +345,14 @@ def test_local_setup_failure_releases_hardware_and_dataset(monkeypatch, tmp_path
 
     if failure_stage == "observation":
         monkeypatch.setattr(robot, "get_observation", MagicMock(side_effect=failure))
-    monkeypatch.setattr(rollout_context, "load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
+    monkeypatch.setattr("lerobot.policies.factory.load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
-    monkeypatch.setattr(rollout_context, "LeRobotDataset", MagicMock(create=MagicMock(return_value=dataset)))
+    monkeypatch.setattr("lerobot.datasets.LeRobotDataset", MagicMock(create=MagicMock(return_value=dataset)))
     monkeypatch.setattr(
-        rollout_context,
-        "make_pre_post_processors",
+        "lerobot.policies.factory.make_pre_post_processors",
         lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
     )
-    monkeypatch.setattr(rollout_context, "create_inference_engine", make_engine)
+    monkeypatch.setattr("lerobot.inference.create_inference_engine", make_engine)
     with pytest.raises(RuntimeError) as raised:
         rollout_context.build_rollout_context(cfg, threading.Event())
     assert raised.value is failure
