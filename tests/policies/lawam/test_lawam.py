@@ -930,3 +930,96 @@ def test_select_action_uses_action_queue_before_refill() -> None:
     assert first.shape == (1, 7)
     assert second.shape == (1, 7)
     assert not torch.equal(first, second)
+
+
+def _bare_backend(**attributes):
+    from lerobot.policies.lawam.vlas.lawam import LatentWorldPolicyBackend
+
+    backend = LatentWorldPolicyBackend.__new__(LatentWorldPolicyBackend)
+    nn.Module.__init__(backend)
+    for name, value in attributes.items():
+        setattr(backend, name, value)
+    return backend
+
+
+def _vlm_stage_setup(act_token: int = 10, flow_token: int = 11, num_queries: int = 2):
+    from transformers import Qwen3VLForConditionalGeneration
+
+    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+
+    torch.manual_seed(0)
+    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
+    act_query, flow_query = torch.randn(2, num_queries, qwen.config.text_config.hidden_size)
+
+    def backend(precompute_grid_thw: bool):
+        return _bare_backend(
+            vlm=qwen,
+            model_cfg=SimpleNamespace(precompute_grid_thw=precompute_grid_thw),
+            num_action_queries=num_queries,
+            vlm_to_lam=nn.Identity(),
+            _vision_grid=None,
+        )
+
+    prompts = image_prompts(qwen.config, suffix=(act_token, act_token, flow_token, flow_token))
+    input_ids = prompts["input_ids"]
+    # The second sample interleaves its queries, so the samples place their action tokens differently.
+    input_ids[1, -3:-1] = torch.tensor([flow_token, act_token])
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": prompts["attention_mask"],
+        "pixel_values": prompts["pixel_values"],
+        "image_grid_thw": prompts["image_grid_thw"],
+        "act_placeholder_mask": input_ids == act_token,
+        "flow_placeholder_mask": input_ids == flow_token,
+        "act_query": act_query,
+        "flow_query": flow_query,
+    }
+    return qwen, backend, inputs
+
+
+def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> None:
+    from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK
+
+    qwen, backend, inputs = _vlm_stage_setup()
+    num_queries = inputs["act_query"].shape[0]
+    stock, fixed = backend(False), backend(True)
+    with torch.no_grad():
+        expected = stock._run_vlm_stage(**inputs)
+    action_hidden = expected["h_vlm"][inputs["act_placeholder_mask"]].view(2, num_queries, -1)
+    assert torch.equal(expected["pred_latent"], action_hidden)
+
+    text_inputs = []
+    qwen.model.language_model.register_forward_pre_hook(
+        lambda module, args, kwargs: text_inputs.append(kwargs["inputs_embeds"]), with_kwargs=True
+    )
+    builds = count_grid_builds(monkeypatch)
+    keys = sorted(inputs)
+
+    class VLMStage(nn.Module):
+        def forward(self, *tensors):
+            output = fixed._run_vlm_stage(**dict(zip(keys, tensors, strict=True)))
+            return output["h_vlm"], output["pred_latent"]
+
+    with torch.no_grad():
+        for _ in range(2):  # The second call reuses the cached grid.
+            actual = VLMStage()(*(inputs[key] for key in keys))
+            torch.testing.assert_close(actual, (expected["h_vlm"], action_hidden), rtol=0, atol=0)
+        exported = torch.export.export(VLMStage(), tuple(inputs[key] for key in keys))
+        torch.testing.assert_close(
+            exported.module()(*(inputs[key] for key in keys)), (expected["h_vlm"], action_hidden)
+        )
+    assert len(builds) == 1
+    assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
+    # Each sample's placeholders hold the queries in order, wherever the sample put its tokens.
+    for name in ("act", "flow"):
+        filled = text_inputs[0][inputs[f"{name}_placeholder_mask"]]
+        assert torch.equal(filled, inputs[f"{name}_query"].repeat(2, 1))
+
+
+def test_query_checks_stay_on_without_precompute_grid_thw(monkeypatch) -> None:
+    _, backend, inputs = _vlm_stage_setup()
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    inputs["act_placeholder_mask"][1] = False
+    with torch.no_grad(), pytest.raises(ValueError, match="act_query placeholder count mismatch"):
+        backend(False)._run_vlm_stage(**inputs)
