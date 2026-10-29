@@ -932,10 +932,37 @@ def test_select_action_uses_action_queue_before_refill() -> None:
     assert not torch.equal(first, second)
 
 
-def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen() -> None:
+def _bare_backend(**attributes):
+    from lerobot.policies.lawam.vlas.lawam import LatentWorldPolicyBackend
+
+    backend = LatentWorldPolicyBackend.__new__(LatentWorldPolicyBackend)
+    nn.Module.__init__(backend)
+    for name, value in attributes.items():
+        setattr(backend, name, value)
+    return backend
+
+
+def test_inject_queries_fills_each_sample_in_order() -> None:
+    inputs_embeds = torch.zeros(2, 6, 4)
+    placeholder_mask = torch.tensor([[0, 1, 0, 0, 1, 1], [1, 1, 0, 1, 0, 0]], dtype=torch.bool)
+    queries = torch.randn(3, 4)
+    expected = inputs_embeds.clone()
+    expected[placeholder_mask] = queries.repeat(2, 1)
+
+    _bare_backend()._inject_queries(
+        inputs_embeds=inputs_embeds,
+        placeholder_mask=placeholder_mask,
+        queries=queries,
+        num_queries=3,
+        name="act_query",
+    )
+
+    assert torch.equal(inputs_embeds, expected)
+
+
+def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> None:
     from transformers import Qwen3VLForConditionalGeneration
 
-    from lerobot.policies.lawam.vlas.lawam import LatentWorldPolicyBackend
     from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
 
     act_token, flow_token, num_queries = 10, 11, 2
@@ -943,31 +970,51 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen() -> None:
     qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
     act_query, flow_query = torch.randn(2, num_queries, qwen.config.text_config.hidden_size)
 
-    def backend(precompute_grid_thw: bool) -> LatentWorldPolicyBackend:
-        backend = LatentWorldPolicyBackend.__new__(LatentWorldPolicyBackend)
-        nn.Module.__init__(backend)
-        backend.vlm = qwen
-        backend.model_cfg = SimpleNamespace(precompute_grid_thw=precompute_grid_thw)
-        backend.num_action_queries = num_queries
-        backend.vlm_to_lam = nn.Identity()
-        backend._vision_grid = None
-        return backend
+    def backend(precompute_grid_thw: bool):
+        return _bare_backend(
+            vlm=qwen,
+            model_cfg=SimpleNamespace(precompute_grid_thw=precompute_grid_thw),
+            num_action_queries=num_queries,
+            vlm_to_lam=nn.Identity(),
+            _vision_grid=None,
+        )
 
-    prompts = image_prompts(qwen.config, suffix=(act_token,) * num_queries + (flow_token,) * num_queries)
+    prompts = image_prompts(qwen.config, suffix=(act_token, act_token, flow_token, flow_token))
+    input_ids = prompts["input_ids"]
+    # The second sample interleaves its queries, so the samples place their action tokens differently.
+    input_ids[1, -3:-1] = torch.tensor([flow_token, act_token])
     inputs = {
-        "input_ids": prompts["input_ids"],
+        "input_ids": input_ids,
         "attention_mask": prompts["attention_mask"],
         "pixel_values": prompts["pixel_values"],
         "image_grid_thw": prompts["image_grid_thw"],
-        "act_placeholder_mask": prompts["input_ids"] == act_token,
-        "flow_placeholder_mask": prompts["input_ids"] == flow_token,
+        "act_placeholder_mask": input_ids == act_token,
+        "flow_placeholder_mask": input_ids == flow_token,
         "act_query": act_query,
         "flow_query": flow_query,
     }
     stock, fixed = backend(False), backend(True)
     with torch.no_grad():
         expected = stock._run_vlm_stage(**inputs)
+    action_hidden = expected["h_vlm"][inputs["act_placeholder_mask"]].view(2, num_queries, -1)
+    assert torch.equal(expected["pred_latent"], action_hidden)
+
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(qwen.model.visual, "forward", stock_vision_tower)
+    keys = sorted(inputs)
+
+    class VLMStage(nn.Module):
+        def forward(self, *tensors):
+            output = fixed._run_vlm_stage(**dict(zip(keys, tensors, strict=True)))
+            return output["h_vlm"], output["pred_latent"]
+
+    with torch.no_grad():
         for _ in range(2):  # The second call reuses the cached grid.
-            actual = fixed._run_vlm_stage(**inputs)
-            torch.testing.assert_close(actual["h_vlm"], expected["h_vlm"], rtol=0, atol=0)
-            torch.testing.assert_close(actual["pred_latent"], expected["pred_latent"], rtol=0, atol=0)
+            actual = VLMStage()(*(inputs[key] for key in keys))
+            torch.testing.assert_close(actual, (expected["h_vlm"], action_hidden), rtol=0, atol=0)
+        program = torch.export.export(VLMStage(), tuple(inputs[key] for key in keys)).module()
+        torch.testing.assert_close(
+            program(*(inputs[key] for key in keys)), (expected["h_vlm"], action_hidden)
+        )

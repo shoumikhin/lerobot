@@ -39,6 +39,7 @@ from lerobot.policies.wall_x.processor_wall_x import (  # noqa: E402
     make_wall_x_pre_post_processors,
 )
 from lerobot.policies.wall_x.qwen_model import (  # noqa: E402
+    Qwen2_5_VLConfig,
     Qwen2_5_VLMoEModel,
     Qwen2_5_VLTextConfig,
     SparseMoeBlock,
@@ -173,6 +174,117 @@ def _make_unloaded_policy(**config_values):
     config_values.setdefault("text_top_p", 1.0)
     policy.config = SimpleNamespace(chunk_size=3, **config_values)
     return policy
+
+
+def _tiny_diffusion_model() -> Qwen2_5_VLMoEForAction:
+    def expert(size):
+        return {"hidden_size": size, "intermediate_size": 2 * size, "hidden_act": "silu"}
+
+    config = Qwen2_5_VLConfig(
+        text_config={
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "pad_token_id": 0,
+            "eos_token_id": 2,
+            "rope_parameters": {"rope_type": "default", "mrope_section": [2, 1, 1]},
+            "num_experts": 2,
+            "experts": [expert(32), expert(16)],
+            "dim_inputs": [32, 16],
+            "mlp_moe": True,
+            "dof_config": {"arm": 3},
+        },
+        vision_config={
+            "depth": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_heads": 4,
+            "out_hidden_size": 32,
+            "patch_size": 2,
+            "window_size": 8,
+            "fullatt_block_indexes": [0],
+        },
+        agent_pos_config={"arm": 4},
+        image_token_id=40,
+        video_token_id=43,
+        vision_start_token_id=41,
+        vision_end_token_id=42,
+    )
+    config._attn_implementation = "eager"
+    token_ids = {"<|action|>": 31, "<|propri|>": 32}
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=token_ids.__getitem__))
+    torch.manual_seed(0)
+    model = Qwen2_5_VLMoEForAction(config, processor=processor, vision_attn_implementation="sdpa").eval()
+    model.to_bfloat16_for_selected_params()
+    return model
+
+
+def test_precompute_grid_thw_requires_sdpa_vision_attention():
+    with pytest.raises(ValueError, match="vision_attn_implementation='sdpa'"):
+        make_policy_config("wall_x", precompute_grid_thw=True)
+    assert make_policy_config("wall_x", precompute_grid_thw=True, vision_attn_implementation="sdpa")
+
+
+def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
+    model = _tiny_diffusion_model()
+    horizon = 3
+    # The second prompt is left padded, which WALL-X positions differently from text.
+    prompt = [41, 40, 40, 42, 7, 32, *[31] * horizon, 2]
+    input_ids = torch.tensor([[4, *prompt], [0, *prompt]])
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "moe_token_types": input_ids.eq(31),
+        "pixel_values": torch.randn(16, 3 * 2 * 2 * 2),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+        "dof_mask": torch.ones(2, horizon, 3),
+        "proprioception": torch.randn(2, 4),
+        "agent_pos_mask": torch.ones(2, 4),
+    }
+    settings = {
+        "predict_mode": "diffusion",
+        "pred_horizon": horizon,
+        "action_dim": 3,
+        "num_inference_timesteps": 2,
+    }
+    torch.manual_seed(0)
+    expected = model.predict(**batch, **settings)["predict_action"]
+    with pytest.raises(ValueError, match="moe_token_types must mark exactly the action tokens"):
+        model.predict(**{**batch, "moe_token_types": input_ids.eq(32)}, **settings)
+
+    policy = _make_unloaded_policy(precompute_grid_thw=True)
+    policy.model = model
+    policy._vision_grid = None
+    static = policy._static_grid_inputs(batch)
+    stock_positions, _ = model.get_rope_index(
+        input_ids, batch["image_grid_thw"], attention_mask=batch["attention_mask"]
+    )
+    assert torch.equal(static["position_ids"], stock_positions)
+    with pytest.raises(ValueError, match="images only"):
+        policy._static_grid_inputs({**batch, "video_grid_thw": batch["image_grid_thw"]})
+
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(model.visual, "forward", stock_vision_tower)
+    torch.manual_seed(0)
+    assert torch.equal(model.predict(**batch, **settings, **static)["predict_action"], expected)
+
+    keys = sorted(batch)
+
+    class Predict(torch.nn.Module):
+        def forward(self, *tensors):
+            inputs = dict(zip(keys, tensors, strict=True))
+            return model.predict(**inputs, **settings, **static)["predict_action"]
+
+    # The diffusion loop runs under no_grad, as predict_action_chunk runs it.
+    with torch.no_grad():
+        program = torch.export.export(Predict(), tuple(batch[key] for key in keys)).module()
+        torch.manual_seed(0)
+        torch.testing.assert_close(program(*(batch[key] for key in keys)), expected)
 
 
 def _model_inputs() -> dict[str, torch.Tensor]:

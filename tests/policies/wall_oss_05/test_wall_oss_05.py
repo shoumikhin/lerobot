@@ -25,7 +25,6 @@ from safetensors import safe_open
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
 from lerobot.policies.factory import (
     make_policy,
     make_pre_post_processors,
@@ -877,16 +876,6 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
         assert len(vision_calls) == 1
         assert decoded_lengths == [ids.shape[1] - 2] + [2] * 10
-        grid = Qwen2_5VisionGrid.build(model.visual, inputs["image_grid_thw"])
-        fixed_grid = model.generate_flow_action(
-            **inputs,
-            action_horizon=2,
-            action_dim=26,
-            num_inference_timesteps=10,
-            noise=noise,
-            vision_grid=grid,
-        )["predict_action"]
-        assert torch.equal(fixed_grid, actual)
         # A new observation must get its own prefix cache.
         inputs["pixel_values"] = inputs["pixel_values"] + 1
         expected = _uncached_flow_sample(model, inputs, noise)
@@ -894,6 +883,47 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
             **inputs, action_horizon=2, action_dim=26, num_inference_timesteps=10, noise=noise
         )["predict_action"]
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_precompute_grid_thw_prediction_matches_stock_and_exports(monkeypatch):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
+    torch.manual_seed(19)
+    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
+    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    ids = torch.tensor(
+        [[0, 0, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31], [4, 5, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31]]
+    )
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(16, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 2]] * 4),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    torch.manual_seed(0)
+    expected = policy.predict_action_chunk(batch)
+    with pytest.raises(ValueError, match="moe_token_types must mark exactly the action tokens"):
+        policy.predict_action_chunk({**batch, "moe_token_types": ids == 4})
+
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(policy.model.visual, "forward", stock_vision_tower)
+    policy.config.precompute_grid_thw = True
+    for _ in range(2):  # The second call reuses the cached grid.
+        torch.manual_seed(0)
+        assert torch.equal(policy.predict_action_chunk(batch), expected)
+
+    keys = sorted(batch)
+
+    class PredictActionChunk(nn.Module):
+        def forward(self, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)))
+
+    program = torch.export.export(PredictActionChunk(), tuple(batch[key] for key in keys)).module()
+    torch.manual_seed(0)
+    torch.testing.assert_close(program(*(batch[key] for key in keys)), expected)
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

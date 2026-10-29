@@ -280,7 +280,8 @@ def _model_with_tiny_qwen(precompute_grid_thw: bool) -> VLAJEPAModel:
     torch.manual_seed(0)
     model = VLAJEPAModel.__new__(VLAJEPAModel)
     nn.Module.__init__(model)
-    model.qwen = SimpleNamespace(model=Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval())
+    model.qwen = nn.Module()
+    model.qwen.model = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
     model.config = SimpleNamespace(
         precompute_grid_thw=precompute_grid_thw, num_embodied_action_tokens_per_instruction=2
     )
@@ -289,15 +290,48 @@ def _model_with_tiny_qwen(precompute_grid_thw: bool) -> VLAJEPAModel:
     return model
 
 
-def test_precompute_grid_thw_matches_stock_qwen() -> None:
+def _embodied_prompts(config) -> dict[str, torch.Tensor]:
     from tests.policies.common.qwen3_vl_helpers import image_prompts
 
+    qwen_inputs = image_prompts(config, suffix=(9, 9, 4))
+    # The second sample spreads its embodied action tokens, so the samples hold them at different positions.
+    qwen_inputs["input_ids"][1, -3:] = torch.tensor([9, 4, 9])
+    return qwen_inputs
+
+
+def test_encode_qwen_gathers_the_embodied_tokens_in_order(monkeypatch) -> None:
+    model = _model_with_tiny_qwen(False)
+    qwen_inputs = _embodied_prompts(model.qwen.model.config)
+    hidden = torch.randn(*qwen_inputs["input_ids"].shape, 8)
+    monkeypatch.setattr(model, "_qwen_last_decoder_hidden", lambda qwen_inputs: hidden)
+
+    embodied_tokens, _ = model._encode_qwen([], [], need_action_tokens=False, qwen_inputs=qwen_inputs)
+
+    assert torch.equal(embodied_tokens, hidden[qwen_inputs["input_ids"] == 9].view(2, 2, 8))
+
+
+def test_precompute_grid_thw_matches_stock_qwen_and_exports(monkeypatch) -> None:
     stock, fixed = _model_with_tiny_qwen(False), _model_with_tiny_qwen(True)
-    qwen_inputs = image_prompts(stock.qwen.model.config)
+    qwen_inputs = _embodied_prompts(stock.qwen.model.config)
     with torch.no_grad():
-        expected = stock._qwen_last_decoder_hidden(qwen_inputs)
+        expected = stock._encode_qwen([], [], need_action_tokens=False, qwen_inputs=qwen_inputs)[0]
+
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(fixed.qwen.model.model.visual, "forward", stock_vision_tower)
+    keys = sorted(qwen_inputs)
+
+    class EncodeQwen(nn.Module):
+        def forward(self, *tensors):
+            inputs = dict(zip(keys, tensors, strict=True))
+            return fixed._encode_qwen([], [], need_action_tokens=False, qwen_inputs=inputs)[0]
+
+    with torch.no_grad():
         for _ in range(2):  # The second call reuses the cached grid.
-            torch.testing.assert_close(fixed._qwen_last_decoder_hidden(qwen_inputs), expected, rtol=0, atol=0)
+            assert torch.equal(EncodeQwen()(*(qwen_inputs[key] for key in keys)), expected)
+        program = torch.export.export(EncodeQwen(), tuple(qwen_inputs[key] for key in keys)).module()
+        torch.testing.assert_close(program(*(qwen_inputs[key] for key in keys)), expected)
 
 
 def test_encode_qwen_rejects_a_wrong_embodied_token_count() -> None:

@@ -251,6 +251,58 @@ def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch)
         torch.testing.assert_close(fixed.visual.pos_embed.weight.grad, stock.visual.pos_embed.weight.grad)
 
 
+def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from transformers import Qwen3VLForConditionalGeneration
+    from transformers.feature_extraction_utils import BatchFeature
+
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+
+    torch.manual_seed(0)
+    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
+    monkeypatch.setattr(
+        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
+    )
+    prompts = image_prompts(qwen.config)
+    stock, fixed = (
+        groot_n1_7.Qwen3Backbone(select_layer=2, precompute_grid_thw=precompute).eval()
+        for precompute in (False, True)
+    )
+    positions = []
+
+    def record_positions(module, args, kwargs):
+        positions.append(kwargs["position_ids"])
+
+    for backbone in (stock, fixed):
+        backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
+    with torch.no_grad():
+        expected = stock(BatchFeature(prompts))["backbone_features"]
+    with pytest.raises(ValueError, match="images only"):
+        fixed(BatchFeature({**prompts, "pixel_values_videos": prompts["pixel_values"]}))
+
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(fixed.visual, "forward", stock_vision_tower)
+    keys = sorted(prompts)
+
+    class Backbone(torch.nn.Module):
+        def forward(self, *tensors):
+            return fixed(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
+
+    with torch.no_grad():
+        positions.clear()
+        stock(BatchFeature(prompts))
+        assert torch.equal(Backbone()(*(prompts[key] for key in keys)), expected)
+        # The stock path adds the legacy text row as a fourth row; the cached path must pass the same.
+        assert positions[0].shape[0] == 4
+        assert torch.equal(positions[1], positions[0])
+        program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys)).module()
+        torch.testing.assert_close(program(*(prompts[key] for key in keys)), expected)
+
+
 def _write_raw_n1_7_libero_checkpoint(path):
     path.mkdir()
     (path / "config.json").write_text(

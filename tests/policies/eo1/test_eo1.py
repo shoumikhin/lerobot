@@ -32,9 +32,10 @@ from packaging.version import Version
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy
-from lerobot.policies.eo1.processor_eo1 import make_eo1_pre_post_processors
+from lerobot.policies.eo1.processor_eo1 import EO1QwenProcessorStep, make_eo1_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
+from lerobot.processor.converters import create_transition
 from lerobot.utils.constants import ACTION, OBS_STATE, QUERY_KIND, QUERY_TEXT
 
 HIDDEN_SIZE = 8
@@ -635,6 +636,31 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         assert decoded_tokens.shape == (1, 3)
 
 
+def test_rollout_processor_reports_where_the_action_tokens_start(monkeypatch):
+    class LeftPaddedProcessor(DummyTextProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["processor_kwargs"]["padding_side"] == "left"
+            prompt = [1, STATE_TOKEN_ID, *[ACTION_TOKEN_ID] * CHUNK_SIZE, 2]
+            input_ids = torch.tensor([[0, 0, *prompt], [1, 1, *prompt]])
+            return {
+                "input_ids": input_ids,
+                "attention_mask": input_ids.ne(0).long(),
+                "pixel_values": torch.zeros(2, 3, 2, 2),
+                "image_grid_thw": torch.ones(2, 3, dtype=torch.long),
+                "mm_token_type_ids": torch.zeros_like(input_ids),
+            }
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: LeftPaddedProcessor(),
+    )
+    step = EO1QwenProcessorStep()
+    messages = [[{"role": "user", "content": "clear the table"}]] * 2
+    processed = step(create_transition(complementary_data={"messages": messages}))
+
+    assert processed["complementary_data"]["action_token_start"] == 4
+
+
 @pytest.mark.skipif(
     Version(transformers.__version__) < Version("5.5.4"),
     reason="transformers before 5.5.4 also scales the temporal position of still images",
@@ -662,7 +688,23 @@ def test_precompute_grid_thw_sampling_matches_stock(monkeypatch):
     torch.manual_seed(0)
     expected = policy.predict_action_chunk(batch)
 
+    def stock_vision_tower(*args, **kwargs):
+        raise AssertionError("precompute_grid_thw must not run the stock vision tower")
+
+    monkeypatch.setattr(backbone.model.visual, "forward", stock_vision_tower)
     policy.config.precompute_grid_thw = True
+    batch["action_token_start"] = 10
     for _ in range(2):  # The second call reuses the cached grid.
         torch.manual_seed(0)
-        assert torch.equal(policy.predict_action_chunk({**batch, "action_token_start": 10}), expected)
+        assert torch.equal(policy.predict_action_chunk(batch), expected)
+
+    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    class SampleActions(nn.Module):
+        def forward(self, *tensors):
+            return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
+
+    with torch.no_grad():
+        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys)).module()
+    torch.manual_seed(0)
+    torch.testing.assert_close(program(*(batch[key] for key in keys)), expected)
