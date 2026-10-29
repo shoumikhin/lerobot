@@ -35,7 +35,9 @@ class Forbidden(nn.Module):
 def test_denoise_step_takes_the_time_conditioning(monkeypatch):
     use_tiny_backbone(monkeypatch, modeling_pi05)
     torch.manual_seed(0)
-    config = PI05Config(image_resolution=(28, 28), device="cpu", dtype=torch.float32, chunk_size=4, n_action_steps=4)
+    config = PI05Config(
+        image_resolution=(28, 28), device="cpu", dtype=torch.float32, chunk_size=4, n_action_steps=4
+    )
     model = modeling_pi05.PI05Pytorch(config).eval()
     width = model.paligemma_with_expert.paligemma.config.text_config.hidden_size
     prefix = torch.randn(1, 5, width)
