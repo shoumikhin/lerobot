@@ -27,42 +27,18 @@ from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Event
-
-import torch
+from typing import TYPE_CHECKING
 
 from lerobot.configs import FeatureType, PreTrainedConfig
-from lerobot.datasets import (
-    LeRobotDataset,
-    aggregate_pipeline_dataset_features,
-    create_initial_features,
-)
-from lerobot.inference import (
-    FeatureSpec,
-    InferenceEngine,
-    RemoteInferenceConfig,
-    RTCInferenceConfig,
-    create_inference_engine,
-    supports_rtc_inference,
-    validate_local_chunk_policy,
-)
+from lerobot.inference import FeatureSpec, InferenceEngine, RemoteInferenceConfig, RTCInferenceConfig
 from lerobot.inference.bundle import BundleInferenceEngine
-from lerobot.policies import (
-    PreTrainedPolicy,
-    make_pre_post_processors,
-    validate_trained_rtc_horizon,
-)
-from lerobot.policies.factory import load_pretrained_policy
 from lerobot.processor import (
-    PolicyProcessorPipeline,
     RenderRuntimeMessagesStep,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
-    bind_relative_anchor,
     make_default_processors,
-    rename_stats,
 )
-from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
 from lerobot.robots import Robot, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.constants import OBS_STATE, OBS_STR
@@ -71,6 +47,13 @@ from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_fea
 from .configs import RolloutConfig
 from .planner import PlannerConfig, VlmPlanner, training_vocabulary
 from .robot_wrapper import ThreadSafeRobot
+
+# A bundle runs without PyTorch, so what only a PyTorch policy, a dataset or a remote server needs is
+# imported where it is used.
+if TYPE_CHECKING:
+    from lerobot.datasets import LeRobotDataset
+    from lerobot.policies import PreTrainedPolicy
+    from lerobot.processor import PolicyProcessorPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +69,8 @@ def _wrap_predict_action_chunk_with_torch_compile(
     ``torch.compile`` compiles lazily on the first invocation, so success here
     does not guarantee that backend compilation will succeed during warm-up.
     """
+    import torch
+
     if not hasattr(torch, "compile"):
         logger.warning("torch.compile is not available in this PyTorch build")
         return False
@@ -106,6 +91,8 @@ def _wrap_predict_action_chunk_with_torch_compile(
 
 def _validate_trained_rtc_rollout_config(policy_config, inference_config: RTCInferenceConfig) -> None:
     """Fail fast when rollout cannot retain every trained RTC prefix."""
+    from lerobot.policies import validate_trained_rtc_horizon
+
     rtc = inference_config.rtc
     if not rtc.enabled or rtc.mode != "trained":
         return
@@ -327,6 +314,8 @@ def _aggregate_rollout_features(
     use_videos: bool,
 ) -> dict:
     """Apply the same robot-side feature transformations for local and remote recording."""
+    from lerobot.datasets import aggregate_pipeline_dataset_features, create_initial_features
+
     return combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=processors.teleop_action_processor,
@@ -345,6 +334,8 @@ def _build_rollout_dataset(cfg: RolloutConfig, robot: Robot, dataset_features: d
     """Create the local recording destination independently of policy placement."""
     dataset = None
     if cfg.dataset is not None:
+        from lerobot.datasets import LeRobotDataset
+
         logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
         # Strategy-owned columns join the robot/policy features above the resume/create
         # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
@@ -451,6 +442,11 @@ def build_rollout_context(
         return build_bundle_rollout_context(
             cfg, shutdown_event, teleop_action_processor, robot_action_processor, robot_observation_processor
         )
+    from lerobot.inference import create_inference_engine, supports_rtc_inference, validate_local_chunk_policy
+    from lerobot.policies import make_pre_post_processors
+    from lerobot.policies.factory import load_pretrained_policy
+    from lerobot.processor import bind_relative_anchor, rename_stats
+
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
@@ -738,6 +734,8 @@ def build_remote_rollout_context(
     Failed setup closes acquired resources; successful setup transfers ownership
     to strategy teardown. Recording uses the ordinary local dataset schema.
     """
+    from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
+
     config = cfg.inference
     if not isinstance(config, RemoteInferenceConfig) or cfg.robot is None:
         raise ValueError("Remote rollout requires remote inference and robot configuration")

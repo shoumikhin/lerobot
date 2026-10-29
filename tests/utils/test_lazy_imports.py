@@ -40,6 +40,7 @@ LAZY_MODULES = [
     "lerobot.processor.converters",
     "lerobot.utils",
     pytest.param("lerobot.rollout", marks=NEEDS_DATASETS),
+    pytest.param("lerobot.rollout.strategies", marks=NEEDS_DATASETS),
     "lerobot.inference",
 ]
 

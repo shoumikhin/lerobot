@@ -300,8 +300,8 @@ def test_build_rollout_context_uses_resolved_device(
         )
         return processor, PolicyProcessorPipeline(steps=[])
 
-    monkeypatch.setattr(rollout_context, "load_pretrained_policy", load_policy)
-    monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
+    monkeypatch.setattr("lerobot.policies.factory.load_pretrained_policy", load_policy)
+    monkeypatch.setattr("lerobot.policies.factory.make_pre_post_processors", make_processors)
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
 
     try:
@@ -331,16 +331,17 @@ def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
     )
     robot = MockRobot(cfg.robot)
     failure = RuntimeError("setup failed")
-    monkeypatch.setattr(rollout_context, "load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
+    monkeypatch.setattr("lerobot.policies.factory.load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
     if failure_stage == "observation":
         monkeypatch.setattr(robot, "get_observation", MagicMock(side_effect=failure))
     elif failure_stage == "processors":
-        monkeypatch.setattr(rollout_context, "make_pre_post_processors", MagicMock(side_effect=failure))
+        monkeypatch.setattr(
+            "lerobot.policies.factory.make_pre_post_processors", MagicMock(side_effect=failure)
+        )
     else:
         monkeypatch.setattr(
-            rollout_context,
-            "make_pre_post_processors",
+            "lerobot.policies.factory.make_pre_post_processors",
             lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
         )
 
@@ -348,7 +349,7 @@ def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
             assert robot.is_connected, "the engine is constructed after hardware is connected"
             raise failure
 
-        monkeypatch.setattr(rollout_context, "create_inference_engine", fail_engine)
+        monkeypatch.setattr("lerobot.inference.create_inference_engine", fail_engine)
     with pytest.raises(RuntimeError) as raised:
         rollout_context.build_rollout_context(cfg, threading.Event())
     assert raised.value is failure
