@@ -31,6 +31,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
 from tests.utils import skip_if_package_missing
 
 CAMERA = "observation.images.camera_top"
+WRIST = "observation.images.camera_wrist"
 CHUNK = 4
 
 
@@ -45,15 +46,12 @@ def _slot_kwargs(arm: list, effector: list) -> dict:
     return {"state_slots": _slots(OBS_STATE, arm, effector), "action_slots": _slots(ACTION, arm, effector)}
 
 
-def _ds_meta(dim: int) -> SimpleNamespace:
+def _ds_meta(dim: int, cameras: tuple[str, ...] = (CAMERA,)) -> SimpleNamespace:
     """The dataset metadata make_policy reads: features and stats of a ``dim``-D robot."""
     names = [f"joint_{i}" for i in range(dim - 1)] + ["gripper"]
     vector = {"dtype": "float32", "shape": (dim,), "names": names}
-    features = {
-        OBS_STATE: vector,
-        ACTION: vector,
-        CAMERA: {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]},
-    }
+    image = {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]}
+    features = {OBS_STATE: vector, ACTION: vector, **dict.fromkeys(cameras, image)}
     g = torch.Generator().manual_seed(dim)
     stats = {}
     for key in (OBS_STATE, ACTION):
@@ -62,11 +60,13 @@ def _ds_meta(dim: int) -> SimpleNamespace:
     return SimpleNamespace(features=features, stats=stats)
 
 
-def _raw_batch(dim: int, device: str = "cpu", batch_size: int = 2) -> dict:
+def _raw_batch(
+    dim: int, device: str = "cpu", batch_size: int = 2, cameras: tuple[str, ...] = (CAMERA,)
+) -> dict:
     g = torch.Generator().manual_seed(0)
     batch = {
         OBS_STATE: torch.randn(batch_size, dim, generator=g),
-        CAMERA: torch.rand(batch_size, 3, 32, 32, generator=g),
+        **{camera: torch.rand(batch_size, 3, 32, 32, generator=g) for camera in cameras},
         ACTION: torch.randn(batch_size, CHUNK, dim, generator=g),
     }
     return {**{k: v.to(device) for k, v in batch.items()}, "task": ["pick up the cube"] * batch_size}
@@ -158,6 +158,88 @@ def test_train_and_select_action(tiny_backbone):
     action = _select_action(policy, preprocessor, postprocessor, 7, "cpu")
     assert action.shape == (2, 7)
     assert torch.isfinite(action).all()
+
+
+@pytest.mark.parametrize(
+    ("cameras", "vision_boundaries"),
+    [((CAMERA,), True), ((CAMERA, WRIST), False)],
+    ids=["one-camera", "adjacent-cameras"],
+)
+def test_precompute_grid_thw_prediction_matches_default_and_exports(
+    tiny_backbone, monkeypatch, cameras, vision_boundaries
+):
+    """Prefix positions come from the image grid ints; with the grid cached, prediction exports."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes
+
+    slots = _slot_kwargs(arm=[[0, 6]], effector=[[6, 7]])
+    meta = _ds_meta(7, cameras)
+    settings = {"qwen3vl_use_vision_boundaries": vision_boundaries, **slots}
+    cfg = _tiny_config(tiny_backbone, **settings)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    fixed = make_policy(
+        _tiny_config(tiny_backbone, precompute_grid_thw=True, **settings), ds_meta=meta
+    ).eval()
+    fixed.load_state_dict(policy.state_dict())
+    preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    raw = _raw_batch(7, cameras=cameras)
+    raw.pop(ACTION)
+    batch = preprocessor(raw)
+    noise = torch.randn(2, CHUNK, cfg.max_action_dim)
+
+    core = policy.model.qwenvl_with_expert
+    build_prefix_position_ids, prefixes = core.build_prefix_position_ids, []
+
+    def recorded(input_ids, attention_mask, image_grid_thw, **kwargs):
+        positions = build_prefix_position_ids(input_ids, attention_mask, image_grid_thw, **kwargs)
+        prefixes.append((input_ids, attention_mask, image_grid_thw, positions))
+        return positions
+
+    monkeypatch.setattr(core, "build_prefix_position_ids", recorded)
+    with torch.no_grad():
+        expected = policy.predict_action_chunk(batch, noise=noise)
+    if vision_boundaries:  # Without them, get_rope_index merges adjacent images into one block.
+        input_ids, attention_mask, grid, positions = prefixes[0]
+        stock, _ = core.qwenvl.model.get_rope_index(
+            input_ids=input_ids,
+            mm_token_type_ids=(input_ids == core.qwenvl.config.image_token_id).int(),
+            image_grid_thw=torch.tensor(grid),
+            attention_mask=attention_mask,
+        )
+        assert torch.equal(positions, stock.masked_fill(attention_mask == 0, 1))
+
+    def stock_rope_index(*args, **kwargs):
+        raise AssertionError("prefix positions must not read the image grid on the host")
+
+    monkeypatch.setattr(Qwen3VLModel, "get_rope_index", stock_rope_index)
+    visual = fixed.model.qwenvl_with_expert.qwenvl.model.visual
+    grid_builds = []
+    build_grid = visual.preprcess_grid_thw
+
+    def recorded_build(*args, **kwargs):
+        grid_builds.append(args or kwargs)
+        return build_grid(*args, **kwargs)
+
+    monkeypatch.setattr(visual, "preprcess_grid_thw", recorded_build)
+    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    class PredictActionChunk(torch.nn.Module):
+        def forward(self, noise, *tensors):
+            return fixed.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))}, noise=noise)
+
+    with torch.no_grad():
+        for _ in range(2):  # The second call reuses the cached grid.
+            assert torch.equal(PredictActionChunk()(noise, *(batch[key] for key in keys)), expected)
+        exported = torch.export.export(PredictActionChunk(), (noise, *(batch[key] for key in keys)))
+        torch.testing.assert_close(exported.module()(noise, *(batch[key] for key in keys)), expected)
+    assert len(grid_builds) == 1
+    assert data_dependent_nodes(exported) == []
+
+    core = fixed.model.qwenvl_with_expert
+    core.visual_grid_thw = [[t, h + 2, w] for t, h, w in core.visual_grid_thw]
+    with torch.no_grad(), pytest.raises(ValueError, match="all batches must use the same image sizes"):
+        fixed.predict_action_chunk(batch, noise=noise)
 
 
 def test_align_query_tokens(tiny_backbone, monkeypatch):
