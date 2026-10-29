@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -928,3 +930,48 @@ def test_internvl3_embedder_loads_default_rope_that_matches_dynamic_and_exports(
     assert all(torch.equal(a, b) for a, b in zip(rotary(x, positions), expected, strict=True))
     exported = torch.export.export(rotary, (x, positions)).module()
     assert all(torch.equal(a, b) for a, b in zip(exported(x, positions), expected, strict=True))
+
+
+def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_length_prompt():
+    transformers = pytest.importorskip("transformers")
+
+    class Tokenizer:  # one id per image placeholder, then one per word
+        def __call__(self, prompts, *, max_length, **kwargs):
+            rows = []
+            for prompt in prompts:
+                words = prompt.rsplit("\n", 1)[-1].split()
+                ids = [7] * prompt.count(internvl3_embedder.IMG_CONTEXT_TOKEN) + [3] * len(words)
+                rows.append(ids[:max_length])
+            input_ids = torch.tensor(rows)
+            return transformers.BatchEncoding({"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)})
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(8, 4)
+
+        def forward(self, input_ids, pixel_values, attention_mask, **kwargs):
+            hidden = self.embed(input_ids) * attention_mask[..., None] + pixel_values.mean()
+            return SimpleNamespace(hidden_states=(hidden,))
+
+    embedder = InternVL3Embedder.__new__(InternVL3Embedder)
+    nn.Module.__init__(embedder)
+    embedder.tokenizer, embedder.model = Tokenizer(), VLM()
+    embedder.num_image_token, embedder.img_context_token_id = 2, 7
+
+    class Embed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedder = embedder
+
+        def forward(self, pixel_values, image_masks):
+            batch_size, num_views = image_masks.shape
+            tiles, prompts = [[1] * num_views] * batch_size, ["pick up the cube"] * batch_size
+            return self.embedder._forward_vlm(pixel_values, tiles, image_masks, prompts, True)[0]
+
+    model, pixels, masks = Embed(), torch.rand(2, 3, 8, 8), torch.tensor([[True, False]])
+    embedder.max_text_length = 3  # cuts into the 4 image tokens of the two views
+    with pytest.raises(ValueError, match="cut into the image placeholder tokens"):
+        model(pixels, masks)
+    embedder.max_text_length = 8  # exactly the prompt, so the check runs and passes
+    assert torch.equal(torch.export.export(model, (pixels, masks)).module()(pixels, masks), model(pixels, masks))
