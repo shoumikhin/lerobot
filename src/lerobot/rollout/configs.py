@@ -427,7 +427,8 @@ class RolloutConfig:
                         "and --device."
                     )
                 self.bundle = Bundle.read(policy_path)
-                if self.planner is not None and self.bundle.manifest.task is not None:
+                manifest = self.bundle.manifest
+                if self.planner is not None and manifest.task is not None and manifest.task_tokens is None:
                     raise ValueError(
                         "This bundle runs only the task it was exported for, so a planner cannot change it. "
                         "Drop --planner."

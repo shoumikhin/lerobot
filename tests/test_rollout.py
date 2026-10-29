@@ -361,15 +361,24 @@ class _TwoActions(torch.nn.Module):
         return torch.stack([state, -state])
 
 
-def _bundle_rollout_config(monkeypatch, tmp_path, *args: str, n_motors: int = 3, task=None, **kwargs):
+def _bundle_rollout_config(
+    monkeypatch, tmp_path, *args: str, n_motors: int = 3, task=None, task_tokens=None, **kwargs
+):
+    import json
+    from dataclasses import asdict
+
     import numpy as np
 
+    from lerobot.inference.bundle.manifest import MANIFEST
     from lerobot.rollout import RolloutConfig
     from lerobot.utils.constants import OBS_STATE
     from tests.export.torch_backend import make_bundle
     from tests.mocks.mock_robot import MockRobotConfig
 
     bundle = make_bundle(tmp_path / "bundle", _TwoActions(), {OBS_STATE: np.zeros(3, np.float32)}, task=task)
+    if task_tokens is not None:
+        data = json.loads((bundle.path / MANIFEST).read_text())
+        (bundle.path / MANIFEST).write_text(json.dumps({**data, "task_tokens": asdict(task_tokens)}))
     monkeypatch.setattr(sys, "argv", ["lerobot-rollout", f"--policy.path={bundle.path}", *args])
     robot = MockRobotConfig(n_motors=n_motors, random_values=False, static_values=[0.0] * n_motors)
     return RolloutConfig(robot=robot, **kwargs)
@@ -407,6 +416,17 @@ def test_rollout_config_refuses_a_planner_for_a_fixed_task_bundle(monkeypatch, t
 
     with pytest.raises(ValueError, match="Drop --planner"):
         _bundle_rollout_config(monkeypatch, tmp_path, task="pick", planner=PlannerConfig())
+
+
+def test_rollout_config_takes_a_planner_for_a_bundle_that_runs_any_task(monkeypatch, tmp_path):
+    from lerobot.inference.bundle.manifest import TaskTokensSpec
+    from lerobot.rollout.planner import PlannerConfig
+
+    spec = TaskTokensSpec([], "tokenizer.json", "token_embeddings.safetensors", "known_tasks.json", 8)
+    cfg = _bundle_rollout_config(
+        monkeypatch, tmp_path, task="pick", task_tokens=spec, planner=PlannerConfig()
+    )
+    assert cfg.planner is not None
 
 
 def test_rollout_config_names_a_bundle_on_the_hub(monkeypatch):
