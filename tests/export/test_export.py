@@ -175,6 +175,36 @@ def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
     assert seen == ["pin123", "pin123"]
 
 
+def test_export_computes_the_test_case_without_tf32(checkpoint, tmp_path, monkeypatch):
+    import lerobot.policies.factory as factory
+
+    seen = []
+    load = factory.load_pretrained_policy
+
+    def load_pretrained_policy(config):
+        seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
+        return load(config)
+
+    monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
+    monkeypatch.setattr(sys, "argv", ["worker"])
+    flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
+    try:
+        worker.trace(
+            {
+                "step": "trace",
+                "args": [
+                    "--backend.type=torch_test",
+                    f"--policy.path={checkpoint}",
+                    f"--output_dir={tmp_path / 'b'}",
+                ],
+            }
+        )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags
+    assert seen == [(False, False)]
+
+
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
     run = subprocess.run
     monkeypatch.setattr(

@@ -66,6 +66,10 @@ def trace(request: dict[str, Any]) -> dict[str, Any]:
 
 @parser.wrap()
 def _trace(cfg: ExportConfig) -> dict[str, Any]:
+    # The test case is the policy's float32 arithmetic. TF32, which PyTorch uses for cuDNN convolutions by
+    # default, would move the expected actions of a float32 policy by about 1e-3 of their spread.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     output_dir = cast(Path, cfg.output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
