@@ -84,6 +84,20 @@ if attempts:
         "lerobot.processor",
         "lerobot.utils.action_interpolator",
         pytest.param(
+            "lerobot.datasets.language",
+            marks=[
+                pytest.mark.dataset,
+                pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
+            ],
+        ),
+        pytest.param(
+            "lerobot.datasets",
+            marks=[
+                pytest.mark.dataset,
+                pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
+            ],
+        ),
+        pytest.param(
             "lerobot.scripts.lerobot_rollout",
             marks=[
                 pytest.mark.dataset,
