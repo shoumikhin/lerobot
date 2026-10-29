@@ -271,6 +271,9 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
 needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+needs_executorch_cuda = pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
 
 
 class MaskedPositions(torch.nn.Module):
@@ -321,10 +324,16 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-@needs_executorch
-def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
-    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("executorch_xnnpack", marks=needs_executorch),
+        pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+    ],
+)
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
+    """The bundle check loads the programs, on the CPU or the GPU, and replays the test case, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
     assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
 
 
