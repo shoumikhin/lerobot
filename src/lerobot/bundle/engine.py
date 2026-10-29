@@ -30,9 +30,10 @@ from safetensors.numpy import load_file
 
 from lerobot.utils.constants import ACTION
 
-from .manifest import NOISE, Bundle, BundleManifest
+from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
 from .runtime import prepare_runtime
 from .target import check_runtime_versions, check_target
+from .task_tokens import TaskEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ class BundleEngine:
         bundle (`Bundle`):
             The bundle to run.
         task (`str`, *optional*, defaults to `""`):
-            The task. A bundle exported for one task runs only that task, which is also the default.
+            The task, by default the one the bundle was exported for. A bundle without `task_tokens` runs
+            only that task.
         rename_map (`dict[str, str]`, *optional*):
             Renames the keys of the robot's frame to the names the bundle's programs take.
         stop_event (`threading.Event`, *optional*):
@@ -66,7 +68,13 @@ class BundleEngine:
     ) -> None:
         """Load the bundle's programs and check them against its test case."""
         manifest = bundle.manifest
+        # First, so a bundle made for another machine is refused before a new task starts a tokenizer.
+        check_target(manifest.target)
+        check_runtime_versions(manifest.runtime_versions, manifest.exact_runtime_modules)
         self._fixed_task = manifest.task
+        self._task_encoder = (
+            None if manifest.task_tokens is None else TaskEncoder(bundle.path, manifest.task_tokens)
+        )
         task = task or self._fixed_task or ""
         self._check_task(task)
         self._task = task
@@ -108,9 +116,13 @@ class BundleEngine:
                 f"programs take noise shaped {expected_noise}. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
-        _check_dataflow(manifest, list(self._frame_spec), list(constants), self._host_noise_shape is not None)
-        check_target(manifest.target)
-        check_runtime_versions(manifest.runtime_versions, manifest.exact_runtime_modules)
+        task_values = self._encode(task)
+        _check_dataflow(
+            manifest,
+            [*self._frame_spec, *task_values],
+            list(constants),
+            self._host_noise_shape is not None,
+        )
         runtime = prepare_runtime(
             manifest.runtime, manifest.runtime_imports, manifest.runtime_options, bundle.path
         )
@@ -122,15 +134,13 @@ class BundleEngine:
         }
         self._runs = [(run, programs[run.program]) for run in manifest.runs]
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
-        self._placed = [
-            {
-                index: program.place(index, constants[name])
-                for index, name in enumerate(run.inputs)
-                if name in constants
-            }
-            for run, program in self._runs
-        ]
+        # So do the values of the task, which stays the same for the whole run: first those of the exported
+        # task, which the test case runs.
+        self._placed = self._place({**constants, **self._encode(self._fixed_task or "")})
         self._check(case, noise, expected, manifest.tolerance)
+        if task != (self._fixed_task or ""):
+            for placed, task_placed in zip(self._placed, self._place(task_values), strict=True):
+                placed.update(task_placed)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_frame(self, frame: Mapping[str, np.ndarray]) -> None:
@@ -233,8 +243,28 @@ class BundleEngine:
                 "Export it again on this device."
             )
 
+    def _place(self, values: Mapping[str, np.ndarray]) -> list[dict[int, Any]]:
+        """`values` copied, for each run, where its program reads them."""
+        return [
+            {
+                index: program.place(index, values[name])
+                for index, name in enumerate(run.inputs)
+                if name in values
+            }
+            for run, program in self._runs
+        ]
+
+    def _encode(self, task: str) -> dict[str, np.ndarray]:
+        """The values the programs take for `task`: none for a bundle without task tokens."""
+        if self._task_encoder is None:
+            return {}
+        embeddings, length = self._task_encoder(task)
+        return {TASK_EMBEDDINGS: embeddings, TASK_LENGTH: length}
+
     def _check_task(self, task: str) -> None:
-        if self._fixed_task is not None and task != self._fixed_task:
+        if self._task_encoder is not None:
+            self._task_encoder.ids(task)
+        elif self._fixed_task is not None and task != self._fixed_task:
             raise ValueError(
                 f"This exported policy runs only the task it was exported for, {self._fixed_task!r}, "
                 f"not {task!r}. Export it again for the new task."
@@ -296,13 +326,18 @@ def _check_noise_draw(noise: np.ndarray, shape: list[int] | None) -> None:
 
 
 def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[str], noise: bool) -> None:
-    """Refuse, before any program loads, runs that read a value nothing gives them or write a constant."""
+    """Refuse, before any program loads, runs that read a value nothing gives them or write a value placed once.
+
+    The constants and the values `task_tokens` makes are placed once where each run reads them, so a run that
+    wrote one would not change what a later run reads.
+    """
     if clashes := sorted(set(constants) & {*frame, NOISE}):
         raise ValueError(
             f"The bundle's constants {clashes} have the name of a value the frame, the task or the noise "
             "gives. Export the policy again."
         )
     available = {*frame, *constants, *([NOISE] if noise else [])}
+    tasks = manifest.task_tokens is not None
     for run in manifest.runs:
         if NOISE in run.outputs and (others := sorted(set(run.outputs) - {NOISE})):
             raise ValueError(
@@ -318,6 +353,11 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
         if shadowed := sorted(set(run.outputs) & set(constants)):
             raise ValueError(
                 f"The bundle's run {run.name!r} writes the constants {shadowed}. Export the policy again."
+            )
+        if tasks and (retasked := sorted(set(run.outputs) & {TASK_EMBEDDINGS, TASK_LENGTH})):
+            raise ValueError(
+                f"The bundle's run {run.name!r} writes {retasked}, which the bundle makes from the task "
+                "itself. Export the policy again."
             )
         if missing := [name for name in run.inputs if name not in available]:
             raise ValueError(

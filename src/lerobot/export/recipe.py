@@ -22,6 +22,7 @@ import logging
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -138,6 +139,36 @@ class TestCase:
 
 
 @dataclass
+class TaskTokenData:
+    """How a policy's task becomes the `task_embeddings` and `task_length` its parts take.
+
+    The bundle runs any task this way, without PyTorch: see `lerobot.bundle.manifest.TaskTokens`, which also says
+    what the parts take. The bundle makes both values, so the test case's frame holds neither, and it runs the
+    exported task, which must be one of `known_tasks`.
+
+    Args:
+        prompt_ops (`list[list[str]]`):
+            The ops that make the prompt text from the task, as `TaskTokens.prompt_ops` describes.
+        tokenizer (`Path`):
+            The policy's tokenizer file, in the format of the `tokenizers` library, copied as it is.
+        embeddings (`Tensor`):
+            The token embedding table, `[vocabulary, width]`, in float32 or bfloat16.
+        known_tasks (`dict[str, list[int]]`):
+            The token ids of the prompt of each task known at export, such as the dataset's tasks: what the
+            tokenizer gives the text `prompt_ops` make of the task, with its special tokens, without padding
+            or truncation.
+        max_tokens (`int`):
+            The most tokens the parts take.
+    """
+
+    prompt_ops: list[list[str]]
+    tokenizer: Path
+    embeddings: Tensor
+    known_tasks: dict[str, list[int]]
+    max_tokens: int
+
+
+@dataclass
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
@@ -150,10 +181,14 @@ class RunPlan:
             names.
         constants (`dict[str, np.ndarray]`):
             Named arrays the runs can read, such as each step's timestep.
+        task_tokens (`TaskTokenData`, *optional*):
+            How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
+            reads it.
     """
 
     runs: list[ProgramRun] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
+    task_tokens: TaskTokenData | None = None
 
     def __post_init__(self) -> None:
         """Refuse a run named like the one that draws a bundle's noise on CUDA, or a run of its program."""

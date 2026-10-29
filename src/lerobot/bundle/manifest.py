@@ -31,6 +31,25 @@ CONSTANTS = "constants.safetensors"
 POLICY_CONFIG = "policy_config.json"
 # The test case and the programs name the starting noise of a sampling policy this way.
 NOISE = "noise"
+# The programs of a policy that reads its task take it as these two values (see `TaskTokens`).
+TASK_EMBEDDINGS = "task_embeddings"
+TASK_LENGTH = "task_length"
+# The files of `task_tokens`, as the export writes them.
+TOKENIZER = "tokenizer.json"
+EMBEDDINGS = "token_embeddings.safetensors"
+KNOWN_TASKS = "known_tasks.json"
+# The ops of `TaskTokens.prompt_ops`, each with the number of arguments it takes (`None`: one or more);
+# `lerobot.bundle.task_tokens` implements them.
+PROMPT_OPS: dict[str, int | None] = {
+    "strip": 0,
+    "lower": 0,
+    "replace": 2,
+    "keep": None,
+    "default": 1,
+    "template": 1,
+}
+# The kinds of character `["keep", ...]` names besides one literal character.
+KEEP_KINDS = frozenset({"alnum", "space"})
 
 
 @dataclass
@@ -70,6 +89,40 @@ class ProgramRun:
     program: str
     inputs: list[str]
     outputs: list[str]
+
+
+@dataclass
+class TaskTokens:
+    """How the task becomes the `task_embeddings` and `task_length` values the programs take.
+
+    The task text is cleaned and placed in the prompt by `prompt_ops`, the tokenizer splits it into token
+    ids, with its special tokens and without padding or truncation, and each id picks its row of the
+    embedding table. The programs take `task_embeddings` as float32 `[max_tokens, width]`, with no batch
+    dimension: those rows as the table holds them, so a policy that scales them does so in its programs,
+    then rows of zeros. `task_length`, int64 `[1]`, counts the real rows.
+
+    Args:
+        prompt_ops (`list[list[str]]`):
+            The ops that make the prompt text from the task, in order, each a name and its arguments:
+            `["strip"]`, `["lower"]`, `["replace", old, new]`, `["keep", kind, ...]` (keeps the characters of
+            each kind: `alnum`, `space`, or one literal character), `["default", text]` (for an empty
+            task), and `["template", "... {task} ..."]`.
+        tokenizer (`str`):
+            The tokenizer file, in the format of the `tokenizers` library.
+        embeddings (`str`):
+            A safetensors file holding one tensor, the token embedding table, in float32 or bfloat16.
+        known_tasks (`str`):
+            A JSON file mapping each task known at export to its token ids, so those tasks never load the
+            tokenizer.
+        max_tokens (`int`):
+            The most tokens the programs take.
+    """
+
+    prompt_ops: list[list[str]]
+    tokenizer: str
+    embeddings: str
+    known_tasks: str
+    max_tokens: int
 
 
 @dataclass
@@ -115,6 +168,9 @@ class BundleManifest:
             The runs of the programs, in order.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
+        task_tokens (`TaskTokens`, *optional*):
+            How the task becomes the programs' `task_embeddings` and `task_length`. A bundle with it can run
+            any task; one without it runs only `task`.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
@@ -148,6 +204,7 @@ class BundleManifest:
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
     constants: str | None = None
+    task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
     task: str | None = None
     action_names: list[str] | None = None
@@ -192,6 +249,8 @@ class BundleManifest:
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
         target = data.get("target")
+        task_tokens = data.get("task_tokens")
+        prompt_ops = (task_tokens or {}).get("prompt_ops", [])
         # A key added later can change how the programs run, so a reader that does not know it stops.
         unknown = (
             sorted(set(data) - {f.name for f in fields(cls)})
@@ -200,6 +259,12 @@ class BundleManifest:
             )
             + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
             + sorted(set(target or {}) - {f.name for f in fields(Target)})
+            + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokens)})
+            + sorted({op[0] for op in prompt_ops} - PROMPT_OPS.keys())
+            + sorted(
+                {kind for name, *kinds in prompt_ops if name == "keep" for kind in kinds if len(kind) != 1}
+                - KEEP_KINDS
+            )
         )
         if unknown:
             raise ValueError(
@@ -211,6 +276,7 @@ class BundleManifest:
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
                 "target": None if target is None else Target(**target),
+                "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
             }
         )
 
@@ -247,6 +313,8 @@ def _check_form(data: dict[str, Any]) -> None:
     It runs before the check for unknown keys, which would read a name given in place of an object as the
     unknown keys of its letters.
     """
+    task_tokens = data.get("task_tokens")
+    prompt_ops = task_tokens.get("prompt_ops", []) if isinstance(task_tokens, dict) else []
     form = {
         "programs": _map_of(data.get("programs") or {}, dict),
         "runs": _list_of(data.get("runs") or [], dict),
@@ -256,6 +324,14 @@ def _check_form(data: dict[str, Any]) -> None:
         "runtime_versions": _map_of(data.get("runtime_versions", {}), str),
         "exact_runtime_modules": _list_of(data.get("exact_runtime_modules", []), str),
         "target": data.get("target") is None or _map_of(data["target"], str),
+        "task_tokens": task_tokens is None
+        or (
+            isinstance(task_tokens, dict)
+            and _list_of(prompt_ops, list)
+            and all(op and _list_of(op, str) and _takes_its_arguments(op) for op in prompt_ops)
+            and type(task_tokens.get("max_tokens")) is int
+            and task_tokens["max_tokens"] > 0
+        ),
     }
     if wrong := [name for name, right in form.items() if not right]:
         raise ValueError(
@@ -267,6 +343,15 @@ def _check_form(data: dict[str, Any]) -> None:
         if f.default is MISSING and f.default_factory is MISSING and f.name not in data
     ]:
         raise ValueError(f"The bundle's manifest lacks {missing}. Export the policy again.")
+
+
+def _takes_its_arguments(op: list[str]) -> bool:
+    """Whether a prompt op has as many arguments as it takes; an op LeRobot does not know is refused later."""
+    name, *args = op
+    if name not in PROMPT_OPS:
+        return True
+    count = PROMPT_OPS[name]
+    return len(args) > 0 if count is None else len(args) == count
 
 
 def _list_of(value: Any, kind: type) -> bool:
