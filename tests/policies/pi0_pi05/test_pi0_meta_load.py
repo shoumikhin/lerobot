@@ -26,7 +26,7 @@ pytest.importorskip("transformers")
 import transformers.utils  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.policies.common.openpi_checkpoint import _parameters_on_meta  # noqa: E402
+from lerobot.policies.common.meta_load import parameters_on_meta  # noqa: E402
 from lerobot.policies.pi0 import PI0Config, PI0Policy, modeling_pi0  # noqa: E402
 from lerobot.utils import import_utils  # noqa: E402
 from tests.policies.pi0_pi05.utils.meta_load import (  # noqa: E402
@@ -158,7 +158,7 @@ def test_model_the_loader_cannot_fill_loads_the_regular_way(config, tmp_path, mo
 def test_meta_build_draws_no_random_numbers(config):
     # Falling back builds the model again, so it must see the same random state as without the fast path.
     state = torch.random.get_rng_state()
-    with _parameters_on_meta():
+    with parameters_on_meta():
         PI0Policy(config)
     assert torch.equal(torch.random.get_rng_state(), state)
 
