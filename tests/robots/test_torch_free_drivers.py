@@ -26,9 +26,12 @@ pytest.importorskip("rustypot", reason="rustypot is required (install lerobot[se
 pytestmark = pytest.mark.hardware
 
 
-def test_drivers_and_loop_helpers_load_without_torch():
+def test_drivers_and_loop_helpers_load_without_torch(tmp_path):
     assert_runs_without_torch(
         """
+        import sys
+        from pathlib import Path
+
         import lerobot.cameras.opencv
         import lerobot.robots.bi_openarm_follower.bi_openarm_follower
         import lerobot.robots.bi_rebot_b601_follower.bi_rebot_b601_follower
@@ -62,7 +65,12 @@ def test_drivers_and_loop_helpers_load_without_torch():
         from lerobot.utils.action_interpolator import ActionInterpolator
         from lerobot.utils.cycle_timer import CycleTimer
         from lerobot.utils.process import ProcessSignalHandler
+        from lerobot.utils.robot_utils import policy_features, return_to_position
 
-        make_robot_from_config(SO101FollowerConfig(port="/dev/null"))
-        """
+        # Not the user's calibration files, which this test does not check.
+        config = SO101FollowerConfig(port="/dev/null", calibration_dir=Path(sys.argv[1]))
+        robot = make_robot_from_config(config)
+        policy_features(robot, None)
+        """,
+        str(tmp_path),
     )
