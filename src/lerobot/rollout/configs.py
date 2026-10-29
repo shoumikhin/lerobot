@@ -469,6 +469,8 @@ class RolloutConfig:
         # device string instead of inconsistent fallbacks.
         if remote or self.bundle is not None:
             return
+        from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
+
         if self.device is None or not is_torch_device_available(self.device):
             resolved = self.policy.device
             if resolved:
