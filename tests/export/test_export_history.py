@@ -95,6 +95,39 @@ def vqbet_checkpoint(path) -> None:
     _save(config, stats, path)
 
 
+def diffusion_checkpoint(path, **sampler) -> None:
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+    config = DiffusionConfig(
+        input_features={
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        n_obs_steps=3,
+        horizon=8,
+        n_action_steps=4,
+        drop_n_last_frames=2,
+        crop_shape=(28, 28),
+        pretrained_backbone_weights=None,
+        use_group_norm=True,
+        spatial_softmax_num_keypoints=8,
+        down_dims=(16, 32),
+        kernel_size=3,
+        n_groups=4,
+        diffusion_step_embed_dim=16,
+        num_train_timesteps=10,
+        device="cpu",
+        **sampler,
+    )
+    stats = {
+        IMAGE: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
+        OBS_STATE: _min_max(2),
+        ACTION: _min_max(2),
+    }
+    _save(config, stats, path)
+
+
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
     get_policy_class(config.type)(config).save_pretrained(path)
@@ -102,10 +135,23 @@ def _save(config, stats, path) -> None:
         processor.save_pretrained(path)
 
 
-CHECKPOINTS = {"vqbet": vqbet_checkpoint}
+CHECKPOINTS = {
+    "vqbet": vqbet_checkpoint,
+    "diffusion": diffusion_checkpoint,
+    "diffusion_ddim": lambda path: diffusion_checkpoint(
+        path, noise_scheduler_type="DDIM", prediction_type="sample", num_inference_steps=5
+    ),
+}
 
 
-@pytest.fixture(scope="module", params=list(CHECKPOINTS))
+# Diffusion Policy and Multi-Task DiT sample with the schedulers of diffusers, an optional package.
+DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="diffusers not installed")
+MARKS = {"diffusion": [DIFFUSERS], "diffusion_ddim": [DIFFUSERS]}
+
+
+@pytest.fixture(
+    scope="module", params=[pytest.param(name, marks=MARKS.get(name, [])) for name in CHECKPOINTS]
+)
 def checkpoint(request, tmp_path_factory):
     path = tmp_path_factory.mktemp(request.param)
     CHECKPOINTS[request.param](path)
@@ -152,6 +198,47 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(checkpoint, tmp_pa
     assert bundle.manifest.history == {IMAGE: steps, OBS_STATE: steps}
     # A compiled backend sums in another order than PyTorch, so a few float32 ulps of drift are expected.
     assert max(play(checkpoint, bundle, monkeypatch)) < 1e-5
+
+
+@DIFFUSERS
+def test_diffusion_runs_its_denoising_step_once_per_timestep(tmp_path):
+    diffusion_checkpoint(tmp_path / "ckpt")
+    export(
+        ["--backend.type=torch_test", f"--policy.path={tmp_path / 'ckpt'}", f"--output_dir={tmp_path / 'b'}"]
+    )
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert [run.program for run in manifest.runs] == ["encoder", *["step"] * 10, "actions"]
+    assert manifest.runs[1].inputs == [
+        "x_0",
+        "conditioning",
+        "timestep_0",
+        "coefficients_0",
+        "noise",
+        "noise_index_0",
+    ]
+    assert manifest.runs[-2].outputs == ["x_10"] and manifest.runs[-1].inputs == ["x_10"]
+    # The starting sample, then the noise DDPM adds at each timestep but the last.
+    assert manifest.noise_shape == [10, 1, 8, 2]
+
+
+@DIFFUSERS
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ({"variance_type": "fixed_large"}, "fixed_small"),
+        ({"thresholding": True}, "thresholding True"),
+        ({"prediction_type": "v_prediction"}, "'v_prediction'"),
+    ],
+)
+def test_a_schedule_the_step_cannot_compute_is_refused(change, error):
+    from diffusers import DDPMScheduler
+
+    from lerobot.policies.common.export_denoising import scheduler_schedule
+
+    scheduler = DDPMScheduler(num_train_timesteps=10, **change)
+    scheduler.set_timesteps(10)
+    with pytest.raises(ValueError, match=error):
+        scheduler_schedule(scheduler)
 
 
 # In normalized action units: how far a chain of parts drifted from its policy on a Jetson Thor GPU, and ten
