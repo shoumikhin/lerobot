@@ -25,7 +25,8 @@ from safetensors.numpy import load_file, save_file as save_numpy
 from safetensors.torch import save_file
 from torch import Tensor, nn
 
-from lerobot.inference.bundle import Bundle, BundleInferenceEngine, task_tokens as task_tokens_module
+from lerobot.bundle import task_tokens as task_tokens_module
+from lerobot.inference.bundle import Bundle, BundleInferenceEngine
 from lerobot.bundle.manifest import (
     EMBEDDINGS_FILE,
     KNOWN_TASKS,
