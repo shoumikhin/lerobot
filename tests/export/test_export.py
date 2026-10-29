@@ -14,6 +14,7 @@
 
 """`lerobot-export` and the bundle it writes, end to end on a tiny ACT, with the test backend."""
 
+import platform
 import subprocess
 import sys
 
@@ -193,6 +194,17 @@ BACKENDS = [
     pytest.param(
         "executorch_xnnpack",
         marks=pytest.mark.skipif(not is_package_available("executorch"), reason="executorch not installed"),
+    ),
+    pytest.param(
+        "executorch_mlx",
+        marks=pytest.mark.skipif(
+            not (
+                sys.platform == "darwin"
+                and platform.machine() == "arm64"
+                and is_package_available("executorch")
+            ),
+            reason="needs ExecuTorch on an Apple Silicon Mac",
+        ),
     ),
 ]
 
