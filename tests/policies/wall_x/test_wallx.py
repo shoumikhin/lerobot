@@ -176,7 +176,7 @@ def _make_unloaded_policy(**config_values):
     return policy
 
 
-def _tiny_diffusion_model() -> Qwen2_5_VLMoEForAction:
+def _tiny_diffusion_model(bfloat16: bool = True) -> Qwen2_5_VLMoEForAction:
     def expert(size):
         return {"hidden_size": size, "intermediate_size": 2 * size, "hidden_act": "silu"}
 
@@ -218,8 +218,33 @@ def _tiny_diffusion_model() -> Qwen2_5_VLMoEForAction:
     processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=token_ids.__getitem__))
     torch.manual_seed(0)
     model = Qwen2_5_VLMoEForAction(config, processor=processor, vision_attn_implementation="sdpa").eval()
-    model.to_bfloat16_for_selected_params()
+    if bfloat16:
+        model.to_bfloat16_for_selected_params()
     return model
+
+
+def _diffusion_batch(horizon: int) -> dict[str, torch.Tensor]:
+    # The second prompt is left padded, which WALL-X positions differently from text.
+    prompt = [41, 40, 40, 42, 7, 32, *[31] * horizon, 2]
+    input_ids = torch.tensor([[4, *prompt], [0, *prompt]])
+    return {
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "moe_token_types": input_ids.eq(31),
+        "pixel_values": torch.randn(16, 3 * 2 * 2 * 2),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+        "dof_mask": torch.ones(2, horizon, 3),
+        "proprioception": torch.randn(2, 4),
+        "agent_pos_mask": torch.ones(2, 4),
+    }
+
+
+def test_diffusion_prediction_runs_with_float32_weights():
+    model = _tiny_diffusion_model(bfloat16=False)
+    settings = {"predict_mode": "diffusion", "pred_horizon": 3, "action_dim": 3, "num_inference_timesteps": 2}
+    actions = model.predict(**_diffusion_batch(3), **settings)["predict_action"]
+    assert actions.shape == (2, 3, 3)
+    assert actions.isfinite().all()
 
 
 def test_precompute_grid_thw_requires_sdpa_vision_attention():
@@ -231,19 +256,8 @@ def test_precompute_grid_thw_requires_sdpa_vision_attention():
 def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
     model = _tiny_diffusion_model()
     horizon = 3
-    # The second prompt is left padded, which WALL-X positions differently from text.
-    prompt = [41, 40, 40, 42, 7, 32, *[31] * horizon, 2]
-    input_ids = torch.tensor([[4, *prompt], [0, *prompt]])
-    batch = {
-        "input_ids": input_ids,
-        "attention_mask": input_ids.ne(0).long(),
-        "moe_token_types": input_ids.eq(31),
-        "pixel_values": torch.randn(16, 3 * 2 * 2 * 2),
-        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
-        "dof_mask": torch.ones(2, horizon, 3),
-        "proprioception": torch.randn(2, 4),
-        "agent_pos_mask": torch.ones(2, 4),
-    }
+    batch = _diffusion_batch(horizon)
+    input_ids = batch["input_ids"]
     settings = {
         "predict_mode": "diffusion",
         "pred_horizon": horizon,
