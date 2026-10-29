@@ -22,6 +22,7 @@ import pytest
 import torch
 from torch import Tensor
 
+import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export.recipe import ActionChunkRecipe, frame_shapes, robot_features
@@ -157,6 +158,25 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
         f"{IMAGE}_hwc": PolicyFeature(type=FeatureType.VISUAL, shape=(24, 32, 3)),
     }
     assert frame_shapes(features) == {IMAGE: (24, 32, 3), f"{IMAGE}_hwc": (24, 32, 3)}
+
+
+def too_big_to_compare(tmp_path, monkeypatch):
+    """A checkpoint on a machine with less memory than twice its weights."""
+    model_file = tmp_path / "model.safetensors"
+    model_file.write_bytes(bytes(1024))
+    monkeypatch.setattr(recipe_module.os, "sysconf", lambda name: 1)
+    return model_file
+
+
+def test_a_policy_too_big_to_compare_is_refused(tmp_path, monkeypatch):
+    model_file = too_big_to_compare(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="--skip_policy_check=true"):
+        recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=False)
+
+
+def test_skip_policy_check_exports_a_policy_too_big_to_compare(tmp_path, monkeypatch):
+    model_file = too_big_to_compare(tmp_path, monkeypatch)
+    assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=True)
 
 
 def test_a_policy_without_an_export_module_gets_the_one_program_recipe():
