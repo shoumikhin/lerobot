@@ -55,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 def compile_bundle(cfg: ExportConfig, folder: Path) -> None:
     """Compile the recipe's parts into `folder` and write the rest of the bundle there."""
+    import torch
+
     from lerobot.export.bundle import write_bundle
     from lerobot.export.recipe import ProgramCall, recipe_class
     from lerobot.inference.bundle import BundleManifest, ProgramSpec
@@ -66,10 +68,12 @@ def compile_bundle(cfg: ExportConfig, folder: Path) -> None:
     for part in recipe.parts():
         file = f"{part.name}{cfg.backend.file_suffix}"
         logger.info("Compiling %s with %s", part.name, cfg.backend.type)
-        data = cfg.backend.compile(part, folder / file)
+        with torch.no_grad():
+            program = torch.export.export(part.module, part.example_inputs)
+        data = cfg.backend.compile(program, folder / file)
         files[part.name] = (file, None if data is None else data.name)
         own_names.append(ProgramCall(part.name, part.input_names, part.output_names))
-        del part
+        del part, program
     plan = recipe.plan()
     calls = own_names if plan.calls is None else plan.calls
     repeats = Counter(call.part for call in calls)
