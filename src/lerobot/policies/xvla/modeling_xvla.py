@@ -44,9 +44,11 @@ from .soft_transformer import SoftPromptedTransformer
 # Florence2 config and modeling depend on transformers
 if TYPE_CHECKING or _transformers_available:
     from transformers import Florence2Config, Florence2Model
+    from transformers.utils import torch_compilable_check
 else:
     Florence2Config = None
     Florence2Model = None
+    torch_compilable_check = None
 
 
 class XVLAModel(nn.Module):
@@ -158,30 +160,34 @@ class XVLAModel(nn.Module):
         input_ids: torch.LongTensor,
         pixel_values: torch.FloatTensor,
         image_mask: torch.Tensor,
+        num_valid_views: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Encode text and multi-view images via Florence2 encoder.
+
+        The first ``num_valid_views`` views of every sample are valid and the rest are padding, as
+        ``image_mask`` marks them (default: all views). The count is an int, not read from the mask,
+        so the vision batch has a fixed size under torch.export and fixed-shape backends.
         """
         batch_size, num_views = pixel_values.shape[:2]
-        flat_mask = image_mask.view(-1).to(dtype=torch.bool)
-        flat_images = pixel_values.flatten(0, 1)
-        if torch.compiler.is_compiling():
-            # Selecting the valid views gives a batch size that tracing cannot know, so zero padding views.
-            image_features = self.vlm.get_image_features(flat_images).pooler_output
-            image_features = image_features.masked_fill(~flat_mask[:, None, None], 0)
-            tokens_per_view, hidden_dim = image_features.shape[1:]
-        else:
-            num_valid = int(flat_mask.sum().item())
-            if num_valid == 0:
-                raise ValueError("At least one image view must be valid per batch.")
+        if num_valid_views is None:
+            num_valid_views = num_views
+        if num_valid_views < 1:
+            raise ValueError("At least one image view must be valid per batch.")
+        expected_mask = torch.arange(num_views, device=image_mask.device) < num_valid_views
+        torch_compilable_check(
+            (image_mask.to(dtype=torch.bool) == expected_mask).all(),
+            f"image_mask must mark the first {num_valid_views} views of every sample as valid, "
+            "the rest as padding.",
+        )
+        valid_images = pixel_values[:, :num_valid_views].flatten(0, 1)
+        valid_feats = self.vlm.get_image_features(valid_images).pooler_output
+        tokens_per_view, hidden_dim = valid_feats.shape[1:]
 
-            valid_images = flat_images[flat_mask]
-            valid_feats = self.vlm.get_image_features(valid_images).pooler_output
-            tokens_per_view, hidden_dim = valid_feats.shape[1:]
-
-            image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
-            image_features[flat_mask] = valid_feats
-        image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
+        valid_feats = valid_feats.view(batch_size, num_valid_views, tokens_per_view, hidden_dim)
+        num_padding = num_views - num_valid_views
+        padding = valid_feats.new_zeros((batch_size, num_padding, tokens_per_view, hidden_dim))
+        image_features = torch.cat([valid_feats, padding], dim=1)
         inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
 
         # XVLA prepends the primary view's image tokens to the text embeddings and attends to everything.
@@ -204,6 +210,7 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,
+        num_valid_views: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for the XVLA model.
@@ -213,7 +220,7 @@ class XVLAModel(nn.Module):
         proprio = proprio.to(dtype=target_dtype)
         action = action.to(dtype=target_dtype)
 
-        enc = self.forward_vlm(input_ids, image_input, image_mask)
+        enc = self.forward_vlm(input_ids, image_input, image_mask, num_valid_views)
 
         batch_size = input_ids.shape[0]
         t = (
@@ -244,6 +251,7 @@ class XVLAModel(nn.Module):
         steps: int,
         *,
         noise: torch.Tensor | None = None,
+        num_valid_views: int | None = None,
     ) -> torch.Tensor:
         self.eval()
 
@@ -251,7 +259,7 @@ class XVLAModel(nn.Module):
         image_input = image_input.to(dtype=target_dtype)
         proprio = proprio.to(dtype=target_dtype)
 
-        enc = self.forward_vlm(input_ids, image_input, image_mask)
+        enc = self.forward_vlm(input_ids, image_input, image_mask, num_valid_views)
 
         batch_size = input_ids.shape[0]
         action_dim = self.dim_action
@@ -432,6 +440,7 @@ class XVLAPolicy(PreTrainedPolicy):
             "image_mask": image_mask,
             "domain_id": domain_id,
             "proprio": proprio,
+            "num_valid_views": sum(key in batch for key in self.config.image_features),
         }
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
