@@ -18,7 +18,6 @@
 from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
 from torch import Tensor
@@ -147,7 +146,6 @@ def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
             IMAGE: {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]},
             OBS_STATE: {"dtype": "float32", "shape": (3,), "names": None},
         },
-        tasks=pd.DataFrame(index=["pick"]),
     )
     recipe = object.__new__(ActionChunkRecipe)
     recipe.policy = SimpleNamespace(config=config)
