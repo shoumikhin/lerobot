@@ -139,6 +139,22 @@ def test_export_writes_nothing_over_tolerance(checkpoint, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+# Robot units of the test checkpoint's actions, whose spread is 30: float32's measured drift between eager
+# PyTorch and correct compilers (8.3e-6 normalized), and ten times that.
+@pytest.mark.parametrize(("offset", "passes"), [(2.5e-4, True), (2.5e-3, False)])
+def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset, passes):
+    args = (
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'bundle'}",
+        f"--backend.offset={offset}",
+    )
+    if passes:
+        run_export(*args)
+    else:
+        with pytest.raises(RuntimeError, match="failed its check"):
+            run_export(*args)
+
+
 @pytest.mark.parametrize("tolerance", ["nan", "inf", "-1"])
 def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, tolerance, capfd):
     with pytest.raises(RuntimeError, match="trace step failed"):

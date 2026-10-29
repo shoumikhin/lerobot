@@ -45,12 +45,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# In the policy's normalized action units (robot units divided by each action's spread in the training data).
-# A compiler that reorders bfloat16 math moved SmolVLA's actions by up to 0.05 of that spread, while another
-# starting noise moved them by 0.6 or more. Float32 policies stayed within 0.002 (TensorRT) and 0.014
-# (OpenVINO, which runs in bfloat16 on some CPUs).
-FLOAT32_TOLERANCE = 0.05
-BFLOAT16_TOLERANCE = 0.25
+# In the policy's normalized action units (robot units divided by each action's spread in the training data),
+# about twice the largest test case difference measured with correct compilers. Float32 bundles of ACT and
+# pi0 stayed within 8.3e-6 of eager PyTorch on every frame tried, about what eager on a CPU and on a GPU
+# differ by. Bfloat16 keeps 3 significant digits: GR00T and SmolVLA bundles differed from their test case by
+# up to 0.036, and eager PyTorch with another attention kernel moves their actions by up to 0.05.
+FLOAT32_TOLERANCE = 2e-5
+BFLOAT16_TOLERANCE = 0.075
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
