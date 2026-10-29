@@ -233,6 +233,60 @@ def test_engine_runs_a_program_several_times_with_constants(tmp_path, monkeypatc
     np.testing.assert_array_equal(engine.get_action({OBS_STATE: np.ones(3, np.float32)}), [1, 1, 1])
 
 
+def test_engine_places_the_constants_once_at_load(tmp_path, monkeypatch):
+    from tests.export import torch_backend
+
+    placed = []
+    place = torch_backend.TorchProgram.place
+    monkeypatch.setattr(
+        torch_backend.TorchProgram,
+        "place",
+        lambda self, index, value: placed.append(value.tolist()) or place(self, index, value),
+    )
+    engine = BundleEngine(_repeat_bundle(tmp_path, ("scaled", "factor_1")))
+    for _ in range(3):
+        engine.reset()
+        engine.get_action({OBS_STATE: np.ones(3, np.float32)})
+    # The two factors once at load; the rest is the state, once for the load check and once per chunk.
+    assert placed[:2] == [[2.0], [0.5]] and len(placed) == 2 + 1 + 3
+
+
+def test_engine_places_a_frame_value_once_per_chunk(tmp_path, monkeypatch):
+    """Two runs read the state; the engine copies it once per chunk."""
+    from tests.export import torch_backend
+
+    bundle = _repeat_bundle(tmp_path)
+    torch.export.save(
+        torch.export.export(Scale(), (torch.ones(3, 3), torch.ones(3))), bundle.path / "scale_state.pt2"
+    )
+    runs = [
+        {"name": "model", "program": "model", "inputs": [OBS_STATE], "outputs": ["chunk"]},
+        {"name": "scale", "program": "scale", "inputs": ["chunk", "factor_0"], "outputs": ["scaled"]},
+        {"name": "by_state", "program": "by_state", "inputs": ["scaled", OBS_STATE], "outputs": [ACTION]},
+    ]
+    programs = {
+        "model": {"file": "model.pt2", "data": None},
+        "scale": {"file": "scale.pt2", "data": None},
+        "by_state": {"file": "scale_state.pt2", "data": None},
+    }
+    _edit(bundle, programs=programs, runs=runs)
+    state = FRAME[OBS_STATE]
+    _edit_test_case(bundle, **{ACTION: 2 * np.outer([1.0, 2.0, 3.0], state) * state})
+    placed = []
+    place = torch_backend.TorchProgram.place
+    monkeypatch.setattr(
+        torch_backend.TorchProgram,
+        "place",
+        lambda self, index, value: placed.append(value.shape) or place(self, index, value),
+    )
+    engine = BundleEngine(Bundle.read(bundle.path))
+    for _ in range(2):
+        engine.reset()
+        engine.get_action(dict(FRAME))
+    # The one constant a run reads, at load; then the state once for the load check and once per chunk.
+    assert placed == [(1,), (3,), (3,), (3,)]
+
+
 def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):
     with pytest.raises(ValueError, match=r"'scale_1' reads \['chunk_factor'\]"):
         BundleEngine(_repeat_bundle(tmp_path))
