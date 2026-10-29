@@ -101,8 +101,11 @@ class EO1PrepareModelMessagesStep(ComplementaryDataProcessorStep):
 
         # LeRobot visual observations reach in processor as float32 tensors in [0, 1].
         # Convert to uint8 in [0, 255] to meet the input requirement of Qwen2.5-VL-3B-Instruct.
+        # Its default (slow) image processor reads pixels with NumPy, so the images go to the CPU even when
+        # the observation is already on the policy device (as in lerobot-rollout and lerobot-train).
         images = {
-            key: observation[key].clamp(0, 1).mul(255.0).round().to(torch.uint8) for key in self._image_keys
+            key: observation[key].clamp(0, 1).mul(255.0).round().to(device="cpu", dtype=torch.uint8)
+            for key in self._image_keys
         }
         recipe_messages = complementary_data.pop("messages_rendered", None)
         recipe_streams = complementary_data.get("message_streams")

@@ -462,6 +462,35 @@ def test_model_messages_use_recipe_system_prompt_and_only_fall_back_for_action_i
         ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_model_messages_build_images_on_cpu_for_gpu_observations():
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep
+    from lerobot.processor.converters import create_transition
+
+    config = make_eo1_config()
+    image = torch.rand(1, 3, 8, 8)
+
+    def message_images(device):
+        transition = create_transition(
+            observation={
+                OBS_STATE: torch.zeros(1, STATE_DIM, device=device),
+                "observation.images.image": image.to(device),
+            },
+            complementary_data={"task": ["tidy"]},
+        )
+        transition = RenderRuntimeMessagesStep(config.recipe)(transition)
+        output = EO1PrepareModelMessagesStep(config.input_features, CHUNK_SIZE)(transition)
+        messages = output[TransitionKey.COMPLEMENTARY_DATA]["messages"][0]
+        return [block["image"] for message in messages for block in message["content"] if "image" in block]
+
+    cpu_images, gpu_images = message_images("cpu"), message_images("cuda")
+    assert len(gpu_images) == len(cpu_images) == 1
+    for cpu_image, gpu_image in zip(cpu_images, gpu_images, strict=True):
+        assert gpu_image.device.type == "cpu"
+        assert torch.equal(gpu_image, cpu_image)
+
+
 def test_saved_message_processor_registry_name_still_loads():
     from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep
     from lerobot.processor import PolicyProcessorPipeline
