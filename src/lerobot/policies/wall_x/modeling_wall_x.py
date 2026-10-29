@@ -1126,8 +1126,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             noise (torch.Tensor, optional): Starting sample for diffusion mode, shape
                 (batch_size, pred_horizon, action_dim). Drawn from a standard normal when None.
             vision_grid (Qwen2_5VisionGrid, optional): The prepared cache of ``image_grid_thw`` (see
-                ``FixedImageGrid.track``), passed under ``torch.export``: the vision tower then runs from it, with
-                SDPA attention, without reading ``image_grid_thw`` on the host
+                ``FixedImageGrid.track``), passed under ``torch.export``: the vision tower then runs from it,
+                without reading ``image_grid_thw`` on the host
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -2047,7 +2047,10 @@ class WallXPolicy(PreTrainedPolicy):
             )
             if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
                 vision_grid.check_visible_images(
-                    batch["input_ids"], batch["attention_mask"], self.model.config.image_token_id
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    self.model.config.image_token_id,
+                    self.model.config.vision_start_token_id,
                 )
             if vision_grid is not None and is_exporting():
                 batch.update(self._static_grid_inputs(batch, vision_grid))

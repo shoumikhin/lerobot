@@ -150,16 +150,31 @@ class FixedImageGrid:
             "The image grid differs from the one prepared for torch.export.",
         )
 
-    def check_visible_images(self, input_ids: Tensor, attention_mask: Tensor, image_token_id: int) -> None:
-        """Refuse image tokens hidden by `attention_mask` when the images differ in size.
+    def check_visible_images(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        image_token_id: int,
+        vision_start_token_id: int | None = None,
+    ) -> None:
+        """Refuse image layouts whose eager rope positions differ from `qwen_image_rope_index`.
 
         Eager rope positions (transformers' `get_rope_index` and the policies' own versions) give the grids to
-        the visible images only, in order, so a hidden image moves the next one onto its grid, while
-        `qwen_image_rope_index` keeps every image on its own grid. With one image size both agree.
+        the visible images only, in order, while `qwen_image_rope_index` keeps every image on its own grid. So
+        when the images differ in size, every image token must be visible. Policies whose eager positions count
+        images by their visible `vision_start_token_id` pass it: every vision start and image token must then
+        be visible, whatever the sizes.
         """
-        if len({tuple(thw) for thw in self.grid_thw}) > 1:
+        visible = attention_mask.bool()
+        if vision_start_token_id is not None:
             check_input(
-                attention_mask.bool() | (input_ids != image_token_id),
+                visible | ((input_ids != image_token_id) & (input_ids != vision_start_token_id)),
+                "Vision start and image tokens must all be visible in the attention mask to run on a fixed image "
+                "grid: eager rope positions count the images by their visible start tokens.",
+            )
+        elif len({tuple(thw) for thw in self.grid_thw}) > 1:
+            check_input(
+                visible | (input_ids != image_token_id),
                 "Images of different sizes must all be visible in the attention mask to run on a fixed image "
                 "grid: eager rope positions give a hidden image's grid to the next visible image.",
             )

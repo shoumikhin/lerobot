@@ -954,7 +954,7 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
         policy.predict_action_chunk(malformed, noise=noise.clone())
 
 
-def test_export_refuses_a_hidden_image_of_another_size():
+def test_export_refuses_hidden_vision_tokens():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
     torch.manual_seed(19)
     policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
@@ -972,11 +972,18 @@ def test_export_refuses_a_hidden_image_of_another_size():
     }
     hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
     hidden["attention_mask"][1, 3:7] = False
+    # Wall-OSS's eager positions count images by their visible start tokens, so even one hidden start token
+    # changes them, whatever the image sizes.
+    start_hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
+    start_hidden["attention_mask"][1, 3] = False
+    same_size_start_hidden = {**start_hidden, "image_grid_thw": torch.tensor([[1, 2, 4]] * 4)}
     noise = torch.randn(2, 2, policy.config.max_action_dim)
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
-        with pytest.raises(ValueError, match="must all be visible"):
-            policy.predict_action_chunk(hidden, noise=noise.clone())
+        for refused in (hidden, same_size_start_hidden):
+            with pytest.raises(ValueError, match="must all be visible"):
+                policy.predict_action_chunk(refused, noise=noise.clone())
+        policy.predict_action_chunk(batch, noise=noise.clone())
     keys = sorted(batch)
 
     class PredictActionChunk(nn.Module):
@@ -988,8 +995,9 @@ def test_export_refuses_a_hidden_image_of_another_size():
     ).module()
     program(noise.clone(), *(batch[key] for key in keys))
     # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        program(noise.clone(), *(hidden[key] for key in keys))
+    for refused in (hidden, start_hidden):
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            program(noise.clone(), *(refused[key] for key in keys))
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

@@ -337,17 +337,25 @@ def test_prepared_diffusion_prediction_exports_and_matches_eager(monkeypatch):
     version.parse(torch.__version__) < version.parse("2.9.0"),
     reason="torch.export before PyTorch 2.9 cannot trace transformers' causal mask with WALL-X's action mask function",
 )
-def test_export_refuses_a_hidden_image_of_another_size():
+def test_export_refuses_hidden_vision_tokens():
     policy = _diffusion_policy(_tiny_diffusion_model())
     # Same token count, different shapes: eager rope positions would give the hidden image's grid to the other.
     batch = {**_diffusion_batch(3), "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]])}
     hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
     hidden["attention_mask"][0, 1:5] = 0
+    # WALL-X's eager positions count images by their visible start tokens, so even one hidden start token
+    # changes them, whatever the image sizes.
+    start_hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
+    start_hidden["attention_mask"][0, 1] = 0
+    same_size_start_hidden = _diffusion_batch(3)
+    same_size_start_hidden["attention_mask"][0, 1] = 0
     noise = torch.randn(2, 3, 3)
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
-        with pytest.raises(ValueError, match="must all be visible"):
-            policy.predict_action_chunk(hidden, noise=noise.clone())
+        for refused in (hidden, same_size_start_hidden):
+            with pytest.raises(ValueError, match="must all be visible"):
+                policy.predict_action_chunk(refused, noise=noise.clone())
+        policy.predict_action_chunk(batch, noise=noise.clone())
     keys = sorted(batch)
 
     class Predict(torch.nn.Module):
@@ -357,8 +365,9 @@ def test_export_refuses_a_hidden_image_of_another_size():
     with torch.no_grad():
         program = torch.export.export(Predict(), (noise.clone(), *(batch[key] for key in keys)), strict=False)
         program.module()(noise.clone(), *(batch[key] for key in keys))
-        with pytest.raises(RuntimeError):
-            program.module()(noise.clone(), *(hidden[key] for key in keys))
+        for refused in (hidden, start_hidden):
+            with pytest.raises(RuntimeError):
+                program.module()(noise.clone(), *(refused[key] for key in keys))
 
 
 @require_cuda

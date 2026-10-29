@@ -992,7 +992,10 @@ class WallOSS05Policy(PreTrainedPolicy):
         )
         if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
             vision_grid.check_visible_images(
-                inputs["input_ids"], inputs["attention_mask"], int(self.model.config.image_token_id)
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                int(self.model.config.image_token_id),
+                int(self.model.config.vision_start_token_id),
             )
         if is_exporting():
             inputs["vision_grid"] = vision_grid
