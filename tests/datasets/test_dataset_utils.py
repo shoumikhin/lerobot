@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import logging
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,7 +27,7 @@ from packaging.version import Version
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 import pandas as pd  # noqa: E402
-from datasets import Dataset  # noqa: E402
+from datasets import Dataset, Features, Value  # noqa: E402
 from huggingface_hub import DatasetCard
 
 import lerobot.datasets.utils as dataset_utils
@@ -39,6 +41,7 @@ from lerobot.datasets.utils import (
     get_safe_version,
     resolve_episode_indices,
 )
+from lerobot.datasets.video_frame import VideoFrame
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.feature_utils import combine_feature_dicts
 
@@ -288,3 +291,23 @@ def test_newer_major_dataset_only_warns_when_major_is_not_enforced(caplog):
 def test_older_major_dataset_still_raises_conversion_error():
     with pytest.raises(BackwardCompatibilityError):
         check_version_compatibility("user/dataset", "v2.1", "v3.0")
+
+
+def test_video_frame_column_loads_in_a_process_that_imports_only_io_utils(tmp_path):
+    # Importing lerobot.datasets registers the VideoFrame feature type, as it did before the package became lazy.
+    (tmp_path / "chunk-000").mkdir()
+    data = {"observation.image": [{"path": "videos/episode_0.mp4", "timestamp": 0.1}], "episode_index": [0]}
+    features = Features({"observation.image": VideoFrame(), "episode_index": Value("int64")})
+    Dataset.from_dict(data, features=features).to_parquet(tmp_path / "chunk-000" / "file-000.parquet")
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from lerobot.datasets.io_utils import load_nested_dataset\n"
+        "assert 'lerobot.datasets.video_utils' not in sys.modules\n"
+        "print(type(load_nested_dataset(Path(sys.argv[1])).features['observation.image']).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-1] == "VideoFrame"
