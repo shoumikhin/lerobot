@@ -17,36 +17,47 @@
 import pytest
 import torch
 
-diffusers = pytest.importorskip("diffusers")
+pytest.importorskip("diffusers")
 
-from lerobot.policies.common.ddpm_scheduler import ExportableDDPMScheduler  # noqa: E402
+from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig  # noqa: E402
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionModel  # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 
 
-class SamplingLoop(torch.nn.Module):
-    def __init__(self, scheduler):
+class Sampler(torch.nn.Module):
+    def __init__(self, model: DiffusionModel):
         super().__init__()
-        self.scheduler = scheduler
-        self.model = torch.nn.Linear(4, 4)
+        self.model = model
 
-    def forward(self, sample):
-        for t in self.scheduler.timesteps.tolist():
-            sample = self.scheduler.step(self.model(sample), t, sample).prev_sample
-        return sample
+    def forward(self, global_cond, noise):
+        return self.model.conditional_sample(noise.shape[0], global_cond=global_cond, noise=noise)
 
 
+@pytest.mark.parametrize("scheduler", ["DDPM", "DDIM"])
 @pytest.mark.parametrize("num_inference_steps", [1, 10])
-def test_exported_sampling_matches_stock_scheduler(num_inference_steps):
-    stock = diffusers.DDPMScheduler(num_train_timesteps=100)
-    exportable = ExportableDDPMScheduler(**stock.config)
-    stock.set_timesteps(num_inference_steps)
-    exportable.set_timesteps(num_inference_steps)
-    loop = SamplingLoop(stock)
-    sample = torch.randn(2, 4)
+def test_exported_diffusion_sampling_matches_eager(scheduler, num_inference_steps):
+    config = DiffusionConfig(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,))},
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        horizon=8,
+        n_action_steps=4,
+        down_dims=(16, 32),
+        diffusion_step_embed_dim=16,
+        n_groups=4,
+        noise_scheduler_type=scheduler,
+        num_inference_steps=5,
+    )
+    model = DiffusionModel(config).eval()
+    model.num_inference_steps = num_inference_steps
+    assert len(model.noise_scheduler.timesteps) == num_inference_steps
+    sampler = Sampler(model)
+    global_cond = torch.randn(2, 4 * config.n_obs_steps)
+    noise = torch.randn(2, config.horizon, 2)
 
     torch.manual_seed(0)
-    expected = loop(sample)
-    loop.scheduler = exportable
+    expected = sampler(global_cond, noise)
     # Strict tracing cannot read the timesteps as ints.
-    exported = torch.export.export(loop, (sample,), strict=False).module()
+    exported = torch.export.export(sampler, (global_cond, noise), strict=False).module()
     torch.manual_seed(0)
-    assert torch.equal(exported(sample), expected)
+    assert torch.equal(exported(global_cond, noise), expected)
