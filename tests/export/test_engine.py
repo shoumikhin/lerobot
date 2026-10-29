@@ -31,7 +31,7 @@ from torch import Tensor, nn
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle
 from lerobot.utils.constants import ACTION, OBS_STATE
-from tests.export.torch_backend import make_bundle
+from tests.export.torch_backend import make_bundle, record_places
 
 FRAME = {OBS_STATE: np.array([1.0, 2.0, 3.0], np.float32)}
 REPO = Path(__file__).parents[2]
@@ -256,6 +256,34 @@ def test_engine_runs_a_program_several_times_with_constants(tmp_path, monkeypatc
     engine = BundleEngine(_repeat_bundle(tmp_path / "bundle", ("scaled", "factor_1")))
     assert loads == ["model.pt2", "scale.pt2"]
     np.testing.assert_array_equal(engine.get_action({OBS_STATE: np.ones(3, np.float32)}), [1, 1, 1])
+
+
+def test_engine_places_the_constants_at_load_and_a_frame_value_once_per_chunk(tmp_path, monkeypatch):
+    """Two runs read the state; the engine copies it once per chunk."""
+    bundle = _repeat_bundle(tmp_path / "bundle")
+    torch.export.save(
+        torch.export.export(Scale(), (torch.ones(3, 3), torch.ones(3))), bundle.path / "scale_state.pt2"
+    )
+    runs = [
+        {"name": "model", "program": "model", "inputs": [OBS_STATE], "outputs": ["chunk"]},
+        {"name": "scale", "program": "scale", "inputs": ["chunk", "factor_0"], "outputs": ["scaled"]},
+        {"name": "by_state", "program": "by_state", "inputs": ["scaled", OBS_STATE], "outputs": [ACTION]},
+    ]
+    programs = {
+        "model": {"file": "model.pt2", "data": None},
+        "scale": {"file": "scale.pt2", "data": None},
+        "by_state": {"file": "scale_state.pt2", "data": None},
+    }
+    _edit(bundle, programs=programs, runs=runs)
+    state = FRAME[OBS_STATE]
+    _edit_test_case(bundle, **{ACTION: 2 * np.outer([1.0, 2.0, 3.0], state) * state})
+    placed = record_places(monkeypatch)
+    engine = BundleEngine(Bundle.read(bundle.path))
+    for _ in range(2):
+        engine.reset()
+        engine.get_action(dict(FRAME))
+    # The one constant a run reads, at load; then the state once for the load check and once per chunk.
+    assert placed == [(1,), (3,), (3,), (3,)]
 
 
 def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):

@@ -48,8 +48,23 @@ class TorchProgram:
     def to_numpy(self, value: Tensor) -> np.ndarray:
         return value.numpy()
 
+    def place(self, index: int, value: np.ndarray) -> Tensor:
+        return torch.as_tensor(value)
+
 
 register_runtime("torch_test", Runtime(TorchProgram))
+
+
+def record_places(monkeypatch) -> list[tuple[int, ...]]:
+    """From now on, record the shape of each value the runtime copies to where a program reads it."""
+    shapes: list[tuple[int, ...]] = []
+    place = TorchProgram.place
+    monkeypatch.setattr(
+        TorchProgram,
+        "place",
+        lambda self, index, value: shapes.append(value.shape) or place(self, index, value),
+    )
+    return shapes
 
 
 def make_bundle(
