@@ -392,6 +392,24 @@ def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tm
     assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
 
 
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and EXECUTORCH), reason="needs ExecuTorch and PyTorch 2.15 on macOS"
+)
+def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    # Test machines may have no GPU or Neural Engine to give.
+    ExecuTorchCoreMLConfig(compute_units="cpu_only").compile(torch.export.export(model, (x,)), path)
+    assert b"CoreMLBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
 class MaskedPositions(torch.nn.Module):
     """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
 
@@ -462,6 +480,35 @@ def test_executorch_cuda_names_no_data_file_for_a_program_without_one(tmp_path):
     program = torch.export.export(torch.nn.Identity(), (torch.randn(4, 3, device="cuda"),))
     assert ExecuTorchCUDAConfig().compile(program, path) is None
     assert path.is_file() and not path.with_suffix(".ptd").exists()
+
+
+class ConstantPositions(torch.nn.Module):
+    """Adds embeddings of position ids that bucketize makes from constants alone, as SmolVLM's vision model does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(4, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ids = torch.bucketize(torch.arange(0, 1 - 1e-6, 1 / 8), torch.arange(1 / 4, 1.0, 1 / 4), right=True)
+        return x + self.embedding(ids)
+
+
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and EXECUTORCH), reason="needs ExecuTorch and PyTorch 2.15 on macOS"
+)
+def test_executorch_coreml_folds_what_a_program_computes_from_constants(tmp_path):
+    """Core ML has no bucketize, so the position ids are computed at export."""
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    model = ConstantPositions().eval()
+    x = torch.randn(8, 8)
+    path = tmp_path / "model.pte"
+    ExecuTorchCoreMLConfig(compute_units="cpu_only").compile(torch.export.export(model, (x,)), path)
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
 
 
 EXPORT_WITHOUT_TORCH = """
