@@ -615,8 +615,9 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         Optimized autoregressive decoding for FAST tokens using KV Caching.
 
         Greedy decoding stops once every sequence emits the end-of-action marker. Under
-        torch.export it runs to ``max_decoding_steps``, because an exported program
-        cannot branch on a tensor value; ``detokenize_actions`` ignores the extra tokens.
+        non-strict torch.export (the default) it runs to ``max_decoding_steps``, because an
+        exported program cannot branch on a tensor value; ``detokenize_actions`` ignores the
+        extra tokens.
         The returned tensor keeps its fixed shape, with positions not generated after the
         batch-wide stop left zero-filled. Stochastic decoding always runs to
         ``max_decoding_steps`` so early stopping does not change the RNG state used by
