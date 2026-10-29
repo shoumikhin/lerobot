@@ -698,6 +698,26 @@ def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkey
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
 
 
+@pytest.mark.parametrize(
+    ("backend", "refused", "allowed", "error"),
+    [
+        ("executorch_openvino", ["darwin"], "linux", "does not export on a Mac"),
+    ],
+)
+def test_a_backend_is_refused_before_tracing_on_a_system_it_does_not_export_on(
+    backend, refused, allowed, error, monkeypatch
+):
+    from lerobot.export.configs import ExportBackendConfig
+
+    config = ExportBackendConfig.get_choice_class(backend)
+    for system in refused:
+        monkeypatch.setattr(sys, "platform", system)
+        with pytest.raises(ValueError, match=f"^{backend} {error}"):
+            config()
+    monkeypatch.setattr(sys, "platform", allowed)
+    config()
+
+
 @needs_executorch
 def test_executorch_xnnpack_takes_the_linear_layers_of_a_bfloat16_program(tmp_path, monkeypatch):
     """XNNPACK takes bfloat16 ops only when asked to, and the portable kernels run them many times slower."""
@@ -736,6 +756,30 @@ from lerobot.scripts.lerobot_export import export
 
 export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
+
+
+# ExecuTorch for macOS has no OpenVINO backend.
+@pytest.mark.skipif(
+    not (
+        EXECUTORCH
+        and sys.platform != "darwin"
+        and is_package_available("openvino")
+        and is_package_available("nncf")
+    ),
+    reason="needs ExecuTorch, PyTorch 2.15 and OpenVINO, off a Mac: pip install openvino nncf",
+)
+def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchOpenVINOConfig().compile(torch.export.export(model, (x,)), path)
+    assert b"OpenvinoBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
 
 
 def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(checkpoint, tmp_path):
