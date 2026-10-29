@@ -30,9 +30,10 @@ from safetensors.numpy import load_file
 
 from lerobot.utils.constants import ACTION
 
-from .manifest import NOISE, Bundle, BundleManifest
+from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
 from .runtime import prepare_runtime
 from .target import check_runtime_versions, check_target
+from .task_tokens import TaskEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ class BundleEngine:
         bundle (`Bundle`):
             The bundle to run.
         task (`str`, *optional*, defaults to `""`):
-            The task. A bundle exported for one task runs only that task, which is also the default.
+            The task, by default the one the bundle was exported for. A bundle without `task_tokens` runs
+            only that task.
         rename_map (`dict[str, str]`, *optional*):
             Renames the keys of the robot's frame to the names the bundle's programs take.
         stop_event (`threading.Event`, *optional*):
@@ -67,6 +69,9 @@ class BundleEngine:
         """Load the bundle's programs and check them against its test case."""
         manifest = bundle.manifest
         self._fixed_task = manifest.task
+        self._task_encoder = (
+            None if manifest.task_tokens is None else TaskEncoder(bundle.path, manifest.task_tokens)
+        )
         task = task or self._fixed_task or ""
         self._check_task(task)
         self.task = task
@@ -103,8 +108,12 @@ class BundleEngine:
                 f"programs take noise shaped {expected_noise}. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
+        self._task_values = self._encode(task)
         _check_dataflow(
-            manifest, list(self._frame_spec), list(self._constants), manifest.noise_shape is not None
+            manifest,
+            [*self._frame_spec, *self._task_values],
+            list(self._constants),
+            manifest.noise_shape is not None,
         )
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions)
@@ -117,15 +126,12 @@ class BundleEngine:
         }
         self._runs = [(run, programs[run.program]) for run in manifest.runs]
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
-        self._placed = [
-            {
-                index: program.place(index, self._constants[name])
-                for index, name in enumerate(run.inputs)
-                if name in self._constants
-            }
-            for run, program in self._runs
-        ]
+        self._placed = self._place(self._constants)
         self._check(case, noise, expected, manifest.tolerance)
+        # The task stays the same for the whole run, so its values are placed once too, after the test case
+        # ran its own task.
+        for placed, task_placed in zip(self._placed, self._place(self._task_values), strict=True):
+            placed.update(task_placed)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_robot(self, observation_shapes: Mapping[str, tuple[int, ...]], action_names: list[str]) -> None:
@@ -159,8 +165,13 @@ class BundleEngine:
                 f"The robot does not match the exported policy, which takes {'; '.join(problems)}.{hint}"
             )
 
-    def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
-        values: dict[str, Any] = {name: frame[name] for name in self._frame_spec}
+    def _run_chunk(
+        self,
+        frame: Mapping[str, np.ndarray],
+        task_values: Mapping[str, np.ndarray],
+        noise: np.ndarray | None = None,
+    ) -> np.ndarray:
+        values: dict[str, Any] = {**{name: frame[name] for name in self._frame_spec}, **task_values}
         if self._noise_shape is not None:
             values[NOISE] = (
                 np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
@@ -187,7 +198,7 @@ class BundleEngine:
         return actions
 
     def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self._run_chunk(frame, noise)
+        actual = self._run_chunk(frame, self._encode(self._fixed_task or ""), noise)
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -201,8 +212,28 @@ class BundleEngine:
                 "Export it again on this device."
             )
 
+    def _place(self, values: Mapping[str, np.ndarray]) -> list[dict[int, Any]]:
+        """`values` copied, for each run, where its program reads them."""
+        return [
+            {
+                index: program.place(index, values[name])
+                for index, name in enumerate(run.inputs)
+                if name in values
+            }
+            for run, program in self._runs
+        ]
+
+    def _encode(self, task: str) -> dict[str, np.ndarray]:
+        """The values the programs take for `task`: none for a bundle without task tokens."""
+        if self._task_encoder is None:
+            return {}
+        embeddings, length = self._task_encoder(task)
+        return {TASK_EMBEDDINGS: embeddings, TASK_LENGTH: length}
+
     def _check_task(self, task: str) -> None:
-        if self._fixed_task is not None and task != self._fixed_task:
+        if self._task_encoder is not None:
+            self._task_encoder.check(task)
+        elif self._fixed_task is not None and task != self._fixed_task:
             raise ValueError(
                 f"This exported policy runs only the task it was exported for, {self._fixed_task!r}, "
                 f"not {task!r}. Export it again for the new task."
@@ -227,9 +258,8 @@ class BundleEngine:
         if obs_frame is None:
             return None
         if not self._actions:
-            self._actions.extend(
-                self._run_chunk({self._rename.get(name, name): value for name, value in obs_frame.items()})
-            )
+            frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+            self._actions.extend(self._run_chunk(frame, self._task_values))
         return self._actions.popleft()
 
 
