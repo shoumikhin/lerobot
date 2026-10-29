@@ -1014,6 +1014,9 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> N
         for _ in range(2):  # The second call reuses the cached grid.
             actual = VLMStage()(*(inputs[key] for key in keys))
             torch.testing.assert_close(actual, (expected["h_vlm"], action_hidden), rtol=0, atol=0)
+        # Eager positions are 0, 1, 2, ... as in the exported program only while no call with `input_ids`
+        # (or `generate`) has cached rope deltas on the model; LaWAM makes no such call.
+        assert qwen.model.rope_deltas is None
         exported = torch.export.export(VLMStage(), tuple(inputs[key] for key in keys), strict=False)
         torch.testing.assert_close(
             exported.module()(*(inputs[key] for key in keys)), (expected["h_vlm"], action_hidden)
