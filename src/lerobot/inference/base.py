@@ -25,7 +25,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import partial
 from threading import Lock, Thread
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
