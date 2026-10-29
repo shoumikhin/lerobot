@@ -311,13 +311,13 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
 
 
 def test_eager_prediction_with_precompute_grid_thw_only_refreshes_the_grid(monkeypatch):
-    visual = _tiny_diffusion_model().visual
+    model = _tiny_diffusion_model()
     batch = _diffusion_batch(3)
     calls = []
 
     class Model:
         def __init__(self):
-            self.visual = visual
+            self.visual, self.config = model.visual, model.config
 
         def __call__(self, **inputs):
             calls.append(inputs)
