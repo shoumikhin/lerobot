@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging import version
 
 # Skip if required dependencies are not available
 pytest.importorskip("peft")
@@ -262,6 +263,10 @@ def _diffusion_policy(model):
     return policy
 
 
+@pytest.mark.skipif(
+    version.parse(torch.__version__) < version.parse("2.9.0"),
+    reason="torch.export before PyTorch 2.9 cannot trace transformers' causal mask with WALL-X's action mask function",
+)
 def test_prepared_diffusion_prediction_exports_and_matches_eager(monkeypatch):
     model = _tiny_diffusion_model()
     batch = _diffusion_batch(3)
