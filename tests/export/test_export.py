@@ -261,6 +261,13 @@ BACKENDS = [
         "executorch_xnnpack",
         marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
     ),
+    pytest.param(
+        "executorch_cuda",
+        marks=pytest.mark.skipif(
+            not (EXECUTORCH and torch.cuda.is_available()),
+            reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+        ),
+    ),
 ]
 
 
