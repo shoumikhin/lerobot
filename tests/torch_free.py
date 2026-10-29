@@ -46,15 +46,16 @@ def checking_torch_unloaded(code: str) -> str:
     return code + _CHECK_UNLOADED
 
 
-def assert_runs_without_torch(code: str, *args: str) -> None:
+def assert_runs_without_torch(code: str, *args: str, cwd=None) -> None:
     """Run `code` in a fresh interpreter with PyTorch installed; it must not load PyTorch.
 
-    `args` become `sys.argv[1:]` of the code.
+    `args` become `sys.argv[1:]` of the code, which runs in the folder `cwd`.
     """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code) + _CHECK_UNLOADED, *args],
         capture_output=True,
         text=True,
+        cwd=cwd,
         timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr

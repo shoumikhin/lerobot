@@ -35,6 +35,11 @@ Inference backends
     --inference.type=rtc       Real-Time Chunking for slow VLA models
     --inference.type=remote    Policy served by lerobot-policy-server (see remote inference docs)
 
+Compiled bundles
+----------------
+    --bundle.path=<folder>     Run a bundle written by ``lerobot-export`` without PyTorch,
+                               base strategy only (see ``lerobot.bundle.rollout``)
+
 Usage examples
 --------------
 ::
@@ -284,7 +289,7 @@ def rollout(cfg: RolloutConfig):
 
 
 def main() -> None:
-    """CLI entry point for ``lerobot-rollout``."""
+    """``lerobot-rollout`` without ``--bundle.path``: run a PyTorch policy."""
     register_third_party_plugins()
     cast(Callable[[], None], rollout)()
 
