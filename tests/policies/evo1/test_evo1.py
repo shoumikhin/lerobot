@@ -23,9 +23,9 @@ from torch import nn
 import lerobot.policies.evo1.evo1_model as evo1_model
 import lerobot.policies.evo1.modeling_evo1 as modeling_evo1
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.evo1 import internvl3_embedder
 from lerobot.policies.evo1.configuration_evo1 import Evo1Config
 from lerobot.policies.evo1.flow_matching import FlowmatchingActionHead
-from lerobot.policies.evo1 import internvl3_embedder
 from lerobot.policies.evo1.internvl3_embedder import (
     IMAGENET_MEAN,
     IMAGENET_STD,
