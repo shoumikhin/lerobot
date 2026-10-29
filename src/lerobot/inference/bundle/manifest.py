@@ -29,6 +29,13 @@ TEST_CASE = "test.safetensors"
 CONSTANTS = "constants.safetensors"
 # The test case and the programs name the starting noise of a sampling policy this way.
 NOISE = "noise"
+# The programs of a policy that reads its task take it as these two values (see `TaskTokensSpec`).
+TASK_EMBEDDINGS = "task_embeddings"
+TASK_LENGTH = "task_length"
+# The files of `task_tokens`, as the export writes them.
+TOKENIZER = "tokenizer.json"
+EMBEDDINGS_FILE = "token_embeddings.safetensors"
+KNOWN_TASKS = "known_tasks.json"
 
 
 @dataclass
@@ -58,6 +65,38 @@ class ProgramSpec:
     data: str | None = None
 
 
+@dataclass
+class TaskTokensSpec:
+    """How the task becomes the `task_embeddings` and `task_length` values the programs take.
+
+    The task text is cleaned and placed in the prompt by `text`, the tokenizer splits it into token ids, and
+    each id picks its row of the embedding table. The rows are padded with zeros to `max_tokens`, and
+    `task_length` counts the real ones.
+
+    Args:
+        text (`list[list[str]]`):
+            The ops that make the prompt text from the task, in order, each a name and its arguments:
+            `["strip"]`, `["lower"]`, `["replace", old, new]`, `["keep", kind, ...]` (keeps the characters of
+            each kind: `alnum`, `space`, or one literal character), `["default", text]` (for an empty
+            task), and `["template", "... {task} ..."]`.
+        tokenizer (`str`):
+            The tokenizer file, in the format of the `tokenizers` library.
+        table (`str`):
+            A safetensors file holding one tensor, the token embedding table, in float32 or bfloat16.
+        known (`str`):
+            A JSON file mapping each task known at export to its token ids, so those tasks never load the
+            tokenizer.
+        max_tokens (`int`):
+            The most tokens the programs take.
+    """
+
+    text: list[list[str]]
+    tokenizer: str
+    table: str
+    known: str
+    max_tokens: int
+
+
 @dataclass(kw_only=True)
 class BundleManifest:
     """The contents of a bundle's `export.json`.
@@ -76,6 +115,9 @@ class BundleManifest:
             The program runs, in order.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
+        task_tokens (`TaskTokensSpec`, *optional*):
+            How the task becomes the programs' `task_embeddings` and `task_length`. A bundle with it can run
+            any task; one without it runs only `task`.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none.
@@ -98,6 +140,7 @@ class BundleManifest:
     runtime_imports: list[str] = field(default_factory=list)
     programs: list[ProgramSpec]
     constants: str | None = None
+    task_tokens: TaskTokensSpec | None = None
     noise_shape: list[int] | None = None
     task: str | None = None
     action_names: list[str] | None = None
@@ -133,16 +176,28 @@ class BundleManifest:
                 f"This bundle has format version {version}, but this version of LeRobot runs version "
                 f"{FORMAT_VERSION}. {fix}"
             )
+        from .task_tokens import TEXT_OPS
+
         programs = data.get("programs") or []
+        task_tokens = data.get("task_tokens")
         # A key added later can change how the programs run, so a reader that does not know it stops.
-        unknown = sorted(set(data) - {f.name for f in fields(cls)}) + sorted(
-            {key for program in programs for key in program} - {f.name for f in fields(ProgramSpec)}
+        unknown = (
+            sorted(set(data) - {f.name for f in fields(cls)})
+            + sorted({key for program in programs for key in program} - {f.name for f in fields(ProgramSpec)})
+            + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokensSpec)})
+            + sorted({op[0] for op in (task_tokens or {}).get("text", [])} - set(TEXT_OPS))
         )
         if unknown:
             raise ValueError(
                 f"This bundle uses {unknown}, which this version of LeRobot does not know. Upgrade LeRobot."
             )
-        return cls(**{**data, "programs": [ProgramSpec(**program) for program in programs]})
+        return cls(
+            **{
+                **data,
+                "programs": [ProgramSpec(**program) for program in programs],
+                "task_tokens": None if task_tokens is None else TaskTokensSpec(**task_tokens),
+            }
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """The manifest as JSON-ready data."""
