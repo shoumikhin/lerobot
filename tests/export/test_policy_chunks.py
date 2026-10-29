@@ -35,7 +35,7 @@ from lerobot.export.recipe import random_frame  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.factory import get_policy_class  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
-from tests.export import tiny_groot, tiny_pi05  # noqa: E402
+from tests.export import tiny_groot, tiny_pi05, tiny_smolvla  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
 
 TASK = "pick up the cube"
@@ -51,7 +51,7 @@ class Chain:
 
     `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. The bundle is
     exported with the first of `tasks` and `args`, and plays each of them. `programs` are its program files,
-    and `lora` the modules of a PEFT adapter for it.
+    `lora` the modules of a PEFT adapter for it, and `check` checks what else it holds.
     """
 
     save: Callable[[Path, pytest.MonkeyPatch], Path]
@@ -61,6 +61,7 @@ class Chain:
     plugins: tuple[str, ...] = ()
     tiny: Callable[[pytest.MonkeyPatch], None] | None = None
     lora: list[str] | None = None
+    check: Callable[[torch.nn.Module, Bundle], None] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
@@ -70,6 +71,31 @@ def save_pi05(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Pa
         return folder / "checkpoint"
 
     return save
+
+
+def save_smolvla(folder: Path, patch: pytest.MonkeyPatch) -> Path:
+    tiny_smolvla.save_checkpoint(folder / "checkpoint", patch)
+    return folder / "checkpoint"
+
+
+def smolvla_programs_hold_only_their_weights(policy: torch.nn.Module, bundle: Bundle) -> None:
+    from lerobot.policies.smolvla.export_smolvla import EMBED_MODULES, LANGUAGE_MODEL_MODULES, STEP_MODULES
+
+    def size(modules) -> int:
+        return sum(p.numel() for name in modules for p in policy.get_submodule(name).parameters())
+
+    for file, own in (
+        ("embed.pt2", size(EMBED_MODULES)),
+        ("language_model.pt2", size(LANGUAGE_MODEL_MODULES)),
+        ("step.pt2", size(STEP_MODULES)),
+        ("actions.pt2", 0),
+    ):
+        program = torch.export.load(bundle.path / file)
+        weights = sum(t.numel() for t in program.state_dict.values())
+        constants = sum(t.numel() for t in program.constants.values() if isinstance(t, torch.Tensor))
+        # Besides its weights a program holds small tables, like the normalization statistics; any other
+        # module of the policy would add at least a few hundred values.
+        assert own <= weights + constants < own + 100, file
 
 
 PI05 = Chain(
@@ -98,6 +124,14 @@ CHAINS = {
         GROOT, save=lambda folder, patch: tiny_groot.save_checkpoint(folder, "albumentations"), lora=None
     ),
     "groot_torchvision": GROOT,
+    "smolvla": Chain(
+        save_smolvla,
+        tasks=(TASK,),
+        programs=["actions", "embed", "language_model", "step"],
+        plugins=("tiny_smolvla",),
+        tiny=tiny_smolvla.use_tiny_smolvla,
+        check=smolvla_programs_hold_only_their_weights,
+    ),
 }
 
 
@@ -154,6 +188,8 @@ def test_the_bundle_plays_the_chunk_the_policy_predicts(exported, monkeypatch):
         # The task changes the actions, so the comparison would catch a program that ignored it.
         assert not np.allclose(expected, predict(chain.tasks[0], noise), atol=1e-3)
     assert sorted(bundle.manifest.programs) == chain.programs
+    if chain.check is not None:
+        chain.check(policy, bundle)
 
 
 @pytest.mark.parametrize(
