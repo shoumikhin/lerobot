@@ -33,7 +33,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 from transformers.utils import torch_compilable_check
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
-from lerobot.policies.common.qwen3_vision import qwen3_image_rope_index
+from lerobot.policies.common.qwen_vision import qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import populate_queues
@@ -289,7 +289,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
 
     def build_prefix_position_ids(self, input_ids, attention_mask, image_grid_thw: list[list[int]]):
         vlm_cfg = self.qwenvl.config
-        position_ids = qwen3_image_rope_index(
+        position_ids = qwen_image_rope_index(
             input_ids,
             attention_mask,
             image_grid_thw,

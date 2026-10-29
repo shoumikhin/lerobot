@@ -39,7 +39,8 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
-from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_rope_index, qwen2_5_vision_forward
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
+from ..common.qwen_vision import qwen_image_rope_index
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
@@ -650,7 +651,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
                 self._vision_grid, vlm.visual, image_grid_thw
             )
-            position_ids = qwen2_5_image_rope_index(
+            position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,
                 self._vision_grid.grid_thw,

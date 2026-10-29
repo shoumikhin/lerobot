@@ -92,7 +92,7 @@ class WallXConfig(PreTrainedConfig):
     vision_attn_implementation: str = "auto"
     # For fixed camera image sizes: compute the vision grid metadata in one eager call and reuse it, so
     # diffusion prediction reads no grid values on the host (torch.export needs this). A different grid with
-    # the same number of images raises an error. The vision attention then runs as with "sdpa".
+    # the same number of images raises an error. Needs vision_attn_implementation="sdpa".
     precompute_grid_thw: bool = False
 
     # Optional explicit external language-recipe override.
@@ -147,10 +147,8 @@ class WallXConfig(PreTrainedConfig):
                 "vision_attn_implementation must be one of 'auto', 'sdpa', or 'varlen', got "
                 f"{self.vision_attn_implementation!r}"
             )
-        if self.precompute_grid_thw and self.vision_attn_implementation == "varlen":
-            raise ValueError(
-                "precompute_grid_thw runs the vision attention per chunk, so it cannot use 'varlen'."
-            )
+        if self.precompute_grid_thw and self.vision_attn_implementation != "sdpa":
+            raise ValueError("precompute_grid_thw needs vision_attn_implementation='sdpa', the attention it exports.")
         if self.tokenizer_max_length < self.chunk_size + 1:
             raise ValueError("tokenizer_max_length must leave room for the WALL-OSS action chunk.")
         if self.flow_loss_weight < 0 or self.text_loss_weight < 0:

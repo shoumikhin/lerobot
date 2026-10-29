@@ -64,7 +64,8 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
-from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_rope_index, qwen2_5_vision_forward
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
+from ..common.qwen_vision import qwen_image_rope_index
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -1163,6 +1164,7 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 if vision_grid is None:
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
+                    vision_grid.check(image_grid_thw)
                     image_embeds = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
@@ -1907,7 +1909,7 @@ class WallXPolicy(PreTrainedPolicy):
         self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
             self._vision_grid, self.model.visual, batch["image_grid_thw"]
         )
-        position_ids = qwen2_5_image_rope_index(
+        position_ids = qwen_image_rope_index(
             batch["input_ids"],
             batch["attention_mask"],
             self._vision_grid.grid_thw,

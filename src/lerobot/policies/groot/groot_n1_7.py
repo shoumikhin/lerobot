@@ -36,7 +36,8 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
-from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_image_rope_index, qwen3_vl_forward
+from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
+from ..common.qwen_vision import qwen_image_rope_index
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
@@ -455,6 +456,8 @@ class Qwen3Backbone(nn.Module):
 
     def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor]) -> None:
         """Run `Qwen3VLModel` with the grid metadata of the first batch, computed once and reused."""
+        if model_input.get("pixel_values_videos") is not None:
+            raise ValueError("GR00T precompute_grid_thw supports images only.")
         qwen = getattr(self.model, "model", self.model)
         input_ids = model_input["input_ids"]
         attention_mask = model_input["attention_mask"]
@@ -462,7 +465,7 @@ class Qwen3Backbone(nn.Module):
         self._vision_grid = Qwen3VisionGrid.reuse_or_build(
             self._vision_grid, qwen.visual, model_input["image_grid_thw"]
         )
-        position_ids = qwen3_image_rope_index(
+        position_ids = qwen_image_rope_index(
             input_ids,
             attention_mask,
             self._vision_grid.grid_thw,
