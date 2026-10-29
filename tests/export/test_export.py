@@ -182,6 +182,17 @@ def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, c
     assert "--tolerance must be a finite number" in capfd.readouterr().err
 
 
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_executorch_coreml_is_refused_before_tracing_off_a_mac(monkeypatch, platform):
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(ValueError, match="executorch_coreml exports only on a Mac"):
+        ExecuTorchCoreMLConfig()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    ExecuTorchCoreMLConfig()
+
+
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
     partial = tmp_path / "partial"
     shutil.copytree(checkpoint, partial)
@@ -507,6 +518,26 @@ needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch a
 needs_executorch_cuda = pytest.mark.skipif(
     not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
 )
+
+
+# ExecuTorch installs coremltools only on the Pythons it supports.
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and EXECUTORCH and is_package_available("coremltools")),
+    reason="needs ExecuTorch, PyTorch 2.15 and coremltools on macOS",
+)
+def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    # Test machines may have no GPU or Neural Engine to give.
+    ExecuTorchCoreMLConfig(compute_units="cpu_only").compile(torch.export.export(model, (x,)), path)
+    assert b"CoreMLBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
 
 
 class MaskedPositions(torch.nn.Module):
