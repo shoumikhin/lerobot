@@ -36,6 +36,7 @@ import draccus
 import torch
 
 from lerobot.bundle.manifest import CONSTANTS, BundleManifest, ProgramSpec
+from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.utils import init_logging, register_third_party_plugins
 
@@ -96,6 +97,8 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
             runtime_imports=list(cfg.backend.runtime_imports),
+            target=cfg.backend.target(),
+            runtime_versions=runtime_versions(cfg.backend.runtime_modules),
             programs=programs,
             constants=CONSTANTS if plan.constants else None,
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
