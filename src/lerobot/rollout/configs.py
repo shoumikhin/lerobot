@@ -24,6 +24,7 @@ from typing import ClassVar
 
 import draccus
 
+from lerobot.bundle.manifest import is_bundle
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
@@ -412,6 +413,11 @@ class RolloutConfig:
         ):
             raise ValueError(
                 "Remote inference owns policy/device configuration; omit --policy, --device and --use_torch_compile"
+            )
+        if policy_path and is_bundle(policy_path):
+            raise ValueError(
+                f"{policy_path} is a bundle written by lerobot-export. Run it with "
+                f"`lerobot-rollout --bundle.path={policy_path} --robot.type=...`."
             )
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")
