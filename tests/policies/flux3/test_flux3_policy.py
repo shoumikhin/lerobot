@@ -771,6 +771,21 @@ def test_exported_policy_takes_its_noise_as_inputs_and_leaves_eager_inference_in
     assert torch.equal(new_task, Predict(twin, "a new task")(images, state, **noise))
 
 
+def test_torch_compile_keeps_the_text_context_cache(fake_vae):
+    policy = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    gen = torch.Generator().manual_seed(2)
+    obs = {
+        "observation.images.top": torch.rand(1, 3, 64, 96, generator=gen),
+        OBS_STATE: torch.rand(1, 6, generator=gen),
+        "task": ["stack the cubes"],
+    }
+    eager = policy.predict_action_chunk(obs)
+    policy._ctx_cache.clear()
+    compiled = torch.compile(policy.predict_action_chunk, backend="eager")
+    assert torch.equal(compiled(obs), eager)
+    assert len(policy._ctx_cache) == 1
+
+
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
     cfg = droid_config()
     policy = Flux3Policy(cfg)

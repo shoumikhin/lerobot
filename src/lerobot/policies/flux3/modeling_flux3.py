@@ -73,6 +73,11 @@ logger = logging.getLogger(__name__)
 TRUNK_WEIGHTS_FILENAME = "dit.safetensors"
 
 
+def _is_exporting() -> bool:
+    # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
+    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
+
+
 @dataclass
 class FrozenComponents:
     """Video VAE and text encoder: eval-only, never saved, never trained.
@@ -407,7 +412,7 @@ class Flux3Policy(PreTrainedPolicy):
             )
             hit = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
             # Tensors traced by torch.export are not real, so they must not be served to later eager calls.
-            if not torch.compiler.is_exporting():
+            if not _is_exporting():
                 if len(self._ctx_cache) > 256:
                     self._ctx_cache.clear()
                 self._ctx_cache[caption] = hit
@@ -417,7 +422,7 @@ class Flux3Policy(PreTrainedPolicy):
         """The Euler grid for the current settings, rebuilt outside tracing because a traced one cannot be read."""
         key = (self.config.num_inference_steps, self.config.sampler_shift, torch.get_default_dtype())
         if self._euler_grid is None or self._euler_grid[0] != key:
-            if torch.compiler.is_exporting():
+            if _is_exporting():
                 raise RuntimeError(
                     "The Euler schedule is out of date: num_inference_steps or sampler_shift changed after the "
                     "last prediction. Run one eager prediction with the new settings before torch.export."
@@ -542,7 +547,7 @@ class Flux3Policy(PreTrainedPolicy):
         device = cond["x_video_cond"].device
         n_pred = self.packer.predicted_latent_frames(cfg)
         if action_noise is None or video_noise is None:
-            if torch.compiler.is_exporting():
+            if _is_exporting():
                 # An exported program keeps one generator whose state carries over between calls.
                 raise ValueError(
                     "Pass both noise and video_noise to export flux3; its sampling noise must be an input."
