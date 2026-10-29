@@ -29,11 +29,10 @@ from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
-import torch
 
 from lerobot import __version__
 from lerobot.inference import (
@@ -42,7 +41,6 @@ from lerobot.inference import (
     ExecutionMode,
     FeatureSpec,
     ObservationSnapshot,
-    PolicyRunner,
     QueryKind,
 )
 from lerobot.transport import (
@@ -71,6 +69,13 @@ from .protocol import (
     instance_prefix,
     session_prefix,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from lerobot.inference import PolicyRunner
+
+    from .bundle import BundleRunner
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +134,7 @@ class SessionWorker:
 
     def __init__(
         self,
-        runner: PolicyRunner,
+        runner: PolicyRunner | BundleRunner,
         *,
         deployment: str,
         artifact_identity: str,
@@ -610,9 +615,16 @@ class SessionWorker:
                 },
             )
 
+        # A plain chunk reads no continuation, so a server of plain chunks never needs PyTorch here.
+        reads_continuation = session.mode is not ExecutionMode.CHUNK
+
         def tensor(name: str) -> torch.Tensor | None:
             value = body.get(name)
-            return None if value is None else torch.from_numpy(value.copy())
+            if value is None or not reads_continuation:
+                return None
+            import torch
+
+            return torch.from_numpy(value.copy())
 
         chunk = self.runner.predict(
             observation,

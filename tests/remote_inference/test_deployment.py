@@ -107,7 +107,7 @@ def test_requested_rtc_is_attached_without_a_saved_dataclass_field(deployment, m
         return ConformingPolicy(config)
 
     monkeypatch.setattr(
-        serving, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
+        "lerobot.policies.factory.get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
     )
     requested = replace(
         deployment,
@@ -172,7 +172,9 @@ def test_slice_override_is_restricted_to_plain_chunks(deployment):
 
 
 def test_oversized_slice_fails_before_loading_weights(deployment, monkeypatch):
-    monkeypatch.setattr(serving, "get_policy_class", lambda name: pytest.fail("must not load policy"))
+    monkeypatch.setattr(
+        "lerobot.policies.factory.get_policy_class", lambda name: pytest.fail("must not load policy")
+    )
     with pytest.raises(ValueError, match="prediction horizon"):
         serving.load_deployment(
             replace(deployment, execution=replace(deployment.execution, n_action_steps=9))
@@ -185,7 +187,7 @@ def test_native_loader_cannot_silently_replace_requested_slice(deployment, monke
         return ConformingPolicy(config)
 
     monkeypatch.setattr(
-        serving, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
+        "lerobot.policies.factory.get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
     )
     with pytest.raises(ValueError, match="does not honor"):
         serving.load_deployment(

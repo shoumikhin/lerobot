@@ -88,6 +88,8 @@ class BundleInferenceEngine(InferenceEngine):
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
+        self.chunk_length = expected.shape[0]
+        """The number of actions one run of the programs returns."""
         given = [
             *self._frame_spec,
             *self._constants,
@@ -140,9 +142,10 @@ class BundleInferenceEngine(InferenceEngine):
                 f"The robot does not match the exported policy, which takes {'; '.join(problems)}.{hint}"
             )
 
-    def _run_chunk(
+    def run_chunk(
         self, frame: Mapping[str, np.ndarray], task: str, noise: np.ndarray | None = None
     ) -> np.ndarray:
+        """Run the programs once on `frame`, keyed by the bundle's names, and return the chunk of actions."""
         values: dict[str, Any] = {name: frame[name] for name in self._frame_spec}
         if self._task_tokens is not None:
             values[TASK_EMBEDDINGS], values[TASK_LENGTH] = self._task_tokens(task)
@@ -167,7 +170,7 @@ class BundleInferenceEngine(InferenceEngine):
         return actions
 
     def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self._run_chunk(frame, self._fixed_task or "", noise)
+        actual = self.run_chunk(frame, self._fixed_task or "", noise)
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -243,7 +246,7 @@ class BundleInferenceEngine(InferenceEngine):
         if not self._actions:
             start = time.perf_counter()
             self._actions.extend(
-                self._run_chunk(
+                self.run_chunk(
                     {self._rename.get(name, name): value for name, value in obs_frame.items()}, task
                 )
             )

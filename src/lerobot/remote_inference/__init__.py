@@ -14,12 +14,28 @@
 
 """Exclusive asynchronous policy serving over Zenoh."""
 
-from .client import RemoteClient, RequestCancelled
+from typing import TYPE_CHECKING
+
+from lerobot.utils.import_utils import lazy_exports
+
 from .configs import ExecutionConfig, LanguageConfig, ModelConfig, ServerConfig
 from .deployment import artifact_identity, load_deployment
-from .engine import RemoteInferenceEngine
 from .protocol import PROTOCOL_VERSION, AdmissionDeniedError, ErrorCode, ProtocolError
 from .server import PolicyServer, SessionWorker
+
+# The robot side imports torch, so each is imported the first time it is used; a server of a bundle never does.
+if TYPE_CHECKING:
+    from .client import RemoteClient, RequestCancelled
+    from .engine import RemoteInferenceEngine
+else:
+    __getattr__, __dir__ = lazy_exports(
+        __name__,
+        {
+            "RemoteClient": ".client.RemoteClient",
+            "RequestCancelled": ".client.RequestCancelled",
+            "RemoteInferenceEngine": ".engine.RemoteInferenceEngine",
+        },
+    )
 
 __all__ = [
     "PROTOCOL_VERSION",
