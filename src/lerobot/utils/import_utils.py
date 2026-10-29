@@ -17,6 +17,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import logging
+from collections.abc import Sequence
 from typing import Any, Literal, overload
 
 from draccus.choice_types import ChoiceRegistry
@@ -243,23 +244,20 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-def register_third_party_plugins() -> None:
+PLUGIN_KINDS = ("robot", "camera", "teleoperator", "policy", "env", "strategy")
+"""The kinds of third-party plugins `register_third_party_plugins` imports by default."""
+
+
+def register_third_party_plugins(kinds: Sequence[str] = PLUGIN_KINDS) -> None:
     """
     Discover and import third-party LeRobot plugins so they can register themselves.
 
     This function uses `importlib.metadata` to find packages installed in the environment
-    (including editable installs) starting with 'lerobot_robot_', 'lerobot_camera_',
-    'lerobot_teleoperator_', 'lerobot_policy_', 'lerobot_env_' or 'lerobot_strategy_' and
-    imports them.
+    (including editable installs) named `lerobot_<kind>_...` for each of `kinds`, such as
+    `lerobot_robot_` or `lerobot_policy_`, and imports them. A command that must not load
+    some plugins, such as policy plugins that import PyTorch, passes only the kinds it needs.
     """
-    prefixes = (
-        "lerobot_robot_",
-        "lerobot_camera_",
-        "lerobot_teleoperator_",
-        "lerobot_policy_",
-        "lerobot_env_",
-        "lerobot_strategy_",
-    )
+    prefixes = tuple(f"lerobot_{kind}_" for kind in kinds)
     imported: list[str] = []
     failed: list[str] = []
 
