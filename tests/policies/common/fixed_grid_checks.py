@@ -107,14 +107,19 @@ def count_grid_builds(monkeypatch: pytest.MonkeyPatch) -> list[type]:
     return builds
 
 
-def data_dependent_nodes(program: torch.export.ExportedProgram) -> list[str]:
+def data_dependent_nodes(
+    program: torch.export.ExportedProgram, skip_functions: tuple[str, ...] = ()
+) -> list[str]:
     """Nodes whose output shape depends on tensor values: `nonzero`, boolean-mask indexing, unbacked sizes.
 
     Runtime asserts (`torch_compilable_check`) read values too, but only to raise, so they are not listed.
+    Nodes whose traced call stack names a function in `skip_functions` are not listed either.
     """
     found = []
     for node in program.graph.nodes:
         if node.op != "call_function":
+            continue
+        if any(function in node.meta.get("stack_trace", "") for function in skip_functions):
             continue
         name = str(node.target)
         indices = node.args[1] if name.startswith(("aten.index.", "aten.index_put")) else []

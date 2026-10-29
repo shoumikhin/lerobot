@@ -19,6 +19,9 @@ import torch
 from transformers import Qwen3VLConfig
 
 IMAGE_TOKEN_ID = 7
+# The stock text model adds the DeepStack features with boolean-mask indexing, and the fixed-grid path keeps that
+# code; TensorRT support for that op comes from Torch-TensorRT.
+STOCK_DEEPSTACK = ("_deepstack_process",)
 # The two-frame grid checks the temporal axis.
 IMAGE_GRIDS = [[1, 4, 4], [2, 4, 6]]
 

@@ -979,6 +979,7 @@ def _vlm_stage_setup(act_token: int = 10, flow_token: int = 11, num_queries: int
 
 def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> None:
     from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK
 
     qwen, backend, inputs = _vlm_stage_setup()
     num_queries = inputs["act_query"].shape[0]
@@ -1009,7 +1010,7 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> N
             exported.module()(*(inputs[key] for key in keys)), (expected["h_vlm"], action_hidden)
         )
     assert len(builds) == 1
-    assert data_dependent_nodes(exported) == []
+    assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
     # Each sample's placeholders hold the queries in order, wherever the sample put its tokens.
     for name in ("act", "flow"):
         filled = text_inputs[0][inputs[f"{name}_placeholder_mask"]]

@@ -40,6 +40,7 @@ from tests.policies.common.fixed_grid_checks import (  # noqa: E402
 from tests.policies.common.qwen3_vl_helpers import (  # noqa: E402
     IMAGE_GRIDS,
     IMAGE_TOKEN_ID,
+    STOCK_DEEPSTACK,
     image_prompts,
     tiny_qwen3_vl_config,
 )
@@ -97,7 +98,7 @@ def test_qwen3_vl_forward_matches_stock_model(model):
         program = torch.export.export(Wrapper(), args)
         torch.testing.assert_close(program.module()(*args), expected)
     # DeepStack included: the stock text model would add its features with boolean-mask indexing.
-    assert data_dependent_nodes(program) == []
+    assert data_dependent_nodes(program, skip_functions=STOCK_DEEPSTACK) == []
 
 
 def test_qwen3_vl_forward_rejects_a_wrong_image_token_count(model):

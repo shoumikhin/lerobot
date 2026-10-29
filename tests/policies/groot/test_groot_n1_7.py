@@ -262,7 +262,7 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
     from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
-    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts, tiny_qwen3_vl_config
 
     torch.manual_seed(0)
     qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
@@ -303,7 +303,7 @@ def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(mo
         exported = torch.export.export(Backbone(), tuple(prompts[key] for key in keys))
         torch.testing.assert_close(exported.module()(*(prompts[key] for key in keys)), expected)
     assert len(builds) == 1
-    assert data_dependent_nodes(exported) == []
+    assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

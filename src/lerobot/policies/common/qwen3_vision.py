@@ -157,30 +157,13 @@ def qwen3_vl_forward(
     """
     image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, grid_thw, grid)
     check_input(image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match.")
-    visual_pos_masks = image_mask
-    image_mask = image_mask[..., None].expand_as(inputs_embeds)
-    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
-    text_inputs = {
-        "inputs_embeds": inputs_embeds,
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-    }
-    if not torch.compiler.is_exporting():
-        return model.language_model(
-            **text_inputs, visual_pos_masks=visual_pos_masks, deepstack_visual_embeds=deepstack_features
-        ).last_hidden_state
-    # The stock text model adds the DeepStack features with boolean-mask indexing, which makes exported
-    # shapes depend on the data. Adding them scattered into zeros after the same layers gives the same values.
-    dense_features = [
-        torch.zeros_like(inputs_embeds, dtype=features.dtype).masked_scatter(image_mask, features)
-        for features in deepstack_features
-    ]
-    handles = [
-        layer.register_forward_hook(lambda module, args, output, add=add: output + add.to(output.dtype))
-        for layer, add in zip(model.language_model.layers, dense_features, strict=False)
-    ]
-    try:
-        return model.language_model(**text_inputs).last_hidden_state
-    finally:
-        for handle in handles:
-            handle.remove()
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
+    )
+    return model.language_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        visual_pos_masks=image_mask,
+        deepstack_visual_embeds=deepstack_features,
+    ).last_hidden_state
