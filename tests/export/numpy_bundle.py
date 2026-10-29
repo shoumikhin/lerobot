@@ -26,7 +26,7 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from lerobot.bundle.manifest import TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
-from lerobot.bundle.runtime import RUNTIMES, Runtime
+from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.robots import RobotConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
@@ -50,7 +50,7 @@ class ScaleProgram:
         return value
 
 
-RUNTIMES[RUNTIME] = Runtime(ScaleProgram)
+register_runtime(RUNTIME, Runtime(ScaleProgram))
 
 
 def make_numpy_bundle(
