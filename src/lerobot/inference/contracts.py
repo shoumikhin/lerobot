@@ -131,10 +131,13 @@ class ActionProvenance:
 
 @dataclass(frozen=True)
 class ActionChunk:
-    """A runner result in canonical coordinates plus optional RTC model values."""
+    """A runner result in canonical coordinates plus optional RTC model values.
+
+    A bundle's runner returns NumPy arrays, since it never imports PyTorch.
+    """
 
     model_actions: torch.Tensor | None
-    canonical_actions: torch.Tensor
+    canonical_actions: torch.Tensor | np.ndarray
     provenance: ActionProvenance
     execution_steps: int
     server_durations: dict[str, float] = field(default_factory=dict)

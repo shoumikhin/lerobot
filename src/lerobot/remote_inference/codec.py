@@ -21,12 +21,12 @@ caller's responsibility, before an asynchronous encoder accesses reused sensor b
 
 import io
 import math
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-import torch
 from PIL import Image, UnidentifiedImageError
 
 from lerobot.utils.import_utils import _msgpack_available, require_package
@@ -173,7 +173,9 @@ def _encode_value(value: Any, budget: _Budget, depth: int = 0) -> Any:
             "channel_order": "RGB",
             "data": data,
         }
-    if isinstance(value, torch.Tensor):
+    # A torch tensor exists only once torch is imported; a server that never imports it stays without it.
+    torch = sys.modules.get("torch")
+    if torch is not None and isinstance(value, torch.Tensor):
         try:
             value = value.detach().cpu().numpy()
         except (TypeError, RuntimeError) as exc:
