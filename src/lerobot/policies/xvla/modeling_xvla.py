@@ -24,7 +24,7 @@ import os
 import re
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor, nn
@@ -362,7 +362,7 @@ class XVLAPolicy(PreTrainedPolicy):
             state = state[:, -1, :]
         return pad_vector(state, self.model.dim_proprio, truncate=True)
 
-    def _prepare_images(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    def _prepare_images(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, int]:
         present_img_keys = [key for key in self.config.image_features if key in batch]
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -392,7 +392,7 @@ class XVLAPolicy(PreTrainedPolicy):
             stacked_imgs = torch.cat([stacked_imgs, pad_imgs], dim=1)
             stacked_masks = torch.cat([stacked_masks, pad_masks], dim=1)
 
-        return stacked_imgs, stacked_masks
+        return stacked_imgs, stacked_masks, len(present_img_keys)
 
     def _get_domain_id(self, batch: dict[str, Tensor], batch_size: int, device: torch.device) -> Tensor:
         candidate = None
@@ -428,10 +428,10 @@ class XVLAPolicy(PreTrainedPolicy):
             actions = pad_vector(actions, self.model.dim_action, truncate=True)
         return actions
 
-    def _build_model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    def _build_model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Any]:
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         batch_size = input_ids.shape[0]
-        images, image_mask = self._prepare_images(batch)
+        images, image_mask, num_valid_views = self._prepare_images(batch)
         domain_id = self._get_domain_id(batch, batch_size, images.device)
         proprio = self._prepare_state(batch, batch_size, images.device)
         return {
@@ -440,7 +440,7 @@ class XVLAPolicy(PreTrainedPolicy):
             "image_mask": image_mask,
             "domain_id": domain_id,
             "proprio": proprio,
-            "num_valid_views": sum(key in batch for key in self.config.image_features),
+            "num_valid_views": num_valid_views,
         }
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
