@@ -3299,6 +3299,10 @@ def test_single_example_image_inputs_export():
     embed = ImageEmbeddings()
     program = torch.export.export(embed, example)
 
+    for node in program.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            assert all(isinstance(size, int) for size in value.shape), node.format_node()
     with torch.no_grad():
         embeddings = embed(*example)
         # Reference: each image feature added to its image patch token, in order.
