@@ -88,6 +88,13 @@ class BundleManifest:
         tolerance (`float`):
             The largest difference allowed between the actions the programs compute for the test case and
             the ones PyTorch computed, in normalized units: robot units divided by `action_scale`.
+        target (`dict[str, str]`, *optional*):
+            What the programs were built for, when they run only there. For a GPU: `device` (`cuda`), `gpu`
+            (its name) and `compute_capability`, such as `"8.7"`. `None` for programs that run anywhere their
+            runtime does.
+        runtime_versions (`dict[str, str]`, *optional*):
+            The version of each Python module the programs were built with and need to load, such as
+            `executorch`, by module name.
         test (`str`, *optional*, defaults to `"test.safetensors"`):
             The test case file: a frame, the noise, and the expected actions under `action`.
     """
@@ -103,6 +110,8 @@ class BundleManifest:
     action_names: list[str] | None = None
     action_scale: list[float]
     tolerance: float
+    target: dict[str, str] | None = None
+    runtime_versions: dict[str, str] = field(default_factory=dict)
     test: str = TEST_CASE
 
     def __post_init__(self) -> None:

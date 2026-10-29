@@ -49,6 +49,8 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         - **device** (`str`) -- Where the policy runs while it is compiled, such as `cuda` or `cpu`.
         - **runtime_imports** (`tuple[str, ...]`) -- Python modules the runtime imports before it loads
           the files, such as one that registers the compiler's kernels with the runtime.
+        - **runtime_modules** (`tuple[str, ...]`) -- Python modules the files need to load, whose versions
+          the bundle records, such as `executorch`.
         - **min_torch** (`str`, *optional*) -- The oldest PyTorch whose traced programs the compiler reads,
           such as `"2.15"`. `None` takes any.
         - **packages** (`tuple[str, ...]`) -- What to install beside LeRobot to export with this backend, pinned
@@ -59,8 +61,13 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     file_suffix: ClassVar[str]
     device: ClassVar[str]
     runtime_imports: ClassVar[tuple[str, ...]] = ()
+    runtime_modules: ClassVar[tuple[str, ...]] = ()
     min_torch: ClassVar[str | None] = None
     packages: ClassVar[tuple[str, ...]] = ()
+
+    def target(self) -> dict[str, str] | None:
+        """What the files are built for when they run only there, for the bundle to record; see `BundleManifest`."""
+        return None
 
     @property
     def type(self) -> str:
