@@ -54,8 +54,9 @@ from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
     logging,
-    torch_compilable_check,
 )
+
+from lerobot.policies.common.input_checks import check_input
 
 from .configuration_molmoact2 import (
     MolmoAct2ActionExpertConfig,
@@ -1870,7 +1871,12 @@ class MolmoAct2VisionBackbone(nn.Module):
 
         # MLP layer to map the feature.
         pooled_features = self.image_projector(pooled_features)
-        return pooled_features.view(-1, pooled_features.shape[-1])[valid_token.flatten()]
+        pooled_features = pooled_features.view(-1, pooled_features.shape[-1])
+        if batch_size == 1:
+            # Only batching adds all-padding rows (every processor pooling window holds a patch), so a
+            # single example skips the data-dependent selection and keeps a static shape.
+            return pooled_features
+        return pooled_features[valid_token.flatten()]
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -3187,20 +3193,20 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         assert image_num_crops.size(0) == num_images, (
             f"Expected {num_images} image num crops, but got {image_num_crops.size(0)}"
         )
-        torch_compilable_check(
+        check_input(
             (end_token_counts == num_images) | (end_token_counts == 2 * num_images) | (num_images <= 0),
             lambda: "Could not infer image counts from image end tokens: "
             f"end_tokens={int(end_token_counts.sum())}, image_grids={num_images}.",
         )
         n_crops, n_patches, _ = pixel_values.shape
-        torch_compilable_check(
+        check_input(
             image_num_crops.sum() == n_crops,
             lambda: f"Expected {int(image_num_crops.sum())} crops, but got {n_crops}",
             error_type=AssertionError,
         )
         num_pooled_patches_per_image = image_grids[:, :2].prod(dim=1) + image_grids[:, 2:].prod(dim=1)
         num_pooled_patches = image_token_pooling.size(0)
-        torch_compilable_check(
+        check_input(
             num_pooled_patches_per_image.sum() == num_pooled_patches,
             lambda: f"Expected {int(num_pooled_patches_per_image.sum())} pooled patches, "
             f"but got {num_pooled_patches}",
@@ -3540,14 +3546,19 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             # Normalize the modality boundary to the text activation dtype;
             # parameter storage and autocast can otherwise make them differ.
             image_features = self.vision_backbone(images, token_pooling).to(device=x.device, dtype=x.dtype)
-            is_image_patch = input_ids.reshape(-1) == self.config.image_patch_id
-            torch_compilable_check(
+            is_image_patch = input_ids.reshape(-1).to(x.device) == self.config.image_patch_id
+            check_input(
                 is_image_patch.sum() == image_features.shape[0],
                 lambda: f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}.",
                 error_type=RuntimeError,
             )
-            flat_x = x.reshape(-1, x.shape[-1]).clone()
-            flat_x[is_image_patch] = flat_x[is_image_patch] + image_features
+            # The k-th image patch token takes the k-th feature. A gather keeps every shape static, which
+            # boolean indexing does not; padded row 0 is never selected.
+            padded_features = F.pad(image_features, (0, 0, 1, 0))
+            flat_x = x.reshape(-1, x.shape[-1])
+            flat_x = torch.where(
+                is_image_patch[:, None], flat_x + padded_features[is_image_patch.cumsum(0)], flat_x
+            )
             x = flat_x.reshape_as(x)
 
         # shape: (batch_size, seq_len, d_model)

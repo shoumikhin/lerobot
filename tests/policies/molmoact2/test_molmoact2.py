@@ -3285,6 +3285,37 @@ def test_saved_both_checkpoint_continuous_inference_exports():
         assert torch.equal(program.module()(*inputs), expected)
 
 
+def test_image_input_checks_raise_in_eager_mode_with_the_transformers_checks_off(monkeypatch):
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    # Two images: one crop and two pooled patches, two crops and two pooled patches.
+    end_token_counts, pixel_values = torch.tensor([2]), torch.randn(3, 4, 14 * 14 * 3)
+    pooling, grids, crops = (
+        torch.zeros(4, 2, dtype=torch.long),
+        torch.tensor([[1, 1, 1, 1], [1, 2, 0, 0]]),
+        torch.tensor([1, 2]),
+    )
+    build = hf_molmoact2_modeling.MolmoAct2Model._build_single_example_images
+    with pytest.raises(ValueError, match="Could not infer image counts"):
+        build(torch.tensor([3]), pixel_values, pooling, grids, crops)
+    with pytest.raises(AssertionError, match="Expected 3 crops"):
+        build(end_token_counts, pixel_values[:2], pooling, grids, crops)
+    with pytest.raises(AssertionError, match="Expected 4 pooled patches"):
+        build(end_token_counts, pixel_values, pooling[:3], grids, crops)
+
+    model = object.__new__(hf_molmoact2_modeling.MolmoAct2Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_patch_id=6)
+    model.vision_backbone = lambda images, token_pooling: torch.zeros(3, 8)
+    model.transformer = torch.nn.Module()
+    model.transformer.wte = torch.nn.Embedding(8, 8)
+    model.transformer.emb_drop = torch.nn.Identity()
+    # Two image patch tokens for three image features.
+    with pytest.raises(RuntimeError, match="Expected 2 image patch embeddings, got 3"):
+        model.build_input_embeddings(
+            torch.tensor([[1, 6, 6, 2]]), torch.zeros(1, 1, 4, 588), pooling[None, :3]
+        )
+
+
 def test_single_example_image_inputs_export():
     torch.manual_seed(0)
     end_id, patch_id = 5, 6
@@ -3338,6 +3369,10 @@ def test_single_example_image_inputs_export():
     embed = ImageEmbeddings()
     program = torch.export.export(embed, example, strict=False)
 
+    for node in program.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            assert all(isinstance(size, int) for size in value.shape), node.format_node()
     with torch.no_grad():
         embeddings = embed(*example)
         # Reference: each image feature added to its image patch token, in order.
@@ -3365,6 +3400,13 @@ def test_single_example_image_inputs_export():
     with torch.no_grad():
         batched = embed(*(torch.cat(pair) for pair in zip(example, other, strict=True)))
     torch.testing.assert_close(batched[:1], embeddings)
+
+    if torch.cuda.is_available():
+        # Accelerate can place the vision tower and the text embeddings on different devices.
+        model.transformer.wte.register_forward_hook(lambda module, args, output: output.cuda())
+        with torch.no_grad():
+            split = model.build_input_embeddings(example[0], *model.build_batched_images(*example))[0]
+        torch.testing.assert_close(split.cpu(), embeddings)
 
 
 def test_rtc_generation_uses_previous_chunk_prefix():
