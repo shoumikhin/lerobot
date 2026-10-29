@@ -87,7 +87,8 @@ def test_greedy_decoding_exports_and_keeps_its_early_stop_under_torch_compile(mo
 
     model = Decode().eval()
     tokens = torch.tensor([[4, 5], [6, 7]])
-    inputs = (torch.randn(2, 3, 8, 8), torch.ones(2, dtype=torch.bool), tokens, torch.ones_like(tokens, dtype=torch.bool))
+    image, image_mask = torch.randn(2, 3, 8, 8), torch.ones(2, dtype=torch.bool)
+    inputs = (image, image_mask, tokens, torch.ones_like(tokens, dtype=torch.bool))
     with torch.no_grad():
         eager = model(*inputs)
         assert eager.tolist() == [[END_OF_ACTION, 0, 0, 0]] * 2
