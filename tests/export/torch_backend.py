@@ -28,7 +28,6 @@ from safetensors.numpy import save_file
 from torch import Tensor, nn
 
 from lerobot.export.configs import ExportBackendConfig
-from lerobot.export.recipe import Part
 from lerobot.inference.bundle import MANIFEST, RUNTIMES, Bundle, BundleManifest, ProgramSpec, Runtime
 from lerobot.inference.bundle.manifest import NOISE, TEST_CASE
 from lerobot.utils.constants import ACTION
@@ -43,7 +42,8 @@ class TorchProgram:
         self._module = torch.export.load(path).module()
 
     def __call__(self, *inputs: Any) -> tuple[Tensor, ...]:
-        outputs = self._module(*(torch.as_tensor(x) for x in inputs))
+        with torch.no_grad():
+            outputs = self._module(*(torch.as_tensor(x) for x in inputs))
         return outputs if isinstance(outputs, tuple) else (outputs,)
 
     def to_numpy(self, value: Tensor) -> np.ndarray:
@@ -117,6 +117,8 @@ class TorchTestBackend(ExportBackendConfig):
 
     offset: float = 0.0
 
-    def compile(self, part: Part, path: Path) -> None:
-        module = _Offset(part.module, self.offset) if self.offset else part.module
-        torch.export.save(torch.export.export(module, part.example_inputs), path)
+    def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+        if self.offset:
+            args, _ = program.example_inputs
+            program = torch.export.export(_Offset(program.module(), self.offset), args)
+        torch.export.save(program, path)
