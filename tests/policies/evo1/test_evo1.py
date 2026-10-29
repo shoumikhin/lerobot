@@ -25,9 +25,11 @@ import lerobot.policies.evo1.modeling_evo1 as modeling_evo1
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.evo1.configuration_evo1 import Evo1Config
 from lerobot.policies.evo1.flow_matching import FlowmatchingActionHead
+from lerobot.policies.evo1 import internvl3_embedder
 from lerobot.policies.evo1.internvl3_embedder import (
     IMAGENET_MEAN,
     IMAGENET_STD,
+    InternVL3Embedder,
     _batched_pixel_values,
 )
 from lerobot.policies.evo1.processor_evo1 import (
@@ -892,3 +894,37 @@ def test_evo1_batched_pixel_values_shape_and_zero_padding():
     assert not torch.allclose(
         grouped[:, 0], expected_pad.expand(batch_size, 3, image_size, image_size), atol=1e-3
     )
+
+
+def test_internvl3_embedder_loads_default_rope_that_matches_dynamic_and_exports(monkeypatch):
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+
+    rope = {"rope_type": "dynamic", "type": "dynamic", "factor": 2.0, "rope_theta": 1e6}
+    text = transformers.Qwen2Config(
+        hidden_size=32, num_attention_heads=2, max_position_embeddings=2048, rope_parameters=rope
+    )
+    loaded = {}
+
+    def load_model(name, *, config, **kwargs):  # stop once the config is final
+        loaded["config"] = config
+        raise RuntimeError("config captured")
+
+    monkeypatch.setattr(internvl3_embedder.AutoTokenizer, "from_pretrained", lambda *a, **k: None)
+    monkeypatch.setattr(
+        internvl3_embedder.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: transformers.InternVLConfig(text_config=text.to_dict()),
+    )
+    monkeypatch.setattr(internvl3_embedder.AutoModel, "from_pretrained", load_model)
+    with pytest.raises(RuntimeError, match="config captured"):
+        InternVL3Embedder(device="cpu", use_flash_attn=False, max_text_length=1024)
+    default = loaded["config"].text_config
+    assert default.rope_parameters == {"rope_type": "default", "rope_theta": 1e6}
+
+    x, positions = torch.zeros(1, 1024, 32), torch.arange(1024)[None]
+    expected = Qwen2RotaryEmbedding(text)(x, positions)
+    rotary = Qwen2RotaryEmbedding(default)
+    assert all(torch.equal(a, b) for a, b in zip(rotary(x, positions), expected, strict=True))
+    exported = torch.export.export(rotary, (x, positions)).module()
+    assert all(torch.equal(a, b) for a, b in zip(exported(x, positions), expected, strict=True))
