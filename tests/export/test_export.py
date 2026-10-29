@@ -31,6 +31,7 @@ from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
+from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
 from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
 from lerobot.inference.sync import SyncInferenceEngine
@@ -280,9 +281,13 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
 needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+needs_executorch_cuda = pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
 BACKENDS = [
     "torch_test",
     pytest.param("executorch_xnnpack", marks=needs_executorch),
+    pytest.param("executorch_cuda", marks=needs_executorch_cuda),
 ]
 
 
@@ -340,6 +345,7 @@ class MaskedPositions(torch.nn.Module):
     "backend",
     [
         pytest.param(ExecuTorchXNNPACKConfig, marks=needs_executorch),
+        pytest.param(ExecuTorchCUDAConfig, marks=needs_executorch_cuda),
     ],
 )
 def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch, backend):
@@ -361,6 +367,15 @@ def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkey
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
 
 
+@needs_executorch_cuda
+def test_executorch_cuda_names_no_data_file_for_a_program_without_one(tmp_path):
+    path = tmp_path / "actions.pte"
+    # No weights and nothing for the GPU to compute, so ExecuTorch writes no data file.
+    program = torch.export.export(torch.nn.Identity(), (torch.randn(4, 3, device="cuda"),))
+    assert ExecuTorchCUDAConfig().compile(program, path) is None
+    assert path.is_file() and not path.with_suffix(".ptd").exists()
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 import tempfile
@@ -370,10 +385,16 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-@needs_executorch
-def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
-    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("executorch_xnnpack", marks=needs_executorch),
+        pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+    ],
+)
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
+    """The bundle check loads the programs, on the CPU or the GPU, and replays the test case, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
     assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
 
 
