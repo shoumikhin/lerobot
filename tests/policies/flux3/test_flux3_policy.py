@@ -685,6 +685,35 @@ def test_policy_single_layout_relative_actions_and_cfg_one(fake_vae):
     assert torch.isfinite(loss) and info["n_valid_windows"] == 2
 
 
+def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
+    policy = Flux3Policy(single_config(sampler="euler", num_inference_steps=1)).eval()
+    gen = torch.Generator().manual_seed(2)
+    obs = {
+        "observation.images.top": torch.rand(1, 3, 64, 96, generator=gen),
+        OBS_STATE: torch.rand(1, 6, generator=gen),
+        "task": ["stack the cubes"],
+    }
+
+    def velocity(samples, t):  # a stand-in for the DiT
+        return {"x": samples["x"] * float(t)}
+
+    class EulerSampler(nn.Module):
+        def forward(self, x):
+            return sampling.euler({"x": x}, velocity, timesteps=policy._euler_timesteps())["x"]
+
+    sampler, x = EulerSampler(), torch.randn(4)
+    # A freshly built policy exports without an eager prediction first.
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+    policy.predict_action_chunk(obs)
+    policy.config.num_inference_steps = 2
+    with pytest.raises(RuntimeError, match="out of date"):
+        torch.export.export(sampler, (x,))
+    fresh = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    fresh.load_state_dict(policy.state_dict())
+    assert torch.equal(policy.predict_action_chunk(obs), fresh.predict_action_chunk(obs))
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+
+
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
     cfg = droid_config()
     policy = Flux3Policy(cfg)
