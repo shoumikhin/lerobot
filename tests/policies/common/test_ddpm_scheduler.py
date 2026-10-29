@@ -22,6 +22,8 @@ pytest.importorskip("diffusers")
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig  # noqa: E402
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionModel  # noqa: E402
+from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig  # noqa: E402
+from lerobot.policies.multi_task_dit.modeling_multi_task_dit import DiffusionObjective  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 
 
@@ -51,6 +53,8 @@ def test_exported_diffusion_sampling_matches_eager(scheduler, num_inference_step
     model = DiffusionModel(config).eval()
     model.num_inference_steps = num_inference_steps
     assert len(model.noise_scheduler.timesteps) == num_inference_steps
+    with pytest.raises(ValueError, match="at least 1"):
+        model.num_inference_steps = 0
     sampler = Sampler(model)
     global_cond = torch.randn(2, 4 * config.n_obs_steps)
     noise = torch.randn(2, config.horizon, 2)
@@ -61,3 +65,43 @@ def test_exported_diffusion_sampling_matches_eager(scheduler, num_inference_step
     exported = torch.export.export(sampler, (global_cond, noise), strict=False).module()
     torch.manual_seed(0)
     assert torch.equal(exported(global_cond, noise), expected)
+
+
+class Denoiser(torch.nn.Module):  # a stand-in for the DiT
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2)
+
+    def forward(self, sample, timestep, conditioning_vec):
+        return self.proj(sample) * timestep[:, None, None] / 100 + conditioning_vec[:, None]
+
+
+@pytest.mark.parametrize("scheduler", ["DDPM", "DDIM"])
+def test_exported_multi_task_dit_sampling_matches_eager(scheduler):
+    config = MultiTaskDiTConfig(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(4,))},
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        objective="diffusion",
+        noise_scheduler_type=scheduler,
+        num_train_timesteps=100,
+        num_inference_steps=10,
+    )
+    objective = DiffusionObjective(config, action_dim=2, horizon=8)
+    with pytest.raises(ValueError, match="at least 1"):
+        objective.num_inference_steps = 0
+
+    class ObjectiveSampler(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.denoiser = Denoiser()
+
+        def forward(self, conditioning_vec, noise):
+            return objective.conditional_sample(self.denoiser, noise.shape[0], conditioning_vec, noise=noise)
+
+    sampler = ObjectiveSampler()
+    conditioning_vec, noise = torch.randn(2, 2), torch.randn(2, 8, 2)
+    torch.manual_seed(0)
+    expected = sampler(conditioning_vec, noise)
+    exported = torch.export.export(sampler, (conditioning_vec, noise), strict=False).module()
+    torch.manual_seed(0)
+    assert torch.equal(exported(conditioning_vec, noise), expected)

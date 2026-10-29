@@ -256,6 +256,8 @@ class DiffusionModel(nn.Module):
 
     @num_inference_steps.setter
     def num_inference_steps(self, value: int) -> None:
+        if value < 1:
+            raise ValueError(f"num_inference_steps must be at least 1, got {value}")
         # Here, not in the traced sampling call, where the timesteps could not be read back as ints.
         self.noise_scheduler.set_timesteps(value)
 
