@@ -1917,10 +1917,10 @@ class WallXPolicy(PreTrainedPolicy):
         """Vision metadata of the batch's camera grid, rebuilt in eager mode when the grid changes."""
         if batch.get("video_grid_thw") is not None:
             raise ValueError("WALL-X precompute_grid_thw supports images only.")
-        self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
+        vision_grid = self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
             self._vision_grid, self.model.visual, batch["image_grid_thw"]
         )
-        return self._vision_grid
+        return vision_grid
 
     def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
         """Vision metadata and rope positions of the cached camera grid, for `torch.export`."""
