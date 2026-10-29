@@ -21,7 +21,7 @@ from dataclasses import asdict
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions import Independent, Normal, TanhTransform, Transform, TransformedDistribution
+from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 
 from lerobot.configs import PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
@@ -654,8 +654,9 @@ class RescaleFromTanh(Transform):
 
 class TanhMultivariateNormalDiag(TransformedDistribution):
     def __init__(self, loc, scale_diag, low=None, high=None):
-        # Same distribution as MultivariateNormal(loc, diag_embed(scale_diag)), without its Cholesky factorization.
-        base_dist = Independent(Normal(loc, scale_diag.sqrt()), 1)
+        # The Cholesky factor of a diagonal covariance is its square root; passing it directly avoids a
+        # factorization (and its validation check) that torch.export cannot trace.
+        base_dist = MultivariateNormal(loc, scale_tril=torch.diag_embed(scale_diag.sqrt()))
 
         transforms = [TanhTransform(cache_size=1)]
 
