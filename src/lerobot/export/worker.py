@@ -37,7 +37,7 @@ import torch
 
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.inference.bundle import BundleManifest, ProgramSpec
-from lerobot.inference.bundle.manifest import (
+from lerobot.bundle.manifest import (
     CONSTANTS,
     EMBEDDINGS_FILE,
     KNOWN_TASKS,

@@ -26,7 +26,7 @@ from safetensors.numpy import save_file
 from safetensors.torch import save_file as save_torch_file
 
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference.bundle.manifest import MANIFEST, NOISE, BundleManifest
+from lerobot.bundle.manifest import MANIFEST, NOISE, BundleManifest
 from lerobot.utils.constants import ACTION
 
 from .recipe import TaskPrompt, TestCase

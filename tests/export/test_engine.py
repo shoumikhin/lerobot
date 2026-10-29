@@ -23,7 +23,7 @@ from safetensors.numpy import load_file, save_file
 from torch import Tensor, nn
 
 from lerobot.inference.bundle import MANIFEST, Bundle, BundleInferenceEngine
-from lerobot.inference.bundle.manifest import NOISE, TEST_CASE
+from lerobot.bundle.manifest import NOISE, TEST_CASE
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle
 

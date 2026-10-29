@@ -60,8 +60,8 @@ from lerobot.export.recipe import (
     TestCase,
     load_policy,
 )
-from lerobot.inference.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH
-from lerobot.inference.bundle.task_tokens import clean, tokenize
+from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH
+from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.policies import prepare_observation_for_inference
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,

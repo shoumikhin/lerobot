@@ -368,7 +368,7 @@ def _bundle_rollout_config(
 
     import numpy as np
 
-    from lerobot.inference.bundle.manifest import MANIFEST
+    from lerobot.bundle.manifest import MANIFEST
     from lerobot.rollout import RolloutConfig
     from lerobot.utils.constants import OBS_STATE
     from tests.export.torch_backend import make_bundle
@@ -418,7 +418,7 @@ def test_rollout_config_refuses_a_planner_for_a_fixed_task_bundle(monkeypatch, t
 
 
 def test_rollout_config_takes_a_planner_for_a_bundle_that_runs_any_task(monkeypatch, tmp_path):
-    from lerobot.inference.bundle.manifest import TaskTokensSpec
+    from lerobot.bundle.manifest import TaskTokensSpec
     from lerobot.rollout.planner import PlannerConfig
 
     spec = TaskTokensSpec([], "tokenizer.json", "token_embeddings.safetensors", "known_tasks.json", 8)

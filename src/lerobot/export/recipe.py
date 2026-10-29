@@ -31,7 +31,7 @@ from torch import Tensor, nn
 from torch.overrides import TorchFunctionMode
 
 from lerobot.configs import FeatureType, PreTrainedConfig
-from lerobot.inference.bundle.manifest import NOISE
+from lerobot.bundle.manifest import NOISE
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.policies.factory import _import_sibling_policy_module
 from lerobot.processor import PolicyProcessorPipeline, RenameObservationsProcessorStep

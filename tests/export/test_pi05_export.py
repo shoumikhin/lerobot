@@ -27,7 +27,7 @@ pytest.importorskip("tokenizers")
 
 import tests.export.torch_backend  # noqa: E402,F401  # registers the test backend
 from lerobot.inference.bundle import Bundle, BundleInferenceEngine  # noqa: E402
-from lerobot.inference.bundle.manifest import NOISE  # noqa: E402
+from lerobot.bundle.manifest import NOISE  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.pi05 import PI05Policy  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402

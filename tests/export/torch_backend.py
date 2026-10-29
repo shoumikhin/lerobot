@@ -29,7 +29,7 @@ from torch import Tensor, nn
 
 from lerobot.export.configs import ExportBackendConfig
 from lerobot.inference.bundle import MANIFEST, RUNTIMES, Bundle, BundleManifest, ProgramSpec, Runtime
-from lerobot.inference.bundle.manifest import NOISE, TEST_CASE
+from lerobot.bundle.manifest import NOISE, TEST_CASE
 from lerobot.utils.constants import ACTION
 
 

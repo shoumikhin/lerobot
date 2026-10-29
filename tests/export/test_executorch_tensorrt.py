@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-from lerobot.inference.bundle.runtime import load_program, prepare_runtime
+from lerobot.bundle.runtime import load_program, prepare_runtime
 
 path, data, inputs, outputs, *runtime_imports = sys.argv[1:]
 prepare_runtime("executorch", runtime_imports)

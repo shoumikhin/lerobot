@@ -26,7 +26,7 @@ from safetensors.torch import save_file
 from torch import Tensor, nn
 
 from lerobot.inference.bundle import Bundle, BundleInferenceEngine, task_tokens as task_tokens_module
-from lerobot.inference.bundle.manifest import (
+from lerobot.bundle.manifest import (
     EMBEDDINGS_FILE,
     KNOWN_TASKS,
     MANIFEST,
@@ -36,7 +36,7 @@ from lerobot.inference.bundle.manifest import (
     BundleManifest,
     TaskTokensSpec,
 )
-from lerobot.inference.bundle.task_tokens import TaskTokens, clean
+from lerobot.bundle.task_tokens import TaskTokens, clean
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle
 

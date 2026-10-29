@@ -55,8 +55,8 @@ from lerobot.export.recipe import (
     TaskPrompt,
     TestCase,
 )
-from lerobot.inference.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH
-from lerobot.inference.bundle.task_tokens import clean, tokenize
+from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH
+from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.policies import prepare_observation_for_inference
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d

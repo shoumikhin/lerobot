@@ -48,8 +48,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from lerobot.inference.bundle.manifest import MANIFEST, BundleManifest
-from lerobot.utils import init_logging
+from lerobot.bundle.manifest import MANIFEST, BundleManifest
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +124,7 @@ def _run_step(
 
 def main() -> None:
     """CLI entry point for `lerobot-export`."""
-    init_logging()
+    logging.basicConfig(level=logging.INFO)
     try:
         export(sys.argv[1:])
     except RuntimeError as error:

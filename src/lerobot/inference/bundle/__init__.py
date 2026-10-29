@@ -21,8 +21,8 @@ it. This package runs the programs without importing PyTorch.
 """
 
 from .engine import BundleInferenceEngine
-from .manifest import FORMAT_VERSION, MANIFEST, Bundle, BundleManifest, ProgramSpec, TaskTokensSpec, is_bundle
-from .runtime import RUNTIMES, Program, Runtime, load_program
+from lerobot.bundle.manifest import FORMAT_VERSION, MANIFEST, Bundle, BundleManifest, ProgramSpec, TaskTokensSpec, is_bundle
+from lerobot.bundle.runtime import RUNTIMES, Program, Runtime, load_program
 
 __all__ = [
     "FORMAT_VERSION",

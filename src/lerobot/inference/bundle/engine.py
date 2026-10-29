@@ -30,9 +30,9 @@ from safetensors.numpy import load_file
 from lerobot.utils.constants import ACTION
 
 from ..base import InferenceEngine
-from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
-from .runtime import Program, load_program, prepare_runtime
-from .task_tokens import TaskTokens
+from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
+from lerobot.bundle.runtime import Program, load_program, prepare_runtime
+from lerobot.bundle.task_tokens import TaskTokens
 
 logger = logging.getLogger(__name__)
 
