@@ -402,6 +402,8 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ({"runs": ["model"]}, "runs"),
         ({"runtime_imports": [123]}, "runtime_imports"),
         ({"target": "cuda"}, "target"),
+        ({"task_tokens": {"prompt_ops": ["strip"]}}, "task_tokens"),
+        ({"task_tokens": {"prompt_ops": [[]]}}, "task_tokens"),
     ],
 )
 def test_bundle_refuses_a_manifest_in_a_form_it_does_not_read(tmp_path, change, wrong):
