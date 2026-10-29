@@ -28,6 +28,10 @@ Check that CPU inference can meet your required control rate before deploying on
 When `--device` is omitted, rollout uses the policy configuration device if set, otherwise it selects an available device automatically.
 The same behavior applies to `RolloutConfig(device=...)` with `build_rollout_context`.
 
+### Running a compiled policy
+
+`--policy.path` can also be a bundle folder written by `lerobot-export`. `lerobot-rollout` then runs the compiled programs instead of the PyTorch policy, without loading PyTorch (except for strategies that record a dataset). See [Compiled Policies](./export).
+
 ---
 
 ## Strategies
