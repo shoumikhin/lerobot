@@ -18,9 +18,11 @@ same noise."""
 
 import importlib.util
 import shutil
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,7 +37,7 @@ from lerobot.export.recipe import random_frame  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.factory import get_policy_class  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
-from tests.export import tiny_groot, tiny_pi05  # noqa: E402
+from tests.export import tiny_groot, tiny_pi05, tiny_smolvla  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
 
 TASK = "pick up the cube"
@@ -51,7 +53,7 @@ class Chain:
 
     `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. The bundle is
     exported with the first of `tasks` and `args`, and plays each of them. `programs` are its program names,
-    and `lora` the modules of a PEFT adapter for it.
+    `lora` the modules of a PEFT adapter for it, and `check` checks what else it holds.
     """
 
     save: Callable[[Path, pytest.MonkeyPatch], Path]
@@ -61,6 +63,7 @@ class Chain:
     plugins: tuple[str, ...] = ()
     tiny: Callable[[pytest.MonkeyPatch], None] | None = None
     lora: list[str] | None = None
+    check: Callable[[torch.nn.Module, Bundle], None] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
@@ -70,6 +73,61 @@ def save_pi05(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Pa
         return folder / "checkpoint"
 
     return save
+
+
+def save_smolvla(folder: Path, patch: pytest.MonkeyPatch) -> Path:
+    tiny_smolvla.save_checkpoint(folder / "checkpoint", patch)
+    return folder / "checkpoint"
+
+
+def programs_hold_only_their_weights(
+    owners: dict[str, tuple[str, ...]], transformed: tuple[str, ...] = ()
+) -> Callable[[torch.nn.Module, Bundle], None]:
+    """A check that each program holds the parameters of the modules `owners` names for it and no other
+    parameter of the policy, found by value among its weights and constants. A part boundary that moves, or
+    a weight copied into a second program, fails it. `transformed` names parameters a program holds computed
+    into another form, which no value matches."""
+
+    def key(tensor: torch.Tensor) -> tuple:
+        tensor = tensor.detach().contiguous()
+        return tuple(tensor.shape), tensor.dtype, tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+
+    def check(policy: torch.nn.Module, bundle: Bundle) -> None:
+        parameters = {key(p) for p in policy.parameters()}
+        for name, files in bundle.manifest.programs.items():
+            program = torch.export.load(bundle.path / files.file)
+            constants = [t for t in program.constants.values() if isinstance(t, torch.Tensor)]
+            held = Counter(k for k in map(key, [*program.state_dict.values(), *constants]) if k in parameters)
+            own = Counter(
+                key(p)
+                for module in owners.get(name, ())
+                for parameter, p in policy.get_submodule(module).named_parameters()
+                if not any(part in parameter for part in transformed)
+            )
+            assert held == own, name
+
+    return check
+
+
+ACTION_PROJECTIONS = ("model.action_in_proj", "model.action_out_proj")
+VLM = "model.vlm_with_expert.vlm.model"
+smolvla_programs_hold_only_their_weights = programs_hold_only_their_weights(
+    {
+        "embed": (
+            f"{VLM}.vision_model",
+            f"{VLM}.connector",
+            f"{VLM}.text_model.embed_tokens",
+            "model.state_proj",
+        ),
+        "language_model": (f"{VLM}.text_model.layers", f"{VLM}.text_model.norm"),
+        "step": (
+            "model.vlm_with_expert.lm_expert",
+            *ACTION_PROJECTIONS,
+            "model.action_time_mlp_in",
+            "model.action_time_mlp_out",
+        ),
+    }
+)
 
 
 PI05 = Chain(
@@ -94,6 +152,14 @@ CHAINS = {
     "pi05_absolute": PI05,
     "pi05_relative": replace(PI05, save=save_pi05(relative_actions=True), lora=None),
     "groot_torchvision": GROOT,
+    "smolvla": Chain(
+        save_smolvla,
+        tasks=(TASK,),
+        programs=["actions", "embed", "language_model", "step"],
+        plugins=("tiny_smolvla",),
+        tiny=tiny_smolvla.use_tiny_smolvla,
+        check=smolvla_programs_hold_only_their_weights,
+    ),
 }
 
 
@@ -151,6 +217,8 @@ def test_the_bundle_plays_the_chunk_the_policy_predicts(exported, monkeypatch):
         # ignored it.
         assert np.abs((expected - predict(chain.tasks[0], noise)) / scale).max() > bundle.manifest.tolerance
     assert sorted(bundle.manifest.programs) == chain.programs
+    if chain.check is not None:
+        chain.check(policy, bundle)
 
 
 @pytest.mark.parametrize("name", [name for name, chain in CHAINS.items() if chain.lora])
@@ -169,3 +237,23 @@ def test_the_export_refuses_a_peft_adapter(name, tmp_path, monkeypatch, capfd):
     with pytest.raises(RuntimeError, match="trace step failed"):
         run_export(chain, adapter, tmp_path / "bundle", monkeypatch)
     assert "is a PEFT adapter" in capfd.readouterr().err
+
+
+def test_the_smolvla_recipe_refuses_a_chain_that_computes_something_else(tmp_path, monkeypatch):
+    from lerobot.policies.smolvla.export_smolvla import SmolVLAExportRecipe, SmolVLAStep
+
+    checkpoint = save_smolvla(tmp_path, monkeypatch)
+    policy = get_policy_class("smolvla").from_pretrained(checkpoint).eval()
+    preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=str(checkpoint))
+    recipe = SmolVLAExportRecipe(
+        policy,
+        preprocessor,
+        postprocessor,
+        SimpleNamespace(
+            backend=SimpleNamespace(device="cpu"), seed=0, dataset=None, task=TASK, tolerance=None
+        ),
+    )
+    step = SmolVLAStep.forward
+    monkeypatch.setattr(SmolVLAStep, "forward", lambda self, *inputs: step(self, *inputs) + 1e-3)
+    with pytest.raises(ValueError, match="computes something else as a chain of parts"):
+        next(recipe.parts())

@@ -14,9 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export helpers shared by policies that check how they are being traced."""
+"""Export helpers shared by the policies' export recipes."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
+
+if TYPE_CHECKING:
+    from lerobot.policies import PreTrainedPolicy
 
 
 def is_non_strict_exporting() -> bool:
@@ -27,3 +35,17 @@ def is_non_strict_exporting() -> bool:
     PyTorch keeps this flag per process, so eager calls on other threads also see it while an export runs.
     """
     return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
+
+
+class PolicyPart(nn.Module):
+    """A part that runs some of the policy's own code.
+
+    `torch.export` keeps every weight of the module it exports, used or not. So the policy is held as a plain
+    reference, not a submodule, and only the modules the part runs are registered: the program holds their
+    weights, not the whole policy's.
+    """
+
+    def __init__(self, policy: PreTrainedPolicy, modules: tuple[str, ...] = ()):
+        super().__init__()
+        object.__setattr__(self, "policy", policy)
+        self.weights = nn.ModuleList(policy.get_submodule(name) for name in modules)
