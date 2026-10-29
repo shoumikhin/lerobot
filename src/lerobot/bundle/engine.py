@@ -113,6 +113,15 @@ class BundleEngine:
             for name, files in manifest.programs.items()
         }
         self._runs = [(run, programs[run.program]) for run in manifest.runs]
+        # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
+        self._placed = [
+            {
+                index: program.place(index, self._constants[name])
+                for index, name in enumerate(run.inputs)
+                if name in self._constants
+            }
+            for run, program in self._runs
+        ]
         self._check(case, noise, expected, manifest.tolerance)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
@@ -148,13 +157,22 @@ class BundleEngine:
             )
 
     def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
-        values: dict[str, Any] = {**self._constants, **{name: frame[name] for name in self._frame_spec}}
+        values: dict[str, Any] = {name: frame[name] for name in self._frame_spec}
         if self._noise_shape is not None:
             values[NOISE] = (
                 np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
             )
-        for run, program in self._runs:
-            values.update(zip(run.outputs, program(*(values[name] for name in run.inputs)), strict=True))
+        for (run, program), placed in zip(self._runs, self._placed, strict=True):
+            inputs = []
+            for index, name in enumerate(run.inputs):
+                if index in placed:
+                    inputs.append(placed[index])
+                    continue
+                if isinstance(values[name], np.ndarray):
+                    # Placed once per chunk; a later run that reads it on the same device gets this copy.
+                    values[name] = program.place(index, values[name])
+                inputs.append(values[name])
+            values.update(zip(run.outputs, program(*inputs), strict=True))
         actions = self._runs[-1][1].to_numpy(values[ACTION])
         if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] != len(self._scale):
             raise RuntimeError(
