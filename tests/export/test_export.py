@@ -274,6 +274,25 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
 
 
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and is_package_available("executorch")), reason="needs ExecuTorch on macOS"
+)
+def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
+    """Not end to end on ACT: Core ML takes no uint8 camera frames until pytorch/executorch#11686 is fixed."""
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+    from lerobot.inference.bundle.executorch import ExecuTorchProgram
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    # Test machines may have no GPU or Neural Engine to give.
+    ExecuTorchCoreMLConfig(compute_units="cpu_only").compile(torch.export.export(model, (x,)), path)
+    assert b"CoreMLBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 from lerobot.scripts.lerobot_export import export
