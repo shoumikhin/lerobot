@@ -80,6 +80,8 @@ class BundleInferenceEngine(InferenceEngine):
                 f"[steps, {len(self._scale)}]. Export the policy again."
             )
         self._frame_spec = {name: value.shape for name, value in case.items()}
+        self.chunk_length = expected.shape[0]
+        """The number of actions one run of the programs returns."""
         _check_dataflow(manifest, [*self._frame_spec, *self._constants], manifest.noise_shape is not None)
         prepare_runtime(manifest.runtime, manifest.runtime_imports)
         # Several runs of one program, such as the steps of a sampler, share it.
@@ -118,7 +120,8 @@ class BundleInferenceEngine(InferenceEngine):
                 f"The robot does not match the exported policy, which takes {'; '.join(problems)}.{hint}"
             )
 
-    def _run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
+    def run_chunk(self, frame: Mapping[str, np.ndarray], noise: np.ndarray | None = None) -> np.ndarray:
+        """Run the programs once on `frame`, keyed by the bundle's names, and return the chunk of actions."""
         values: dict[str, Any] = {**self._constants, **{name: frame[name] for name in self._frame_spec}}
         if self._noise_shape is not None:
             values[NOISE] = (
@@ -132,7 +135,7 @@ class BundleInferenceEngine(InferenceEngine):
         return actions
 
     def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self._run_chunk(frame, noise)
+        actual = self.run_chunk(frame, noise)
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -197,7 +200,7 @@ class BundleInferenceEngine(InferenceEngine):
         if not self._actions:
             start = time.perf_counter()
             self._actions.extend(
-                self._run_chunk({self._rename.get(name, name): value for name, value in obs_frame.items()})
+                self.run_chunk({self._rename.get(name, name): value for name, value in obs_frame.items()})
             )
             end = time.perf_counter()
             self.inference_times.append((end, end - start))
