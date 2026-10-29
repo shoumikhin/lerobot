@@ -22,7 +22,7 @@ import logging
 from collections.abc import Iterator
 from copy import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -108,8 +108,8 @@ class ExportRecipe(abc.ABC):
     """Knows one kind of policy, never a compiler: turns it into parts and makes the test case.
 
     A policy gets its own recipe only when the default one, [`ActionChunkRecipe`], does not fit. It lives
-    beside the policy's configuration, in `export_<type>.py`, as a class named like the policy class with
-    `ExportRecipe` in place of `Policy`, such as `PI05ExportRecipe`.
+    beside the policy's configuration, in `export_<type>.py`, as a class named like the configuration class
+    with `ExportRecipe` in place of `Config`, such as `PI05ExportRecipe` for `PI05Config`.
 
     Args:
         policy (`PreTrainedPolicy`):
@@ -128,6 +128,15 @@ class ExportRecipe(abc.ABC):
         - **tolerance** (`float`) -- The largest allowed action difference on the test case, in normalized
           action units.
     """
+
+    @classmethod
+    def load(cls, cfg: ExportConfig) -> ExportRecipe:
+        """The recipe for the checkpoint `cfg.policy` names.
+
+        By default it loads the whole policy. A recipe that builds its parts one at a time, to export on a
+        small board, overrides this to load only what each part needs.
+        """
+        return cls(*load_policy(cfg), cfg)
 
     def __init__(
         self,
@@ -433,19 +442,43 @@ def _default_tolerance(policy: PreTrainedPolicy) -> float:
     return FLOAT32_TOLERANCE
 
 
-def make_recipe(
-    policy: PreTrainedPolicy,
-    preprocessor: PolicyProcessorPipeline,
-    postprocessor: PolicyProcessorPipeline,
-    cfg: ExportConfig,
-) -> ExportRecipe:
+def recipe_class(config: PreTrainedConfig) -> type[ExportRecipe]:
     """The policy's own recipe, from `export_<type>.py` beside its configuration, or [`ActionChunkRecipe`]."""
-    config_class = type(policy.config)
+    config_class = type(config)
     module = _import_sibling_policy_module(config_class, "export")
     if module is None:
-        return ActionChunkRecipe(policy, preprocessor, postprocessor, cfg)
+        return ActionChunkRecipe
     name = config_class.__name__.removesuffix("Config") + "ExportRecipe"
-    recipe_class = getattr(module, name, None)
-    if recipe_class is None:
+    found = getattr(module, name, None)
+    if found is None:
         raise ValueError(f"{module.__name__} must define the export recipe {name}.")
-    return recipe_class(policy, preprocessor, postprocessor, cfg)
+    return found
+
+
+def load_policy(
+    cfg: ExportConfig,
+) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """The whole trained policy, in eval mode on the CPU, and its processors set to the backend's device."""
+    from lerobot.policies.factory import load_pretrained_policy, make_pre_post_processors
+
+    config = cast(PreTrainedConfig, cfg.policy)
+    # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
+    config.device = "cpu"
+    # How the policy runs, not how it trained, decides what compiles it.
+    if hasattr(config, "compile_model"):
+        config.compile_model = False
+    policy = load_pretrained_policy(config)
+    if hasattr(policy, "merge_and_unload"):
+        # A PEFT adapter: compile the base weights with the adapter folded in.
+        policy = policy.merge_and_unload()
+    policy.eval()
+    config.device = cfg.backend.device
+    overrides = {"device_processor": {"device": config.device}}
+    preprocessor, postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=config.pretrained_path,
+        pretrained_revision=config.pretrained_revision,
+        preprocessor_overrides=overrides,
+        postprocessor_overrides=overrides,
+    )
+    return policy, preprocessor, postprocessor
