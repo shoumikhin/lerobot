@@ -16,17 +16,15 @@
 
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from draccus.utils import ParsingError
 from safetensors.numpy import load_file
 
 import tests.export.torch_backend  # noqa: F401  # registers the test backend
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export import recipe as recipe_module
+from lerobot.export import worker
 from lerobot.export.bundle import POLICY_CONFIG
 from lerobot.inference.bundle import Bundle, BundleInferenceEngine
 from lerobot.inference.sync import SyncInferenceEngine
@@ -37,9 +35,10 @@ from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
-from tests.export.chain_recipe import ACTChainRecipe
 
 IMAGE = "observation.images.front"
+# The export steps run in processes of their own, which import this to know the test backend.
+IMPORTS = ["tests.export.torch_backend"]
 
 
 def save_checkpoint(path, image: str) -> None:
@@ -77,10 +76,8 @@ def checkpoint(tmp_path_factory):
     return path
 
 
-def run_export(*args: str, backend: str = "torch_test") -> None:
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(sys, "argv", ["lerobot-export", f"--backend.type={backend}", *args])
-        export()
+def run_export(*args: str, backend: str = "torch_test", imports: list[str] = IMPORTS) -> None:
+    export([f"--backend.type={backend}", *args], imports)
 
 
 @pytest.fixture(scope="module")
@@ -143,12 +140,12 @@ def test_export_writes_nothing_over_tolerance(checkpoint, tmp_path):
 
 
 @pytest.mark.parametrize("tolerance", ["nan", "inf", "-1"])
-def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, tolerance):
-    with pytest.raises(ParsingError) as error:
+def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, tolerance, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
         run_export(
             f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", f"--tolerance={tolerance}"
         )
-    assert "--tolerance must be a finite number" in str(error.value.__cause__)
+    assert "--tolerance must be a finite number" in capfd.readouterr().err
 
 
 def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
@@ -167,15 +164,25 @@ def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
 
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     monkeypatch.setattr(factory, "make_pre_post_processors", make_pre_post_processors)
-    run_export(
-        f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--policy.pretrained_revision=pin123"
-    )
+    monkeypatch.setattr(sys, "argv", ["worker"])
+    args = [
+        "--backend.type=torch_test",
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--policy.pretrained_revision=pin123",
+    ]
+    worker.trace({"step": "trace", "args": args})
     assert seen == ["pin123", "pin123"]
 
 
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
+    run = subprocess.run
     monkeypatch.setattr(
-        lerobot_export.subprocess, "run", lambda args: subprocess.CompletedProcess(args, returncode=-11)
+        lerobot_export.subprocess,
+        "run",
+        lambda args: subprocess.CompletedProcess(args, -11)
+        if "lerobot.inference.bundle" in args
+        else run(args),
     )
     with pytest.raises(RuntimeError, match="crashed with SIGSEGV"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
@@ -191,11 +198,14 @@ BACKENDS = [
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path, monkeypatch, backend):
+def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path, backend):
     """ACT exported as a chain whose last part runs twice, reading its factor from the constants."""
-    module = SimpleNamespace(__name__="export_act", ACTExportRecipe=ACTChainRecipe)
-    monkeypatch.setattr(recipe_module, "_import_sibling_policy_module", lambda *args: module)
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    run_export(
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        backend=backend,
+        imports=[*IMPORTS, "tests.export.chain_recipe"],
+    )
     bundle = Bundle.read(tmp_path / "b")
     assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
     programs = bundle.manifest.programs
@@ -209,3 +219,23 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     assert [p.name for p in programs] == ["prepare", "model", "scale_0", "scale_1"]
     constants = load_file(bundle.path / bundle.manifest.constants)
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
+
+
+EXPORT_WITHOUT_TORCH = """
+import sys
+from lerobot.scripts.lerobot_export import export
+
+export(sys.argv[1:], {imports})
+assert "torch" not in sys.modules
+"""
+
+
+def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
+    """Only the steps import PyTorch, so what one step used is freed before the next starts."""
+    from tests.test_torch_free_imports import BLOCK_TORCH
+
+    script = BLOCK_TORCH + EXPORT_WITHOUT_TORCH.format(imports=IMPORTS)
+    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
+    subprocess.run([sys.executable, "-c", script, *args], check=True)
+    assert_plays_like_pytorch(checkpoint, Bundle.read(tmp_path / "b"), IMAGE)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["b"]
