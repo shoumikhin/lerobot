@@ -144,6 +144,12 @@ class DummyTextProcessor:
         return ["the cup is left of the plate"]
 
 
+class RecordingTextProcessor(DummyTextProcessor):
+    def apply_chat_template(self, messages, **kwargs):
+        self.images = [b["image"] for row in messages for m in row for b in m["content"] if "image" in b]
+        return super().apply_chat_template(messages, **kwargs)
+
+
 def make_eo1_config():
     return EO1Config(
         device="cpu",
@@ -460,6 +466,154 @@ def test_model_messages_use_recipe_system_prompt_and_only_fall_back_for_action_i
         assert system_messages == [
             {"role": "system", "content": [{"type": "text", "text": "You are a helpful physical assistant."}]}
         ]
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
+
+@pytest.mark.parametrize(
+    ("use_fast_processor", "input_device", "image_device"),
+    [
+        (False, "cpu", "cpu"),
+        pytest.param(False, "cuda", "cpu", marks=needs_cuda),
+        pytest.param(True, "cuda", "cuda", marks=needs_cuda),
+    ],
+)
+def test_qwen_step_gives_only_the_slow_processor_cpu_images(
+    monkeypatch, use_fast_processor, input_device, image_device
+):
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep, EO1QwenProcessorStep
+    from lerobot.processor.converters import create_transition
+
+    processor = RecordingTextProcessor()
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: processor,
+    )
+    config = make_eo1_config()
+    camera_keys = ["observation.images.image", "observation.images.wrist"]
+    input_features = {**config.input_features, camera_keys[1]: config.input_features[camera_keys[0]]}
+    images = {key: torch.rand(2, 3, 8, 8, device=input_device) for key in camera_keys}
+    transition = create_transition(
+        observation={OBS_STATE: torch.zeros(2, STATE_DIM, device=input_device), **images},
+        complementary_data={"task": ["tidy", "stack"]},
+    )
+    transition = EO1PrepareModelMessagesStep(input_features, CHUNK_SIZE)(transition)
+    EO1QwenProcessorStep(use_fast_processor=use_fast_processor)(transition)
+
+    expected = [
+        images[key][row].clamp(0, 1).mul(255.0).round().to(torch.uint8)
+        for row in range(2)
+        for key in camera_keys
+    ]
+    messages = transition[TransitionKey.COMPLEMENTARY_DATA]["messages"]
+    kept = [b["image"] for row in messages for m in row for b in m["content"] if "image" in b]
+    for found, device in [(processor.images, image_device), (kept, input_device)]:
+        assert [img.device.type for img in found] == [device] * 4
+        assert [img.dtype for img in found] == [torch.uint8] * 4
+        for img, exp in zip(found, expected, strict=True):
+            assert torch.equal(img.to(exp.device), exp)
+
+
+@pytest.mark.dataset
+@needs_cuda
+@pytest.mark.parametrize("with_action", [True, False], ids=["training", "rollout"])
+def test_eo1_processor_accelerate_scenario(monkeypatch, with_action):
+    """Rollout and training hand the preprocessor a batch that is already on the GPU."""
+    pytest.importorskip("datasets", reason="language recipes require lerobot[dataset]")
+    processor = RecordingTextProcessor()
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: processor,
+    )
+    config = make_eo1_config()
+    config.device = "cuda:0"
+    preprocessor, _ = make_eo1_pre_post_processors(
+        config,
+        dataset_stats={
+            OBS_STATE: {"mean": torch.zeros(STATE_DIM), "std": torch.ones(STATE_DIM)},
+            ACTION: {"mean": torch.zeros(ACTION_DIM), "std": torch.ones(ACTION_DIM)},
+        },
+    )
+
+    device = torch.device("cuda:0")
+    batch = {
+        OBS_STATE: torch.randn(1, STATE_DIM, device=device),
+        "observation.images.image": torch.rand(1, 3, 16, 16, device=device),
+        "task": ["tidy"],
+    }
+    if with_action:
+        batch[ACTION] = torch.randn(1, CHUNK_SIZE, ACTION_DIM, device=device)
+    processed = preprocessor(batch)
+
+    assert [img.device.type for img in processor.images] == ["cpu"]
+    for key in ("input_ids", "pixel_values", "attention_mask"):
+        assert processed[key].device == device
+
+
+@pytest.mark.dataset
+@needs_cuda
+@pytest.mark.parametrize("annotated", [False, True], ids=["plain", "annotated"])
+@pytest.mark.parametrize("use_fast_processor", [False, True])
+def test_real_qwen_processor_takes_gpu_images(use_fast_processor, annotated):
+    pytest.importorskip("datasets", reason="language recipes require lerobot[dataset]")
+    config = make_eo1_config()
+    config.vlm_base = "Qwen/Qwen2.5-VL-3B-Instruct"
+    config.use_fast_processor = use_fast_processor
+    config.device = "cuda:0"
+    preprocessor, _ = make_eo1_pre_post_processors(
+        config,
+        dataset_stats={
+            OBS_STATE: {"mean": torch.zeros(STATE_DIM), "std": torch.ones(STATE_DIM)},
+            ACTION: {"mean": torch.zeros(ACTION_DIM), "std": torch.ones(ACTION_DIM)},
+        },
+    )
+    generator = torch.Generator().manual_seed(0)
+    batch = {
+        OBS_STATE: torch.randn(1, STATE_DIM, generator=generator),
+        "observation.images.image": torch.rand(1, 3, 480, 640, generator=generator),
+        ACTION: torch.randn(1, CHUNK_SIZE, ACTION_DIM, generator=generator),
+        "task": ["tidy"],
+    }
+    if annotated:
+        # Language annotations take the recipe path, which also renders text targets.
+        batch["timestamp"] = torch.tensor([0.0])
+        batch["index"] = torch.tensor([7])
+        batch["language_persistent"] = [
+            [
+                {
+                    "role": "assistant",
+                    "content": "pick up the red block",
+                    "style": "subtask",
+                    "timestamp": 0.0,
+                    "camera": None,
+                    "tool_calls": None,
+                }
+            ]
+        ]
+        batch["language_events"] = [[]]
+
+    on_cpu = preprocessor(dict(batch))
+    on_gpu = preprocessor({k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()})
+
+    tensor_keys = sorted(k for k, v in on_cpu.items() if isinstance(v, torch.Tensor))
+    assert {"input_ids", "attention_mask", "pixel_values"} <= set(tensor_keys)
+    if annotated:
+        assert (on_cpu["text_labels"] != -100).any()
+    for key in tensor_keys:
+        if use_fast_processor and key == "pixel_values":
+            # The fast processor resizes on the images' device, and its CUDA and CPU kernels round a little
+            # differently (here at most 0.11, 0.002 on average). The bounds leave room for upstream rounding
+            # changes and still catch a swapped channel order (2.9, 0.36 on average) or a wrong rescale.
+            torch.testing.assert_close(
+                on_gpu[key], on_cpu[key], rtol=0, atol=1.0, msg=lambda m, key=key: f"{key}: {m}"
+            )
+            assert (on_gpu[key] - on_cpu[key]).abs().mean() < 0.05
+        else:
+            torch.testing.assert_close(
+                on_gpu[key], on_cpu[key], rtol=0, atol=0, msg=lambda m, key=key: f"{key}: {m}"
+            )
 
 
 def test_saved_message_processor_registry_name_still_loads():
