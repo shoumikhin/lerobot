@@ -15,7 +15,7 @@
 # limitations under the License.
 """Checks shared by the fixed-grid Qwen-VL vision tests.
 
-In eager mode the fixed-grid helpers must call the stock tower module, so FSDP2 hooks on a sharded tower or
+In eager mode the fixed-grid code must keep the stock module calls, so FSDP2 hooks on a sharded model, tower or
 block and gradient checkpointing still run. Under export their programs must not depend on tensor values
 for any shape.
 """
@@ -53,28 +53,33 @@ def count_block_calls_with_checkpointing(visual: nn.Module, forward: Callable[[]
 
 
 class _Root(nn.Module):
-    def __init__(self, visual: nn.Module, forward: Callable[[nn.Module], Tensor]):
+    def __init__(self, module: nn.Module, forward: Callable[[nn.Module], Tensor]):
         super().__init__()
-        self.visual = visual
+        self.module = module
         self.run = forward
 
     def forward(self) -> Tensor:
-        return self.run(self.visual)
+        return self.run(self.module)
 
 
 def run_with_fsdp(
-    tmp_path: Path, visual: nn.Module, forward: Callable[[nn.Module], Tensor], *, whole_tower: bool
+    tmp_path: Path,
+    module: nn.Module,
+    forward: Callable[[nn.Module], Tensor],
+    units: Callable[[nn.Module], list[nn.Module]],
+    *,
+    reshard_after_forward: bool = True,
 ) -> Tensor:
-    """Run `forward(visual)` and its backward with FSDP2 on one CPU rank, and return the output.
+    """Run `forward(module)` with FSDP2 on one CPU rank, plus its backward when it has one, and return the output.
 
-    The tower sits under a root module, as in LeRobot's FSDP training. Every vision block is its own wrap unit
-    (the policies' default), or with `whole_tower` the tower is one unit (an `fsdp.wrap_modules` override).
+    `module` sits under a root module, as in LeRobot's FSDP training, and each of `units(module)` is its own wrap
+    unit (the policies' defaults, or an `fsdp.wrap_modules` override).
     """
     # Imported here because builds without torch.distributed cannot import them.
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
 
-    root = _Root(visual, forward)
+    root = _Root(module, forward)
     dist.init_process_group(
         "gloo",
         init_method=(tmp_path / "rendezvous").as_uri(),
@@ -84,11 +89,12 @@ def run_with_fsdp(
     )
     try:
         mesh = init_device_mesh("cpu", (1,))
-        for unit in [visual] if whole_tower else visual.blocks:
-            fully_shard(unit, mesh=mesh)
-        fully_shard(root, mesh=mesh)
+        for unit in units(module):
+            fully_shard(unit, mesh=mesh, reshard_after_forward=reshard_after_forward)
+        fully_shard(root, mesh=mesh, reshard_after_forward=reshard_after_forward)
         output = root()
-        output.square().sum().backward()
+        if output.requires_grad:
+            output.square().sum().backward()
         return output.detach()
     finally:
         dist.destroy_process_group()

@@ -980,7 +980,7 @@ class WallOSS05Policy(PreTrainedPolicy):
         return loss, metrics
 
     def _static_vision_grid(self, inputs: dict[str, Tensor]) -> Qwen2_5VisionGrid:
-        """Vision metadata of the fixed camera grid, computed from the first batch."""
+        """Vision metadata of the camera grid for `torch.export`, rebuilt in eager mode when the grid changes."""
         self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
             self._vision_grid, self.model.visual, inputs["image_grid_thw"]
         )
@@ -991,7 +991,10 @@ class WallOSS05Policy(PreTrainedPolicy):
         del kwargs
         inputs = self._pretokenized_inputs(batch)
         if self.config.precompute_grid_thw:
-            inputs["vision_grid"] = self._static_vision_grid(inputs)
+            vision_grid = self._static_vision_grid(inputs)
+            # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before.
+            if torch.compiler.is_exporting():
+                inputs["vision_grid"] = vision_grid
         output = self.model.generate_flow_action(
             action_horizon=self.config.chunk_size,
             action_dim=self.config.max_action_dim,

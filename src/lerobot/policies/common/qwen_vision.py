@@ -21,14 +21,15 @@ The stock towers turn the image grid (`image_grid_thw`) into Python ints on ever
 grid can be computed once in eager mode and reused. `FixedImageGrid` holds that cache and decides when it
 can be reused; the tower-specific subclasses live in `qwen2_5_vision.py` and `qwen3_vision.py`.
 
-Only an exported program needs the cache. In eager mode the helpers call the stock tower module, so FSDP
-and gradient checkpointing see exactly the stock module calls; the eager call also builds the cache that a
-later `torch.export` uses. Under export, `replay_vision_block` runs each vision block from its submodules
-with the attention chunk lengths as Python ints, because the stock attention reads them back from a tensor.
+Only an exported program needs the cache. In eager mode the policies keep their stock calls, so FSDP and
+gradient checkpointing see exactly the stock module calls, and the cache is only built, and rebuilt
+whenever the grid, device or dtype changes, for a later `torch.export`. Under export, `replay_vision_block`
+runs each vision block from its submodules with the attention chunk lengths as Python ints, because the
+stock attention reads them back from a tensor.
 
-The grid checks use transformers' `torch_compilable_check`, so `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns
-them off like every other check of that kind. In an exported program a failed check keeps the assert but
-loses the message. `check_input` is for a policy's own input checks: always on in eager mode.
+Under export the cached grid is checked with transformers' `torch_compilable_check`, a runtime assert in
+the program that `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off like every other check of that kind; a
+failed assert loses its message. `check_input` is for a policy's own input checks: always on in eager mode.
 """
 
 from collections.abc import Callable
@@ -50,10 +51,10 @@ else:
 
 @dataclass
 class FixedImageGrid:
-    """What a vision tower derives from one image grid, built once in eager mode.
+    """What a vision tower derives from one image grid, built in eager mode.
 
     Subclasses add the tower's metadata and implement `_from_grid`. Only weight-independent tensors are
-    cached, built outside inference mode, so the cache works for inference and training alike.
+    cached, so the cache never holds stale weights.
     """
 
     grid_thw: list[list[int]]
@@ -67,36 +68,36 @@ class FixedImageGrid:
     @classmethod
     def build(cls, visual: nn.Module, grid_thw: Tensor) -> Self:
         """Compute the metadata of `grid_thw` for `visual`; this reads the grid on the host."""
-        grid = grid_thw.tolist()
-        # Tensors made under inference mode cannot be saved for backward later, so a cache built during
-        # prediction must still be made of normal tensors.
-        with torch.inference_mode(False), torch.no_grad():
-            return cls._from_grid(visual, grid)
+        with torch.no_grad():
+            return cls._from_grid(visual, grid_thw.tolist())
 
     @classmethod
     def reuse_or_build(cls, cache: Self | None, visual: nn.Module, grid_thw: Tensor) -> Self:
-        """Return `cache` if it was built for this number of images and the tower's device and dtype.
+        """Return the cache for `grid_thw` on the tower's device and dtype.
 
-        A cache with a different grid of the same shape raises an error. Without a fitting cache a new grid
-        is built, which reads `grid_thw` on the host; under `torch.export` that raises instead, so run one
-        eager call first, and again after moving or casting the model.
+        In eager mode this reads `grid_thw` on the host and builds a new cache whenever the grid, the device or
+        the dtype changed. Under `torch.export` the grid cannot be read, so the cache must already fit: the
+        image count, device and dtype are checked while tracing, and the grid values by a runtime assert in the
+        program. Run one eager call with the same inputs before export, and again after moving or casting the
+        model.
         """
-        if (
-            cache is None
-            or len(cache.grid_thw) != grid_thw.shape[0]
-            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
-        ):
-            if torch.compiler.is_exporting():
-                raise RuntimeError(
-                    "precompute_grid_thw has no image grid cached for this model, device and dtype. Run one "
-                    "eager call with the same inputs before torch.export."
-                )
-            return cls.build(visual, grid_thw)
+        fits = (
+            cache is not None
+            and len(cache.grid_thw) == grid_thw.shape[0]
+            and (cache.device, cache.dtype) == (visual.device, visual.dtype)
+        )
+        if not torch.compiler.is_exporting():
+            return cache if fits and cache.grid_thw == grid_thw.tolist() else cls.build(visual, grid_thw)
+        if not fits:
+            raise RuntimeError(
+                "precompute_grid_thw has no image grid cached for this model, device and dtype. Run one "
+                "eager call with the same inputs before torch.export."
+            )
         cache.check(grid_thw)
         return cache
 
     def check(self, grid_thw: Tensor) -> None:
-        """Raise if `grid_thw` differs from the cached grid (a runtime assert in an exported program)."""
+        """Assert in an exported program that `grid_thw` equals the cached grid."""
         torch_compilable_check(
             grid_thw == grid_thw.new_tensor(self.grid_thw),
             "The image grid differs from the one cached for precompute_grid_thw.",

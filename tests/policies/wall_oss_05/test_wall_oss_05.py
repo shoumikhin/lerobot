@@ -935,11 +935,17 @@ def test_precompute_grid_thw_prediction_matches_stock_and_exports(monkeypatch):
         def forward(self, *tensors):
             return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)))
 
-    program = torch.export.export(PredictActionChunk(), tuple(batch[key] for key in keys))
+    program = torch.export.export(PredictActionChunk(), tuple(batch[key] for key in keys), strict=False)
     torch.manual_seed(0)
     torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
     assert len(builds) == 1
     assert data_dependent_nodes(program) == []
+    # The exported program keeps the input checks: a prompt whose last action token is replaced is rejected.
+    malformed = {**batch, "input_ids": ids.clone()}
+    malformed["input_ids"][0, -1] = 6
+    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        program.module()(*(malformed[key] for key in keys))
 
 
 def test_flow_checks_stay_on_without_precompute_grid_thw(monkeypatch):

@@ -160,19 +160,7 @@ def test_train_and_select_action(tiny_backbone):
     assert torch.isfinite(action).all()
 
 
-@pytest.mark.parametrize(
-    ("cameras", "vision_boundaries"),
-    [((CAMERA,), True), ((CAMERA, WRIST), False)],
-    ids=["one-camera", "adjacent-cameras"],
-)
-def test_precompute_grid_thw_prediction_matches_default_and_exports(
-    tiny_backbone, monkeypatch, cameras, vision_boundaries
-):
-    """Prefix positions come from the image grid ints; with the grid cached, prediction exports."""
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-    from tests.policies.common.fixed_grid_checks import data_dependent_nodes
-
+def _precompute_policies(tiny_backbone, cameras, vision_boundaries):
     slots = _slot_kwargs(arm=[[0, 6]], effector=[[6, 7]])
     meta = _ds_meta(7, cameras)
     settings = {"qwen3vl_use_vision_boundaries": vision_boundaries, **slots}
@@ -185,9 +173,17 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
     preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
     raw = _raw_batch(7, cameras=cameras)
     raw.pop(ACTION)
-    batch = preprocessor(raw)
-    noise = torch.randn(2, CHUNK, cfg.max_action_dim)
+    return policy, fixed, preprocessor(raw), torch.randn(2, CHUNK, cfg.max_action_dim)
 
+
+@pytest.mark.parametrize("cameras", [(CAMERA,), (CAMERA, WRIST)], ids=["one-camera", "two-cameras"])
+def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbone, monkeypatch, cameras):
+    """Prefix positions come from the image grid ints; with the grid cached, prediction exports."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes
+
+    policy, fixed, batch, noise = _precompute_policies(tiny_backbone, cameras, vision_boundaries=True)
     core = policy.model.qwenvl_with_expert
     build_prefix_position_ids, prefixes = core.build_prefix_position_ids, []
 
@@ -197,20 +193,20 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
         return positions
 
     monkeypatch.setattr(core, "build_prefix_position_ids", recorded)
+    # The sampler updates its noise in place, so every call gets its own copy.
     with torch.no_grad():
-        expected = policy.predict_action_chunk(batch, noise=noise)
-    if vision_boundaries:  # Without them, get_rope_index merges adjacent images into one block.
-        input_ids, attention_mask, grid, positions = prefixes[0]
-        stock, _ = core.qwenvl.model.get_rope_index(
-            input_ids=input_ids,
-            mm_token_type_ids=(input_ids == core.qwenvl.config.image_token_id).int(),
-            image_grid_thw=torch.tensor(grid),
-            attention_mask=attention_mask,
-        )
-        assert torch.equal(positions, stock.masked_fill(attention_mask == 0, 1))
+        expected = policy.predict_action_chunk(batch, noise=noise.clone()).clone()
+    input_ids, attention_mask, grid, positions = prefixes[0]
+    stock, _ = core.qwenvl.model.get_rope_index(
+        input_ids=input_ids,
+        mm_token_type_ids=(input_ids == core.qwenvl.config.image_token_id).int(),
+        image_grid_thw=torch.tensor(grid),
+        attention_mask=attention_mask,
+    )
+    assert torch.equal(positions, stock.masked_fill(attention_mask == 0, 1))
 
     def stock_rope_index(*args, **kwargs):
-        raise AssertionError("prefix positions must not read the image grid on the host")
+        raise AssertionError("prefix positions must not use get_rope_index")
 
     monkeypatch.setattr(Qwen3VLModel, "get_rope_index", stock_rope_index)
     visual = fixed.model.qwenvl_with_expert.qwenvl.model.visual
@@ -228,18 +224,33 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(
         def forward(self, noise, *tensors):
             return fixed.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))}, noise=noise)
 
+    def run(module, inputs):
+        return module(noise.clone(), *(inputs[key] for key in keys))
+
     with torch.no_grad():
         for _ in range(2):  # The second call reuses the cached grid.
-            assert torch.equal(PredictActionChunk()(noise, *(batch[key] for key in keys)), expected)
-        exported = torch.export.export(PredictActionChunk(), (noise, *(batch[key] for key in keys)))
-        torch.testing.assert_close(exported.module()(noise, *(batch[key] for key in keys)), expected)
+            assert torch.equal(run(PredictActionChunk(), batch), expected)
+        exported = torch.export.export(
+            PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+        )
+        torch.testing.assert_close(run(exported.module(), batch), expected)
+        # A grid other than the cached one fails the exported program's check.
+        changed = {**batch, "image_grid_thw": batch["image_grid_thw"].clone()}
+        changed["image_grid_thw"][..., 1] += 2
+        with pytest.raises(RuntimeError):
+            run(exported.module(), changed)
     assert len(grid_builds) == 1
     assert data_dependent_nodes(exported) == []
 
-    core = fixed.model.qwenvl_with_expert
-    core.visual_grid_thw = [[t, h + 2, w] for t, h, w in core.visual_grid_thw]
-    with torch.no_grad(), pytest.raises(ValueError, match="all batches must use the same image sizes"):
-        fixed.predict_action_chunk(batch, noise=noise)
+
+@pytest.mark.parametrize("precompute_grid_thw", [False, True], ids=["option-off", "option-on"])
+def test_adjacent_cameras_without_vision_boundaries_are_refused(tiny_backbone, precompute_grid_thw):
+    """Without boundary tokens two visible cameras form one image block, which has no rope positions."""
+    policy, fixed, batch, noise = _precompute_policies(
+        tiny_backbone, (CAMERA, WRIST), vision_boundaries=False
+    )
+    with torch.no_grad(), pytest.raises(ValueError, match="at most one visible camera per sample"):
+        (fixed if precompute_grid_thw else policy).predict_action_chunk(batch, noise=noise)
 
 
 def test_align_query_tokens(tiny_backbone, monkeypatch):

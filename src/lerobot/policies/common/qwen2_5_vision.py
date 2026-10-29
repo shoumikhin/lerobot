@@ -17,7 +17,9 @@
 """Run a transformers Qwen2.5-VL vision tower on one fixed image grid (see `qwen_vision.py`).
 
 `Qwen2_5VisionGrid` calls the tower's `rot_pos_emb` and `get_window_index`. Transformers removed both in
-5.17, while LeRobot pins it below 5.6, so this module needs updating before the pin moves past 5.16.
+5.17, while LeRobot pins it below 5.6, so this module needs updating before the pin moves past 5.16. That
+release also lets callers pass precomputed vision tensors (`cu_seqlens`, position ids, window index) to the
+tower, which is the natural replacement for this cache once the pin allows it.
 """
 
 from dataclasses import dataclass

@@ -914,17 +914,23 @@ class FlowMatchingV2(FlowMatchingV1):
         else:
             att_masks = torch.zeros((bsize, embs.shape[1]), device=device, dtype=torch.bool)
 
-        # A grid cached with the vision metadata (by precompute_grid_thw or the CUDA graph capture) avoids a
-        # host read.
-        rope_grid_thw = self.qwenvl_with_expert.visual_grid_thw
-        if rope_grid_thw is None or len(rope_grid_thw) != flat_grid_thw.shape[0]:
-            rope_grid_thw = flat_grid_thw.tolist()
-        else:
+        if not self.config.qwen3vl_use_vision_boundaries:
+            # Without boundary tokens, visible cameras form one image block that transformers'
+            # `get_rope_index` cannot place, so such prompts stay refused as before.
             check_input(
-                flat_grid_thw == flat_grid_thw.new_tensor(rope_grid_thw),
-                "The image grid differs from the one cached with the vision metadata by precompute_grid_thw or "
-                "use_cudagraph_prefix_full; all batches must use the same image sizes.",
+                img_masks.sum(dim=1) <= 1,
+                "qwen3vl_use_vision_boundaries=False supports at most one visible camera per sample.",
             )
+        cached_grid_thw = self.qwenvl_with_expert.visual_grid_thw
+        if torch.compiler.is_exporting() and cached_grid_thw is not None:
+            # Export cannot read the grid on the host, so the grid cached with the vision metadata stands in.
+            check_input(
+                flat_grid_thw == flat_grid_thw.new_tensor(cached_grid_thw),
+                "The image grid differs from the one cached for precompute_grid_thw.",
+            )
+            rope_grid_thw = cached_grid_thw
+        else:
+            rope_grid_thw = flat_grid_thw.tolist()
         prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
             prefix_input_ids, pad_masks.long(), rope_grid_thw
         )

@@ -301,12 +301,17 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
     with torch.no_grad():
         torch.manual_seed(0)
         assert torch.equal(Predict()(*(batch[key] for key in keys)), expected)
-        program = torch.export.export(Predict(), tuple(batch[key] for key in keys))
+        program = torch.export.export(Predict(), tuple(batch[key] for key in keys), strict=False)
         torch.manual_seed(0)
         torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
     assert builds == []  # the eager call and the export reused the cached grid
     # Boolean-mask writes and reads of the action and proprioception tokens would make shapes data-dependent.
     assert data_dependent_nodes(program) == []
+    # The exported program keeps the input checks: one image token fewer than image features is rejected.
+    malformed = {**batch, "input_ids": input_ids.clone()}
+    malformed["input_ids"][:, 2] = 7
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        program.module()(*(malformed[key] for key in keys))
 
 
 def test_diffusion_checks_stay_on_without_precompute_grid_thw(monkeypatch):

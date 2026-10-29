@@ -694,10 +694,25 @@ def test_sampling_checks_stay_on_without_precompute_grid_thw(monkeypatch):
         policy.predict_action_chunk(batch)
 
 
-@pytest.mark.skipif(
+def _export_sampling(policy, batch):
+    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    class SampleActions(nn.Module):
+        def forward(self, *tensors):
+            return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
+
+    with torch.no_grad():
+        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys), strict=False)
+    return program, lambda inputs: program.module()(*(inputs[key] for key in keys))
+
+
+requires_transformers_5_5_4 = pytest.mark.skipif(
     Version(transformers.__version__) < Version("5.5.4"),
     reason="transformers before 5.5.4 also scales the temporal position of still images",
 )
+
+
+@requires_transformers_5_5_4
 def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
     torch.manual_seed(0)
@@ -711,15 +726,32 @@ def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
         assert torch.equal(policy.predict_action_chunk(batch), expected)
     assert len(builds) == 1
 
-    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
-
-    class SampleActions(nn.Module):
-        def forward(self, *tensors):
-            return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
-
-    with torch.no_grad():
-        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys))
+    program, run = _export_sampling(policy, batch)
     torch.manual_seed(0)
-    torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
+    torch.testing.assert_close(run(batch), expected)
     assert len(builds) == 1
     assert data_dependent_nodes(program) == []
+    # The exported program keeps the prompt checks: one action token fewer is rejected.
+    malformed = {**batch, "input_ids": batch["input_ids"].clone()}
+    malformed["input_ids"][0, -2] = 2
+    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        run(malformed)
+
+
+@requires_transformers_5_5_4
+def test_precompute_grid_thw_rebuilds_a_changed_grid(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    # Same image count and token count, different shape: a stale cache would give other positions and windows.
+    changed = {**batch, "image_grid_thw": torch.tensor([[1, 2, 8]])}
+    torch.manual_seed(0)
+    expected = policy.predict_action_chunk(changed)
+
+    # With the export checks off, only the rebuild keeps the cache right.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    policy.config.precompute_grid_thw = True
+    for inputs in (batch, changed):
+        policy.predict_action_chunk({**inputs, "action_token_start": 10})
+    _, run = _export_sampling(policy, {**changed, "action_token_start": 10})
+    torch.manual_seed(0)
+    torch.testing.assert_close(run({**changed, "action_token_start": 10}), expected)

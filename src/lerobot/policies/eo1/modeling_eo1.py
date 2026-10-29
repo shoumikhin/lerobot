@@ -647,10 +647,13 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
-        if self.config.precompute_grid_thw and pixel_values is not None:
+        use_cached_grid = self.config.precompute_grid_thw and pixel_values is not None
+        if use_cached_grid:
             self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
                 self._vision_grid, vlm.visual, image_grid_thw
             )
+        # Eager mode keeps the stock calls, so FSDP and checkpointing hooks on the backbone run as before.
+        if use_cached_grid and torch.compiler.is_exporting():
             position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,

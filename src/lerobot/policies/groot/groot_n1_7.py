@@ -445,7 +445,7 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
-            if self.precompute_grid_thw:
+            if self.precompute_grid_thw and torch.compiler.is_exporting():
                 self._qwen_on_fixed_grid(model_input)
                 return captured["features"]
             outputs = self.model(**model_input, output_hidden_states=True)
@@ -455,16 +455,11 @@ class Qwen3Backbone(nn.Module):
         return captured.get("features", outputs.hidden_states[-1])
 
     def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor]) -> None:
-        """Run `Qwen3VLModel` with the grid metadata of the first batch, computed once and reused."""
-        if model_input.get("pixel_values_videos") is not None:
-            raise ValueError("GR00T precompute_grid_thw supports images only.")
+        """Run `Qwen3VLModel` under `torch.export` on the cached grid metadata."""
         qwen = getattr(self.model, "model", self.model)
         input_ids = model_input["input_ids"]
         attention_mask = model_input["attention_mask"]
         pixel_values = model_input["pixel_values"]
-        self._vision_grid = Qwen3VisionGrid.reuse_or_build(
-            self._vision_grid, qwen.visual, model_input["image_grid_thw"]
-        )
         position_ids = qwen_image_rope_index(
             input_ids,
             attention_mask,
@@ -491,7 +486,15 @@ class Qwen3Backbone(nn.Module):
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
-        if not self.precompute_grid_thw:
+        if self.precompute_grid_thw:
+            if model_input.get("pixel_values_videos") is not None:
+                raise ValueError("GR00T precompute_grid_thw supports images only.")
+            qwen = getattr(self.model, "model", self.model)
+            self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+                self._vision_grid, qwen.visual, model_input["image_grid_thw"]
+            )
+        # Eager mode keeps the stock calls, so FSDP and checkpointing hooks on the Qwen model run as before.
+        if not (self.precompute_grid_thw and torch.compiler.is_exporting()):
             self._ensure_mm_token_type_ids(model_input)
             self._ensure_legacy_qwen3_position_ids(model_input)
         features = self._last_decoder_layer_output(model_input)

@@ -92,27 +92,41 @@ def test_vision_forward_matches_stock_and_exports(grids):
     with torch.no_grad():
         expected = visual(pixel_values, grid_thw=grid_thw).pooler_output
         model = FixedGridVision(visual, Qwen2_5VisionGrid.build(visual, grid_thw))
-        exported = torch.export.export(model, (pixel_values, grid_thw))
+        exported = torch.export.export(model, (pixel_values, grid_thw), strict=False)
         torch.testing.assert_close(model(pixel_values, grid_thw), expected, rtol=0, atol=0)
         torch.testing.assert_close(exported.module()(pixel_values, grid_thw), expected, rtol=0, atol=0)
     assert data_dependent_nodes(exported) == []
 
 
-def test_export_without_a_cached_grid_asks_for_an_eager_call():
+def test_export_without_a_fitting_cached_grid_asks_for_an_eager_call():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
-    with pytest.raises(RuntimeError, match="Run one eager call"):
-        torch.export.export(FixedGridVision(visual, None), (_pixels(grid_thw), grid_thw))
+    two_images = Qwen2_5VisionGrid.build(visual, torch.tensor(GRID * 2))
+    for cache in (None, two_images):
+        with pytest.raises(RuntimeError, match="Run one eager call"):
+            torch.export.export(FixedGridVision(visual, cache), (_pixels(grid_thw), grid_thw), strict=False)
+
+
+@pytest.mark.parametrize("disable_checks", [False, True], ids=["checks-on", "checks-off"])
+@pytest.mark.parametrize(
+    "changed", [[[1, 12, 8]], [[1, 8, 12], [1, 4, 4]]], ids=["same-count", "more-images"]
+)
+def test_eager_rebuilds_a_changed_grid(monkeypatch, changed, disable_checks):
+    if disable_checks:
+        monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    visual = _tiny_visual()
+    cache = Qwen2_5VisionGrid.reuse_or_build(None, visual, torch.tensor(GRID))
+    rebuilt = Qwen2_5VisionGrid.reuse_or_build(cache, visual, torch.tensor(changed))
+    assert rebuilt.grid_thw == changed
+    assert Qwen2_5VisionGrid.reuse_or_build(rebuilt, visual, torch.tensor(changed)) is rebuilt
 
 
 def test_exported_program_rejects_a_changed_grid():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
     model = FixedGridVision(visual, Qwen2_5VisionGrid.build(visual, grid_thw))
-    with pytest.raises(ValueError, match="image grid differs"):
-        model(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
     with torch.no_grad():
-        program = torch.export.export(model, (_pixels(grid_thw), grid_thw)).module()
+        program = torch.export.export(model, (_pixels(grid_thw), grid_thw), strict=False).module()
     program(_pixels(grid_thw), grid_thw)
     with pytest.raises(RuntimeError):
         program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
@@ -159,29 +173,15 @@ def test_reused_grid_follows_dtype_changes():
     grid = Qwen2_5VisionGrid.reuse_or_build(grid, visual, grid_thw)
     pixel_values = pixel_values.bfloat16()
     with torch.no_grad():
-        program = torch.export.export(FixedGridVision(visual, grid), (pixel_values, grid_thw)).module()
+        program = torch.export.export(
+            FixedGridVision(visual, grid), (pixel_values, grid_thw), strict=False
+        ).module()
         torch.testing.assert_close(
             program(pixel_values, grid_thw),
             visual(pixel_values, grid_thw=grid_thw).pooler_output,
             rtol=0,
             atol=0,
         )
-
-
-def test_grid_built_in_inference_mode_can_train():
-    visual = _tiny_visual()
-    grid_thw = torch.tensor(GRID)
-    pixel_values = _pixels(grid_thw)
-    with torch.inference_mode():
-        grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
-    visual.train()
-    # The cache feeds the exported computation, which is what would save its tensors for backward.
-    program = torch.export.export(FixedGridVision(visual, grid), (pixel_values, grid_thw)).module()
-    program(pixel_values, grid_thw).square().sum().backward()
-    cached_grad = visual.patch_embed.proj.weight.grad.clone()
-    visual.zero_grad()
-    visual(pixel_values, grid_thw=grid_thw).pooler_output.square().sum().backward()
-    torch.testing.assert_close(cached_grad, visual.patch_embed.proj.weight.grad, rtol=0, atol=0)
 
 
 def test_gradient_checkpointing_reruns_every_block():
@@ -207,5 +207,7 @@ def test_vision_forward_runs_with_fsdp2(tmp_path, whole_tower):
         grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
         return qwen2_5_vision_forward(visual, pixel_values, grid_thw, grid)
 
-    actual = run_with_fsdp(tmp_path, deepcopy(visual), forward, whole_tower=whole_tower)
+    actual = run_with_fsdp(
+        tmp_path, deepcopy(visual), forward, lambda tower: [tower] if whole_tower else list(tower.blocks)
+    )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

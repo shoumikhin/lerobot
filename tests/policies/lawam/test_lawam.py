@@ -566,6 +566,9 @@ def test_native_config_uses_padded_lawam_action_space() -> None:
     assert policy_cfg.flow_cfg.state_dim == 32
     assert policy_cfg.action_horizon == 4
     assert policy_cfg.effective_action_horizon == 4
+    assert policy_cfg.precompute_grid_thw is False
+    cfg.precompute_grid_thw = True
+    assert _build_native_policy_config(cfg).precompute_grid_thw is True
 
 
 def test_lam_constructs_without_checkpoint_or_pretrained_dino() -> None:
@@ -656,6 +659,12 @@ def test_natural_time_grid_uses_dataset_frequency() -> None:
     grid = build_time_grid(hz=torch.tensor([20.0, 25.0]), seq_len=3)
 
     assert torch.allclose(grid, torch.tensor([[0.0, 0.05, 0.1], [0.0, 0.04, 0.08]]))
+
+
+@pytest.mark.parametrize("bad_hz", [0.0, float("nan")])
+def test_natural_time_grid_rejects_a_frequency_that_is_not_positive(bad_hz) -> None:
+    with pytest.raises(ValueError, match=r"got hz\[1\]="):
+        build_time_grid(hz=torch.tensor([20.0, bad_hz]), seq_len=3)
 
 
 def test_dataset_sampling_uses_the_configured_action_horizon() -> None:
@@ -1005,12 +1014,17 @@ def test_vlm_stage_with_precompute_grid_thw_matches_stock_qwen(monkeypatch) -> N
         for _ in range(2):  # The second call reuses the cached grid.
             actual = VLMStage()(*(inputs[key] for key in keys))
             torch.testing.assert_close(actual, (expected["h_vlm"], action_hidden), rtol=0, atol=0)
-        exported = torch.export.export(VLMStage(), tuple(inputs[key] for key in keys))
+        exported = torch.export.export(VLMStage(), tuple(inputs[key] for key in keys), strict=False)
         torch.testing.assert_close(
             exported.module()(*(inputs[key] for key in keys)), (expected["h_vlm"], action_hidden)
         )
     assert len(builds) == 1
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
+    # The exported program keeps the query checks: a sample without action placeholders is rejected.
+    malformed = {**inputs, "act_placeholder_mask": inputs["act_placeholder_mask"].clone()}
+    malformed["act_placeholder_mask"][1] = False
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        exported.module()(*(malformed[key] for key in keys))
     # Each sample's placeholders hold the queries in order, wherever the sample put its tokens.
     for name in ("act", "flow"):
         filled = text_inputs[0][inputs[f"{name}_placeholder_mask"]]

@@ -58,7 +58,7 @@ def build_time_grid(
     hz_f = hz.to(device=device, dtype=torch.float32)
 
     def nonpositive_hz() -> str:
-        bad_idx = int(torch.nonzero(hz_f <= 0, as_tuple=False)[0].item())
+        bad_idx = int(torch.nonzero(~(hz_f > 0), as_tuple=False)[0].item())
         return f"`hz` must be > 0 for all samples, got hz[{bad_idx}]={float(hz_f[bad_idx])}."
 
     check_input(hz_f > 0, nonpositive_hz)

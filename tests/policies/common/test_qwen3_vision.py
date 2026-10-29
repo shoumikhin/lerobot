@@ -46,7 +46,8 @@ from tests.policies.common.qwen3_vl_helpers import (  # noqa: E402
 )
 
 
-@pytest.fixture(scope="module")
+# A fresh model per test: the stock forward keeps `rope_deltas` on the model, which would leak between tests.
+@pytest.fixture
 def model():
     torch.manual_seed(0)
     return Qwen3VLModel(tiny_qwen3_vl_config()).eval()
@@ -67,7 +68,7 @@ class VisionProgram(torch.nn.Module):
 
 
 def _export_vision(visual, grid, pixel_values, grid_thw):
-    return torch.export.export(VisionProgram(visual, grid), (pixel_values, grid_thw)).module()
+    return torch.export.export(VisionProgram(visual, grid), (pixel_values, grid_thw), strict=False).module()
 
 
 def test_qwen3_vl_forward_matches_stock_model(model):
@@ -95,7 +96,7 @@ def test_qwen3_vl_forward_matches_stock_model(model):
 
     args = (inputs_embeds, attention_mask, pixel_values, grid_thw, image_mask)
     with torch.no_grad():
-        program = torch.export.export(Wrapper(), args)
+        program = torch.export.export(Wrapper(), args, strict=False)
         torch.testing.assert_close(program.module()(*args), expected)
     # DeepStack included: the stock text model would add its features with boolean-mask indexing.
     assert data_dependent_nodes(program, skip_functions=STOCK_DEEPSTACK) == []
@@ -215,5 +216,7 @@ def test_vision_forward_runs_with_fsdp2(model, tmp_path, whole_tower):
         grid = Qwen3VisionGrid.reuse_or_build(None, visual, grid_thw)
         return qwen3_vision_forward(visual, pixel_values, grid_thw, grid)[0]
 
-    actual = run_with_fsdp(tmp_path, deepcopy(visual), forward, whole_tower=whole_tower)
+    actual = run_with_fsdp(
+        tmp_path, deepcopy(visual), forward, lambda tower: [tower] if whole_tower else list(tower.blocks)
+    )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

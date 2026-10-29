@@ -1907,7 +1907,10 @@ class WallXPolicy(PreTrainedPolicy):
         return inputs
 
     def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
-        """Vision metadata and rope positions of the fixed camera grid, computed from the first batch."""
+        """Vision metadata and rope positions of the camera grid for `torch.export`.
+
+        The metadata is rebuilt in eager mode when the grid changes.
+        """
         if batch.get("video_grid_thw") is not None:
             raise ValueError("WALL-X precompute_grid_thw supports images only.")
         self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
@@ -2028,7 +2031,10 @@ class WallXPolicy(PreTrainedPolicy):
 
         if self.config.prediction_mode == "diffusion":
             if self.config.precompute_grid_thw:
-                batch.update(self._static_grid_inputs(batch))
+                grid_inputs = self._static_grid_inputs(batch)
+                # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before.
+                if torch.compiler.is_exporting():
+                    batch.update(grid_inputs)
             output = self.model(
                 **batch,
                 action_dim=self.config.max_action_dim,
