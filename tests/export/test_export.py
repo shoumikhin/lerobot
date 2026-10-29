@@ -635,6 +635,9 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
 needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+needs_executorch_cuda = pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
 
 
 class MaskedPositions(torch.nn.Module):
