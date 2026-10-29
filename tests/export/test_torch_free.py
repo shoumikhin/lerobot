@@ -14,9 +14,15 @@
 
 """The parts of a bundle that a process without PyTorch loads."""
 
+import os
+from pathlib import Path
+
 import pytest
 
-from tests.torch_free import assert_runs_without_torch
+from tests.export.numpy_bundle import make_numpy_bundle
+from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
+
+REPO = Path(__file__).parents[2]
 
 BUNDLE_MODULES = [
     "lerobot.bundle.manifest",
@@ -43,3 +49,11 @@ def test_executorch_loads_without_torch_once_prepared():
         import executorch.runtime
         """
     )
+
+
+def test_the_bundle_check_runs_without_torch(tmp_path, monkeypatch):
+    """`python -m lerobot.bundle` loads the programs and replays the test case without PyTorch."""
+    bundle = make_numpy_bundle(tmp_path / "bundle")
+    # The check does not look in the current folder, so the test runtime's module comes from PYTHONPATH.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")])))
+    assert_runs_without_torch(CHECK_BUNDLE, str(bundle))
