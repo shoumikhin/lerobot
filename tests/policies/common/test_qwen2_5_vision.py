@@ -169,6 +169,31 @@ def test_exported_program_rejects_a_changed_grid():
         program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
 
 
+def test_hidden_images_of_different_sizes_are_refused_also_after_export():
+    visual = _tiny_visual()
+    mixed = Qwen2_5VisionGrid.build(visual, torch.tensor([[1, 4, 6], [1, 6, 4]]))
+    one_size = Qwen2_5VisionGrid.build(visual, torch.tensor([[1, 4, 6], [1, 4, 6]]))
+    image = [IMAGE_TOKEN_ID] * 6
+    input_ids = torch.tensor([[1, *image, 2, *image, 3]])
+    visible = torch.ones_like(input_ids)
+    hidden = visible.clone()
+    hidden[0, 1:7] = 0
+
+    class CheckVisibleImages(torch.nn.Module):
+        def forward(self, input_ids, attention_mask):
+            mixed.check_visible_images(input_ids, attention_mask, IMAGE_TOKEN_ID)
+            return attention_mask + 0
+
+    # With one image size, eager and fixed-grid positions agree, so a hidden image is fine.
+    one_size.check_visible_images(input_ids, hidden, IMAGE_TOKEN_ID)
+    with pytest.raises(ValueError, match="must all be visible"):
+        mixed.check_visible_images(input_ids, hidden, IMAGE_TOKEN_ID)
+    program = torch.export.export(CheckVisibleImages(), (input_ids, visible), strict=False).module()
+    program(input_ids, visible)
+    with pytest.raises(RuntimeError):
+        program(input_ids, hidden)
+
+
 def test_image_rope_index_matches_stock():
     model = Qwen2_5_VLModel._from_config(_tiny_config())
     grids = [[1, 4, 6], [1, 4, 4], [1, 6, 2]]

@@ -280,35 +280,36 @@ def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monke
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
 
 
-def test_n1_7_backbone_refuses_to_prepare_hidden_images_of_different_sizes(monkeypatch):
+def test_n1_7_backbone_refuses_hidden_images_of_different_sizes_also_after_export(monkeypatch):
     pytest.importorskip("transformers")
 
     from transformers.feature_extraction_utils import BatchFeature
 
     from lerobot.policies.common.qwen_vision import prepare_image_grid
-    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID
+    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID, image_prompts
 
     backbone = _tiny_n1_7_backbone(monkeypatch)
-    # Two images with the same token count but different shapes, the first one hidden by the attention mask: eager
-    # `get_rope_index` lays the visible second image out on the first grid.
-    image = [IMAGE_TOKEN_ID] * 6
-    input_ids = torch.tensor([[1, 2, *image, 3, *image, 3, 4, 5]])
-    attention_mask = torch.ones_like(input_ids)
-    attention_mask[0, 2:8] = 0
-    prompts = BatchFeature(
-        {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "mm_token_type_ids": (input_ids == IMAGE_TOKEN_ID).int(),
-            "pixel_values": torch.randn(48, 96),
-            "image_grid_thw": torch.tensor([[1, 4, 6], [1, 6, 4]]),
-        }
-    )
+    prompts = image_prompts(backbone.model.config)
+    # Eager rope positions would give the hidden first image's grid to the second image, of another size.
+    hidden = {**prompts, "attention_mask": prompts["attention_mask"].clone()}
+    first_image_tokens = int(prompts["image_grid_thw"][0].prod()) // backbone.visual.spatial_merge_size**2
+    first_image = (prompts["input_ids"][1] == IMAGE_TOKEN_ID).nonzero()[:first_image_tokens, 0]
+    hidden["attention_mask"][1, first_image] = 0
+    keys = sorted(prompts)
+
+    class Backbone(torch.nn.Module):
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
 
     with torch.no_grad():
-        backbone(prompts)
-        with prepare_image_grid(), pytest.raises(ValueError, match="hides image tokens"):
-            backbone(prompts)
+        with prepare_image_grid():
+            Backbone()(*(prompts[key] for key in keys))
+            with pytest.raises(ValueError, match="must all be visible"):
+                Backbone()(*(hidden[key] for key in keys))
+        program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False).module()
+        program(*(prompts[key] for key in keys))
+        with pytest.raises(RuntimeError):
+            program(*(hidden[key] for key in keys))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

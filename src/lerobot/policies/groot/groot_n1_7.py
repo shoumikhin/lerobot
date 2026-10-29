@@ -479,29 +479,20 @@ class Qwen3Backbone(nn.Module):
             position_ids=position_ids,
         )
 
-    def _check_exportable_image_layout(self, model_input: dict[str, torch.Tensor]) -> None:
-        """Refuse to prepare an export for a prompt whose exported positions would differ from eager ones."""
-        image_tokens = model_input["input_ids"] == self.model.config.image_token_id
-        hidden = (image_tokens & (model_input["attention_mask"] == 0)).any()
-        # Eager `get_rope_index` hands the grids only to visible images, the exported positions to every image.
-        if hidden and len({tuple(grid) for grid in model_input["image_grid_thw"].tolist()}) > 1:
-            raise ValueError(
-                "GR00T cannot export a batch whose attention mask hides image tokens while its image sizes "
-                "differ: eager and exported rope positions would not match."
-            )
-
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
-        if is_preparing_image_grid():
-            self._check_exportable_image_layout(model_input)
         qwen = getattr(self.model, "model", self.model)
         self._vision_grid = Qwen3VisionGrid.track(
             self._vision_grid, qwen.visual, model_input["image_grid_thw"]
         )
+        if is_preparing_image_grid() or is_exporting():
+            self._vision_grid.check_visible_images(
+                model_input["input_ids"], model_input["attention_mask"], qwen.config.image_token_id
+            )
         if not is_exporting():
             self._ensure_mm_token_type_ids(model_input)
             self._ensure_legacy_qwen3_position_ids(model_input)

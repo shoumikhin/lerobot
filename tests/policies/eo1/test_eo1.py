@@ -756,3 +756,30 @@ def test_preparation_follows_a_changed_grid(monkeypatch):
             policy.predict_action_chunk(inputs, noise=noise.clone())
     _, run = _export_sampling(policy, changed, noise)
     torch.testing.assert_close(run(changed), expected)
+
+
+def test_export_refuses_a_hidden_image_of_another_size(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    # Two images with the same token count but different shapes; eager rope positions would give a hidden
+    # image's grid to the next visible image.
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 42, 41, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        **batch,
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "action_token_start": 12,
+    }
+    hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
+    hidden["attention_mask"][0, 2:6] = 0
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        with pytest.raises(ValueError, match="must all be visible"):
+            policy.predict_action_chunk(hidden, noise=noise.clone())
+    _, run = _export_sampling(policy, batch, noise)
+    run(batch)
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        run(hidden)

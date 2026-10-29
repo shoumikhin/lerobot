@@ -245,10 +245,19 @@ def _diffusion_batch(horizon: int) -> dict[str, torch.Tensor]:
 
 def test_diffusion_prediction_runs_with_float32_weights():
     model = _tiny_diffusion_model(bfloat16=False)
+    batch = _diffusion_batch(3)
+    text_inputs = []
+    model.model.register_forward_pre_hook(
+        lambda module, args, kwargs: text_inputs.append(kwargs["inputs_embeds"]), with_kwargs=True
+    )
     settings = {"predict_mode": "diffusion", "pred_horizon": 3, "action_dim": 3, "num_inference_timesteps": 2}
-    actions = model.predict(**_diffusion_batch(3), **settings)["predict_action"]
+    actions = model.predict(**batch, **settings)["predict_action"]
     assert actions.shape == (2, 3, 3)
     assert actions.isfinite().all()
+    # The state embedding goes in at float32, not rounded through bfloat16.
+    state = model.action_preprocessor.proprioception_proj(batch["proprioception"], batch["agent_pos_mask"])
+    state_tokens = batch["input_ids"] == model.action_token_id_set["propri_token_id"]
+    assert torch.equal(text_inputs[0][state_tokens], state.reshape(-1, state.shape[-1]))
 
 
 def _diffusion_policy(model):
@@ -318,6 +327,34 @@ def test_prepared_diffusion_prediction_exports_and_matches_eager(monkeypatch):
     monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     with pytest.raises(ValueError, match="Image features and image tokens do not match"):
         policy.predict_action_chunk(malformed, noise=noise.clone())
+
+
+@pytest.mark.skipif(
+    version.parse(torch.__version__) < version.parse("2.9.0"),
+    reason="torch.export before PyTorch 2.9 cannot trace transformers' causal mask with WALL-X's action mask function",
+)
+def test_export_refuses_a_hidden_image_of_another_size():
+    policy = _diffusion_policy(_tiny_diffusion_model())
+    # Same token count, different shapes: eager rope positions would give the hidden image's grid to the other.
+    batch = {**_diffusion_batch(3), "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]])}
+    hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
+    hidden["attention_mask"][0, 1:5] = 0
+    noise = torch.randn(2, 3, 3)
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        with pytest.raises(ValueError, match="must all be visible"):
+            policy.predict_action_chunk(hidden, noise=noise.clone())
+    keys = sorted(batch)
+
+    class Predict(torch.nn.Module):
+        def forward(self, noise, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
+
+    with torch.no_grad():
+        program = torch.export.export(Predict(), (noise.clone(), *(batch[key] for key in keys)), strict=False)
+        program.module()(noise.clone(), *(batch[key] for key in keys))
+        with pytest.raises(RuntimeError):
+            program.module()(noise.clone(), *(hidden[key] for key in keys))
 
 
 def test_eager_diffusion_prediction_builds_no_rope_positions(monkeypatch):

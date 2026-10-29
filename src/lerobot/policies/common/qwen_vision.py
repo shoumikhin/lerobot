@@ -150,6 +150,20 @@ class FixedImageGrid:
             "The image grid differs from the one prepared for torch.export.",
         )
 
+    def check_visible_images(self, input_ids: Tensor, attention_mask: Tensor, image_token_id: int) -> None:
+        """Refuse image tokens hidden by `attention_mask` when the images differ in size.
+
+        Eager rope positions (transformers' `get_rope_index` and the policies' own versions) give the grids to
+        the visible images only, in order, so a hidden image moves the next one onto its grid, while
+        `qwen_image_rope_index` keeps every image on its own grid. With one image size both agree.
+        """
+        if len({tuple(thw) for thw in self.grid_thw}) > 1:
+            check_input(
+                attention_mask.bool() | (input_ids != image_token_id),
+                "Images of different sizes must all be visible in the attention mask to run on a fixed image "
+                "grid: eager rope positions give a hidden image's grid to the next visible image.",
+            )
+
 
 def check_input(
     condition: Tensor | bool, message: str | Callable[[], str], error_type: type[Exception] = ValueError
@@ -166,25 +180,22 @@ def check_input(
         raise error_type(message() if callable(message) else message)
 
 
-def replay_vision_block(
-    block: nn.Module,
+def chunked_vision_attention(
+    attn: nn.Module,
     hidden_states: Tensor,
     position_embeddings: tuple[Tensor, Tensor],
     lengths: list[int],
     apply_rotary_pos_emb_vision: Callable,
     eager_attention_forward: Callable,
 ) -> Tensor:
-    """Under `torch.export`, what a Qwen-VL vision block computes when its attention runs per chunk of `lengths`.
+    """The non-flash path of a stock Qwen-VL vision attention, split per chunk of `lengths` (Python ints).
 
-    This is the block forward with the non-flash path of the stock vision attention, split by Python ints
-    instead of `cu_seqlens`. The last two arguments come from the tower's transformers modeling module.
+    The stock attention splits by `cu_seqlens`, which it reads back from a tensor. The last two arguments come
+    from the tower's transformers modeling module.
     """
-    attn, seq_length = block.attn, hidden_states.shape[0]
+    seq_length = hidden_states.shape[0]
     query, key, value = (
-        attn.qkv(block.norm1(hidden_states))
-        .reshape(seq_length, 3, attn.num_heads, -1)
-        .permute(1, 0, 2, 3)
-        .unbind(0)
+        attn.qkv(hidden_states).reshape(seq_length, 3, attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     query, key = apply_rotary_pos_emb_vision(query, key, *position_embeddings)
     query, key, value = (state.transpose(0, 1).unsqueeze(0) for state in (query, key, value))
@@ -199,7 +210,31 @@ def replay_vision_block(
             *(torch.split(state, lengths, dim=2) for state in (query, key, value)), strict=True
         )
     ]
-    hidden_states = hidden_states + attn.proj(torch.cat(outputs, dim=1).reshape(seq_length, -1).contiguous())
+    return attn.proj(torch.cat(outputs, dim=1).reshape(seq_length, -1).contiguous())
+
+
+def replay_vision_block(
+    block: nn.Module,
+    hidden_states: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+    lengths: list[int],
+    apply_rotary_pos_emb_vision: Callable,
+    eager_attention_forward: Callable,
+) -> Tensor:
+    """Under `torch.export`, what a Qwen-VL vision block computes when its attention runs per chunk of `lengths`.
+
+    The attention is `chunked_vision_attention`, unless the block's attention module has its own
+    `replay_on_lengths(hidden_states, position_embeddings, lengths)` (WALL-X's packed varlen attention does).
+    """
+    attn, normed = block.attn, block.norm1(hidden_states)
+    replay = getattr(attn, "replay_on_lengths", None)
+    if replay is None:
+        attended = chunked_vision_attention(
+            attn, normed, position_embeddings, lengths, apply_rotary_pos_emb_vision, eager_attention_forward
+        )
+    else:
+        attended = replay(normed, position_embeddings, lengths)
+    hidden_states = hidden_states + attended
     return hidden_states + block.mlp(block.norm2(hidden_states))
 
 

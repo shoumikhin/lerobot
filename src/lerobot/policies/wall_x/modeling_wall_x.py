@@ -65,7 +65,7 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
+from ..common.qwen_vision import check_input, is_exporting, is_preparing_image_grid, qwen_image_rope_index
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -1169,13 +1169,13 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
                     image_embeds = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
-                n_image_tokens = (input_ids == self.config.image_token_id).sum()
+                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
 
                 # Validate image token and feature count match
                 check_input(
                     n_image_tokens == n_image_features,
-                    lambda: f"Image features and image tokens do not match: tokens: {int(n_image_tokens)}, features {n_image_features}",
+                    lambda: f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}",
                 )
 
                 mask = input_ids == self.config.image_token_id
@@ -1225,7 +1225,6 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     f"Proprioception features and state tokens do not match: each sample needs "
                     f"{tokens_per_sample} state tokens.",
                 )
-                proprio_embed = proprio_embed.to(torch.bfloat16)
                 inputs_embeds = inputs_embeds.masked_scatter(
                     proprioception_mask.unsqueeze(-1).expand_as(inputs_embeds),
                     proprio_embed.reshape(-1, inputs_embeds.shape[-1]).to(inputs_embeds.dtype),
@@ -2045,6 +2044,10 @@ class WallXPolicy(PreTrainedPolicy):
             vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
                 self._vision_grid, self.model.visual, batch["image_grid_thw"]
             )
+            if is_preparing_image_grid() or is_exporting():
+                vision_grid.check_visible_images(
+                    batch["input_ids"], batch["attention_mask"], self.model.config.image_token_id
+                )
             if vision_grid is not None and is_exporting():
                 batch.update(self._static_grid_inputs(batch, vision_grid))
             output = self.model(

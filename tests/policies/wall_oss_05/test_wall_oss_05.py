@@ -25,6 +25,7 @@ from safetensors import safe_open
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
 from lerobot.policies.common.qwen_vision import prepare_image_grid
 from lerobot.policies.factory import (
     make_policy,
@@ -907,6 +908,11 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
     expected = policy.predict_action_chunk(batch, noise=noise.clone())
     with pytest.raises(ValueError, match="moe_token_types must mark exactly the action tokens"):
         policy.predict_action_chunk({**batch, "moe_token_types": ids == 4}, noise=noise.clone())
+    # The exported positions equal the eager ones, padding included (Wall-OSS puts padding at 1).
+    grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+    eager_positions = policy.model._position_ids(ids, batch["attention_mask"], batch["image_grid_thw"])
+    fixed_positions = policy.model._position_ids(ids, batch["attention_mask"], batch["image_grid_thw"], grid)
+    assert torch.equal(fixed_positions, eager_positions)
 
     builds = count_grid_builds(monkeypatch)
     # The routed projections must get contiguous inputs, as the boolean-mask gather gave them; a strided
@@ -950,6 +956,44 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])
 @pytest.mark.parametrize("batch_size", [1, 2])
+def test_export_refuses_a_hidden_image_of_another_size():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
+    torch.manual_seed(19)
+    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
+    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    # Two images per sample with the same token count but different shapes.
+    image = [29, 28, 28, 30]
+    ids = torch.tensor([[0, 0, 4, *image, *image, 6, 31, 31], [4, 5, 4, *image, *image, 6, 31, 31]])
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(32, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]] * 2),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
+    hidden["attention_mask"][1, 3:7] = False
+    noise = torch.randn(2, 2, policy.config.max_action_dim)
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        with pytest.raises(ValueError, match="must all be visible"):
+            policy.predict_action_chunk(hidden, noise=noise.clone())
+    keys = sorted(batch)
+
+    class PredictActionChunk(nn.Module):
+        def forward(self, noise, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
+
+    program = torch.export.export(
+        PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+    ).module()
+    program(noise.clone(), *(batch[key] for key in keys))
+    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        program(noise.clone(), *(hidden[key] for key in keys))
+
+
 def test_native_multimodal_model_trains_language_for_five_steps(joint, batch_size):
     """Exercise the real vision encoder, routed decoder, tied head and flow expert on CPU."""
     model_config = _tiny_native_config()
