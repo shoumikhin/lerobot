@@ -19,9 +19,10 @@ from __future__ import annotations
 import abc
 import inspect
 import logging
+import os
 from collections.abc import Callable, Iterator
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -34,6 +35,8 @@ from lerobot.bundle.manifest import NOISE, ProgramRun
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
+    DeviceProcessorStep,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
     policy_output_to_transition,
@@ -436,6 +439,30 @@ def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str
     }
 
 
+def split_absolute_step(
+    postprocessor: PolicyProcessorPipeline, action_dim: int
+) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
+    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
+
+    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
+    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
+    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
+    """
+    steps = list(postprocessor.steps)
+    index = next(
+        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
+    )
+    if index is None:
+        return postprocessor, None
+    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
+        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
+    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
+    if relative_step is None:
+        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
+    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
+    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
+
+
 def robot_features(
     config: PreTrainedConfig,
     preprocessor: PolicyProcessorPipeline,
@@ -541,6 +568,46 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
 
 
+_MEMINFO = Path("/proc/meminfo")
+
+
+def _available_memory() -> int | None:
+    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere."""
+    if not _MEMINFO.exists():
+        return None
+    for line in _MEMINFO.read_text().splitlines():
+        name, value, *_ = line.split()
+        if name == "MemAvailable:":
+            return int(value) * 1024
+    return None
+
+
+def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
+    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it.
+
+    When it does not, logs that the comparison is skipped; the bundle's own check of its test case still runs.
+    """
+    size = model_file.stat().st_size
+    if device.type == "cuda":
+        available, measured = torch.cuda.mem_get_info(device)[0], "free"
+    elif (linux_available := _available_memory()) is not None:
+        available, measured = linux_available, "available"
+    else:
+        available, measured = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "installed"
+    # Room for the activations and for what the export already holds.
+    if 2 * size <= available:
+        return True
+    logger.warning(
+        "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB %s. The bundle's "
+        "own check against its test case still runs.",
+        policy_name,
+        2 * size / 1e9,
+        available / 1e9,
+        measured,
+    )
+    return False
+
+
 def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
@@ -561,6 +628,22 @@ def load_policy(
     policy.eval()
     config.device = cfg.backend.device
     return policy, *load_processors(config)
+
+
+def refuse_peft_adapter(config: PreTrainedConfig, policy_name: str) -> None:
+    """Refuse a PEFT adapter, for a recipe that reads each part's weights from the checkpoint's own file."""
+    from lerobot.policies.factory import has_peft_adapter_config
+
+    if (
+        config.use_peft
+        and config.pretrained_path is not None
+        and has_peft_adapter_config(config.pretrained_path, config.pretrained_revision)
+    ):
+        raise ValueError(
+            f"{config.pretrained_path} is a PEFT adapter, and {policy_name}'s export reads each part's weights "
+            "from the checkpoint's model.safetensors, which an adapter does not hold. Merge the adapter into "
+            "its base policy, save that, and export it. See https://huggingface.co/docs/lerobot/export."
+        )
 
 
 def load_processors(config: PreTrainedConfig) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
