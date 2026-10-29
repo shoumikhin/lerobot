@@ -184,10 +184,13 @@ def qwen_image_rope_index(
     Text tokens count up by one. An image's tokens get `(start, start + row, start + col)` and move the
     next start by `max(rows, cols)`. Padding gets 0. `image_grid_thw` lists the (t, h, w) grid of every
     image block in `input_ids`, in order, as Python ints, including blocks hidden by `attention_mask`.
+    Only still images (t == 1) are supported, as the image processors produce them; video grids raise.
 
     This is what transformers 4.x and 5.5.4+ compute. For Qwen2.5-VL, 5.4.0 to 5.5.3 also scale the
     temporal position of still images (a bug fixed upstream in 5.5.4), so their stock positions differ.
     """
+    if any(t != 1 for t, _, _ in image_grid_thw):
+        raise ValueError(f"qwen_image_rope_index supports still images only (t == 1), got {image_grid_thw}.")
     device = input_ids.device
     valid = attention_mask.bool()
     is_image = input_ids == image_token_id
@@ -195,12 +198,12 @@ def qwen_image_rope_index(
     # Per image token, in batch order: its (t, h, w) offset inside the image, and how far the image
     # moves the text position, put on the image's last token so earlier tokens keep the image's start.
     offsets, advances = [], []
-    for t, h, w in image_grid_thw:
+    for _, h, w in image_grid_thw:
         h, w = h // spatial_merge_size, w // spatial_merge_size
-        rows = torch.arange(h, device=device).repeat_interleave(w * t)
-        cols = torch.arange(w, device=device).repeat(h * t)
+        rows = torch.arange(h, device=device).repeat_interleave(w)
+        cols = torch.arange(w, device=device).repeat(h)
         offsets.append(torch.stack([torch.zeros_like(rows), rows, cols]))
-        advance = torch.zeros(t * h * w, dtype=torch.long, device=device)
+        advance = torch.zeros(h * w, dtype=torch.long, device=device)
         advance[-1] = max(h, w)
         advances.append(advance)
     offsets = torch.cat(offsets, dim=1)

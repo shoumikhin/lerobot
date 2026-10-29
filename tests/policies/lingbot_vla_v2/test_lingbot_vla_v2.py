@@ -246,6 +246,17 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
     assert len(grid_builds) == 1
     assert data_dependent_nodes(exported) == []
 
+    if len(cameras) > 1:
+        # A hidden camera keeps its image tokens in the prefix, masked out: the export positions take every
+        # camera's grid, transformers takes the visible ones, and both must agree.
+        config = core.qwenvl.config
+        start = (input_ids[0] == config.vision_start_token_id).nonzero()[0, 0]
+        end = (input_ids[0] == config.vision_end_token_id).nonzero()[0, 0]
+        hidden = attention_mask.clone()
+        hidden[0, start : end + 1] = 0
+        stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
+        assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
+
 
 @pytest.mark.parametrize("precompute_grid_thw", [False, True], ids=["option-off", "option-on"])
 def test_adjacent_cameras_without_vision_boundaries_are_refused(tiny_backbone, precompute_grid_thw):

@@ -176,6 +176,12 @@ def test_image_rope_index_matches_stock():
     assert torch.equal(position_ids, expected)
 
 
+def test_image_rope_index_rejects_video_grids():
+    input_ids = torch.tensor([[1] + [IMAGE_TOKEN_ID] * 12 + [2]])
+    with pytest.raises(ValueError, match="still images only"):
+        qwen_image_rope_index(input_ids, torch.ones_like(input_ids), [[2, 4, 6]], 2, IMAGE_TOKEN_ID)
+
+
 def test_reused_grid_follows_dtype_changes():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
