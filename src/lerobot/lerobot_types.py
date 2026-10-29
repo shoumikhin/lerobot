@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypeAlias, T
 
 import numpy as np
 
+# Re-exported: robots and teleoperators import them from `lerobot.hardware_types`, which loads without PyTorch.
+from lerobot.hardware_types import RobotAction as RobotAction, RobotObservation as RobotObservation
 from lerobot.utils.import_utils import lazy_exports
 
 # PolicyAction is torch.Tensor, so it is resolved, and torch imported, the first time it is used.
@@ -61,9 +63,7 @@ class TransitionKey:
     COMPLEMENTARY_DATA: Final[Literal["complementary_data"]] = "complementary_data"
 
 
-RobotAction = dict[str, Any]
 EnvAction: TypeAlias = np.ndarray  # noqa: UP040
-RobotObservation = dict[str, Any]
 BatchType = dict[str, Any]
 
 
