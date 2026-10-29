@@ -954,8 +954,6 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
         policy.predict_action_chunk(malformed, noise=noise.clone())
 
 
-@pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])
-@pytest.mark.parametrize("batch_size", [1, 2])
 def test_export_refuses_a_hidden_image_of_another_size():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
     torch.manual_seed(19)
@@ -994,6 +992,8 @@ def test_export_refuses_a_hidden_image_of_another_size():
         program(noise.clone(), *(hidden[key] for key in keys))
 
 
+@pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])
+@pytest.mark.parametrize("batch_size", [1, 2])
 def test_native_multimodal_model_trains_language_for_five_steps(joint, batch_size):
     """Exercise the real vision encoder, routed decoder, tied head and flow expert on CPU."""
     model_config = _tiny_native_config()
