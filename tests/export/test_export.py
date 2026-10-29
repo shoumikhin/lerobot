@@ -280,6 +280,13 @@ BACKENDS = [
         "executorch_xnnpack",
         marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
     ),
+    pytest.param(
+        "executorch_cuda",
+        marks=pytest.mark.skipif(
+            not (EXECUTORCH and torch.cuda.is_available()),
+            reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+        ),
+    ),
 ]
 
 
@@ -300,6 +307,48 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     assert sorted(manifest.programs) == ["model", "prepare", "scale"]
     constants = load_file(bundle.path / bundle.manifest.constants)
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
+
+
+class MaskedPositions(torch.nn.Module):
+    """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(8, dtype=torch.bool)
+        ids = torch.zeros(8, dtype=torch.long)
+        ids[mask] = torch.arange(8)[mask]
+        return x + self.embedding(ids)
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
+    """Indexing with a boolean mask makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    model = MaskedPositions().eval()
+    x = torch.randn(8, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchCUDAConfig().compile(torch.export.export(model, (x,)), path)
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+    program = ExecuTorchProgram(path, data=path.with_suffix(".ptd"))
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-6, atol=1e-6)
 
 
 EXPORT_WITHOUT_TORCH = """
