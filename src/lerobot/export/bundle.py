@@ -35,9 +35,13 @@ POLICY_CONFIG = "policy_config.json"
 
 
 def write_bundle(
-    folder: Path, manifest: BundleManifest, test_case: TestCase, config: PreTrainedConfig
+    folder: Path,
+    manifest: BundleManifest,
+    test_case: TestCase,
+    config: PreTrainedConfig,
+    constants: dict[str, np.ndarray] | None = None,
 ) -> None:
-    """Write the test case, the policy config and the manifest into `folder`.
+    """Write the test case, the constants, the policy config and the manifest into `folder`.
 
     Args:
         folder (`Path`):
@@ -48,12 +52,19 @@ def write_bundle(
             The frame, noise and actions the programs must reproduce.
         config (`PreTrainedConfig`):
             The policy config, naming the frame the programs take.
+        constants (`dict[str, np.ndarray]`, *optional*):
+            Named arrays the programs read, written to the file the manifest names in `constants`.
     """
     case = {**test_case.frame, ACTION: test_case.actions}
     if test_case.noise is not None:
         case[NOISE] = test_case.noise
     # safetensors writes an array's memory in order, which scrambles a non-contiguous one.
     save_file({name: np.ascontiguousarray(value) for name, value in case.items()}, folder / manifest.test)
+    if manifest.constants is not None:
+        save_file(
+            {name: np.ascontiguousarray(value) for name, value in (constants or {}).items()},
+            folder / manifest.constants,
+        )
     config.save_pretrained(folder)
     (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)
     (folder / MANIFEST).write_text(json.dumps(manifest.to_dict(), indent=2) + "\n")

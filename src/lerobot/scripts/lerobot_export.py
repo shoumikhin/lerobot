@@ -40,6 +40,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -55,34 +56,46 @@ logger = logging.getLogger(__name__)
 def compile_bundle(cfg: ExportConfig, folder: Path) -> None:
     """Compile the recipe's parts into `folder` and write the rest of the bundle there."""
     from lerobot.export.bundle import write_bundle
-    from lerobot.export.recipe import recipe_class
+    from lerobot.export.recipe import ProgramCall, recipe_class
     from lerobot.inference.bundle import BundleManifest, ProgramSpec
+    from lerobot.inference.bundle.manifest import CONSTANTS
 
     recipe = recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
-    programs = []
+    files: dict[str, tuple[str, str | None]] = {}
+    own_names: list[ProgramCall] = []
     for part in recipe.parts():
         file = f"{part.name}{cfg.backend.file_suffix}"
         logger.info("Compiling %s with %s", part.name, cfg.backend.type)
         data = cfg.backend.compile(part, folder / file)
-        programs.append(
-            ProgramSpec(
-                part.name, file, part.input_names, part.output_names, None if data is None else data.name
-            )
-        )
+        files[part.name] = (file, None if data is None else data.name)
+        own_names.append(ProgramCall(part.name, part.input_names, part.output_names))
         del part
+    plan = recipe.plan()
+    calls = own_names if plan.calls is None else plan.calls
+    repeats = Counter(call.part for call in calls)
+    seen: Counter[str] = Counter()
+    programs = []
+    for call in calls:
+        if call.part not in files:
+            raise ValueError(f"{type(recipe).__name__} runs a part it did not yield: {call.part!r}.")
+        name = call.part if repeats[call.part] == 1 else f"{call.part}_{seen[call.part]}"
+        seen[call.part] += 1
+        program_file, data_file = files[call.part]
+        programs.append(ProgramSpec(name, program_file, call.inputs, call.outputs, data_file))
     test_case = recipe.test_case()
     manifest = BundleManifest(
         backend=cfg.backend.type,
         runtime=cfg.backend.runtime,
         runtime_imports=list(cfg.backend.runtime_imports),
         programs=programs,
+        constants=CONSTANTS if plan.constants else None,
         noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
         task=recipe.task,
         action_names=getattr(recipe.config, "action_feature_names", None),
         action_scale=test_case.action_scale.tolist(),
         tolerance=recipe.tolerance,
     )
-    write_bundle(folder, manifest, test_case, recipe.config)
+    write_bundle(folder, manifest, test_case, recipe.config, plan.constants)
 
 
 @parser.wrap()
