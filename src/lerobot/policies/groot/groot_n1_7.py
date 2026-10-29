@@ -36,6 +36,8 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
+from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
+from ..common.qwen_vision import qwen_image_rope_index
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
@@ -92,6 +94,7 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "select_layer": 16,
     "reproject_vision": False,
     "use_flash_attention": False,
+    "precompute_grid_thw": False,
     "load_bf16": False,
     "backbone_trainable_params_fp32": True,
     "image_crop_size": N1_7_DEFAULT_IMAGE_CROP_SIZE,
@@ -272,6 +275,7 @@ class Qwen3Backbone(nn.Module):
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict[str, Any] | None = None,
         load_pretrained_weights: bool = True,
+        precompute_grid_thw: bool = False,
     ):
         require_package("transformers", extra="groot")
         if Qwen3VLForConditionalGeneration is None:
@@ -312,6 +316,8 @@ class Qwen3Backbone(nn.Module):
             self.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self.precompute_grid_thw = precompute_grid_thw
+        self._vision_grid: Qwen3VisionGrid | None = None
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             for parameter in self.parameters():
@@ -439,11 +445,41 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
+            grid = self._vision_grid
+            if grid is not None and self.precompute_grid_thw and torch.compiler.is_exporting():
+                self._qwen_on_fixed_grid(model_input, grid)
+                return captured["features"]
             outputs = self.model(**model_input, output_hidden_states=True)
         finally:
             hook.remove()
 
         return captured.get("features", outputs.hidden_states[-1])
+
+    def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid) -> None:
+        """Run `Qwen3VLModel` under `torch.export` on the cached grid metadata."""
+        qwen = getattr(self.model, "model", self.model)
+        input_ids = model_input["input_ids"]
+        attention_mask = model_input["attention_mask"]
+        pixel_values = model_input["pixel_values"]
+        position_ids = qwen_image_rope_index(
+            input_ids,
+            attention_mask,
+            grid.grid_thw,
+            qwen.visual.spatial_merge_size,
+            qwen.config.image_token_id,
+        )
+        # The legacy text position row, as `_ensure_legacy_qwen3_position_ids` adds it.
+        position_ids = torch.cat([position_ids[:1], position_ids], dim=0)
+        qwen3_vl_forward(
+            qwen,
+            qwen.get_input_embeddings()(input_ids),
+            attention_mask,
+            pixel_values,
+            model_input["image_grid_thw"],
+            grid,
+            image_mask=input_ids == qwen.config.image_token_id,
+            position_ids=position_ids,
+        )
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -451,8 +487,17 @@ class Qwen3Backbone(nn.Module):
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
-        self._ensure_mm_token_type_ids(model_input)
-        self._ensure_legacy_qwen3_position_ids(model_input)
+        if self.precompute_grid_thw:
+            if model_input.get("pixel_values_videos") is not None:
+                raise ValueError("GR00T precompute_grid_thw supports images only.")
+            qwen = getattr(self.model, "model", self.model)
+            self._vision_grid = Qwen3VisionGrid.reuse_or_build(
+                self._vision_grid, qwen.visual, model_input["image_grid_thw"]
+            )
+        # Eager mode keeps the stock calls, so FSDP and checkpointing hooks on the Qwen model run as before.
+        if not (self.precompute_grid_thw and torch.compiler.is_exporting()):
+            self._ensure_mm_token_type_ids(model_input)
+            self._ensure_legacy_qwen3_position_ids(model_input)
         features = self._last_decoder_layer_output(model_input)
         image_mask = model_input["input_ids"] == self.model.config.image_token_id
         attention_mask = model_input["attention_mask"] == 1
@@ -865,6 +910,7 @@ class GR00TN17(PreTrainedModel):
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             transformers_loading_kwargs=transformers_loading_kwargs,
             load_pretrained_weights=load_backbone_weights,
+            precompute_grid_thw=config.precompute_grid_thw,
         )
         self.action_head = GR00TN17ActionHead(config)
         self.post_init()
