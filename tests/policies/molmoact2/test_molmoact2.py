@@ -56,6 +56,7 @@ from lerobot.policies.molmoact2.modeling_molmoact2 import (
     _position_ids_from_attention_mask,
 )
 from lerobot.policies.molmoact2.molmoact2_hf_model import (
+    inference as hf_molmoact2_inference,
     modeling_molmoact2 as hf_molmoact2_modeling,
 )
 from lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2 import (
@@ -1885,6 +1886,51 @@ def test_cuda_graph_managers_are_inference_only():
     policy.eval()
     assert policy.model.model.action_cuda_graph_manager.enabled is False
     assert policy.model.depth_decode_cuda_graph_manager.enabled is False
+
+
+def test_action_cuda_graph_is_not_replayed_while_exporting(monkeypatch):
+    action_model = SimpleNamespace(
+        training=False, _require_action_expert=lambda: SimpleNamespace(training=False)
+    )
+    inputs = SimpleNamespace(
+        trajectory=SimpleNamespace(device=torch.device("cuda")),
+        context=SimpleNamespace(
+            kv_contexts=[], cross_mask=None, self_mask=None, valid_action=None, rope_cache=None
+        ),
+        action_dim_is_pad=None,
+        modulations=[],
+    )
+    manager = hf_molmoact2_modeling.ActionCudaGraphManager(action_model)
+    assert manager.can_use_action_flow(inputs)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(torch.compiler, "is_exporting", lambda: True)
+    assert not manager.can_use_action_flow(inputs)
+    # Under torch.compile (which also reports exporting before torch 2.12), Dynamo breaks the graph at the replay.
+    monkeypatch.setattr(torch.compiler, "is_dynamo_compiling", lambda: True)
+    assert manager.can_use_action_flow(inputs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The depth decode CUDA graph needs CUDA inputs.")
+def test_depth_decode_cuda_graph_is_not_replayed_while_exporting(monkeypatch):
+    backbone = SimpleNamespace(transformer=SimpleNamespace(training=False))
+    manager = hf_molmoact2_modeling.DepthDecodeCudaGraphManager(
+        SimpleNamespace(model=backbone, training=False)
+    )
+    manager.graph_spec = SimpleNamespace(eligible=True)
+    next_input_ids = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+    kwargs = {
+        "past_key_values": object.__new__(hf_molmoact2_inference._DepthDecodeStaticCache),
+        "attention_bias": torch.zeros(1, 1, 1, 1, device="cuda"),
+        "position_ids": torch.zeros_like(next_input_ids),
+    }
+    assert manager.can_use(next_input_ids, **kwargs)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(torch.compiler, "is_exporting", lambda: True)
+    assert not manager.can_use(next_input_ids, **kwargs)
+    monkeypatch.setattr(torch.compiler, "is_dynamo_compiling", lambda: True)
+    assert manager.can_use(next_input_ids, **kwargs)
 
 
 def test_lora_targets_exclude_action_expert():

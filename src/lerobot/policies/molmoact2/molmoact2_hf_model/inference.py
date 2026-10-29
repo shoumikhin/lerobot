@@ -77,6 +77,15 @@ class _DepthDecodeCudaGraphSpec:
     num_attention_heads: int
 
 
+def _is_non_strict_exporting() -> bool:
+    """Return whether non-strict torch.export is tracing.
+
+    torch.compile and strict export run Dynamo instead. Before torch 2.12, is_exporting() is also true while
+    torch.compile traces.
+    """
+    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
+
+
 def _cache_seq_len_int(past_key_values: Cache | None) -> int:
     if past_key_values is None:
         return 0
@@ -192,6 +201,10 @@ class ActionCudaGraphManager:
         action_model = self.model
         if not self.enabled:
             return False
+        # Non-strict export would record the replay instead of the flow loop. torch.compile breaks the graph at
+        # the replay and still runs it.
+        if _is_non_strict_exporting():
+            return False
         if action_model.training or action_model._require_action_expert().training:
             return False
         if inputs.trajectory.device.type != "cuda":
@@ -304,6 +317,10 @@ class DepthDecodeCudaGraphManager:
         position_ids: torch.Tensor,
     ) -> bool:
         if not self.enabled or self.model.training or self.backbone.transformer.training:
+            return False
+        # Non-strict export would record the replay instead of the decode step. torch.compile breaks the graph at
+        # the replay and still runs it.
+        if _is_non_strict_exporting():
             return False
         if next_input_ids.device.type != "cuda":
             return False
