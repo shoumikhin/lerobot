@@ -59,6 +59,10 @@ from lerobot.policies.molmoact2.molmoact2_hf_model import (
     inference as hf_molmoact2_inference,
     modeling_molmoact2 as hf_molmoact2_modeling,
 )
+from lerobot.policies.molmoact2.molmoact2_hf_model.configuration_molmoact2 import (
+    MolmoAct2AdapterConfig,
+    MolmoAct2VitConfig,
+)
 from lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2 import (
     ActionExpert,
     ActionExpertModulation,
@@ -3208,6 +3212,113 @@ def test_both_action_expert_mask_retains_checkpoint_span_masking():
 
     assert torch.equal(mask, torch.tensor([[False, False, False, False, True]]))
     assert policy.model.model.calls == 1
+
+
+def test_discrete_output_span_mask_exports():
+    model = object.__new__(hf_molmoact2_modeling.MolmoAct2Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        action_mode="both", eos_token_id=None, action_start_token_id=7, action_end_token_id=9
+    )
+
+    class EncoderAttentionMask(torch.nn.Module):
+        def forward(self, input_ids):
+            return model._get_encoder_attention_mask(input_ids, None)
+
+    input_ids = torch.tensor(
+        [
+            [1, 7, 2, 9, 3, 3],  # one span, both boundary tokens masked
+            [9, 1, 7, 2, 9, 3],  # an end token with no open span is ignored
+            [7, 7, 9, 1, 9, 3],  # a nested start extends the span to the next end
+            [1, 2, 7, 3, 3, 3],  # an unterminated span runs to the end
+        ]
+    )
+    program = torch.export.export(EncoderAttentionMask(), (input_ids,))
+
+    expected = torch.tensor(
+        [
+            [True, False, False, False, True, True],
+            [True, True, False, False, False, True],
+            [False, False, False, False, False, True],
+            [True, True, False, False, False, False],
+        ]
+    )
+    assert torch.equal(program.module()(input_ids), expected)
+
+
+def test_single_example_image_inputs_export():
+    torch.manual_seed(0)
+    end_id, patch_id = 5, 6
+    model = object.__new__(hf_molmoact2_modeling.MolmoAct2Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_end_token_id=end_id, image_patch_id=patch_id)
+    model.vision_backbone = hf_molmoact2_modeling.MolmoAct2VisionBackbone(
+        MolmoAct2VitConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=4,
+            image_default_input_size=(28, 28),
+            image_num_pos=4,
+        ),
+        MolmoAct2AdapterConfig(
+            vit_layers=(-1,),
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=4,
+            intermediate_size=16,
+            text_hidden_size=8,
+        ),
+    ).eval()
+    model.transformer = torch.nn.Module()
+    model.transformer.wte = torch.nn.Embedding(8, 8)
+    model.transformer.emb_drop = torch.nn.Identity()
+
+    class ImageEmbeddings(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model
+
+        def forward(self, input_ids, pixel_values, image_token_pooling, image_grids, image_num_crops):
+            images, token_pooling = self.model.build_batched_images(
+                input_ids, pixel_values, image_token_pooling, image_grids, image_num_crops
+            )
+            return self.model.build_input_embeddings(input_ids, images, token_pooling)[0]
+
+    # Image 0 has one crop of four patches, image 1 has two crops; each pools into two tokens.
+    example = (
+        torch.tensor([[1, patch_id, patch_id, end_id, patch_id, patch_id, end_id, 2]]),
+        torch.randn(3, 4, 14 * 14 * 3),
+        torch.tensor([[0, 1], [2, -1], [0, 5], [7, -1]]),
+        torch.tensor([[1, 1, 1, 1], [1, 2, 0, 0]]),
+        torch.tensor([1, 2]),
+    )
+    embed = ImageEmbeddings()
+    program = torch.export.export(embed, example)
+
+    with torch.no_grad():
+        embeddings = embed(*example)
+        # Reference: each image feature added to its image patch token, in order.
+        images, token_pooling = model.build_batched_images(*example)
+        expected = model.transformer.wte(example[0]).reshape(-1, 8)
+        expected[example[0].flatten() == patch_id] += model.vision_backbone(images, token_pooling)
+    assert torch.equal(embeddings, expected.reshape_as(embeddings))
+    assert torch.equal(program.module()(*example), embeddings)
+
+    # The same example batched with a one-image example, so the batch adds padding rows.
+    other = (
+        torch.tensor([[1, patch_id, patch_id, end_id, 2, -1, -1, -1]]),
+        torch.randn(1, 4, 14 * 14 * 3),
+        torch.tensor([[3, 2], [1, -1]]),
+        torch.tensor([[1, 1, 1, 1]]),
+        torch.tensor([1]),
+    )
+    with torch.no_grad():
+        batched = embed(*(torch.cat(pair) for pair in zip(example, other, strict=True)))
+    torch.testing.assert_close(batched[:1], embeddings)
 
 
 def test_rtc_generation_uses_previous_chunk_prefix():

@@ -54,6 +54,7 @@ from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
     logging,
+    torch_compilable_check,
 )
 
 from .configuration_molmoact2 import (
@@ -2826,28 +2827,20 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         return kv_states
 
     @staticmethod
-    def _mask_discrete_output_span(
-        row_ids: torch.Tensor,
-        row_mask: torch.Tensor,
+    def _mask_discrete_output_spans(
+        input_ids: torch.Tensor,
+        mask: torch.Tensor,
         start_id: int | None,
         end_id: int | None,
-    ) -> None:
+    ) -> torch.Tensor:
         if start_id is None or end_id is None:
-            return
-        start_positions = (row_ids == start_id).nonzero(as_tuple=False).flatten().tolist()
-        if not start_positions:
-            return
-        end_positions = (row_ids == end_id).nonzero(as_tuple=False).flatten().tolist()
-        end_ptr = 0
-        for start_pos in start_positions:
-            while end_ptr < len(end_positions) and end_positions[end_ptr] < start_pos:
-                end_ptr += 1
-            if end_ptr >= len(end_positions):
-                row_mask[start_pos:] = False
-                break
-            end_pos = end_positions[end_ptr]
-            row_mask[start_pos : end_pos + 1] = False
-            end_ptr += 1
+            return mask
+        # Count the spans open at each position. The cummin term drops an end that closes no span.
+        step = (input_ids == start_id).long() - (input_ids == end_id).long()
+        total = step.cumsum(-1)
+        depth = total - total.cummin(-1).values.clamp(max=0)
+        depth_before = F.pad(depth[..., :-1], (1, 0))
+        return mask & (depth == 0) & (depth_before == 0)
 
     def _get_encoder_attention_mask(
         self,
@@ -2865,14 +2858,12 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         eos_id = getattr(self.config, "eos_token_id", None)
         if eos_id is not None:
             mask &= input_ids != int(eos_id)
-        for batch_idx in range(input_ids.shape[0]):
-            self._mask_discrete_output_span(
-                input_ids[batch_idx],
-                mask[batch_idx],
-                self.config.action_start_token_id,
-                self.config.action_end_token_id,
-            )
-        return mask
+        return self._mask_discrete_output_spans(
+            input_ids,
+            mask,
+            self.config.action_start_token_id,
+            self.config.action_end_token_id,
+        )
 
     def _get_depth_token_mask(
         self,
@@ -3179,6 +3170,52 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             trajectory = self._run_action_flow_loop(flow_inputs, steps)
         return trajectory
 
+    @staticmethod
+    def _build_single_example_images(
+        end_token_counts: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_token_pooling: torch.Tensor,
+        image_grids: torch.Tensor,
+        image_num_crops: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Same result as the general path for one example, but no Python branch depends on a tensor
+        # value, so torch.export can trace single-example inference.
+        num_images = image_grids.size(0)
+        assert image_num_crops.size(0) == num_images, (
+            f"Expected {num_images} image num crops, but got {image_num_crops.size(0)}"
+        )
+        torch_compilable_check(
+            (end_token_counts == num_images) | (end_token_counts == 2 * num_images) | (num_images <= 0),
+            lambda: "Could not infer image counts from image end tokens: "
+            f"end_tokens={int(end_token_counts.sum())}, image_grids={num_images}.",
+        )
+        n_crops, n_patches, _ = pixel_values.shape
+        torch_compilable_check(
+            image_num_crops.sum() == n_crops,
+            lambda: f"Expected {int(image_num_crops.sum())} crops, but got {n_crops}",
+            error_type=AssertionError,
+        )
+        num_pooled_patches_per_image = image_grids[:, :2].prod(dim=1) + image_grids[:, 2:].prod(dim=1)
+        num_pooled_patches = image_token_pooling.size(0)
+        torch_compilable_check(
+            num_pooled_patches_per_image.sum() == num_pooled_patches,
+            lambda: f"Expected {int(num_pooled_patches_per_image.sum())} pooled patches, "
+            f"but got {num_pooled_patches}",
+            error_type=AssertionError,
+        )
+        # Pooling indices are relative to their own image: shift each row by the patches of the
+        # images before it.
+        patches_per_image = image_num_crops * n_patches
+        image_offsets = (patches_per_image.cumsum(0) - patches_per_image).to(image_token_pooling.dtype)
+        rows = torch.arange(num_pooled_patches, device=image_token_pooling.device)
+        image_of_row = (rows[:, None] >= num_pooled_patches_per_image.cumsum(0)[None, :]).sum(1)
+        token_pooling = torch.where(
+            image_token_pooling >= 0,
+            image_token_pooling + image_offsets[image_of_row][:, None],
+            image_token_pooling,
+        )
+        return pixel_values[None], token_pooling[None]
+
     def build_batched_images(
         self,
         input_ids: torch.LongTensor,
@@ -3190,6 +3227,10 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         # 1) Count the number of images in each example
         raw_counts = (input_ids == self.config.image_end_token_id).sum(1)  # [N]
         total_images = int(image_grids.size(0))
+        if input_ids.size(0) == 1:
+            return self._build_single_example_images(
+                raw_counts, pixel_values, image_token_pooling, image_grids, image_num_crops
+            )
         total_end_tokens = int(raw_counts.sum().item())
         if total_images <= 0:
             counts = raw_counts.new_zeros(raw_counts.shape)
@@ -3496,10 +3537,11 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             # parameter storage and autocast can otherwise make them differ.
             image_features = self.vision_backbone(images, token_pooling).to(device=x.device, dtype=x.dtype)
             is_image_patch = input_ids.reshape(-1) == self.config.image_patch_id
-            if is_image_patch.sum() != len(image_features):
-                raise RuntimeError(
-                    f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}."
-                )
+            torch_compilable_check(
+                is_image_patch.sum() == image_features.shape[0],
+                lambda: f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}.",
+                error_type=RuntimeError,
+            )
             flat_x = x.reshape(-1, x.shape[-1]).clone()
             flat_x[is_image_patch] = flat_x[is_image_patch] + image_features
             x = flat_x.reshape_as(x)
