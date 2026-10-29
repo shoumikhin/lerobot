@@ -28,7 +28,7 @@ from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.default import DatasetConfig
 
 if TYPE_CHECKING:
-    from .recipe import Part
+    from torch.export import ExportedProgram
 
 
 @dataclass
@@ -57,11 +57,12 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         return self.get_choice_name(self.__class__)
 
     @abc.abstractmethod
-    def compile(self, part: Part, path: Path) -> Path | None:
-        """Compile `part` into the program file `path`, without changing `part`.
+    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
+        """Compile `program`, one part traced by `torch.export`, into the program file `path`.
 
-        Returns a second file written beside `path` that the runtime loads with the program, such as its
-        weights, or `None`.
+        `program.example_inputs` holds the inputs it was traced with, on the backend's device. Returns a
+        second file written beside `path` that the runtime loads with the program, such as its weights, or
+        `None`.
         """
 
 
