@@ -24,7 +24,7 @@ from torch import Tensor
 
 import lerobot.export.recipe as recipe_module
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export.recipe import ActionChunkRecipe, recipe_class
+from lerobot.export.recipe import ActionChunkRecipe, ReplayDraws, recipe_class
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -106,6 +106,14 @@ class TwoNoisesACT(ACTPolicy):
         return super().predict_action_chunk(batch) + torch.randn(1, 4, 1) + torch.randn(1, 4, 1)
 
 
+class SamplingACT(ACTPolicy):
+    """ACT that adds a category it samples from its actions, as a policy that samples codes would."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        actions = super().predict_action_chunk(batch)
+        return actions + torch.multinomial(actions[0].softmax(-1), 1).float()
+
+
 def test_recipe_measures_the_action_scale_from_the_postprocessor():
     np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
 
@@ -128,6 +136,53 @@ def test_recipe_asks_the_policy_for_its_noise_shape():
 def test_recipe_refuses_a_policy_that_draws_two_noises():
     with pytest.raises(ValueError, match="draws 2 random tensors"):
         make(TwoNoisesACT)
+
+
+def test_recipe_refuses_a_policy_that_samples_categories_itself():
+    with pytest.raises(ValueError, match=r"draws 1 random tensors shaped \[\(2, 4, 3\)\]"):
+        make(SamplingACT)
+
+
+def test_replayed_draws_read_the_noise_in_order():
+    noise = torch.arange(6.0).reshape(3, 1, 2)
+    with ReplayDraws(noise) as draws:
+        drawn = [torch.randn(1, 2), torch.randn_like(torch.ones(1, 2)), torch.ones(1, 2).normal_()]
+    assert torch.equal(torch.stack(drawn), noise) and draws.shapes == [(1, 2)] * 3
+    with pytest.raises(ValueError, match=r"Draw 0 reads noise shaped \[1, 3\]"), ReplayDraws(noise):
+        torch.randn(1, 3)
+    with pytest.raises(ValueError, match="Draw 3"), ReplayDraws(noise):
+        for _ in range(4):
+            torch.randn(1, 2)
+
+
+def test_pytorch_samples_one_category_by_an_exponential_race():
+    """What `ReplayDraws` relies on to sample categories as PyTorch does."""
+    probs = torch.softmax(torch.randn(64, 16) / 0.3, -1)
+    for seed in range(20):
+        sampled = torch.multinomial(probs, 1, generator=torch.Generator().manual_seed(seed))
+        race = torch.empty_like(probs).exponential_(generator=torch.Generator().manual_seed(seed))
+        assert torch.equal(sampled, torch.argmax(probs / race, dim=-1, keepdim=True))
+
+
+def test_replayed_categories_follow_the_probabilities():
+    probs = torch.tensor([[0.1, 0.2, 0.7]]).expand(20000, 3)
+    noise = torch.randn(1, 2, 20000, 3, generator=torch.Generator().manual_seed(0))
+    with ReplayDraws(noise):
+        sampled = torch.multinomial(probs, num_samples=1)
+    counts = torch.bincount(sampled[:, 0], minlength=3) / 20000
+    torch.testing.assert_close(counts, probs[0], atol=0.01, rtol=0)
+
+
+def test_a_program_samples_from_its_noise_input():
+    class Sample(torch.nn.Module):
+        def forward(self, logits: Tensor, noise: Tensor) -> Tensor:
+            with ReplayDraws(noise):
+                return torch.multinomial(logits.softmax(-1), 1)
+
+    logits, noise = torch.randn(4, 8), torch.randn(1, 2, 4, 8)
+    program = torch.export.export(Sample(), (logits, noise))
+    assert "multinomial" not in str(program.graph)
+    assert torch.equal(program.module()(logits, noise), Sample()(logits, noise))
 
 
 def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():

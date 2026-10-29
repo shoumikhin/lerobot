@@ -59,6 +59,7 @@ IMAGE_CELLS = (6, 8)
 # Two tasks whose first words differ, so they stay different when a tokenizer cuts them short.
 PROBE_TASKS = ("pick up the red cube", "stop")
 _RANDOM_NORMAL = {torch.randn, torch.randn_like, torch.normal, Tensor.normal_}
+_MULTINOMIAL = {torch.multinomial, Tensor.multinomial}
 
 
 @dataclass
@@ -408,10 +409,10 @@ class ActionChunkRecipe(ExportRecipe):
         """
         if NOISE not in inspect.signature(self.policy.predict_action_chunk).parameters:
             return None
-        shapes: list[tuple[int, ...]] = []
         self._reset()
-        with torch.no_grad(), _RecordNormalDraws(shapes):
+        with torch.no_grad(), ReplayDraws() as draws:
             self.policy.predict_action_chunk(self.preprocessor(self._observation(frame, self.task)))
+        shapes = draws.shapes
         if len(shapes) != 1 or shapes[0][0] != 1:
             raise ValueError(
                 f"The {self.policy.config.type} policy draws {len(shapes)} random tensors shaped {shapes} for "
@@ -498,18 +499,59 @@ class _ActionChunk(nn.Module):
         return self.postprocessor(actions[:, : self.steps])[0].float()
 
 
-class _RecordNormalDraws(TorchFunctionMode):
-    """Records the shape of every random normal tensor drawn while it is active."""
+class ReplayDraws(TorchFunctionMode):
+    """Makes the random draws of what runs while it is active read a given noise, one draw after another.
 
-    def __init__(self, shapes: list[tuple[int, ...]]) -> None:
+    A compiled program cannot draw random numbers the way PyTorch does, so a policy's randomness becomes the
+    program's `noise` input, which the bundle draws from a standard normal. The k-th draw reads `noise[k]`:
+
+    - a random normal tensor is `noise[k]` itself;
+    - a multinomial draw of one category per row is made the way PyTorch makes it, `argmax(p / q)` with `q`
+      exponentially distributed, and takes `q = (a**2 + b**2) / 2` from the two halves of `noise[k]`, shaped
+      `[2, *p.shape]`.
+
+    Without a noise, the draws are made as usual and `shapes` records the shape each would read.
+
+    Args:
+        noise (`Tensor`, *optional*):
+            The draws, stacked on the first axis.
+    """
+
+    def __init__(self, noise: Tensor | None = None) -> None:
+        """Read the draws from `noise`, or make them as usual and record their shapes without one."""
         super().__init__()
-        self.shapes = shapes
+        self.noise = noise
+        self.shapes: list[tuple[int, ...]] = []
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
-        result = func(*args, **(kwargs or {}))
+        """Run `func`, reading it from the noise if it is a random draw."""
+        kwargs = kwargs or {}
+        if func in _MULTINOMIAL:
+            probs = args[0]
+            if (args[1] if len(args) > 1 else kwargs.get("num_samples")) != 1:
+                raise ValueError("Only a multinomial draw of one category per row can read the noise.")
+            if self.noise is None:
+                self.shapes.append((2, *probs.shape))
+                return func(*args, **kwargs)
+            first, second = self._next((2, *probs.shape))
+            return torch.argmax(probs / ((first * first + second * second) / 2), dim=-1, keepdim=True)
+        result = func(*args, **kwargs)
         if func in _RANDOM_NORMAL:
-            self.shapes.append(tuple(result.shape))
+            if self.noise is None:
+                self.shapes.append(tuple(result.shape))
+            else:
+                result = self._next(tuple(result.shape)).to(result)
         return result
+
+    def _next(self, shape: tuple[int, ...]) -> Tensor:
+        drawn = len(self.shapes)
+        if self.noise is None or drawn == len(self.noise) or tuple(self.noise.shape[1:]) != shape:
+            raise ValueError(
+                f"Draw {drawn} reads noise shaped {list(shape)}, which the noise "
+                f"{None if self.noise is None else list(self.noise.shape)} does not hold."
+            )
+        self.shapes.append(shape)
+        return self.noise[drawn]
 
 
 def _default_tolerance(policy: PreTrainedPolicy) -> float:
