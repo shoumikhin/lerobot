@@ -17,6 +17,7 @@
 """Export helpers shared by policies that check how they are being traced."""
 
 import torch
+from torch import nn
 from torch._guards import detect_fake_mode
 
 
@@ -33,3 +34,14 @@ def is_non_strict_exporting() -> bool:
         and not torch.compiler.is_dynamo_compiling()
         and detect_fake_mode() is not None
     )
+
+
+def hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
+    """Store the linear layers of `module`, which runs them only under bfloat16 autocast, in bfloat16.
+
+    Autocast casts a float32 linear layer's weight to bfloat16 on every call, so this is the same arithmetic
+    without a float32 copy of the weights in the program.
+    """
+    for layer in module.modules():
+        if isinstance(layer, nn.Linear):
+            layer.to(torch.bfloat16)

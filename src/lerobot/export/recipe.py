@@ -20,6 +20,8 @@ import abc
 import contextlib
 import inspect
 import logging
+import math
+import os
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
@@ -28,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from torch import Tensor, nn
 from torch.overrides import TorchFunctionMode
 
@@ -35,9 +38,12 @@ from lerobot.bundle.manifest import CONTINUOUS_ACTIONS, NOISE, ProgramRun
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, is_depth_map
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
+    DeviceProcessorStep,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
     policy_output_to_transition,
+    to_absolute_actions,
     transition_to_policy_action,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STR
@@ -225,6 +231,30 @@ class RunPlan:
             )
 
 
+def repeated_runs(
+    program: str,
+    inputs: list[str],
+    outputs: list[str],
+    steps: Sequence[dict[str, np.ndarray]],
+    start: dict[str, str] | None = None,
+) -> tuple[list[ProgramRun], dict[str, np.ndarray]]:
+    """The runs of a part that runs once per step, such as a denoising step, and the constants they read.
+
+    Run `i` reads and writes the part's own `inputs` and `outputs` names, so a value the part reads and writes
+    under one name, such as the sample `x`, passes from each run to the next. The first run reads
+    `start[name]` in place of such an input, such as the starting `noise`. Each name in `steps[i]` is a
+    constant of run `i` only, such as its timestep: the run reads it as `f"{name}_{i}"`, and the returned
+    constants hold it.
+    """
+    runs, constants = [], {}
+    for i, row in enumerate(steps):
+        names = dict(start or {}) if i == 0 else {}
+        names.update((name, f"{name}_{i}") for name in row)
+        runs.append(ProgramRun(f"{program}_{i}", program, [names.get(n, n) for n in inputs], list(outputs)))
+        constants.update({f"{name}_{i}": value for name, value in row.items()})
+    return runs, constants
+
+
 class ExportRecipe(abc.ABC):
     """Knows one kind of policy, never a compiler: turns it into parts and makes the test case.
 
@@ -241,6 +271,9 @@ class ExportRecipe(abc.ABC):
             Its saved postprocessor.
         cfg (`ExportConfig`):
             The `lerobot-export` configuration.
+
+    A recipe that overrides `load` and `__init__`, to load its weights one part at a time, sets the attributes
+    below itself; `lerobot-export` reads no other.
 
     Attributes:
         config (`PreTrainedConfig`):
@@ -276,13 +309,25 @@ class ExportRecipe(abc.ABC):
         self.task: str | None = None
         self.tolerance = cfg.tolerance if cfg.tolerance is not None else _default_tolerance(policy)
 
+    def _read_features(self, policy_config: PreTrainedConfig) -> None:
+        """Seed the random test frames, and read the frame the robot sends, which the bundle's config names."""
+        self._generator = torch.Generator().manual_seed(self.cfg.seed)
+        self._metadata = dataset_metadata(self.cfg)
+        self._features = robot_features(policy_config, self.preprocessor, self._metadata)
+        self._visual = {name for name, f in self._features.items() if f.type is FeatureType.VISUAL}
+        self.config = copy(policy_config)
+        self.config.input_features = self._features
+
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:
         """Yield the parts in the order they run. `lerobot-export` traces and frees each before the next."""
 
     @abc.abstractmethod
     def test_case(self) -> TestCase:
-        """The frame, noise and actions the bundle's programs must reproduce."""
+        """The frame, noise and actions the bundle's programs must reproduce.
+
+        `lerobot-export` asks for it once `parts` is used up, after `plan`.
+        """
 
     def plan(self) -> RunPlan:
         """How the compiled parts run, asked once `parts` is used up. By default each part runs once."""
@@ -320,12 +365,7 @@ class ActionChunkRecipe(ExportRecipe):
             raise ValueError(f"This {policy_type} checkpoint cannot be exported: {error}") from error
         self._device = torch.device(cfg.backend.device)
         policy.to(self._device)
-        self._generator = torch.Generator().manual_seed(cfg.seed)
-        self._metadata = dataset_metadata(cfg)
-        self._features = robot_features(policy.config, preprocessor, self._metadata)
-        self._visual = {name for name, f in self._features.items() if f.type is FeatureType.VISUAL}
-        self.config = copy(policy.config)
-        self.config.input_features = self._features
+        self._read_features(policy.config)
         frame = random_frame(self._features, self._generator)
         self.task = self._task(frame)
         self._noise_shape = self._sampled_noise_shape(frame)
@@ -608,6 +648,30 @@ def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str
     return renames
 
 
+def split_absolute_step(
+    postprocessor: PolicyProcessorPipeline, action_dim: int
+) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
+    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
+
+    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
+    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
+    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
+    """
+    steps = list(postprocessor.steps)
+    index = next(
+        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
+    )
+    if index is None:
+        return postprocessor, None
+    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
+        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
+    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
+    if relative_step is None:
+        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
+    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
+    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
+
+
 # The names of what `action_pipelines` compute, in order: the actions to play, then those without the thresholds.
 ACTION_OUTPUTS = (ACTION, CONTINUOUS_ACTIONS)
 
@@ -677,6 +741,41 @@ class PostprocessedActions(nn.Module):
         """`chunk` is `[1, steps, width]`; each output is `[steps, action]` in float32."""
         played = tuple(pipeline(chunk)[0].float() for pipeline in self.pipelines)
         return played if len(played) > 1 else played[0]
+
+
+class ChunkActions(nn.Module):
+    """The denoised actions in, the actions to play out, in robot units, and those without thresholds if any.
+
+    A policy trained on actions relative to the state turns them back around the robot's state. The policy's
+    postprocessor adds the state its preprocessor cached in Python, which a program would hold as a constant,
+    so this module adds the state it takes as an input instead. `outputs` names what it returns, in order.
+    """
+
+    def __init__(self, postprocessor: PolicyProcessorPipeline, execution_steps: int, action_dim: int):
+        """Play the first `execution_steps` actions of `action_dim` each through `postprocessor`."""
+        super().__init__()
+        postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
+        self.pipelines = action_pipelines(postprocessor)
+        self.outputs = list(ACTION_OUTPUTS[: len(self.pipelines)])
+        self.execution_steps = execution_steps
+        self.action_dim = action_dim
+
+    @property
+    def reads_state(self) -> bool:
+        """Whether the module takes the robot's state, for a policy trained on actions relative to it."""
+        return self.mask is not None
+
+    def forward(self, actions: Tensor, *state: Tensor) -> Tensor | tuple[Tensor, ...]:
+        """The actions, and the robot's state for a policy trained on actions relative to it."""
+        chunk = actions[None, : self.execution_steps, : self.action_dim]
+        played = [pipeline(chunk) for pipeline in self.pipelines]
+        if self.mask is not None:
+            (anchor,) = state
+            played = [to_absolute_actions(a, anchor[None], self.mask) for a in played]
+        outputs = tuple(a[0].float() for a in played)
+        return outputs if len(outputs) > 1 else outputs[0]
+
+
 def robot_features(
     config: PreTrainedConfig,
     preprocessor: PolicyProcessorPipeline,
@@ -808,6 +907,106 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
 
 
+_MEMINFO = Path("/proc/meminfo")
+_CGROUP = Path("/proc/self/cgroup")
+_CGROUPS = Path("/sys/fs/cgroup")
+
+
+def _available_memory() -> int | None:
+    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere.
+
+    In a container or another cgroup with a cgroup v2 memory limit, the room that limit leaves, if it is less.
+    """
+    if not _MEMINFO.exists():
+        return None
+    for line in _MEMINFO.read_text().splitlines():
+        name, value, *_ = line.split()
+        if name == "MemAvailable:":
+            room = _cgroup_room()
+            return int(value) * 1024 if room is None else min(int(value) * 1024, room)
+    return None
+
+
+def _cgroup_room() -> int | None:
+    """Bytes left under the tightest cgroup v2 memory limit of this process and its parents, or None.
+
+    Inactive page cache, which the cgroup counts as used and the kernel drops first, counts as room.
+    """
+    try:
+        group = next(line[3:] for line in _CGROUP.read_text().splitlines() if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return None
+    rooms = []
+    path = _CGROUPS / group.lstrip("/")
+    while path.is_relative_to(_CGROUPS):
+        try:
+            limit = (path / "memory.max").read_text().strip()
+            if limit != "max":
+                stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
+                used = int((path / "memory.current").read_text()) - int(stats.get("inactive_file", 0))
+                rooms.append(max(int(limit) - used, 0))
+        except (OSError, ValueError):
+            pass
+        path = path.parent
+    return min(rooms, default=None)
+
+
+# Loading the whole policy peaks at 2.45 times its checkpoint's size, since pi0.5 builds its policy in float32 and
+# then loads a bfloat16 checkpoint into it (measured); the rest is room for the activations.
+WHOLE_POLICY_PEAK = 3
+
+
+def whole_policy_fits(
+    model_file: Path, device: torch.device, policy_name: str, float32: bool = False
+) -> bool:
+    """Whether the whole policy fits in memory beside the export, to check the test case against it.
+
+    It needs `WHOLE_POLICY_PEAK` times its checkpoint's size in the host's memory and, on a CUDA device, in the
+    GPU's free memory too; a CUDA device whose host does not say how much memory it has is checked on the GPU
+    alone. With `float32`, the size counts the checkpoint's bfloat16 and float16 weights in float32, as a
+    policy held in float32 needs them. When it does not fit, or a CPU machine does not say how much memory it
+    has, logs that the comparison is skipped; the bundle's own check of its test case still runs.
+    """
+    size = model_file.stat().st_size
+    if float32:
+        with safe_open(model_file, framework="pt") as file:
+            weights = [file.get_slice(name) for name in file.keys()]  # noqa: SIM118
+            size += sum(2 * math.prod(w.get_shape()) for w in weights if w.get_dtype() in ("BF16", "F16"))
+    if device.type == "cuda":
+        # Memory that PyTorch keeps cached for the parts already run is free to the policy too.
+        torch.cuda.empty_cache()
+        available, measured = torch.cuda.mem_get_info(device)[0], "free on the GPU"
+        # A policy can be built in host memory before it moves to the GPU, and a Jetson's GPU uses the host's
+        # memory.
+        if (host := _available_memory()) is not None and host < available:
+            available, measured = host, "available on the host"
+    elif (linux_available := _available_memory()) is not None:
+        available, measured = linux_available, "available"
+    elif hasattr(os, "sysconf"):
+        available, measured = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "installed"
+    else:
+        # Windows has neither /proc/meminfo nor os.sysconf.
+        logger.warning(
+            "Skipped the comparison with the whole %s policy%s: this machine does not say how much memory it "
+            "has. The bundle's own check against its test case still runs.",
+            policy_name,
+            " in float32" if float32 else "",
+        )
+        return False
+    if WHOLE_POLICY_PEAK * size <= available:
+        return True
+    logger.warning(
+        "Skipped the comparison with the whole %s policy%s: it needs about %.1f GB, %.1f GB %s. The bundle's "
+        "own check against its test case still runs.",
+        policy_name,
+        " in float32" if float32 else "",
+        WHOLE_POLICY_PEAK * size / 1e9,
+        available / 1e9,
+        measured,
+    )
+    return False
+
+
 def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
@@ -830,6 +1029,22 @@ def load_policy(
         policy = policy.merge_and_unload()
     policy.eval()
     return policy, *load_processors(config)
+
+
+def refuse_peft_adapter(config: PreTrainedConfig, policy_name: str) -> None:
+    """Refuse a PEFT adapter, for a recipe that reads each part's weights from the checkpoint's own file."""
+    from lerobot.policies.factory import has_peft_adapter_config
+
+    if (
+        config.use_peft
+        and config.pretrained_path is not None
+        and has_peft_adapter_config(config.pretrained_path, config.pretrained_revision)
+    ):
+        raise ValueError(
+            f"{config.pretrained_path} is a PEFT adapter, and {policy_name}'s export reads each part's weights "
+            "from the checkpoint's model.safetensors, which an adapter does not hold. Merge the adapter into "
+            "its base policy, save that, and export it. See https://huggingface.co/docs/lerobot/export."
+        )
 
 
 def load_processors(config: PreTrainedConfig) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
