@@ -280,6 +280,13 @@ BACKENDS = [
         "executorch_xnnpack",
         marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
     ),
+    pytest.param(
+        "executorch_cuda",
+        marks=pytest.mark.skipif(
+            not (EXECUTORCH and torch.cuda.is_available()),
+            reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+        ),
+    ),
 ]
 
 
@@ -333,6 +340,30 @@ def test_lower_folds_what_a_program_computes_from_constants(monkeypatch):
     )
     with torch.no_grad():
         lower(torch.export.export(MaskedPositions().eval(), (torch.randn(8, 4),)), XnnpackPartitioner())
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
+    """Indexing with a boolean mask makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    model = MaskedPositions().eval()
+    x = torch.randn(8, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchCUDAConfig().compile(torch.export.export(model, (x,)), path)
     ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
 
