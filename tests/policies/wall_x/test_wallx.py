@@ -272,6 +272,10 @@ def test_precompute_grid_thw_diffusion_matches_stock_and_exports(monkeypatch):
     monkeypatch.setattr(model.visual, "forward", stock_vision_tower)
     torch.manual_seed(0)
     assert torch.equal(model.predict(**batch, **settings, **static)["predict_action"], expected)
+    with pytest.raises(ValueError, match="image grid differs"):
+        model.predict(
+            **{**batch, "image_grid_thw": torch.tensor([[1, 4, 2], [1, 2, 4]])}, **settings, **static
+        )
 
     keys = sorted(batch)
 
