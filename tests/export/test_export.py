@@ -338,3 +338,26 @@ def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path):
     assert case[IMAGE].shape == (2, 32, 32, 3) and case[OBS_STATE].shape == (2, 3)
     engine = BundleInferenceEngine(bundle)
     engine.check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])
+
+
+class _MixedPrecision(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 4))
+
+    def forward(self, x):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return (x @ self.weight).float()
+
+
+def test_a_traced_part_keeps_no_autocast_region(tmp_path):
+    from torch._higher_order_ops.wrap import wrap_with_autocast
+
+    from lerobot.export.recipe import Part
+
+    module, x = _MixedPrecision(), torch.randn(2, 4)
+    program = worker.export_part(Part("model", module, (x,), ["x"], [ACTION]))
+    assert not any(node.target is wrap_with_autocast for node in program.graph.nodes)
+    torch.export.save(program, tmp_path / "model.pt2")
+    with torch.no_grad():
+        assert torch.equal(torch.export.load(tmp_path / "model.pt2").module()(x), module(x))
