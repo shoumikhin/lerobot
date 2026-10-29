@@ -73,7 +73,9 @@ class Tokenizer:
 
 def test_greedy_decoding_exports_and_keeps_its_early_stop_under_torch_compile(monkeypatch):
     monkeypatch.setattr(modeling_pi0_fast, "PI0FastPaliGemma", TinyPaliGemma)
-    core = modeling_pi0_fast.PI0FastPytorch(PI0FastConfig(dtype=torch.float32), paligemma_tokenizer=Tokenizer())
+    core = modeling_pi0_fast.PI0FastPytorch(
+        PI0FastConfig(dtype=torch.float32), paligemma_tokenizer=Tokenizer()
+    )
 
     class Decode(nn.Module):
         def __init__(self):
