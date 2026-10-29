@@ -64,11 +64,13 @@ TINY_FLORENCE = {
 }
 
 
-def test_export_with_a_padding_view_has_fixed_shapes():
-    cams = [f"{OBS_IMAGES}.cam{i}" for i in range(3)]
+CAMS = [f"{OBS_IMAGES}.cam{i}" for i in range(3)]
+
+
+def tiny_policy() -> XVLAPolicy:
     config = XVLAConfig(
         input_features={
-            **{cam: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)) for cam in cams},
+            **{cam: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)) for cam in CAMS},
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
         },
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(20,))},
@@ -84,17 +86,21 @@ def test_export_with_a_padding_view_has_fixed_shapes():
         device="cpu",
     )
     torch.manual_seed(0)
-    policy = XVLAPolicy(config).eval()
+    return XVLAPolicy(config).eval()
+
+
+def test_export_with_a_padding_view_has_fixed_shapes():
+    policy = tiny_policy()
     gen = torch.Generator().manual_seed(0)
     ids = torch.randint(3, 1000, (1, 8), generator=gen)
     state = torch.randn(1, 8, generator=gen)
     images = torch.rand(1, 2, 3, 64, 64, generator=gen)
-    noise = torch.randn(1, config.chunk_size, policy.model.dim_action, generator=gen)
+    noise = torch.randn(1, policy.config.chunk_size, policy.model.dim_action, generator=gen)
 
     class Predict(nn.Module):
         def forward(self, ids, state, images, noise):
             # Only two of the three cameras are present, so the model sees one padding view.
-            batch = {OBS_LANGUAGE_TOKENS: ids, OBS_STATE: state, cams[0]: images[:, 0], cams[1]: images[:, 1]}
+            batch = {OBS_LANGUAGE_TOKENS: ids, OBS_STATE: state, CAMS[0]: images[:, 0], CAMS[1]: images[:, 1]}
             return policy.predict_action_chunk(batch, noise=noise)
 
     model = Predict()
@@ -104,3 +110,19 @@ def test_export_with_a_padding_view_has_fixed_shapes():
     assert not [n for n in ep.graph.nodes if "nonzero" in str(n.target)]
     assert all(r.lower == r.upper for r in ep.range_constraints.values())
     assert torch.equal(ep.module()(ids, state, images, noise), model(ids, state, images, noise))
+
+
+def test_forward_vlm_checks_a_given_view_count_and_takes_any_mask_without_one():
+    model = tiny_policy().model
+    gen = torch.Generator().manual_seed(0)
+    ids = torch.randint(3, 1000, (2, 8), generator=gen)
+    images = torch.rand(2, 3, 3, 64, 64, generator=gen)
+    prefix = torch.tensor([[1, 1, 0], [1, 1, 0]])
+    counted = model.forward_vlm(ids, images, prefix, num_valid_views=2)
+    read = model.forward_vlm(ids, images, prefix)
+    assert counted.keys() == read.keys() and all(torch.equal(counted[k], read[k]) for k in read)
+    model.forward_vlm(ids, images, torch.tensor([[1, 0, 1], [1, 1, 1]]))
+    with pytest.raises(ValueError, match="first 2 views"):
+        model.forward_vlm(ids, images, torch.tensor([[1, 1, 1], [1, 1, 0]]), num_valid_views=2)
+    with pytest.raises(ValueError, match="At least one image view"):
+        model.forward_vlm(ids, images, torch.zeros(2, 3), num_valid_views=0)

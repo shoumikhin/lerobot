@@ -165,29 +165,42 @@ class XVLAModel(nn.Module):
         """
         Encode text and multi-view images via Florence2 encoder.
 
-        The first ``num_valid_views`` views of every sample are valid and the rest are padding, as
-        ``image_mask`` marks them (default: all views). The count is an int, not read from the mask,
-        so the vision batch has a fixed size under torch.export and fixed-shape backends.
+        Without ``num_valid_views``, ``image_mask`` may mark any views as valid, and the number of valid
+        views is read from it. With ``num_valid_views``, the first that many views of every sample must be
+        the valid ones, so the vision batch has a fixed size under torch.export and fixed-shape backends.
         """
         batch_size, num_views = pixel_values.shape[:2]
         if num_valid_views is None:
-            num_valid_views = num_views
-        if num_valid_views < 1:
-            raise ValueError("At least one image view must be valid per batch.")
-        expected_mask = torch.arange(num_views, device=image_mask.device) < num_valid_views
-        torch_compilable_check(
-            (image_mask.to(dtype=torch.bool) == expected_mask).all(),
-            f"image_mask must mark the first {num_valid_views} views of every sample as valid, "
-            "the rest as padding.",
-        )
-        valid_images = pixel_values[:, :num_valid_views].flatten(0, 1)
-        valid_feats = self.vlm.get_image_features(valid_images).pooler_output
-        tokens_per_view, hidden_dim = valid_feats.shape[1:]
+            flat_mask = image_mask.view(-1).to(dtype=torch.bool)
+            flat_images = pixel_values.flatten(0, 1)
+            num_valid = int(flat_mask.sum().item())
+            if num_valid == 0:
+                raise ValueError("At least one image view must be valid per batch.")
 
-        valid_feats = valid_feats.view(batch_size, num_valid_views, tokens_per_view, hidden_dim)
-        num_padding = num_views - num_valid_views
-        padding = valid_feats.new_zeros((batch_size, num_padding, tokens_per_view, hidden_dim))
-        image_features = torch.cat([valid_feats, padding], dim=1)
+            valid_images = flat_images[flat_mask]
+            valid_feats = self.vlm.get_image_features(valid_images).pooler_output
+            tokens_per_view, hidden_dim = valid_feats.shape[1:]
+
+            image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
+            image_features[flat_mask] = valid_feats
+            image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
+        else:
+            if num_valid_views < 1:
+                raise ValueError("At least one image view must be valid per batch.")
+            expected_mask = torch.arange(num_views, device=image_mask.device) < num_valid_views
+            torch_compilable_check(
+                (image_mask.to(dtype=torch.bool) == expected_mask).all(),
+                f"image_mask must mark the first {num_valid_views} views of every sample as valid, "
+                "the rest as padding.",
+            )
+            valid_images = pixel_values[:, :num_valid_views].flatten(0, 1)
+            valid_feats = self.vlm.get_image_features(valid_images).pooler_output
+            tokens_per_view, hidden_dim = valid_feats.shape[1:]
+
+            valid_feats = valid_feats.view(batch_size, num_valid_views, tokens_per_view, hidden_dim)
+            num_padding = num_views - num_valid_views
+            padding = valid_feats.new_zeros((batch_size, num_padding, tokens_per_view, hidden_dim))
+            image_features = torch.cat([valid_feats, padding], dim=1)
         inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
 
         # XVLA prepends the primary view's image tokens to the text embeddings and attends to everything.
