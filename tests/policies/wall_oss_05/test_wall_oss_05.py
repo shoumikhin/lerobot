@@ -50,6 +50,7 @@ from lerobot.processor import (
     transition_to_batch,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
 
 
 @pytest.fixture
@@ -883,6 +884,79 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
             **inputs, action_horizon=2, action_dim=26, num_inference_timesteps=10, noise=noise
         )["predict_action"]
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_precompute_grid_thw_prediction_matches_stock_and_exports(monkeypatch):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
+    torch.manual_seed(19)
+    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
+    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    ids = torch.tensor(
+        [[0, 0, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31], [4, 5, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31]]
+    )
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(16, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 2]] * 4),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    torch.manual_seed(0)
+    expected = policy.predict_action_chunk(batch)
+    with pytest.raises(ValueError, match="moe_token_types must mark exactly the action tokens"):
+        policy.predict_action_chunk({**batch, "moe_token_types": ids == 4})
+
+    builds = count_grid_builds(monkeypatch)
+    # The routed projections must get contiguous inputs, as the boolean-mask gather gave them; a strided
+    # width slice changes the matrix multiply bits at real model sizes.
+    contiguous = []
+    attention = policy.model.model.layers[0].self_attn
+    for projection in attention.qkv_proj_experts:
+        projection.register_forward_pre_hook(lambda module, args: contiguous.append(args[0].is_contiguous()))
+    policy.config.precompute_grid_thw = True
+    for _ in range(2):  # The second call reuses the cached grid.
+        torch.manual_seed(0)
+        assert torch.equal(policy.predict_action_chunk(batch), expected)
+    assert len(builds) == 1
+    assert contiguous and all(contiguous)
+
+    keys = sorted(batch)
+
+    class PredictActionChunk(nn.Module):
+        def forward(self, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)))
+
+    program = torch.export.export(PredictActionChunk(), tuple(batch[key] for key in keys), strict=False)
+    torch.manual_seed(0)
+    torch.testing.assert_close(program.module()(*(batch[key] for key in keys)), expected)
+    assert len(builds) == 1
+    assert data_dependent_nodes(program) == []
+    # The exported program keeps the input checks: a prompt whose last action token is replaced is rejected.
+    malformed = {**batch, "input_ids": ids.clone()}
+    malformed["input_ids"][0, -1] = 6
+    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        program.module()(*(malformed[key] for key in keys))
+
+
+def test_flow_checks_stay_on_without_precompute_grid_thw(monkeypatch):
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
+    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
+    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    ids = torch.tensor([[4, 29, 28, 30, 29, 28, 30, 31, 31, 6]])  # the action tokens do not end the prompt
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(8, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 2]] * 2),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(1, 2, -1).clone(),
+    }
+    # That switch only turns off the checks of the export option.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with pytest.raises(ValueError, match="Flow inputs must end"):
+        policy.predict_action_chunk(batch)
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])
