@@ -20,15 +20,10 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 import torch  # noqa: E402
 from torch import Tensor, nn  # noqa: E402
-from torch.distributions import MultivariateNormal, TanhTransform, TransformedDistribution  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.gaussian_actor.configuration_gaussian_actor import GaussianActorConfig  # noqa: E402
-from lerobot.policies.gaussian_actor.modeling_gaussian_actor import (  # noqa: E402
-    MLP,
-    GaussianActorPolicy,
-    TanhMultivariateNormalDiag,
-)
+from lerobot.policies.gaussian_actor.modeling_gaussian_actor import MLP, GaussianActorPolicy  # noqa: E402
 from lerobot.rl.algorithms.sac import SACAlgorithm, SACAlgorithmConfig  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE  # noqa: E402
 from lerobot.utils.random_utils import seeded_context, set_seed  # noqa: E402
@@ -88,23 +83,40 @@ def test_mlp_with_custom_final_activation():
     assert (y >= -1).all() and (y <= 1).all()
 
 
-def test_tanh_diag_gaussian_matches_the_multivariate_normal_it_replaced():
-    gen = torch.Generator().manual_seed(0)
-    loc = torch.randn(256, 6, generator=gen)
-    scale_diag = torch.rand(256, 6, generator=gen) + 0.05
-    dist = TanhMultivariateNormalDiag(loc, scale_diag)
-    reference = TransformedDistribution(
-        MultivariateNormal(loc, torch.diag_embed(scale_diag)), [TanhTransform(cache_size=1)]
-    )
-    torch.manual_seed(1)
-    sample = dist.rsample()
-    torch.manual_seed(1)
-    expected = reference.rsample()
-    torch.testing.assert_close(sample, expected)
-    # Each log_prob of its own sample, as the actor computes it.
-    torch.testing.assert_close(dist.log_prob(sample), reference.log_prob(expected))
-    torch.testing.assert_close(dist.base_dist.entropy(), reference.base_dist.entropy())
-    torch.testing.assert_close(dist.base_dist.stddev, reference.base_dist.stddev)
+class _Actor(nn.Module):
+    def __init__(self, actor: nn.Module):
+        super().__init__()
+        self.actor = actor
+
+    def forward(self, state: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        return self.actor({OBS_STATE: state}, None)
+
+
+@pytest.mark.skipif(
+    tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 15),
+    reason="torch.export traces the distribution argument checks from PyTorch 2.15 (2.11 fails)",
+)
+def test_actor_exports_with_distribution_validation(monkeypatch):
+    monkeypatch.setattr(torch.distributions.Distribution, "_validate_args", True)
+    policy = GaussianActorPolicy(config=create_default_config(state_dim=10, continuous_action_dim=6)).eval()
+    actor, state = _Actor(policy.actor), torch.rand(2, 10)
+    exported = torch.export.export(actor, (state,)).module()
+    torch.manual_seed(0)
+    expected = actor(state)
+    torch.manual_seed(0)
+    for out, ref in zip(exported(state), expected, strict=True):
+        assert torch.equal(out, ref)
+
+
+def test_actor_log_prob_stays_float32_with_finite_gradients_under_fp16_autocast():
+    policy = GaussianActorPolicy(config=create_default_config(state_dim=10, continuous_action_dim=6))
+    nn.init.zeros_(policy.actor.std_layer.weight)
+    nn.init.constant_(policy.actor.std_layer.bias, -11.0)  # a small std, still above the default std_min
+    with torch.autocast("cpu", dtype=torch.float16):
+        _, log_probs, _ = policy.actor({OBS_STATE: torch.rand(1, 10)}, None)
+    assert log_probs.dtype == torch.float32
+    log_probs.mean().backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in policy.actor.parameters())
 
 
 def test_gaussian_actor_policy_with_default_args():
