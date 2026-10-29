@@ -148,7 +148,9 @@ class WallXConfig(PreTrainedConfig):
                 f"{self.vision_attn_implementation!r}"
             )
         if self.precompute_grid_thw and self.vision_attn_implementation != "sdpa":
-            raise ValueError("precompute_grid_thw needs vision_attn_implementation='sdpa', the attention it exports.")
+            raise ValueError(
+                "precompute_grid_thw needs vision_attn_implementation='sdpa', the attention it exports."
+            )
         if self.tokenizer_max_length < self.chunk_size + 1:
             raise ValueError("tokenizer_max_length must leave room for the WALL-OSS action chunk.")
         if self.flow_loss_weight < 0 or self.text_loss_weight < 0:

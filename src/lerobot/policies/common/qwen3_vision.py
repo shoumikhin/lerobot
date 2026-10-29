@@ -22,7 +22,7 @@ which can replace this module once the pin moves.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import torch
 from torch import Tensor
@@ -93,7 +93,7 @@ class Qwen3VisionGrid(FixedImageGrid):
     chunk_lengths: list[int]
 
     @classmethod
-    def _from_grid(cls, visual: "Qwen3VLVisionModel", grid_thw: list[list[int]]) -> "Qwen3VisionGrid":
+    def _from_grid(cls, visual: "Qwen3VLVisionModel", grid_thw: list[list[int]]) -> Self:
         indices, weights = _bilinear_indices_and_weights(
             grid_thw, visual.num_grid_per_side, visual.spatial_merge_size
         )

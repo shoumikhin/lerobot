@@ -23,7 +23,7 @@
 
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import torch
 from torch import Tensor, nn
@@ -53,7 +53,7 @@ class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
     window_lengths: list[int]
 
     @classmethod
-    def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> "Qwen2_5VisionGrid":
+    def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> Self:
         grid = torch.tensor(grid_thw, device=visual.device)
         unit = visual.spatial_merge_unit
         rotary_pos_emb = visual.rot_pos_emb(grid)

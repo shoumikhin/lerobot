@@ -33,7 +33,7 @@ loses the message.
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import torch
 from torch import Tensor, nn
@@ -61,11 +61,11 @@ class FixedImageGrid:
     dtype: torch.dtype
 
     @classmethod
-    def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> "FixedImageGrid":
+    def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> Self:
         raise NotImplementedError
 
     @classmethod
-    def build(cls, visual: nn.Module, grid_thw: Tensor) -> "FixedImageGrid":
+    def build(cls, visual: nn.Module, grid_thw: Tensor) -> Self:
         """Compute the metadata of `grid_thw` for `visual`; this reads the grid on the host."""
         grid = grid_thw.tolist()
         # Tensors made under inference mode cannot be saved for backward later, so a cache built during
@@ -74,9 +74,7 @@ class FixedImageGrid:
             return cls._from_grid(visual, grid)
 
     @classmethod
-    def reuse_or_build(
-        cls, cache: "FixedImageGrid | None", visual: nn.Module, grid_thw: Tensor
-    ) -> "FixedImageGrid":
+    def reuse_or_build(cls, cache: Self | None, visual: nn.Module, grid_thw: Tensor) -> Self:
         """Return `cache` if it was built for `grid_thw` and the tower's current device and dtype.
 
         Otherwise build a new grid. Building reads `grid_thw` on the host, so it cannot happen inside
