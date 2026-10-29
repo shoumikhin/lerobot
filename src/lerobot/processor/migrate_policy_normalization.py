@@ -48,6 +48,7 @@ with the new PolicyProcessorPipeline architecture.
 """
 
 import argparse
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -574,6 +575,20 @@ def main():
             print(f"Removing '{field}' field from config")
             del cleaned_config[field]
 
+    # Legacy checkpoints can carry fields that were later removed from the config class.
+    config_class = PreTrainedConfig.get_choice_class(policy_type)
+    config_fields = {field.name for field in dataclasses.fields(config_class) if field.init}
+    for field in sorted(cleaned_config.keys() - config_fields):
+        print(f"Removing '{field}' field from config (no longer a {policy_type} config field)")
+        del cleaned_config[field]
+
+    # config.json stores JSON values (lists for tuples, `dtype` by name); decode them the way config
+    # loading does, so the config can be saved again.
+    type_hints = get_type_hints(config_class)
+    for field, value in cleaned_config.items():
+        if field not in ("input_features", "output_features"):
+            cleaned_config[field] = draccus.decode(type_hints[field], value)
+
     # Convert input_features and output_features to PolicyFeature objects if they exist
     if "input_features" in cleaned_config:
         cleaned_config["input_features"] = convert_features_to_policy_features(
@@ -586,11 +601,6 @@ def main():
 
     # Add normalization mapping to config
     cleaned_config["normalization_mapping"] = norm_map
-
-    # config.json stores `dtype` by name; decode it the way config loading does (a torch.dtype).
-    if "dtype" in cleaned_config:
-        dtype_type = get_type_hints(PreTrainedConfig.get_choice_class(policy_type))["dtype"]
-        cleaned_config["dtype"] = draccus.decode(dtype_type, cleaned_config["dtype"])
 
     # Create policy configuration using the factory
     print(f"Creating {policy_type} policy configuration...")
