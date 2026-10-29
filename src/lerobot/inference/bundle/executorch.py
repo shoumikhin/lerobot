@@ -73,6 +73,10 @@ class ExecuTorchProgram:
         """An output as a host array."""
         return np.asarray(value if value.device == "cpu" else value.to_host())
 
+    def place(self, index: int, value: np.ndarray) -> Any:
+        """`value` copied where input `index` reads it, once."""
+        return self._place(value, self._devices[index])
+
     def _place(self, value: Any, device: str) -> Any:
         if not isinstance(value, np.ndarray):
             if value.device == device:

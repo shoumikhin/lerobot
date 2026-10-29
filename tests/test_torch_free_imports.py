@@ -156,6 +156,9 @@ class TwoActions:
     def to_numpy(self, value):
         return value
 
+    def place(self, index, value):
+        return value
+
 
 RUNTIMES["numpy_test"] = Runtime(TwoActions)
 """
