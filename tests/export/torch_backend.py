@@ -35,7 +35,7 @@ from lerobot.bundle.manifest import (
     ProgramFiles,
     ProgramRun,
 )
-from lerobot.bundle.runtime import RUNTIMES, Runtime
+from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.utils.constants import ACTION
 
 
@@ -55,7 +55,7 @@ class TorchProgram:
         return value.numpy()
 
 
-RUNTIMES["torch_test"] = Runtime(TorchProgram)
+register_runtime("torch_test", Runtime(TorchProgram))
 
 
 def make_bundle(
@@ -101,9 +101,7 @@ def make_bundle(
         runtime="torch_test",
         runtime_imports=["tests.export.torch_backend"],
         programs={"model": ProgramFiles("model.pt2", data)},
-        runs=[
-            ProgramRun("model", "model", list(case), [ACTION, *([CONTINUOUS_ACTIONS] if continuous else [])])
-        ],
+        runs=[ProgramRun("model", "model", list(case), [ACTION, *([CONTINUOUS_ACTIONS] if continuous else [])])],
         noise_shape=None if noise_shape is None else list(noise_shape),
         task=task,
         action_names=action_names,

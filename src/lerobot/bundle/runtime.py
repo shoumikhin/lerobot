@@ -55,7 +55,7 @@ class Runtime:
             Loads a program file, with its data file if the manifest names one.
         prepare (`Callable[[], None]`, *optional*):
             Runs before the programs load, and before the manifest's `runtime_imports` import when the
-            runtime is registered before them.
+            runtime is registered before them. It may run more than once.
     """
 
     load: Callable[[Path, Path | None], Program]
@@ -63,7 +63,17 @@ class Runtime:
 
 
 RUNTIMES: dict[str, Runtime] = {"executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare)}
-"""Runtimes by name. A module a manifest names in `runtime_imports` may add one."""
+"""The runtimes by name: the ones LeRobot has, and the ones modules added with `register_runtime`."""
+
+
+def register_runtime(name: str, runtime: Runtime) -> None:
+    """Add a runtime, from a module a manifest names in `runtime_imports`.
+
+    Registering must not load the runtime's native code: that waits for `prepare` and `load`.
+    """
+    if name in RUNTIMES:
+        raise ValueError(f"A runtime named {name!r} is already registered.")
+    RUNTIMES[name] = runtime
 
 
 def prepare_runtime(runtime: str, modules: Sequence[str], folder: Path | None = None) -> Runtime:
