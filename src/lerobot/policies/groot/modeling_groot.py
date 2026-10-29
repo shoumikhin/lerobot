@@ -128,6 +128,7 @@ class GrootPolicy(PreTrainedPolicy):
             # Read back by set_trainable_parameters.
             "tune_top_llm_layers": config.tune_top_llm_layers,
             "use_flash_attention": config.use_flash_attention,
+            "precompute_grid_thw": config.precompute_grid_thw,
         }
         # Surface the inference-time knobs onto the model config only when the user set them; None
         # leaves the value baked into the checkpoint untouched.
