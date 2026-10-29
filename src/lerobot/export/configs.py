@@ -149,7 +149,8 @@ class ExportConfig:
     # The bundle folder to write. It must not exist yet. Defaults to
     # `outputs/export/<policy type>_<backend type>`.
     output_dir: Path | None = None
-    # The task, for a policy that reads one. Its bundle then runs only this task.
+    # The task, for a policy that reads one. The bundle's test case runs it, and so does the bundle by default;
+    # a bundle without task tokens runs only this task.
     task: str = ""
     # The dataset the policy was trained on. The bundle then takes the robot's frame from the dataset's
     # observations, through the renames the preprocessor saved, and the dataset's first task when `task` is
