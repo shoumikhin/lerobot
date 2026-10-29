@@ -693,7 +693,6 @@ def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
         OBS_STATE: torch.rand(1, 6, generator=gen),
         "task": ["stack the cubes"],
     }
-    policy.predict_action_chunk(obs)
 
     def velocity(samples, t):  # a stand-in for the DiT
         return {"x": samples["x"] * float(t)}
@@ -703,6 +702,9 @@ def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
             return sampling.euler({"x": x}, velocity, timesteps=policy._euler_timesteps())["x"]
 
     sampler, x = EulerSampler(), torch.randn(4)
+    # A freshly built policy exports without an eager prediction first.
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+    policy.predict_action_chunk(obs)
     policy.config.num_inference_steps = 2
     with pytest.raises(RuntimeError, match="out of date"):
         torch.export.export(sampler, (x,))
