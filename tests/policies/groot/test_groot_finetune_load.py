@@ -149,10 +149,10 @@ def _overwrite_weights_in_file(path):
         file.write(bytes(path.stat().st_size - 8 - header_size))
 
 
-def _load_regular(finetune, monkeypatch, policy_cls=GrootPolicy):
+def _load_regular(finetune, monkeypatch, policy_cls=GrootPolicy, **kwargs):
     with monkeypatch.context() as patch:
         patch.setattr(GrootPolicy, "_build_groot_model_from_checkpoint", classmethod(lambda cls, *args: None))
-        return policy_cls.from_pretrained(finetune)
+        return policy_cls.from_pretrained(finetune, **kwargs)
 
 
 def _record_builds(monkeypatch):
@@ -408,3 +408,52 @@ def test_regular_construction_still_loads_the_base_weights(tmp_path):
     assert base_weights
     for name, tensor in base_weights.items():
         assert torch.equal(state[name], tensor.to(state[name].dtype)), name
+
+
+CHOSEN_MODULES = [
+    "_groot_model.action_head.state_encoder",
+    # The checkpoint holds this tied weight under the LM head's name.
+    "_groot_model.backbone.model.model.language_model.embed_tokens",
+]
+
+
+@pytest.mark.parametrize("saved", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("loaded_as", [torch.float32, torch.bfloat16])
+def test_chosen_modules_load_as_in_the_full_load(tmp_path, monkeypatch, saved, loaded_as):
+    base, finetune = _save_finetune(tmp_path, dtype=saved)
+
+    def config():
+        config = GrootConfig.from_pretrained(finetune)
+        # A checkpoint can load in another dtype than it was saved in, as an export to bfloat16 does.
+        config.dtype = loaded_as
+        return config
+
+    full = _load_regular(finetune, monkeypatch, config=config())
+
+    (base / "model.safetensors").unlink()
+    policy = GrootPolicy.load_checkpoint_modules(finetune, config(), CHOSEN_MODULES)
+
+    assert not policy.training
+    for name in CHOSEN_MODULES:
+        expected = dict(full.get_submodule(name).named_parameters())
+        loaded = dict(policy.get_submodule(name).named_parameters())
+        assert expected.keys() == loaded.keys()
+        for key, tensor in expected.items():
+            assert (loaded[key].dtype, loaded[key].device) == (tensor.dtype, tensor.device), key
+            assert torch.equal(loaded[key], tensor), key
+    # The rest has no weights, so code that reaches it fails instead of reading random ones.
+    assert policy._groot_model.action_head.action_encoder is None
+    assert policy._groot_model.backbone.model.model.visual is None
+    assert not any(parameter.is_meta for parameter in policy.parameters())
+
+
+def test_chosen_module_missing_from_the_checkpoint_is_reported(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    _, finetune = _save_finetune(tmp_path)
+    weights = load_file(finetune / "model.safetensors")
+    weights.pop(next(k for k in weights if k.startswith(f"{CHOSEN_MODULES[0]}.")))
+    save_file(weights, finetune / "model.safetensors")
+
+    with pytest.raises(KeyError, match="does not hold _groot_model.action_head.state_encoder"):
+        GrootPolicy.load_checkpoint_modules(finetune, GrootConfig.from_pretrained(finetune), CHOSEN_MODULES)
