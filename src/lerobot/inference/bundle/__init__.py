@@ -20,7 +20,15 @@ as a record of what was exported, and `test.safetensors`, a frame with the actio
 it. The format and the program runtimes live in `lerobot.bundle`, which never imports PyTorch.
 """
 
-from lerobot.bundle.manifest import FORMAT_VERSION, MANIFEST, Bundle, BundleManifest, ProgramSpec, is_bundle
+from lerobot.bundle.manifest import (
+    FORMAT_VERSION,
+    MANIFEST,
+    Bundle,
+    BundleManifest,
+    ProgramSpec,
+    TaskTokensSpec,
+    is_bundle,
+)
 from lerobot.bundle.runtime import RUNTIMES, Program, Runtime, load_program
 
 from .engine import BundleInferenceEngine
@@ -35,6 +43,7 @@ __all__ = [
     "Program",
     "ProgramSpec",
     "Runtime",
+    "TaskTokensSpec",
     "is_bundle",
     "load_program",
 ]

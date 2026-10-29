@@ -48,7 +48,12 @@ class BlockTorch(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockTorch())
 """
 
-BUNDLE_MODULES = ["lerobot.bundle.manifest", "lerobot.bundle.runtime", "lerobot.bundle.executorch"]
+BUNDLE_MODULES = [
+    "lerobot.bundle.manifest",
+    "lerobot.bundle.runtime",
+    "lerobot.bundle.executorch",
+    "lerobot.bundle.task_tokens",
+]
 
 
 def test_the_bundle_modules_import_without_torch():
