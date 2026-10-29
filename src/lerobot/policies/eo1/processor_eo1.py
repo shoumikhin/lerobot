@@ -313,6 +313,15 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         # Supervised batches use right padding to match standard training collation.
         padding_side = "right" if self.transition.get(TransitionKey.ACTION) is not None else "left"
 
+        if not self.use_fast_processor:
+            # The slow image processor reads pixels with NumPy, but lerobot-rollout and lerobot-train
+            # send the batch on the policy device.
+            for row in messages:
+                for message in row:
+                    for block in message["content"]:
+                        if isinstance(block.get("image"), torch.Tensor):
+                            block["image"] = block["image"].cpu()
+
         inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
