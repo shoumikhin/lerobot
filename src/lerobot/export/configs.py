@@ -147,6 +147,10 @@ class ExportConfig:
     # policy's normalized action units (robot units divided by the spread of each action in the training
     # data). Defaults to the recipe's.
     tolerance: float | None = None
+    # For a policy whose bundle takes any task, such as pi0.5, the most tokens a task may take in the bundle.
+    # Defaults to the recipe's: a little more than the longest task known at export, as far as the policy's
+    # prompt has room.
+    max_task_tokens: int | None = None
     # Seeds the random test case.
     seed: int = 1000
     # INFO logs each step of the export and how long it took; DEBUG adds the logs of torch.export, ExecuTorch and
@@ -167,6 +171,8 @@ class ExportConfig:
             )
         if self.policy is None or self.policy.pretrained_path is None:
             raise ValueError("--policy.path is required: the trained policy to export.")
+        if self.max_task_tokens is not None and self.max_task_tokens < 1:
+            raise ValueError(f"--max_task_tokens must be at least 1, not {self.max_task_tokens}.")
         if self.tolerance is not None and not (math.isfinite(self.tolerance) and self.tolerance >= 0):
             raise ValueError(f"--tolerance must be a finite number of at least 0, not {self.tolerance}.")
         if self.output_dir is None:

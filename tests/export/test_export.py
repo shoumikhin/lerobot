@@ -153,6 +153,12 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     assert 'pip install "torch>=99.0,<99.1" "torchvision>=9.0,<9.1" "compiler>=99.0,<99.1"' in message
 
 
+def test_export_refuses_a_task_token_budget_for_a_policy_that_takes_no_task(checkpoint, tmp_path, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--max_task_tokens=8")
+    assert "--max_task_tokens applies only to a policy whose bundle takes any task" in capfd.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("args", "min_torch", "error"),
     [
@@ -160,6 +166,11 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
         (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=nan"], None, "not nan"),
         (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=inf"], None, "not inf"),
         (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=-1"], None, "not -1"),
+        (
+            ["--policy.path={checkpoint}", "--output_dir={b}", "--max_task_tokens=0"],
+            None,
+            "at least 1, not 0",
+        ),
         (["--policy.path={checkpoint}", "--output_dir={tmp}"], None, "already exists. Pick another"),
         (["--policy.path={checkpoint}", "--output_dir={link}"], None, "already exists. Pick another"),
         (["--policy.path={checkpoint}", "--output_dir={b}"], "99.0", "needs PyTorch 99.0 or newer"),
@@ -317,7 +328,7 @@ def test_export_keeps_an_output_folder_made_while_it_ran(checkpoint, tmp_path, m
         assert [path.name for path in output_dir.iterdir()] == (["export.json"] if made == "bundle" else [])
 
 
-@pytest.mark.parametrize("step", ["check"])
+@pytest.mark.parametrize("step", ["trace", "check"])
 def test_a_failed_export_removes_the_parents_it_made_for_the_output_folder(
     checkpoint, tmp_path, monkeypatch, step
 ):

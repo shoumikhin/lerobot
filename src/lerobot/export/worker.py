@@ -147,6 +147,10 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
             del part, program
         plan = recipe.plan()
+        if cfg.max_task_tokens is not None and plan.task_tokens is None:
+            raise ValueError(
+                "--max_task_tokens applies only to a policy whose bundle takes any task, such as pi0.5."
+            )
         test_case = recipe.test_case()
         runs = runs if plan.runs is None else plan.runs
         if test_case.noise is not None and cfg.backend.device == "cuda":

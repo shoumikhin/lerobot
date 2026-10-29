@@ -14,6 +14,7 @@
 
 """The default export recipe, on a tiny ACT built in memory."""
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +91,37 @@ class NoisyACT(ACTPolicy):
 class TwoNoisesACT(ACTPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         return super().predict_action_chunk(batch) + torch.randn(1, 4, 1) + torch.randn(1, 4, 1)
+
+
+def test_a_part_run_once_per_step_passes_its_value_on_and_reads_each_steps_constants():
+    from lerobot.bundle.manifest import ProgramRun
+    from lerobot.export.recipe import repeated_runs
+
+    steps = [{"timestep": np.array([1.0], np.float32)}, {"timestep": np.array([0.5], np.float32)}]
+    runs, constants = repeated_runs("step", ["cache", "x", "timestep"], ["x"], steps, start={"x": "noise"})
+    assert runs == [
+        ProgramRun("step_0", "step", ["cache", "noise", "timestep_0"], ["x"]),
+        ProgramRun("step_1", "step", ["cache", "x", "timestep_1"], ["x"]),
+    ]
+    assert list(constants) == ["timestep_0", "timestep_1"]
+    np.testing.assert_array_equal(constants["timestep_1"], [0.5])
+
+
+def test_the_relative_to_absolute_step_must_be_last_and_know_its_relative_step():
+    from lerobot.export.recipe import split_absolute_step
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        RelativeActionsProcessorStep,
+        RenameObservationsProcessorStep,
+    )
+
+    paired = AbsoluteActionsProcessorStep(
+        enabled=True, relative_step=RelativeActionsProcessorStep(enabled=True)
+    )
+    with pytest.raises(ValueError, match="must be the postprocessor's last step"):
+        split_absolute_step(SimpleNamespace(steps=[paired, RenameObservationsProcessorStep()]), 3)
+    with pytest.raises(ValueError, match="linked to no relative step"):
+        split_absolute_step(SimpleNamespace(steps=[AbsoluteActionsProcessorStep(enabled=True)]), 3)
 
 
 def test_recipe_measures_the_action_scale_from_the_postprocessor():
@@ -488,6 +520,116 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
         f"{IMAGE}_hwc": PolicyFeature(type=FeatureType.VISUAL, shape=(24, 32, 3)),
     }
     assert frame_shapes(features) == {IMAGE: (24, 32, 3), f"{IMAGE}_hwc": (24, 32, 3)}
+
+
+@pytest.mark.parametrize(
+    ("meminfo", "pages", "spare"),
+    [
+        # 64 GB installed, of which Linux counts 6.1 GB available.
+        ("MemTotal:       62500000 kB\nMemAvailable:    5957032 kB\n", 15_625_000, "6.1 GB available"),
+        # More than twice the checkpoint, but not three times.
+        ("MemTotal:       62500000 kB\nMemAvailable:   14648438 kB\n", 15_625_000, "15.0 GB available"),
+        # No /proc/meminfo, as on macOS: 6.1 GB installed.
+        (None, 1_489_258, "6.1 GB installed"),
+    ],
+)
+def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
+    tmp_path, monkeypatch, caplog, meminfo, pages, spare
+):
+    """A 6 GB checkpoint on a machine with less than three times that much memory to spare."""
+    # Only the checkpoint's size is read, so no file that big is made.
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=6_000_000_000))
+    meminfo_file = tmp_path / "meminfo"
+    if meminfo is not None:
+        meminfo_file.write_text(meminfo)
+    monkeypatch.setattr(recipe_module, "_MEMINFO", meminfo_file)
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "no_cgroup")
+    monkeypatch.setattr(
+        recipe_module.os, "sysconf", {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": pages}.__getitem__, raising=False
+    )
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 3)
+    assert (
+        f"Skipped the comparison with the whole pi0.5 policy: it needs about 18.0 GB, {spare}. The "
+        "bundle's own check against its test case still runs." in caplog.text
+    )
+
+
+@pytest.mark.parametrize(("parent_limit", "available"), [("max", "1.5 GB"), ("1500000000", "0.8 GB")])
+def test_a_policy_too_big_for_its_container_is_skipped(
+    tmp_path, monkeypatch, caplog, parent_limit, available
+):
+    """A 2 GB container on a machine with 1.8 TB available: its or its parent's tighter limit decides."""
+    (tmp_path / "meminfo").write_text("MemAvailable: 1800000000 kB\n")
+    (tmp_path / "cgroup").write_text("0::/user.slice/job.scope\n")
+    job = tmp_path / "cgroups" / "user.slice" / "job.scope"
+    job.mkdir(parents=True)
+    (job.parent / "memory.max").write_text(f"{parent_limit}\n")
+    (job.parent / "memory.current").write_text("700000000\n")
+    (job.parent / "memory.stat").write_text("anon 700000000\ninactive_file 0\n")
+    (job / "memory.max").write_text("2000000000\n")
+    (job / "memory.current").write_text("600000000\n")
+    # Page cache the kernel can drop counts as room.
+    (job / "memory.stat").write_text("anon 500000000\ninactive_file 100000000\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "cgroup")
+    monkeypatch.setattr(recipe_module, "_CGROUPS", tmp_path / "cgroups")
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 3)
+    assert f"it needs about 3.0 GB, {available} available" in caplog.text
+
+
+def test_a_policy_too_big_for_host_memory_is_skipped_on_a_gpu(tmp_path, monkeypatch, caplog):
+    """A 3 GB container on a GPU with 60 GB free: the whole policy passes through host memory too."""
+    (tmp_path / "meminfo").write_text("MemAvailable: 1800000000 kB\n")
+    (tmp_path / "cgroup").write_text("0::/job.scope\n")
+    job = tmp_path / "cgroups" / "job.scope"
+    job.mkdir(parents=True)
+    (job / "memory.max").write_text("3000000000\n")
+    (job / "memory.current").write_text("500000000\n")
+    (job / "memory.stat").write_text("anon 500000000\ninactive_file 0\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "cgroup")
+    monkeypatch.setattr(recipe_module, "_CGROUPS", tmp_path / "cgroups")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (60_000_000_000, 80_000_000_000))
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cuda"), "pi0.5", 3)
+    assert "it needs about 3.0 GB, 2.5 GB available on the host" in caplog.text
+
+
+def test_the_whole_policy_needs_the_memory_its_recipe_measured(tmp_path, monkeypatch):
+    """15 GB available: enough for a 6 GB checkpoint whose policy peaks at twice its size, not three times."""
+    (tmp_path / "meminfo").write_text("MemAvailable:   14648438 kB\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "no_cgroup")
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=6_000_000_000))
+    assert recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 2)
+    assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 3)
+
+
+def test_memory_that_pytorch_caches_counts_as_free_on_a_gpu(tmp_path, monkeypatch):
+    """A GPU with 2 GB free, and 8 GB more that PyTorch keeps cached for the parts already run."""
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    free = [2_000_000_000]
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: free.append(10_000_000_000))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free[-1], 80_000_000_000))
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
+    assert recipe_module.whole_policy_fits(model_file, torch.device("cuda"), "pi0.5", 3)
+
+
+def test_a_policy_is_not_compared_on_a_machine_that_does_not_say_how_much_memory_it_has(
+    tmp_path, monkeypatch, caplog
+):
+    """As on Windows: no /proc/meminfo and no os.sysconf."""
+    model_file = tmp_path / "model.safetensors"
+    model_file.write_bytes(b"0")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.delattr(recipe_module.os, "sysconf", raising=False)
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 3)
+    assert "this machine does not say how much memory it has" in caplog.text
 
 
 def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
