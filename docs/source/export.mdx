@@ -109,7 +109,7 @@ outputs/export/act_executorch_tensorrt/
 }
 ```
 
-Programs connect by the names of their inputs and outputs: keys of the robot's frame, `noise`, or outputs of an earlier program. The last program outputs `action`. A program may name a second file in `data`, such as its weights, which the runtime loads with it. `runtime_imports` lists the Python modules the runtime imports before it loads the programs, such as the one that adds TensorRT to ExecuTorch. `action_scale` holds the spread of each action, in robot units. A version of LeRobot refuses a bundle whose format or keys it does not know.
+Programs connect by the names of their inputs and outputs: keys of the robot's frame, `noise`, the arrays in the `constants` file if the bundle has one, or outputs of an earlier program. The list runs in order, and several entries can name one file, for example a denoising step that runs ten times with a different timestep from `constants`; the file loads once. The last program outputs `action`. A bundle whose programs read a value nothing gives is refused before any program loads. A program may name a second file in `data`, such as its weights, which the runtime loads with it. `runtime_imports` lists the Python modules the runtime imports before it loads the programs, such as the one that adds TensorRT to ExecuTorch. `action_scale` holds the spread of each action, in robot units. A version of LeRobot refuses a bundle whose format or keys it does not know.
 
 ## Adding a backend or a recipe
 
