@@ -379,6 +379,14 @@ class ActionChunkRecipe(ExportRecipe):
         """
         if NOISE not in inspect.signature(self.policy.predict_action_chunk).parameters:
             return None
+        # The policy takes the noise as it would draw it, and the bundle draws a standard normal.
+        return self._recorded_noise_shape(frame, standard=True)
+
+    def _recorded_noise_shape(self, frame: dict[str, np.ndarray], standard: bool = False) -> tuple[int, ...]:
+        """The shape of the one random normal tensor `predict_chunk` draws for one sample.
+
+        With `standard`, a draw with another mean or spread than a standard normal is refused.
+        """
         self._reset()
         with torch.no_grad(), ReplayDraws() as draws:
             self.predict_chunk(self.policy, self.preprocessor(self._observation(frame, self.task)), None)
@@ -388,6 +396,11 @@ class ActionChunkRecipe(ExportRecipe):
             raise ValueError(
                 f"The {self.policy.config.type} policy draws {len(shapes)} random tensors shaped {shapes} for "
                 "one chunk, not one starting noise for one sample. It needs its own export recipe."
+            )
+        if standard and draws.standard != [True]:
+            raise ValueError(
+                f"The {self.policy.config.type} policy draws its starting noise with another mean or spread than "
+                "a standard normal, which is what its bundle would draw. It needs its own export recipe."
             )
         return shapes[0][1:]
 
@@ -470,7 +483,8 @@ class ReplayDraws(TorchFunctionMode):
       exponentially distributed, and takes `q = (a**2 + b**2) / 2` from the two halves of `noise[k]`, shaped
       `[2, *p.shape]`.
 
-    Without a noise, the draws are made as usual and `shapes` records the shape each would read.
+    Without a noise, the draws are made as usual, `shapes` records the shape each would read, and `standard`
+    whether each random normal draw is a standard normal, as the noise a bundle draws is.
 
     Args:
         noise (`Tensor`, *optional*):
@@ -482,6 +496,7 @@ class ReplayDraws(TorchFunctionMode):
         super().__init__()
         self.noise = noise
         self.shapes: list[tuple[int, ...]] = []
+        self.standard: list[bool] = []
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         """Run `func`, reading it from the noise if it is a random draw."""
@@ -504,6 +519,11 @@ class ReplayDraws(TorchFunctionMode):
         if func in _RANDOM_NORMAL:
             if self.noise is None:
                 self.shapes.append(tuple(result.shape))
+                mean, std = (0.0, 1.0)
+                if func in (torch.normal, Tensor.normal_):
+                    mean, std = self._mean_and_std(args[1:] if func is Tensor.normal_ else args, kwargs)
+                standard = (torch.as_tensor(mean) == 0).all() and (torch.as_tensor(std) == 1).all()
+                self.standard.append(bool(standard))
             else:
                 result = self._next(tuple(result.shape)).to(result)
                 if func is torch.normal:

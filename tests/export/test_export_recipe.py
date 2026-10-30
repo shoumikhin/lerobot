@@ -219,6 +219,25 @@ def test_recipe_refuses_a_policy_that_draws_two_noises():
         make(TwoNoisesACT)
 
 
+class ShiftedNoiseACT(ACTPolicy):
+    """ACT that draws its starting noise around 5 with a spread of 0.5, with `torch.normal` or `Tensor.normal_`."""
+
+    in_place = False
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        if noise is None:
+            shape = (1, self.config.chunk_size, 1)
+            noise = torch.empty(shape).normal_(5.0, 0.5) if self.in_place else torch.normal(5.0, 0.5, shape)
+        return super().predict_action_chunk(batch) + noise
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_recipe_refuses_a_policy_whose_noise_is_not_a_standard_normal(monkeypatch, in_place):
+    monkeypatch.setattr(ShiftedNoiseACT, "in_place", in_place)
+    with pytest.raises(ValueError, match="another mean or spread than a standard normal"):
+        make(ShiftedNoiseACT)
+
+
 class OneNumberNoiseACT(ACTPolicy):
     """ACT that draws one number of noise, for each sample (`shape` (1,)) or in all (`shape` ())."""
 
