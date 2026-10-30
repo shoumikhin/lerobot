@@ -64,9 +64,14 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
-from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
 from ..common.input_checks import check_input
-from ..common.qwen_vision import check_visible_images, is_exporting, is_preparing_image_grid, qwen_image_rope_index
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
+from ..common.qwen_vision import (
+    check_visible_images,
+    is_exporting,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig

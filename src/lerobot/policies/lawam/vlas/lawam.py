@@ -21,8 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
 from lerobot.policies.common.input_checks import check_input
+from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
 from lerobot.policies.common.qwen_vision import is_exporting
 from lerobot.policies.lawam.lam_core.core.lam_model import build_latent_action_model
 from lerobot.policies.lawam.latent_world.processor_utils import (

@@ -26,8 +26,8 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
 from lerobot.policies.common.input_checks import check_input
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
 from lerobot.policies.common.qwen_vision import (
     check_visible_images,
     is_exporting,

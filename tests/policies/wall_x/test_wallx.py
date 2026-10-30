@@ -451,8 +451,12 @@ def test_diffusion_reads_the_action_hidden_states_in_token_order():
     model = _tiny_diffusion_model()
     batch = _diffusion_batch(3)
     hidden_states, read = [], []
-    model.model.register_forward_hook(lambda module, args, output: hidden_states.append(output.last_hidden_state))
-    model.action_preprocessor.action_proj_back.register_forward_pre_hook(lambda module, args: read.append(args[0]))
+    model.model.register_forward_hook(
+        lambda module, args, output: hidden_states.append(output.last_hidden_state)
+    )
+    model.action_preprocessor.action_proj_back.register_forward_pre_hook(
+        lambda module, args: read.append(args[0])
+    )
     model.predict(**batch, predict_mode="diffusion", pred_horizon=3, action_dim=3, num_inference_timesteps=2)
     action_mask = batch["input_ids"] == 31
     assert read
