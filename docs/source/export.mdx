@@ -32,6 +32,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 
   Torch-TensorRT's `executorch` extra brings ExecuTorch and `torch-tensorrt-executorch-runtime`, which loads the TensorRT engines of a bundle without PyTorch, so do not install them separately. It must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 
+- With an older PyTorch, `lerobot-export` stops before it starts and prints the install command for its backend.
 - **ExecuTorch 1.6 has fixes this backend needs.** `executorch_tensorrt` needs [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. Every program that keeps an input check needs [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298).
 - **Running a bundle never imports PyTorch.** PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), such as Torch-TensorRT 2.15. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load.
@@ -187,6 +188,17 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
   "action_names": null,
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
   "tolerance": 2e-5,
+  "target": {
+    "device": "cuda",
+    "gpu": "NVIDIA H100",
+    "compute_capability": "9.0"
+  },
+  "runtime_versions": {
+    "executorch": "1.6.0",
+    "tensorrt": "11.4.0.106",
+    "torch_tensorrt_executorch_runtime": "0.2.1"
+  },
+  "exact_runtime_modules": ["tensorrt"],
   "test_case": "test.safetensors"
 }
 ```
@@ -196,6 +208,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
 - The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time.
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
+- `target` is the GPU the programs were built on, when they run only on that kind of GPU, as a TensorRT engine does. A machine whose GPU has another compute capability refuses the bundle, and another GPU model of the same compute capability gets a warning. `runtime_versions` are the versions of the Python modules the programs need to load. Another version of one gets a warning, but one in `exact_runtime_modules` is refused: a TensorRT engine loads only with the TensorRT version that built it.
 
 A version of LeRobot refuses a bundle whose format or keys it does not know, and says whether to upgrade LeRobot or to export again.
 
@@ -204,7 +217,7 @@ A version of LeRobot refuses a bundle whose format or keys it does not know, and
 The export makes a random test frame and records the actions PyTorch computes for it. Then:
 
 - **At export**, the finished bundle replays the test frame in a fresh process, the same way `lerobot-check-bundle` does. If the actions differ too much from PyTorch's, nothing is written.
-- **At load**, `lerobot-check-bundle` replays the test frame again. Before any program loads, a bundle is refused if its programs read a value that nothing gives, or if its manifest names a file outside the bundle folder.
+- **At load**, `lerobot-check-bundle` replays the test frame again. Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module gets a warning, unless it is in `exact_runtime_modules`), if its programs read a value that nothing gives, or if its manifest names a file outside the bundle folder.
 
 The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. Change the tolerance with `--tolerance`.
 
@@ -246,8 +259,14 @@ Other policies have not been tested with `lerobot-export`.
 **`outputs/export/... already exists. Pick another --output_dir.`**
 The export never overwrites a bundle. Delete the old folder, or pass `--output_dir`.
 
-**`The executorch_tensorrt backend could not import what it needs (...). If it is not installed: pip install ...`**, or at run time, **`This bundle could not import the Python module 'torch_tensorrt_executorch_runtime', which loads its programs (...).`**
+**`The executorch_tensorrt backend needs PyTorch 2.15 or newer to export, but PyTorch 2.11.0 is installed.`**
+This environment has an older PyTorch. Install PyTorch 2.15 in it, with the command the message shows.
+
+**`The executorch_tensorrt backend could not import what it needs (...). If it is not installed: pip install ...`**, or at run time, **`This bundle was exported with torch_tensorrt_executorch_runtime ..., which is not installed.`** or **`This bundle could not import the Python module 'torch_tensorrt_executorch_runtime', which loads its programs (...).`**
 The backend's packages are missing on this machine, or one of them fails to load. If they are missing, install them as shown in [Install](#install). If they are installed, the export's message and the run-time message for the module give in parentheses what fails to load, such as a shared library; fix that.
+
+**`This bundle was exported with tensorrt 11.4.0.106, and this machine has 11.3.0.1. Its programs load only with tensorrt 11.4.0.106 ...`**
+A TensorRT engine loads only with the TensorRT version that built it. Install the version the message names, or export the policy again on this machine.
 
 **`The exported policy does not reproduce its test case (... > 2e-05). Export it again on this device.`**
 The compiled actions differ from PyTorch's by more than the tolerance. With TensorRT, this usually means the bundle was built on another GPU model: export on the board that runs it. Raise `--tolerance` only if you know the difference does not matter for your task.
@@ -293,7 +312,7 @@ Two optional methods cover bigger policies:
 
 ### A backend
 
-A backend is one config class, registered under its `--backend.type` name. It compiles one part, already traced by `torch.export`, into one program file. An installed package named `lerobot_backend_<name>` adds a backend when imported, the way `lerobot_runtime_<name>` adds a runtime (below). A backend whose programs ExecuTorch loads builds on `ExecuTorchConfig`, which sets the runtime and the file suffix:
+A backend is one config class, registered under its `--backend.type` name. It compiles one part, already traced by `torch.export`, into one program file. An installed package named `lerobot_backend_<name>` adds a backend when imported, the way `lerobot_runtime_<name>` adds a runtime (below). A backend whose programs ExecuTorch loads builds on `ExecuTorchConfig`, which sets the runtime, the file suffix and the PyTorch the compiler needs:
 
 ```python
 from dataclasses import dataclass
@@ -310,6 +329,7 @@ from lerobot.export.configs import ExportBackendConfig
 class ExecuTorchMyChipConfig(ExecuTorchConfig):
     device = "cpu"  # where the programs run; the parts are traced and compiled there too
     runtime_imports = ("mychip_executorch",)  # modules that register the chip with the runtime, if any
+    runtime_modules = ("executorch", "mychip_executorch")  # modules whose versions the bundle records
     packages = (EXECUTORCH, "mychip-executorch")  # what to install beside LeRobot to export
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
@@ -321,7 +341,7 @@ class ExecuTorchMyChipConfig(ExecuTorchConfig):
         return None  # or a data file written beside `path`, such as separate weights
 ```
 
-LeRobot's own backends live in `src/lerobot/export/backends/`.
+A backend whose `device` is `cuda` records the GPU it builds on in the bundle's `target`, since its programs then run only on that kind of GPU. A backend lists in `exact_runtime_modules` the runtime modules its programs load only at the version that built them, as the TensorRT backend lists `tensorrt`. LeRobot's own backends live in `src/lerobot/export/backends/`.
 
 A backend with a new file format, such as ONNX, also needs a **runtime**: a class that loads one program file and runs it on NumPy arrays (see `Program` in `lerobot.bundle.runtime`). An installed package named `lerobot_runtime_<name>` adds it when imported:
 
