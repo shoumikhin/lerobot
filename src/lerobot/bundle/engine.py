@@ -81,6 +81,10 @@ class BundleEngine:
         self._stop = stop_event or Event()
         constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
+        # A GPU bundle draws its noise in a run of its own; otherwise the engine draws it on the host.
+        self._host_noise_shape = (
+            None if any(NOISE in run.outputs for run in manifest.runs) else manifest.noise_shape
+        )
         self._action_names = manifest.action_names
         self._scale = np.asarray(manifest.action_scale, dtype=np.float32)
         if not (np.isfinite(self._scale) & (self._scale > 0)).all():
@@ -118,7 +122,7 @@ class BundleEngine:
             manifest,
             [*self._frame_spec, *self._task_values],
             list(constants),
-            manifest.noise_shape is not None,
+            self._host_noise_shape is not None,
         )
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions)
@@ -199,11 +203,14 @@ class BundleEngine:
         noise: np.ndarray | None = None,
     ) -> np.ndarray:
         values: dict[str, Any] = {**{name: frame[name] for name in self._frame_spec}, **task_values}
-        if self._noise_shape is not None:
-            values[NOISE] = (
-                np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
-            )
+        if noise is None and self._host_noise_shape is not None:
+            noise = np.random.standard_normal(self._host_noise_shape).astype(np.float32)
+        if noise is not None:
+            values[NOISE] = noise
         for (run, program), placed in zip(self._runs, self._placed, strict=True):
+            if NOISE in values and NOISE in run.outputs:
+                # The test case's recorded noise stands in for the draw.
+                continue
             inputs = []
             for index, name in enumerate(run.inputs):
                 if index in placed:
@@ -225,6 +232,10 @@ class BundleEngine:
         return actions
 
     def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
+        # The test case's noise stands in for a draw when the chunks replay, so each draw runs once here.
+        for run, program in self._runs:
+            if NOISE in run.outputs:
+                _check_noise_draw(program.to_numpy(program()[0]), self._noise_shape)
         actual = self._run_chunk(frame, self._encode(self._fixed_task or ""), noise)
         if actual.shape != expected.shape:
             raise RuntimeError(
@@ -301,6 +312,28 @@ class BundleEngine:
         return self._actions.popleft()
 
 
+def _check_noise_draw(noise: np.ndarray, shape: list[int] | None) -> None:
+    """Refuse a noise draw that is not standard normal noise shaped `shape`, such as a constant or zeros.
+
+    A true draw passes with a chance above 1 - 1e-8: its sum is within 6 standard deviations of 0 and no value
+    is 8 or more away from it.
+    """
+    if (
+        shape is None
+        or noise.shape != tuple(shape)
+        or noise.dtype != np.float32
+        or not np.isfinite(noise).all()
+        or (np.abs(noise) >= 8).any()
+        or abs(float(noise.sum())) > 6 * np.sqrt(noise.size)
+        or (noise.size > 1 and noise.min() == noise.max())
+    ):
+        raise RuntimeError(
+            f"The bundle's noise draw gives {noise.dtype} values shaped {noise.shape}, from {noise.min():.3g} "
+            f"to {noise.max():.3g}, not standard normal noise shaped {shape}. Export the policy again on this "
+            "device."
+        )
+
+
 def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[str], noise: bool) -> None:
     """Refuse, before any program loads, runs that read a value nothing gives them or write a value placed once.
 
@@ -315,6 +348,17 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
     available = {*frame, *constants, *([NOISE] if noise else [])}
     tasks = manifest.task_tokens is not None
     for run in manifest.runs:
+        if NOISE in run.outputs and (others := sorted(set(run.outputs) - {NOISE})):
+            raise ValueError(
+                f"The bundle's run {run.name!r} writes {NOISE!r} and {others}: a run that draws the "
+                "noise writes nothing else, since the test case's noise stands in for the whole run. "
+                "Export the policy again."
+            )
+        if NOISE in run.outputs and run.inputs:
+            raise ValueError(
+                f"The bundle's run {run.name!r} draws the noise from {run.inputs}: a noise draw reads "
+                "nothing, since the bundle runs it on its own to check it. Export the policy again."
+            )
         if shadowed := sorted(set(run.outputs) & set(constants)):
             raise ValueError(
                 f"The bundle's run {run.name!r} writes the constants {shadowed}. Export the policy again."
