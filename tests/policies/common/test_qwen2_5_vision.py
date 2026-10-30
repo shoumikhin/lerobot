@@ -198,9 +198,10 @@ def test_masks_hiding_more_than_padding_are_refused_also_after_export():
     for mask in (attention_mask, more_padding):
         check_visible_images(input_ids, mask, config)
         program(input_ids, mask)
-    # The vision start token, an image token, the vision end token, the text token between the second row's
-    # images (eager would join them into one image), and a whole row.
-    for row, columns in ((0, [2]), (0, [5]), (0, [9]), (1, [5]), (1, list(range(11)))):
+    # The vision start token with the text before it, the last image token and the vision end token with the
+    # text after it (each leaves one visible run), the text token between the second row's images (eager would
+    # join them into one image), and a whole row.
+    for row, columns in ((0, [1, 2]), (1, [9]), (0, [9, 10]), (1, [5]), (1, list(range(11)))):
         hidden = attention_mask.clone()
         hidden[row, columns] = 0
         with pytest.raises(ValueError, match="must hide only padding"):
