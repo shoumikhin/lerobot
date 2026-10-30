@@ -197,6 +197,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. No policy
   "constants": null,
   "task_tokens": null,
   "noise_shape": null,
+  "history": {},
   "task": null,
   "action_names": null,
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
@@ -241,7 +242,7 @@ float32 is the default because it matches PyTorch most closely. A big policy, su
 
 ### Big models: bundles with several programs
 
-On an 8 GB board, pi0.5 and GR00T N1.7 do not fit as one program. So their recipes cut one chunk into a **chain** of small programs. The programs run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. pi0.5 starts from random noise and removes it in ten steps, and its chain looks like this:
+On an 8 GB board, pi0.5, GR00T N1.7 and SmolVLA do not fit well as one program. So their recipes cut one chunk into a **chain** of small programs. The programs run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. pi0.5 starts from random noise and removes it in ten steps, and its chain looks like this:
 
 ```
 embed                 cameras, state, task          -> the prompt, as vectors
@@ -256,6 +257,12 @@ Two things let a board with 8 GB build such a policy:
 
 - The recipe loads only the weights of the part it is tracing, then frees them.
 - Each part is compiled in a process of its own, and the memory goes back to the system when that process ends.
+
+### Past frames
+
+Diffusion Policy, Multi-Task DiT and VQ-BeT read the last few frames, not only the current one. In PyTorch the policy keeps them in queues that fill on every control tick. A compiled program keeps nothing between runs, so the bundle names those frames in its manifest under `history`, with how many to keep. `lerobot-rollout` then keeps them on every tick and passes them to the programs, oldest first. A policy that samples random numbers inside its steps reads them from the bundle's `noise`, so the compiled policy samples like the PyTorch one.
+
+Diffusion Policy and Multi-Task DiT run their encoder once per chunk, and one denoising step many times in a loop, the same way the pi0.5 chain runs its `step`.
 
 ### Tasks
 
@@ -336,28 +343,35 @@ This table lists what has been tested:
 - **No**: tested, and it does not work yet.
 - **-**: not tested.
 
-| Policy      | Recipe      | TensorRT                                | CUDA                                   | XNNPACK               | OpenVINO      | MLX                     |
-| ----------- | ----------- | --------------------------------------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
-| ACT         | default     | Yes (data center GPU, Jetson Orin Nano) | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
-| pi0.5       | own (chain) | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
-| GR00T N1.7  | own (chain) | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
-| SmolVLA     | default     | Yes (data center GPU, Jetson Orin Nano) | No                                     | No (bfloat16 weights) | Program       | -                       |
-| pi0         | default     | Yes (data center GPU)                   | Yes (data center GPU)                  | Program               | Program       | Program                 |
-| FineART VLA | default     | Program                                 | -                                      | Program               | Program       | -                       |
+| Policy           | Recipe            | TensorRT                                | CUDA                                   | XNNPACK               | OpenVINO      | MLX                     |
+| ---------------- | ----------------- | --------------------------------------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
+| ACT              | default           | Yes (data center GPU, Jetson Orin Nano) | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
+| pi0.5            | own (chain)       | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
+| GR00T N1.7       | own (chain)       | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
+| SmolVLA          | own (chain)       | Yes (Jetson AGX Thor)                   | No                                     | No (bfloat16 weights) | Program       | -                       |
+| Diffusion Policy | own (past frames) | Yes (data center GPU)                   | -                                      | -                     | -             | -                       |
+| Multi-Task DiT   | own (past frames) | Yes (data center GPU)                   | -                                      | -                     | -             | -                       |
+| VQ-BeT           | own (past frames) | Yes (data center GPU)                   | -                                      | -                     | -             | -                       |
+| Gaussian actor   | own (one action)  | Yes (data center GPU)                   | -                                      | -                     | -             | -                       |
+| pi0              | default           | Yes (data center GPU)                   | Yes (data center GPU)                  | Program               | Program       | Program                 |
+| X-VLA            | default           | Yes (data center GPU)                   | -                                      | No                    | No            | -                       |
+| FineART VLA      | default           | Program                                 | -                                      | Program               | Program       | -                       |
+| DM05             | default           | Program                                 | -                                      | -                     | -             | -                       |
 
 - The ACT TensorRT, XNNPACK and OpenVINO results on an x86 computer used PyTorch 2.15 with development builds of ExecuTorch 1.6 and Torch-TensorRT 2.15. The other results used development builds of PyTorch 2.16, ExecuTorch and Torch-TensorRT.
 - The ACT MLX result used an Apple Silicon Mac with PyTorch 2.15 and a development build of ExecuTorch 1.6.
-- The pi0.5 and GR00T rows are for their chain recipes, which have only been tested with TensorRT so far.
+- The pi0.5 and GR00T rows are for their chain recipes, which have only been tested with TensorRT so far. The SmolVLA TensorRT result is for its chain recipe. Its other results were measured when it was exported as one program.
 - SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its `executorch_cuda` export fails because SmolVLA computes its time embedding in float64, and ExecuTorch's CUDA backend cannot yet load float64 values. Use TensorRT or OpenVINO for SmolVLA.
+- The SmolVLA chain was checked on a Jetson AGX Thor, where it needs about half the memory of one program. The Diffusion Policy, Multi-Task DiT, VQ-BeT, Gaussian actor and X-VLA rows were checked on data center GPUs.
 - `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images ([pytorch/executorch#11686](https://github.com/pytorch/executorch/issues/11686)).
+- EVO1 does not export yet. It runs inside `torch.autocast`, and PyTorch saves its traced program but then refuses to load it (`wrap_with_autocast is missing val field`), which is a PyTorch bug.
 
 These policies also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes their vision model compute the layout of image patches once, instead of on every call: EO-1, WALL-X, Wall-OSS 0.5, LaWAM, LingBot-VLA v2 and VLA-JEPA. The option assumes that the camera layout does not change while the robot runs.
 
 Some policies do not fit the default recipe and would each need their own recipe:
 
-- Diffusion Policy, Multi-task DiT, VQ-BeT and TD-MPC read past frames or prepare their steps one at a time.
+- TD-MPC plans its actions one step at a time.
 - pi0-FAST turns its output tokens into actions with Python code that cannot be compiled.
-- The Gaussian actor predicts no chunk of actions.
 
 Other policies have not been tested with `lerobot-export`.
 
@@ -419,9 +433,10 @@ Two optional methods cover bigger policies:
 - `plan()` returns a `RunPlan`, which can hold:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree;
   - `constants`: named arrays the runs read, such as time values;
-  - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task.
+  - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;
+  - `history`: how many past frames of each frame key the programs read.
 
-`tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants. `policies/pi05/export_pi05.py` and `policies/groot/export_groot.py` are full ones.
+`tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants. `policies/pi05/export_pi05.py`, `policies/groot/export_groot.py` and `policies/smolvla/export_smolvla.py` are full ones. `policies/diffusion/export_diffusion.py` shows a recipe that reads past frames, and `policies/gaussian_actor/export_gaussian_actor.py` a small change to the default recipe.
 
 ### A backend
 
