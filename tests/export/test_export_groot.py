@@ -220,6 +220,9 @@ def exported(request, tmp_path_factory):
             f"--policy.path={checkpoint}",
             f"--output_dir={bundle}",
             f"--task={TASK}",
+            # On this random tiny GR00T the chained parts and the whole policy differ by up to 3.7e-05 on a busy
+            # CPU, as float32 sums run in another order, which is over the 2e-05 default for real checkpoints.
+            "--tolerance=1e-4",
         ]
     )
     return checkpoint, Bundle.read(bundle)
