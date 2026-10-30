@@ -32,6 +32,8 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+from lerobot.policies.common.input_checks import check_input
+from lerobot.policies.common.qwen_vision import is_exporting, qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.utils import populate_queues
@@ -169,6 +171,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         self.cu_seqlens = None
         self.visual_split_sizes = None
         self.visual_max_seqlen = None
+        self.visual_grid_thw = None
         # Capture-context flag: set by the full-prefix CUDA-graph wrapper so the vision
         # grid metadata (pos_embeds / cu_seqlens / split_sizes / max_seqlen) is hoisted
         # out of the per-call host-sync path and cached once. See ``_prefix_graphed``.
@@ -250,6 +253,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                 self.visual_split_sizes,
                 self.visual_max_seqlen,
             ) = self.qwenvl.model.visual.preprcess_grid_thw(grid_thw=image_grid_thw)
+            self.visual_grid_thw = image_grid_thw.tolist()
         image_embeds, deepstack_image_embeds = self.qwenvl.model.visual(
             pixel_values,
             grid_thw=image_grid_thw,
@@ -302,6 +306,25 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
+        return self._pad_positions_as_trained(position_ids, attention_mask)
+
+    def build_fixed_grid_position_ids(self, input_ids, attention_mask, grid_thw: list[list[int]]):
+        """`build_prefix_position_ids` for `torch.export`, which cannot read the image grid on the host.
+
+        `grid_thw` is the grid of every camera as Python ints, including cameras hidden by `attention_mask`.
+        """
+        vlm_cfg = self.qwenvl.config
+        position_ids = qwen_image_rope_index(
+            input_ids,
+            attention_mask,
+            grid_thw,
+            vlm_cfg.vision_config.spatial_merge_size,
+            vlm_cfg.image_token_id,
+        )
+        return self._pad_positions_as_trained(position_ids, attention_mask)
+
+    @staticmethod
+    def _pad_positions_as_trained(position_ids, attention_mask):
         # transformers 4.57 (which the 6B checkpoint was trained under) filled masked
         # (padding) rope positions with 1; transformers 5.5 fills them with 0. Restore the
         # 4.57 convention so cached-prefix rope matches the trained weights exactly.
@@ -921,16 +944,36 @@ class FlowMatchingV2(FlowMatchingV1):
         else:
             att_masks = torch.zeros((bsize, embs.shape[1]), device=device, dtype=torch.bool)
 
-        flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
-        rope_grid_thw = flat_grid_thw[flat_img_masks]
-        if rope_grid_thw.numel() == 0:
-            rope_grid_thw = flat_grid_thw[:1]
-        prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
-            prefix_input_ids,
-            pad_masks.long(),
-            image_grid_thw=rope_grid_thw,
-            video_grid_thw=None,
-        )
+        if not self.config.qwen3vl_use_vision_boundaries:
+            # Without boundary tokens, visible cameras form one image block that transformers'
+            # `get_rope_index` cannot place, so such prompts stay refused as before.
+            check_input(
+                img_masks.sum(dim=1) <= 1,
+                "qwen3vl_use_vision_boundaries=False supports at most one visible camera per sample.",
+            )
+        cached_grid_thw = self.qwenvl_with_expert.visual_grid_thw
+        if is_exporting() and cached_grid_thw is not None:
+            # Export cannot read the grid on the host, so the grid cached with the vision metadata stands in.
+            check_input(
+                flat_grid_thw == flat_grid_thw.new_tensor(cached_grid_thw),
+                "The image grid differs from the one cached for precompute_grid_thw.",
+            )
+            # Eager rope positions fail on a sample with no visible token.
+            check_input(pad_masks.any(dim=1), "Every sample needs a visible prefix token.")
+            prefix_position_ids = self.qwenvl_with_expert.build_fixed_grid_position_ids(
+                prefix_input_ids, pad_masks.long(), cached_grid_thw
+            )
+        else:
+            flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
+            rope_grid_thw = flat_grid_thw[flat_img_masks]
+            if rope_grid_thw.numel() == 0:
+                rope_grid_thw = flat_grid_thw[:1]
+            prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
+                prefix_input_ids,
+                pad_masks.long(),
+                image_grid_thw=rope_grid_thw,
+                video_grid_thw=None,
+            )
         # Dense (capture-safe) deepstack layout: zero-masked per-camera embeds
         # laid out over the full prefix length instead of bool-filtered rows.
         # _apply_deepstack then does a plain shape-static add; the old filtered
@@ -1520,6 +1563,7 @@ class FlowMatchingV2(FlowMatchingV1):
             core.cu_seqlens,
             core.visual_split_sizes,
             core.visual_max_seqlen,
+            core.visual_grid_thw,
         )
         static_in = images.clone()
         try:
@@ -1533,6 +1577,7 @@ class FlowMatchingV2(FlowMatchingV1):
             core.cu_seqlens = None
             core.visual_split_sizes = None
             core.visual_max_seqlen = None
+            core.visual_grid_thw = None
 
             def run_vit():
                 return core.embed_image(static_in, flat_grid_thw)
@@ -1558,6 +1603,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 core.cu_seqlens,
                 core.visual_split_sizes,
                 core.visual_max_seqlen,
+                core.visual_grid_thw,
             ) = prev_grid
             self._vision_graph_disabled = True
             return None
@@ -1579,6 +1625,7 @@ class FlowMatchingV2(FlowMatchingV1):
                 core.cu_seqlens,
                 core.visual_split_sizes,
                 core.visual_max_seqlen,
+                core.visual_grid_thw,
             ) = prev_grid
             self._vision_graph_disabled = True
             return None
