@@ -47,7 +47,9 @@ from .pipeline import ActionProcessorStep, ObservationProcessorStep, ProcessorSt
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoProcessor, AutoTokenizer
+    from transformers import AutoProcessor, AutoTokenizer, ProcessorMixin
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.utils import cached_file
 else:
     AutoProcessor = None
     AutoTokenizer = None
@@ -388,9 +390,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         elif self.action_tokenizer_name is not None:
             if AutoProcessor is None:
                 raise ImportError("AutoProcessor is not available")
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
-            )
+            self.action_tokenizer = _load_action_tokenizer(self.action_tokenizer_name, self.trust_remote_code)
         else:
             raise ValueError(
                 "Either 'action_tokenizer' or 'action_tokenizer_name' must be provided. "
@@ -616,3 +616,30 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
             The updated dictionary of policy features.
         """
         return features
+
+
+def _load_action_tokenizer(name: str, trust_remote_code: bool) -> Any:
+    """Load the action tokenizer processor saved at `name`.
+
+    Transformers 5 loads a processor's `bpe_tokenizer` from a `bpe_tokenizer/` subfolder. FAST processors saved
+    by transformers 4, such as `physical-intelligence/fast`, keep it at the top of the repository instead, so for
+    that layout the tokenizer is loaded from there and passed to the processor class.
+    """
+    bpe_tokenizer_config = cached_file(
+        name,
+        "bpe_tokenizer/tokenizer_config.json",
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if trust_remote_code and bpe_tokenizer_config is None:
+        processor_dict, _ = ProcessorMixin.get_processor_dict(name)
+        class_reference = processor_dict.get("auto_map", {}).get("AutoProcessor")
+        if class_reference is not None:
+            processor_class = get_class_from_dynamic_module(class_reference, name)
+            if processor_class.get_attributes() == ["bpe_tokenizer"]:
+                # So that saving the processor also saves its code, as AutoProcessor does for remote code.
+                processor_class.register_for_auto_class()
+                return processor_class.from_args_and_dict(
+                    [AutoTokenizer.from_pretrained(name)], processor_dict
+                )
+    return AutoProcessor.from_pretrained(name, trust_remote_code=trust_remote_code)
