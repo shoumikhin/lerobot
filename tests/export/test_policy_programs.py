@@ -39,6 +39,7 @@ class Recipe:
 
 
 RECIPES = {
+    "wall_x": Recipe("tests.policies.wall_x.export_stand_in"),
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
 }
 
