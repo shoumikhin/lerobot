@@ -66,6 +66,12 @@ if attempts:
 )
 
 
+NEEDS_DATASETS = [
+    pytest.mark.dataset,
+    pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
+]
+
+
 @pytest.mark.parametrize(
     "module",
     [
@@ -84,11 +90,12 @@ if attempts:
         "lerobot.processor",
         "lerobot.utils.action_interpolator",
         pytest.param(
+            "lerobot.datasets.language",
+            marks=NEEDS_DATASETS,
+        ),
+        pytest.param(
             "lerobot.scripts.lerobot_rollout",
-            marks=[
-                pytest.mark.dataset,
-                pytest.mark.skipif(not _datasets_available, reason="datasets not installed"),
-            ],
+            marks=NEEDS_DATASETS,
         ),
     ],
 )
