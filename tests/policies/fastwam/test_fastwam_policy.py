@@ -495,3 +495,29 @@ def test_chunk_serving_reads_the_current_frame(monkeypatch):
 
     assert (spec.prediction_steps, spec.execution_steps) == (4, 2)
     assert spec.current_observation_only
+
+
+def test_the_core_follows_its_weights_to_another_device():
+    expert_kwargs = {
+        "hidden_dim": 8,
+        "action_dim": 3,
+        "ffn_dim": 16,
+        "text_dim": 8,
+        "freq_dim": 8,
+        "eps": 1.0e-6,
+        "num_heads": 2,
+        "attn_head_dim": 4,
+        "num_layers": 1,
+        "fp32_attention": False,
+    }
+    video_expert, action_expert = ActionDiT(**expert_kwargs), ActionDiT(**expert_kwargs)
+    mot = MoT(mixtures={"video": video_expert, "action": action_expert}, mot_checkpoint_mixed_attn=False)
+    model = FastWAM(
+        video_expert=video_expert, action_expert=action_expert, mot=mot, vae=nn.Identity(), text_dim=8
+    )
+    assert model.device == torch.device("cpu")
+
+    # The meta device stands in for a GPU on a CPU box.
+    model.to("meta")
+
+    assert model.device == torch.device("meta")
