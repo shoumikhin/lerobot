@@ -22,11 +22,12 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from lerobot.configs import PreTrainedConfig
+from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import ChunkPolicySpec, FeatureSpec
 from .configuration_fastwam import FastWAMConfig
 from .wan import (
     ActionDiT,
@@ -228,6 +229,34 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Serve the current frame and the configured action horizon.
+
+        The video frames in `observation_delta_indices` are future training targets. Inference predicts
+        the action chunk from the current frame alone.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("FastWAM chunk serving requires n_obs_steps=1.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.action_horizon,
+            execution_steps=self.config.n_action_steps,
+        )
+
+    def validate_chunk_input_features(self, features: tuple[FeatureSpec, ...]) -> None:
+        """Accept cameras of any size: the model resizes every camera to its share of `image_size`."""
+        expected = self.config.input_features or {}
+        supplied = {feature.name: feature for feature in features}
+        if supplied.keys() != expected.keys():
+            raise ValueError("Canonical feature names must exactly match policy input_features.")
+        for name, policy_feature in expected.items():
+            feature = supplied[name]
+            if policy_feature.type == FeatureType.VISUAL:
+                shape = policy_feature.shape
+                if len(shape) != 3 or shape[0] != 3 or feature.kind != "rgb":
+                    raise ValueError(f"FastWAM requires RGB camera inputs: {name}.")
+            elif feature.kind != "tensor" or feature.shape != tuple(policy_feature.shape):
+                raise ValueError(f"Tensor feature shape differs from checkpoint: {name}.")
 
     def _batch_to_training_sample(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Adapt a standard LeRobot batch to the FastWAM-native sample that
