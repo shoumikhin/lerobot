@@ -110,9 +110,7 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
                 "The override replaces every PyTorch pin, so the packages after lerobot are pinned to that PyTorch "
                 "by hand."
             )
-        raise ValueError(
-            f"{message} Run the bundle in your usual LeRobot environment. See https://huggingface.co/docs/lerobot/export."
-        )
+        raise ValueError(f"{message} See https://huggingface.co/docs/lerobot/export.")
 
     @abc.abstractmethod
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
