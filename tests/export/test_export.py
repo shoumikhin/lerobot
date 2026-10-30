@@ -29,7 +29,7 @@ from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
-from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
+from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
 from lerobot.inference.sync import SyncInferenceEngine
@@ -371,6 +371,45 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     assert sorted(manifest.programs) == ["model", "prepare", "scale"]
     constants = load_file(bundle.path / bundle.manifest.constants)
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
+    """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU."""
+    from lerobot.bundle.executorch import ExecuTorchProgram
+
+    use_plugins(monkeypatch, "noise_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_cuda")
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
+    placed = []
+    place = ExecuTorchProgram.place
+    monkeypatch.setattr(
+        ExecuTorchProgram,
+        "place",
+        lambda self, index, value: placed.append(value.shape) or place(self, index, value),
+    )
+    engine = BundleEngine(bundle)
+    loaded = len(placed)
+    rng = np.random.default_rng(0)
+    frame = {
+        IMAGE: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+        OBS_STATE: rng.random(3, dtype=np.float32),
+    }
+    first = np.stack([engine.get_action(dict(frame)) for _ in range(4)])
+    second = np.stack([engine.get_action(dict(frame)) for _ in range(4)])
+    assert not np.array_equal(first, second)
+    assert placed[loaded:] == [(32, 32, 3), (3,)] * 2
+    # The policy samples from a standard normal, so the noise program must too.
+    files = bundle.manifest.programs[NOISE]
+    noise = ExecuTorchProgram(
+        bundle.path / files.file, None if files.data is None else bundle.path / files.data
+    )
+    count = 4000 // int(np.prod(bundle.manifest.noise_shape)) + 1
+    draws = np.concatenate([noise.to_numpy(noise()[0]).ravel() for _ in range(count)])
+    assert abs(draws.mean()) < 0.1 and abs(draws.std() - 1) < 0.1
 
 
 @pytest.mark.skipif(
