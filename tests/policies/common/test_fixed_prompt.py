@@ -38,6 +38,17 @@ class Tokenizer(ProcessorStep):
         return features
 
 
+class ChatTokenizer(Tokenizer):
+    """Like EO-1's processor step: it renders the messages it is given and says where the action tokens start."""
+
+    def __call__(self, transition):
+        out = super().__call__(transition)
+        comp = dict(out[TransitionKey.COMPLEMENTARY_DATA])
+        del comp["messages"]
+        comp["action_token_start"] = 2
+        return {**out, TransitionKey.COMPLEMENTARY_DATA: comp}
+
+
 def pixels(transition):
     return {"pixel_values": transition[TransitionKey.OBSERVATION][IMAGE].flatten(1) * 2}
 
@@ -90,3 +101,14 @@ def test_tracing_before_an_eager_call_is_refused():
 
     with pytest.raises(ValueError, match="eager call before the program is traced"):
         torch.export.export(Program(step), (torch.rand(1, 3, 2, 2),), strict=False)
+
+
+def test_the_step_keeps_plain_values_and_removes_what_the_step_removes():
+    step = FixedPromptStep(ChatTokenizer(), pixels)
+    eager = frame(0.2)
+    eager[TransitionKey.COMPLEMENTARY_DATA]["messages"] = [["pick"]]
+
+    expected = ChatTokenizer()(eager)[TransitionKey.COMPLEMENTARY_DATA]
+    comp = step(eager)[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert comp.keys() == expected.keys() and comp["action_token_start"] == 2
