@@ -156,7 +156,8 @@ class BundleManifest:
             any task; one without it runs only `task`.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
-            none.
+            none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
+            case's recorded noise replaces the draw when the bundle checks itself.
         history (`dict[str, int]`, *optional*):
             For each key of the robot's frame that the programs read with its past values, how many: the
             programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
