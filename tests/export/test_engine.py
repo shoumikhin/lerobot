@@ -34,7 +34,7 @@ from torch import Tensor, nn
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle, BundleManifest
 from lerobot.bundle.runtime import RUNTIMES
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 from tests.export.torch_backend import TorchProgram, make_bundle, record_places
 
 FRAME = {OBS_STATE: np.array([1.0, 2.0, 3.0], np.float32)}
@@ -484,6 +484,45 @@ def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
         engine.get_action(FRAME)
 
 
+class History(nn.Module):
+    """The chunk is the program's history of the state: one action per state it remembers, oldest first."""
+
+    def forward(self, states: Tensor) -> Tensor:
+        return states * 1
+
+
+# Two ticks, fewer than the three states the program remembers, so the check replays the first-frame fill too.
+TICKS = {OBS_STATE: np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], np.float32)}
+
+
+def _states(*values: float) -> list[np.ndarray]:
+    return [np.full(3, value, np.float32) for value in values]
+
+
+def _history_bundle(folder: Path, size: int = 3) -> Bundle:
+    return make_bundle(folder, History(), TICKS, history={OBS_STATE: size})
+
+
+def test_engine_gives_the_programs_the_frames_of_past_ticks_until_a_reset(tmp_path):
+    engine = BundleEngine(_history_bundle(tmp_path / "bundle"))
+    engine.check_robot({OBS_STATE: (3,)}, ["a", "b", "c"])
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(10, 11, 12, 13, 14, 15, 16)]
+    # A chunk at tick 0, from the first state repeated, and at tick 3, from the states of ticks 1 to 3.
+    np.testing.assert_array_equal(np.stack(actions), _states(10, 10, 10, 11, 12, 13, 14))
+    engine.reset()
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(20, 21, 22)]
+    np.testing.assert_array_equal(np.stack(actions), _states(20, 20, 20))
+
+
+def test_engine_keeps_a_copy_of_each_past_frame(tmp_path):
+    engine = BundleEngine(_history_bundle(tmp_path / "bundle", size=2))
+    state = np.full(3, 10.0, np.float32)
+    for value in (10.0, 11.0, 12.0):
+        state[:] = value
+        action = engine.get_action({OBS_STATE: state})
+    np.testing.assert_array_equal(action, [11.0, 11.0, 11.0])
+
+
 @pytest.mark.parametrize(
     ("change", "error"),
     [
@@ -504,6 +543,7 @@ def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
         # An infinite tolerance would let any program pass its check.
         ({"tolerance": float("inf")}, "tolerance must be a finite number"),
         ({"tolerance": -1.0}, "tolerance must be a finite number of at least 0"),
+        ({"history": {OBS_STATE: 0}}, "whole number of frames above 0"),
     ],
 )
 def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
@@ -581,6 +621,8 @@ def test_a_manifest_leaves_out_the_fields_at_their_default(tmp_path):
             {},
             r"writes the constants \['factor_1'\]",
         ),
+        (_history_bundle, {"history": {OBS_ENV_STATE: 3}}, {}, rf"history of \['{OBS_ENV_STATE}'\]"),
+        (_history_bundle, {}, {OBS_ENV_STATE: np.ones((3, 2), np.float32)}, "same number of frames"),
     ],
 )
 def test_engine_refuses_a_bundle_it_cannot_run(tmp_path, make, change, case, error):
