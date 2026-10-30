@@ -1252,6 +1252,8 @@ class FastWAM(torch.nn.Module):
         # A pinned text encoder (e.g. on CPU) must NOT follow device moves — leave it put.
         if self.text_encoder is not None and self._text_encoder_device is None:
             self.text_encoder._apply(fn)
+        # The inputs the model moves itself, such as the prompt's token ids, go where its weights now are.
+        self.device = next(self.parameters()).device
         return self
 
     @staticmethod
