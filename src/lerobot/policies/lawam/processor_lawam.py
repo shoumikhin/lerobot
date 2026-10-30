@@ -92,6 +92,10 @@ class LaWAMPreSnapGripperProcessorStep(ProcessorStep):
         transition[TransitionKey.ACTION] = snapped
         return transition
 
+    def without_threshold(self) -> None:
+        """Nothing: the snap is the threshold, which `lerobot-export`'s check leaves out (see `action_pipelines`)."""
+        return None
+
     def transform_features(self, features):
         """Preserve feature declarations because snapping does not change shape."""
         return features
@@ -118,6 +122,10 @@ class LaWAMBinarizeGripperProcessorStep(PolicyActionProcessorStep):
             2.0 * (binarized[..., self.gripper_dim] > self.threshold).float() - 1.0
         )
         return binarized
+
+    def without_threshold(self) -> None:
+        """Nothing: the step is the threshold, which `lerobot-export`'s check leaves out (see `action_pipelines`)."""
+        return None
 
     def transform_features(self, features):
         """Preserve feature declarations because binarization does not change shape."""
@@ -266,8 +274,10 @@ class LaWAMQwenInputsProcessorStep(ProcessorStep):
             raise RuntimeError("LaWAM Qwen processor did not initialize its placeholder token.")
         return self._processor, self._placeholder_token_id
 
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        observation = transition.get(TransitionKey.OBSERVATION) or {}
+    def camera_views(
+        self, observation: dict[str, Any]
+    ) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+        """Each sample's current primary and wrist camera images, as the prompt shows them."""
         camera_features = self.primary_image_features + self.wrist_image_features
         missing = [key for key in camera_features if key not in observation]
         if missing:
@@ -279,9 +289,6 @@ class LaWAMQwenInputsProcessorStep(ProcessorStep):
         batch_size = int(videos[self.primary_image_features[0]].shape[0])
         if any(int(video.shape[0]) != batch_size for video in videos.values()):
             raise ValueError("LaWAM camera features must share the same batch size.")
-
-        comp = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
-        tasks = _task_batch(comp.get("task"), batch_size=batch_size, default_task=self.default_task)
         image_views = [
             [videos[key][batch_idx, 0] for key in self.primary_image_features]
             for batch_idx in range(batch_size)
@@ -290,7 +297,15 @@ class LaWAMQwenInputsProcessorStep(ProcessorStep):
             [videos[key][batch_idx, 0] for key in self.wrist_image_features]
             for batch_idx in range(batch_size)
         ]
-        device = videos[self.primary_image_features[0]].device
+        return image_views, wrist_image_views
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        observation = transition.get(TransitionKey.OBSERVATION) or {}
+        image_views, wrist_image_views = self.camera_views(observation)
+        batch_size = len(image_views)
+        comp = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
+        tasks = _task_batch(comp.get("task"), batch_size=batch_size, default_task=self.default_task)
+        device = image_views[0][0].device
         processor, placeholder_token_id = self._ensure_processor()
         qwen_inputs = processor.apply_chat_template(
             build_qwenvl_messages(

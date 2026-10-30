@@ -363,6 +363,29 @@ def test_lawam_postprocessor_matches_libero_gripper_convention(
     assert processed[:, -1].tolist() == [-1.0, 1.0]
 
 
+def test_lawam_export_checks_the_gripper_without_the_pre_snap_and_binarize_steps() -> None:
+    """`lerobot-export` checks a compiled program on the actions without its threshold steps, where rounding alone
+    cannot pick either side of a threshold; the program still plays the snapped and binarized gripper."""
+    from lerobot.export.recipe import PostprocessedActions
+
+    cfg = make_config()
+    cfg.clip_normalized_actions = True
+    cfg.pre_snap_gripper_action = True
+    cfg.binarize_gripper_action = True
+    dataset_stats = {ACTION: {"min": torch.zeros(7), "max": torch.ones(7)}}
+    _, postprocessor = make_pre_post_processors(
+        cfg, dataset_stats=dataset_stats, dataset_meta=SimpleNamespace(fps=20)
+    )
+    chunk = torch.zeros(1, 2, 7)
+    chunk[0, :, cfg.gripper_dim] = torch.tensor([0.45, 0.55])
+
+    actions, continuous = PostprocessedActions(postprocessor)(chunk)
+
+    assert actions[:, cfg.gripper_dim].tolist() == [-1.0, 1.0]
+    # Unnormalized from [-1, 1] to the dataset's [0, 1], with neither the snap nor the binarization.
+    torch.testing.assert_close(continuous[:, cfg.gripper_dim], torch.tensor([0.725, 0.775]))
+
+
 @pytest.mark.parametrize(("dataset_open", "dataset_closed"), [(0.0, 1.0), (-1.0, 1.0)])
 def test_lawam_training_preprocessor_preserves_binary_gripper_targets(
     dataset_open: float, dataset_closed: float

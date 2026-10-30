@@ -301,7 +301,10 @@ class LaWAMPolicy(PreTrainedPolicy):
         `self.model.policy_backend.vlm.set_attn_implementation("sdpa")`.
         """
         self.eval()
-        output = self.model.predict_action(batch, noise=noise, vision_grid=vision_grid)
+        return self._action_chunk(self.model.predict_action(batch, noise=noise, vision_grid=vision_grid))
+
+    def _action_chunk(self, output: Tensor | dict[str, Tensor]) -> Tensor:
+        """The `[B, action_horizon, action_dim]` normalized chunk LeRobot plays, from LaWAM's inference output."""
         actions = output.get("normalized_actions") if isinstance(output, dict) else output
         if actions is None:
             raise KeyError("LaWAM inference output is missing normalized actions.")
