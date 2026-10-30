@@ -169,6 +169,12 @@ class BundleManifest:
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
             case's recorded noise replaces the draw when the bundle checks itself.
+        history (`dict[str, int]`, *optional*):
+            For each key of the robot's frame that the programs read with its past values, how many: the
+            programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
+            reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
+            only. The test case then holds the frames of several control ticks in each frame value, oldest first,
+            and the actions computed at the last one.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -197,6 +203,7 @@ class BundleManifest:
     runs: list[ProgramRun]
     task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
+    history: dict[str, int] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -215,6 +222,8 @@ class BundleManifest:
             raise ValueError("The manifest names a different number of actions than it scales.")
         if not self.runs:
             raise ValueError("The manifest lists no run.")
+        if not all(type(n) is int and n > 0 for n in self.history.values()):
+            raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
         names = [run.name for run in self.runs]
         if len(set(names)) != len(names):
             raise ValueError(f"The manifest names a run twice: {names}.")
@@ -322,6 +331,7 @@ def _check_form(data: dict[str, Any]) -> None:
             and type(task_tokens.get("max_tokens")) is int
             and task_tokens["max_tokens"] > 0
         ),
+        "history": isinstance(data.get("history", {}), dict),
     }
     if wrong := [name for name, right in form.items() if not right]:
         raise ValueError(
