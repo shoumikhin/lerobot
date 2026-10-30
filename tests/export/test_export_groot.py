@@ -202,7 +202,7 @@ def save_checkpoint(path, mode: str):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def test_backend():
+def torch_test_backend():
     """Add the test backend to the export's steps, which run in processes of their own."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         use_plugins(monkeypatch, "torch_backend")

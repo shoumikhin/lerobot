@@ -478,7 +478,7 @@ class GrootExportRecipe(ExportRecipe):
     def _prompt_constants(self, qwen: nn.Module) -> dict[str, Any]:
         """The prompt's fixed head, its rope positions, and the token ids of every task known at export.
 
-        The prompt is a head that ends with the last image, then the task's text. The text ops must give
+        The prompt is a head that ends with the last image, then the task's text. The prompt ops must give
         the processor's own ids for every known task and a few edge cases; the drift check refuses otherwise.
         """
         from transformers.utils import cached_file
