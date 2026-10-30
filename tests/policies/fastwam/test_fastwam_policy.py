@@ -470,3 +470,28 @@ def test_vae_adapter_empty_build_encode_decode_shapes():
 
     # list input is accepted and equals the batched path
     assert torch.equal(vae.encode([video[0]]), latents)
+
+
+def test_chunk_serving_reads_the_current_frame(monkeypatch):
+    monkeypatch.setattr(FastWAMPolicy, "_build_core_model", lambda self, config: FakeFastWAMCore())
+    cfg = FastWAMConfig(
+        action_dim=3,
+        proprio_dim=2,
+        action_horizon=4,
+        n_action_steps=2,
+        num_video_frames=5,
+        action_video_freq_ratio=1,
+        image_size=(16, 16),
+        input_features={
+            "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 16, 16)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
+        base_model_id=None,
+    )
+    assert cfg.observation_delta_indices == [0, 1, 2, 3, 4]
+
+    spec = FastWAMPolicy(cfg).chunk_inference_spec()
+
+    assert (spec.prediction_steps, spec.execution_steps) == (4, 2)
+    assert spec.current_observation_only
