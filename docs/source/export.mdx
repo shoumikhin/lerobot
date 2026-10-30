@@ -1,11 +1,12 @@
 # Compiled Policies (lerobot-export)
 
-A trained policy normally runs in PyTorch. PyTorch is flexible, but on a small robot computer it can be too slow. `lerobot-export` solves this: it compiles a trained policy once, ahead of time, into a folder called a **bundle**. `lerobot-rollout` then runs the bundle in place of the checkpoint.
+A trained policy normally runs in PyTorch. PyTorch is flexible, but on a small robot computer it can be too slow, and a large policy may not fit in memory at all. `lerobot-export` solves this: it compiles a trained policy once, ahead of time, into a folder called a **bundle**. `lerobot-rollout` then runs the bundle in place of the checkpoint.
 
 A bundle is useful because:
 
 - **It is fast.** A compiler such as NVIDIA TensorRT tunes the policy's math for one chip.
 - **It runs no policy code.** The robot process runs the compiled programs instead of the PyTorch policy.
+- **It is built for small boards.** Large policies such as π₀.₅ (pi0.5) and GR00T N1.7 are split into small programs, so they can be built and run on an NVIDIA Jetson Orin Nano with 8 GB of memory.
 - **It checks itself.** The bundle carries a test frame. It is replayed at export and again before the robot moves.
 
 ```
@@ -123,9 +124,10 @@ Then the robot moves, as with any policy. While it runs, an action that is NaN o
 | `--policy.path`            | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                             |
 | `--backend.type`           | The compiler, from the table above.                                                                                                  |
 | `--output_dir`             | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                 |
-| `--task`                   | The task, for a policy that reads one, such as SmolVLA. See [Tasks](#tasks).                                                         |
-| `--dataset.repo_id`        | The dataset the policy was trained on. The export takes the robot's frame from it, and its first task if `--task` is empty.          |
+| `--task`                   | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                |
+| `--dataset.repo_id`        | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                |
 | `--tolerance`              | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                        |
+| `--max_task_tokens`        | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                            |
 | `--seed`                   | Seeds the random test frame. Defaults to `1000`.                                                                                     |
 | `--backend.workspace_size` | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                      |
 
@@ -184,6 +186,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. No policy
     }
   ],
   "constants": null,
+  "task_tokens": null,
   "noise_shape": null,
   "task": null,
   "action_names": null,
@@ -218,26 +221,101 @@ The export makes a random test frame and records the actions PyTorch computes fo
 - **At export**, the finished bundle replays the test frame in a fresh process, the same way `lerobot-rollout` will. If the actions differ too much from PyTorch's, nothing is written.
 - **At load**, `lerobot-rollout` replays the test frame again, before the robot connects. It also checks the robot's cameras and state (after `--rename_map`), the number of joints, and the joint names when the policy recorded them. Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module only gets a warning), or if its programs read a value that nothing gives. While the robot runs, every chunk must have the right shape and be finite before it is used.
 
-The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. Change it with `--tolerance`.
+The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. In bfloat16 the pi0.5 recipe uses 0.2, measured on its test frame. Change it with `--tolerance`.
 
 <Tip>
 
-float32 is the default because it matches PyTorch most closely. A big policy, such as pi0, exports faster and runs faster in bfloat16. Add `--policy.dtype=bfloat16` to `lerobot-export`, and the check then uses the bfloat16 tolerance.
+float32 is the default because it matches PyTorch most closely. A big policy, such as pi0, pi0.5 or GR00T, exports faster and runs faster in bfloat16. Add `--policy.dtype=bfloat16` to `lerobot-export`, and the check then uses the bfloat16 tolerance.
 
 </Tip>
 
-### Several programs in one bundle
+### Big models: bundles with several programs
 
-A recipe can cut one chunk into several programs. They run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. One program file can also run several times, each time reading other values from a `constants.safetensors` file, for example the time value of each step of a denoising loop. Each part is traced, saved and freed before the next, and compiled in a process of its own, so the memory goes back to the system between steps.
+On an 8 GB board, pi0.5 and GR00T N1.7 do not fit as one program. So their recipes cut one chunk into a **chain** of small programs. The programs run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. pi0.5 starts from random noise and removes it in ten steps, and its chain looks like this:
+
+```
+embed                 cameras, state, task          -> the prompt, as vectors
+language_model_0..k   a few language model layers   -> what those layers remember about the prompt
+step (x10)            that memory, noisy actions    -> less noisy actions
+actions               clean actions                 -> actions in robot units
+```
+
+The `step` is one program file that runs ten times, each time with a different time value from a `constants.safetensors` file. The file loads once.
+
+Two things let a board with 8 GB build such a policy:
+
+- The recipe loads only the weights of the part it is tracing, then frees them.
+- Each part is compiled in a process of its own, and the memory goes back to the system when that process ends.
 
 ### Tasks
 
-A vision-language-action policy reads a task such as "pick up the cube". A compiled program cannot run the policy's tokenizer (the code that splits text into word pieces), so the default recipe stores the task inside the program. Give it with `--task="pick up the cube"`, or let the export take the first task of `--dataset.repo_id`. The bundle then runs only that task.
+A vision-language-action policy reads a task such as "pick up the cube". To read it, the policy first splits the text into **tokens** (word pieces) with its **tokenizer**, and looks up a vector for each token in its **embedding table**. A compiled program cannot run a tokenizer, so a bundle handles the task in one of two ways:
+
+- **Fixed task.** The default recipe stores the task inside the program. Give it with `--task="pick up the cube"`, or let the export take the first task of `--dataset.repo_id`. The bundle then runs only that task.
+- **Any task.** The pi0.5 and GR00T recipes write `task_tokens` into the bundle: the policy's tokenizer file and its embedding table. At run time, the bundle turns any task into vectors without PyTorch. Tasks known at export, such as the dataset's, are stored ready to use. A new task is tokenized once, in a short-lived child process, so the tokenizer's memory does not stay in the robot process. This needs the `tokenizers` package on the robot computer: `pip install "tokenizers>=0.22"`.
+
+For an any-task bundle, the task's prompt must fit in `--max_task_tokens`. The prompt is the task plus a few fixed words the policy adds around it. By default, the budget is a little more than the longest prompt known at export.
+
+Change the task with `--task` when you start `lerobot-rollout --bundle.path=<folder>`.
 
 ### PyTorch at export and at run time
 
 - The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the trace and compile processes, which give their memory back when they end.
 - `lerobot-rollout --bundle.path=<folder>` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads robots, cameras and runtimes only, since other plugins may import PyTorch.
+
+## Run pi0.5 and GR00T on a Jetson Orin Nano
+
+The Jetson Orin Nano has 8 GB of memory, shared by the CPU and the GPU. The pi0.5 and GR00T recipes are made for it: they build one small part at a time. Both fit and run on a Jetson Orin Nano 8 GB, with the numbers below.
+
+### 1. Prepare the board
+
+- Use JetPack 7, NVIDIA's software for Jetson boards. It brings CUDA 13.
+- Install LeRobot and the `executorch_tensorrt` packages from [Install](#install). Jetson boards are aarch64 (64-bit Arm), so use the aarch64 builds for CUDA 13.
+- Put the CUDA compiler on your `PATH`: `export PATH=/usr/local/cuda/bin:$PATH`.
+- Turn on swap. During a TensorRT build, memory the CPU uses can move to swap, but memory given to the GPU cannot.
+
+### 2. Export on the board
+
+Export on the Orin Nano itself, because a TensorRT engine runs only on the GPU model that built it. The first export takes roughly 10 to 15 minutes.
+
+```bash
+lerobot-export \
+    --policy.path=<user>/<pi05_checkpoint> \
+    --backend.type=executorch_tensorrt \
+    --dataset.repo_id=<user>/<dataset> \
+    --task="pick up the cube"
+```
+
+For GR00T N1.7, pass a GR00T checkpoint instead. Close other programs while it runs: the export uses most of the board's memory at its peak.
+
+### 3. Run
+
+```bash
+lerobot-rollout \
+    --bundle.path=outputs/export/pi05_executorch_tensorrt \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --task="put the cube in the box" \
+    --duration=60
+```
+
+Use the camera names and sizes the policy was trained with. The task can be any task whose prompt fits in the bundle's token budget.
+
+### Results on the Orin Nano
+
+Measured on a Jetson Orin Nano 8 GB with SO-101 checkpoints, on the first export (no TensorRT timing cache yet), and a 120 second run. Memory is the whole board's, above what it used before the command.
+
+|                                               | pi0.5   | GR00T N1.7 |
+| --------------------------------------------- | ------- | ---------- |
+| Export time                                   | 565 s   | 893 s      |
+| Peak memory during export                     | 5.4 GiB | 4.7 GiB    |
+| Time per action chunk                         | 449 ms  | 196 ms     |
+| Memory while the robot runs                   | 4.7 GiB | 4.3 GiB    |
+| Largest action error per frame, mean          | 0.58°   | 0.67°      |
+| Same error for PyTorch in bfloat16, for scale | 0.41°   | 0.79°      |
+
+The error is measured against the PyTorch policy in float32, on 50 dataset frames. The bundles stay close to the error that PyTorch itself makes when it runs the policy in bfloat16. These runs used a rollout process that never imported PyTorch, as `lerobot-rollout --mode=bundle` does. Loading the PyTorch library alone would take about 0.3 GiB more on an Orin Nano.
 
 ## Supported policies and backends
 
@@ -248,14 +326,17 @@ This table lists what has been tested:
 - **No**: tested, and it does not work yet.
 - **-**: not tested.
 
-| Policy      | Recipe  | TensorRT                                |
-| ----------- | ------- | --------------------------------------- |
-| ACT         | default | Yes (data center GPU, Jetson Orin Nano) |
-| SmolVLA     | default | Yes (data center GPU, Jetson Orin Nano) |
-| pi0         | default | Yes (data center GPU)                   |
-| FineART VLA | default | Program                                 |
+| Policy      | Recipe      | TensorRT                                |
+| ----------- | ----------- | --------------------------------------- |
+| ACT         | default     | Yes (data center GPU, Jetson Orin Nano) |
+| pi0.5       | own (chain) | Yes (data center GPU, Jetson Orin Nano) |
+| GR00T N1.7  | own (chain) | Yes (data center GPU, Jetson Orin Nano) |
+| SmolVLA     | default     | Yes (data center GPU, Jetson Orin Nano) |
+| pi0         | default     | Yes (data center GPU)                   |
+| FineART VLA | default     | Program                                 |
 
 - The ACT result on an x86 computer used PyTorch 2.15 with development builds of ExecuTorch 1.6 and Torch-TensorRT 2.15. The other results used development builds of PyTorch 2.16, ExecuTorch and Torch-TensorRT.
+- The pi0.5 and GR00T rows are for their chain recipes.
 
 These policies also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes their vision model compute the layout of image patches once, instead of on every call: EO-1, WALL-X, Wall-OSS 0.5, LaWAM, LingBot-VLA v2 and VLA-JEPA. The option assumes that the camera layout does not change while the robot runs.
 
@@ -284,8 +365,8 @@ The compiled actions differ from PyTorch's by more than the tolerance. With Tens
 **`The robot does not match the exported policy, which takes observation.images.front (480, 640, 3) (the robot gives None).`**
 The robot's cameras or joints differ from the ones the policy was trained with. Give the cameras the same names and sizes, or map the names with `--rename_map`, for example `--rename_map='{"observation.images.wrist": "observation.images.front"}'`.
 
-**`This exported policy runs only the task it was exported for, ...`**
-A bundle runs only its task: export again with the new `--task`.
+**`This exported policy runs only the task it was exported for, ...`** or **`The task ... is 40 tokens long, but this exported policy takes at most 32.`**
+A fixed-task bundle runs only its task: export again with the new `--task`. An any-task bundle has a token budget: shorten the task, or export again with a larger `--max_task_tokens`.
 
 **`This act checkpoint cannot be exported: ...`**
 The default recipe does not fit this policy, and the message says why. Change the setting it names if your policy works without it, or write a recipe for the policy (see below).
@@ -324,9 +405,10 @@ Two optional methods cover bigger policies:
 - `load` (a class method) builds the recipe from the export configuration. Override it to load each part's weights only when that part is traced.
 - `plan()` returns a `RunPlan`, which can hold:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree;
-  - `constants`: named arrays the runs read, such as time values.
+  - `constants`: named arrays the runs read, such as time values;
+  - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task.
 
-`tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants.
+`tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants. `policies/pi05/export_pi05.py` and `policies/groot/export_groot.py` are full ones.
 
 ### A backend
 
