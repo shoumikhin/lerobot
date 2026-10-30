@@ -465,6 +465,37 @@ def test_model_messages_use_recipe_system_prompt_and_only_fall_back_for_action_i
         ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(("use_fast_processor", "image_device"), [(False, "cpu"), (True, "cuda")])
+def test_qwen_step_gives_only_the_slow_processor_cpu_images(monkeypatch, use_fast_processor, image_device):
+    from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep, EO1QwenProcessorStep
+    from lerobot.processor.converters import create_transition
+
+    class RecordingTextProcessor(DummyTextProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            self.images = [b["image"] for row in messages for m in row for b in m["content"] if "image" in b]
+            return super().apply_chat_template(messages, **kwargs)
+
+    processor = RecordingTextProcessor()
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: processor,
+    )
+    config = make_eo1_config()
+    image = torch.rand(1, 3, 8, 8, device="cuda")
+    transition = create_transition(
+        observation={OBS_STATE: torch.zeros(1, STATE_DIM, device="cuda"), "observation.images.image": image},
+        complementary_data={"task": ["tidy"]},
+    )
+    transition = RenderRuntimeMessagesStep(config.recipe)(transition)
+    transition = EO1PrepareModelMessagesStep(config.input_features, CHUNK_SIZE)(transition)
+    EO1QwenProcessorStep(use_fast_processor=use_fast_processor)(transition)
+
+    assert [img.device.type for img in processor.images] == [image_device]
+    expected = image[0].clamp(0, 1).mul(255.0).round().to(torch.uint8)
+    assert torch.equal(processor.images[0].to(expected.device), expected)
+
+
 def test_saved_message_processor_registry_name_still_loads():
     from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep
     from lerobot.processor import PolicyProcessorPipeline
