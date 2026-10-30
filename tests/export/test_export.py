@@ -32,7 +32,6 @@ import pytest
 import torch
 from safetensors.numpy import load_file, save_file
 
-import tests.export.torch_backend  # noqa: F401  # registers the test backend
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
 from lerobot.export import worker
@@ -44,6 +43,7 @@ from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
+from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
 
 
@@ -121,6 +121,30 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
             run_export(*args)
         # Nothing is written, not even the folders the export made beside the output folder.
         assert list(tmp_path.iterdir()) == []
+
+
+def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
+    TorchTestBackend().check_torch()
+    # A nightly or a release candidate of the version a backend needs counts as that version.
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "2.15")
+    monkeypatch.setattr(torch, "__version__", "2.15.0.dev20260901")
+    TorchTestBackend().check_torch()
+    monkeypatch.setattr(torch, "__version__", "2.15.0rc1")
+    TorchTestBackend().check_torch()
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "99.0")
+    with pytest.raises(
+        ValueError, match="needs PyTorch 99.0 or newer to export, but PyTorch 2.15.0rc1 is installed"
+    ) as refusal:
+        TorchTestBackend().check_torch()
+    assert "pip install" not in str(refusal.value)
+
+    monkeypatch.setattr(TorchTestBackend, "packages", ("compiler>=99.0,<99.1",))
+    monkeypatch.setattr(TorchTestBackend, "torch_pins", ("torch>=99.0,<99.1", "torchvision>=9.0,<9.1"))
+    with pytest.raises(ValueError) as refusal:
+        TorchTestBackend().check_torch()
+    message = str(refusal.value)
+    assert 'pip install "torch>=99.0,<99.1" "torchvision>=9.0,<9.1" "compiler>=99.0,<99.1"' in message
 
 
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
