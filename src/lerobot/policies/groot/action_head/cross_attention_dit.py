@@ -293,33 +293,52 @@ class DiT(ModelMixin, ConfigMixin):
         all_hidden_states = [hidden_states]
 
         # Process through transformer blocks
-        for idx, block in enumerate(self.transformer_blocks):
-            if idx % 2 == 1 and self.config.interleave_self_attention:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
-            else:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
+        for idx in range(len(self.transformer_blocks)):
+            hidden_states = self.run_block(idx, hidden_states, encoder_hidden_states, temb)
             all_hidden_states.append(hidden_states)
 
-        # Output processing
-        conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return self.output(hidden_states, temb), all_hidden_states
         else:
-            return self.proj_out_2(hidden_states)
+            return self.output(hidden_states, temb)
+
+    def run_block(
+        self,
+        idx: int,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
+        temb: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Block `idx`: self-attention on every other block when the config interleaves it, else cross-attention."""
+        block = self.transformer_blocks[idx]
+        if idx % 2 == 1 and self.config.interleave_self_attention:
+            return block(
+                hidden_states,
+                attention_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                temb=temb,
+            )
+        return block(
+            hidden_states,
+            attention_mask=None,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            temb=temb,
+        )
+
+    def block_encoder_mask(
+        self, idx: int, image_mask: torch.Tensor | None, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Which encoder tokens cross-attention block `idx` attends to, of those `attention_mask` keeps."""
+        return attention_mask
+
+    def output(self, hidden_states: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+        """The blocks' last hidden states, normalized with the time conditioning and projected."""
+        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        return self.proj_out_2(hidden_states)
 
 
 class AlternateVLDiT(DiT):
@@ -348,43 +367,26 @@ class AlternateVLDiT(DiT):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
-        image_attention_mask = image_mask & backbone_attention_mask
-        non_image_attention_mask = (~image_mask) & backbone_attention_mask
-
         all_hidden_states = [hidden_states]
         if not self.config.interleave_self_attention:
             raise ValueError("AlternateVLDiT requires interleave_self_attention=True.")
 
-        for idx, block in enumerate(self.transformer_blocks):
-            if idx % 2 == 1:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
-            else:
-                curr_encoder_attention_mask = (
-                    non_image_attention_mask
-                    if idx % (2 * self.attend_text_every_n_blocks) == 0
-                    else image_attention_mask
-                )
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=curr_encoder_attention_mask,
-                    temb=temb,
-                )
+        for idx in range(len(self.transformer_blocks)):
+            mask = self.block_encoder_mask(idx, image_mask, backbone_attention_mask)
+            hidden_states = self.run_block(idx, hidden_states, encoder_hidden_states, temb, mask)
             all_hidden_states.append(hidden_states)
 
-        conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
-        return self.proj_out_2(hidden_states)
+            return self.output(hidden_states, temb), all_hidden_states
+        return self.output(hidden_states, temb)
+
+    def block_encoder_mask(
+        self, idx: int, image_mask: torch.Tensor | None, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """The text tokens on every `attend_text_every_n_blocks`-th cross-attention block, else the image tokens."""
+        if idx % (2 * self.attend_text_every_n_blocks) == 0:
+            return ~image_mask & attention_mask
+        return image_mask & attention_mask
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):
