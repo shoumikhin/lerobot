@@ -15,6 +15,7 @@
 """`lerobot-export` and the bundle it writes, end to end on a tiny ACT, with the test backend."""
 
 import json
+import platform
 import subprocess
 import sys
 
@@ -285,6 +286,13 @@ BACKENDS = [
         marks=pytest.mark.skipif(
             not (EXECUTORCH and torch.cuda.is_available()),
             reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
+        ),
+    ),
+    pytest.param(
+        "executorch_mlx",
+        marks=pytest.mark.skipif(
+            not (sys.platform == "darwin" and platform.machine() == "arm64" and EXECUTORCH),
+            reason="needs ExecuTorch and PyTorch 2.15 on an Apple Silicon Mac",
         ),
     ),
 ]
