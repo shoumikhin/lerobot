@@ -29,7 +29,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 | `executorch_coreml`   | Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install "executorch>=1.6.0,<1.7.0"` (the macOS wheel includes Core ML)       |
 
 - LeRobot has no `export` extra yet, so install these packages yourself.
-- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. This holds for every backend in the table. LeRobot itself still pins an older PyTorch, so export from a second environment that overrides the pin, for example with [uv](https://docs.astral.sh/uv/):
+- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. This holds for every backend in the table. LeRobot itself still pins an older PyTorch, while the ExecuTorch 1.6 package pins `torch==2.15.0`, so install them in a second environment that overrides LeRobot's pin, for example with [uv](https://docs.astral.sh/uv/):
 
   ```bash
   printf 'torch>=2.15,<2.16\ntorchvision>=0.29.2,<0.30\n' > torch-overrides.txt
@@ -38,7 +38,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 
   The override replaces every PyTorch pin, also those of the packages after `lerobot`. So pin them to PyTorch 2.15 by hand, as above, or uv can pick a Torch-TensorRT made for an older PyTorch. torchvision is overridden too, because LeRobot also pins it below the release that installs with PyTorch 2.15. With an older PyTorch, `lerobot-export` stops before it starts and prints these commands for its backend.
 
-- **Running a bundle does not need PyTorch at all.** `lerobot-rollout --bundle.path=<folder>` never imports it, so the robot computer keeps that memory for the policy. It runs in your usual LeRobot environment; the export environment can run it too.
+- **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
