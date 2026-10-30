@@ -447,7 +447,7 @@ class ActionChunkRecipe(ExportRecipe):
         module = _ActionChunk(
             self.predict_chunk,
             self.policy,
-            self.preprocessor,
+            self.program_preprocessor(),
             self.postprocessor,
             list(self._features),
             self._visual,
@@ -467,6 +467,15 @@ class ActionChunkRecipe(ExportRecipe):
     def test_case(self) -> TestCase:
         """The random frame and noise, and the actions PyTorch computes for them as `lerobot-rollout` does."""
         return self._case
+
+    def program_preprocessor(self) -> PolicyProcessorPipeline:
+        """The preprocessor the program runs: the saved one.
+
+        A recipe for a policy whose preprocessor does Python work on the frame, such as building a prompt with
+        a transformers processor, returns one that computes the same with tensor operations. The program is
+        still checked against the saved preprocessor.
+        """
+        return self.preprocessor
 
     def _check_chain(self, run: Callable[..., Tensor]) -> None:
         """Refuse a program, or a chain of parts, whose actions differ from the ones lerobot-rollout plays.
