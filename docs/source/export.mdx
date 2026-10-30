@@ -38,7 +38,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 
   The override replaces every PyTorch pin, also those of the packages after `lerobot`. So pin them to PyTorch 2.15 by hand, as above, or uv can pick a Torch-TensorRT made for an older PyTorch. torchvision is overridden too, because LeRobot also pins it below the release that installs with PyTorch 2.15. With an older PyTorch, `lerobot-export` stops before it starts and prints these commands for its backend.
 
-- **Running a bundle does not need PyTorch at all.** `lerobot-rollout --mode=bundle` never imports it, so the robot computer keeps that memory for the policy. It runs in your usual LeRobot environment; the export environment can run it too.
+- **Running a bundle does not need PyTorch at all.** `lerobot-rollout --bundle.path=<folder>` never imports it, so the robot computer keeps that memory for the policy. It runs in your usual LeRobot environment; the export environment can run it too.
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
@@ -100,10 +100,10 @@ python -m lerobot.bundle outputs/export/act_executorch_tensorrt
 
 ### 3. Run it on the robot
 
-Add `--mode=bundle` and pass the bundle folder as `--bundle.path`. The robot options are the same as for a checkpoint:
+Pass the bundle folder as `--bundle.path` in place of `--policy.path`. The robot options are the same as for a checkpoint:
 
 ```bash
-lerobot-rollout --mode=bundle \
+lerobot-rollout \
     --bundle.path=outputs/export/act_executorch_tensorrt \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
@@ -121,7 +121,7 @@ INFO ... Bundle loaded from outputs/export/act_executorch_tensorrt (backend exec
 
 Then the robot moves, as with any policy. While it runs, an action that is NaN or infinite stops the run before it reaches the motors. After Ctrl-C or `--duration`, the robot returns to where it started (turn this off with `--return_to_initial_position=false`) and disconnects. After an error it is not moved again.
 
-`lerobot-rollout --mode=bundle --help` lists its options: `--bundle.path`, `--robot.*`, `--fps`, `--duration`, `--interpolation_multiplier`, `--task`, `--rename_map`, `--return_to_initial_position`, and `--config_path` for a file that holds them. It runs the base strategy only, because it imports no PyTorch. Every `--strategy.*` option, recording (`--dataset.*`), teleoperation (`--teleop.*`), `--inference.*`, `--planner`, `--interactive` and `--display_data` need PyTorch, so they are refused, and so are `--policy.*`, `--device` and `--use_torch_compile`, since a bundle runs exactly as it was compiled. Of the installed plugins, robots and cameras load, and a runtime when the bundle names one LeRobot does not have; other plugins may import PyTorch. `--robot.discover_packages_path` loads a robot plugin from a module, as in `lerobot-rollout`. The Unitree G1 is not available in this mode, because its config needs PyTorch.
+`lerobot-rollout --bundle.path=<folder> --help` lists its options: `--bundle.path`, `--robot.*`, `--fps`, `--duration`, `--interpolation_multiplier`, `--task`, `--rename_map`, `--return_to_initial_position`, and `--config_path` for a file that holds them. Give `--bundle.path` on the command line even then, because in the file alone it does not select this mode. It runs the base strategy only, because it imports no PyTorch. Every `--strategy.*` option, recording (`--dataset.*`), teleoperation (`--teleop.*`), `--inference.*`, `--planner`, `--interactive` and `--display_data` need PyTorch, so they are refused, and so are `--policy.*`, `--device` and `--use_torch_compile`, since a bundle runs exactly as it was compiled. Of the installed plugins, robots and cameras load, and a runtime when the bundle names one LeRobot does not have; other plugins may import PyTorch. `--robot.discover_packages_path` loads a robot plugin from a module, as in `lerobot-rollout`. The Unitree G1 is not available in this mode, because its config needs PyTorch.
 
 ### Options
 
@@ -141,7 +141,7 @@ Then the robot moves, as with any policy. While it runs, an action that is NaN o
 
 With the default recipe, a checkpoint trained with a PEFT adapter (a small set of extra weights, such as LoRA) is exported with the adapter merged into the base weights.
 
-A bundle on the Hub must be downloaded first, for example with `hf download <repo> --local-dir <folder>`. A bundle passed to `lerobot-rollout` as `--policy.path` is refused with a pointer to `--mode=bundle`.
+A bundle on the Hub must be downloaded first, for example with `hf download <repo> --local-dir <folder>`. A bundle passed to `lerobot-rollout` as `--policy.path` is refused with a pointer to `--bundle.path`.
 
 ## How it works
 
@@ -276,7 +276,7 @@ Change the task with `--task` when you start `lerobot-rollout --mode=bundle`.
 ### PyTorch at export and at run time
 
 - The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the trace and compile processes, which give their memory back when they end.
-- `lerobot-rollout --mode=bundle` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads robots, cameras and runtimes only, since other plugins may import PyTorch.
+- `lerobot-rollout --bundle.path=<folder>` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads robots, cameras and runtimes only, since other plugins may import PyTorch.
 
 ## Run pi0.5 and GR00T on a Jetson Orin Nano
 
@@ -477,4 +477,4 @@ from lerobot.bundle.runtime import Runtime, register_runtime
 register_runtime("onnxruntime", Runtime(load=OnnxProgram))
 ```
 
-`lerobot-rollout --mode=bundle` imports such packages only when a bundle names a runtime LeRobot does not have. Nothing in LeRobot changes, and a runtime must not import PyTorch.
+`lerobot-rollout --bundle.path=<folder>` imports such packages only when a bundle names a runtime LeRobot does not have. Nothing in LeRobot changes, and a runtime must not import PyTorch.
