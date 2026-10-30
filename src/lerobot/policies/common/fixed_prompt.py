@@ -38,20 +38,24 @@ from .qwen_vision import is_exporting
 def _same(a: Any, b: Any) -> bool:
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
         return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b.to(a.device))
-    return a is None and b is None
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return False
+    return type(a) is type(b) and a == b
 
 
 class FixedPromptStep(ProcessorStep):
     """`step` for one task and camera size: the prompt of the first eager frame, the tensors of each frame.
 
     `frame_inputs` computes, from a transition, the complementary-data entries that change from frame to
-    frame. Every other tensor (or None) entry `step` adds to the complementary data is the prompt.
+    frame. Every other entry `step` adds to the complementary data is the prompt, and the entries it removes,
+    such as the chat messages it renders, are removed under export too.
     """
 
     def __init__(self, step: ProcessorStep, frame_inputs: Callable[[EnvTransition], dict[str, Any]]) -> None:
         self.step = step
         self.frame_inputs = frame_inputs
         self.prompt: dict[str, Any] | None = None
+        self.removed: set[str] = set()
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         frame = self.frame_inputs(transition)
@@ -59,7 +63,8 @@ class FixedPromptStep(ProcessorStep):
             self._check(transition, frame)
         if self.prompt is None:
             raise ValueError("The prompt is made from an eager call before the program is traced.")
-        comp: dict[str, Any] = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
+        given = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        comp = {key: value for key, value in given.items() if key not in self.removed}
         comp.update(self.prompt)
         comp.update(frame)
         return {**transition, TransitionKey.COMPLEMENTARY_DATA: comp}
@@ -67,15 +72,14 @@ class FixedPromptStep(ProcessorStep):
     def _check(self, transition: EnvTransition, frame: dict[str, Any]) -> None:
         given = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
         saved = self.step(transition)[TransitionKey.COMPLEMENTARY_DATA] or {}
-        prompt = {
-            key: value
-            for key, value in saved.items()
-            if key not in frame and key not in given and (value is None or isinstance(value, torch.Tensor))
-        }
+        prompt = {key: value for key, value in saved.items() if key not in frame and key not in given}
+        removed = given.keys() - saved.keys()
         if self.prompt is None:
-            self.prompt = prompt
-        elif prompt.keys() != self.prompt.keys() or not all(
-            _same(value, self.prompt[key]) for key, value in prompt.items()
+            self.prompt, self.removed = prompt, removed
+        elif (
+            prompt.keys() != self.prompt.keys()
+            or removed != self.removed
+            or not all(_same(value, self.prompt[key]) for key, value in prompt.items())
         ):
             raise ValueError(
                 f"{type(self.step).__name__}'s prompt changed between two frames of the same task and camera "
