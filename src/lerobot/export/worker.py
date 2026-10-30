@@ -33,6 +33,7 @@ import draccus
 import torch
 
 from lerobot.bundle.manifest import CONSTANTS, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
 from lerobot.utils import init_logging, register_third_party_plugins
@@ -89,6 +90,8 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             action_names=getattr(recipe.config, "action_feature_names", None),
             action_scale=test_case.action_scale.tolist(),
             tolerance=recipe.tolerance,
+            target=cfg.backend.target(),
+            runtime_versions=runtime_versions(cfg.backend.runtime_modules),
         )
         write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants)
     except BaseException:
