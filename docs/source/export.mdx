@@ -40,6 +40,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
+- A policy that starts from a random noise, such as pi0.5, SmolVLA or GR00T, draws that noise in a small program on the GPU. `executorch_tensorrt` can save that program only with a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), which is not in a release yet.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
 - On macOS, export and run from such an environment too, without Torch-TensorRT: `uv pip install --override torch-overrides.txt lerobot "executorch>=1.6.0,<1.7.0"`. LeRobot's own pin keeps an older PyTorch for older macOS versions, so this needs a macOS version that PyTorch 2.15 supports.
@@ -216,6 +217,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. No policy
 
 - `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
+- On a GPU backend, the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
 - `target` is the GPU the programs were built on, when they run only on that kind of GPU, as a TensorRT engine does. `runtime_versions` are the versions of the Python modules the programs need to load.
