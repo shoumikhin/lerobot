@@ -17,6 +17,7 @@
 import logging
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,7 +43,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.processor import ProcessorStep, TransitionKey
+from lerobot.processor import NormalizerProcessorStep, ProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 IMAGE = f"{OBS_IMAGES}.front"
@@ -80,14 +81,17 @@ def export_config(task: str = "") -> SimpleNamespace:
 
 
 def make(
-    policy_class=ACTPolicy, task: str = "", extra_step: ProcessorStep | None = None
+    policy_class=ACTPolicy,
+    task: str = "",
+    extra_step: ProcessorStep | None = None,
+    recipe_class: type[ActionChunkRecipe] = ActionChunkRecipe,
 ) -> ActionChunkRecipe:
     torch.manual_seed(0)
     config = act_config()
     preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
     if extra_step is not None:
         preprocessor.steps.insert(0, extra_step)
-    return ActionChunkRecipe(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
+    return recipe_class(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
 
 
 class TaskCodes(ProcessorStep):
@@ -556,3 +560,34 @@ def test_a_policy_that_reads_its_checkpoint_itself_gets_its_device(tmp_path, mon
     monkeypatch.setattr(ACTPolicy, "_load_as_safetensor", classmethod(reads_its_checkpoint))
     ACTPolicy.from_pretrained(tmp_path, config=config)
     assert mapped == {"policy": "meta", "file": "cpu"}
+
+
+class EditedStepsRecipe(ActionChunkRecipe):
+    """A recipe whose program runs the saved preprocessor with its steps changed by `edit`."""
+
+    def program_preprocessor(self):
+        return replace(self.preprocessor, steps=self.edit(self.preprocessor.steps))
+
+
+@pytest.mark.parametrize(
+    ("recipe_class", "edit", "error"),
+    [
+        # ACT ignores the task codes the first step makes, so the program computes the same without it.
+        (EditedStepsRecipe, lambda steps: steps[1:], None),
+        (
+            EditedStepsRecipe,
+            lambda steps: [step for step in steps if not isinstance(step, NormalizerProcessorStep)],
+            "computes something else",
+        ),
+    ],
+)
+def test_a_recipe_gives_the_program_a_preprocessor_that_computes_the_same(recipe_class, edit, error):
+    recipe = make(task="pick", extra_step=TaskCodes(), recipe_class=recipe_class)
+    recipe.edit = edit
+    if error:
+        with pytest.raises(ValueError, match=error):
+            list(recipe.parts())
+    else:
+        [part] = recipe.parts()
+        steps = [type(step) for step in part.module.preprocessor.steps]
+        assert steps == [type(step) for step in edit(recipe.preprocessor.steps)]
