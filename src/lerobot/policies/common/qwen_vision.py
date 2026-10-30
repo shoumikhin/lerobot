@@ -33,7 +33,7 @@ Python ints, because the stock attention reads them back from a tensor.
 
 Under export the cached grid is checked with transformers' `torch_compilable_check`, a runtime assert in
 the program that `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off like every other check of that kind; a
-failed assert loses its message. `check_input` is for a policy's own input checks: always on in eager mode.
+failed assert loses its message.
 """
 
 from collections.abc import Callable, Iterator
@@ -46,6 +46,8 @@ import torch
 from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available
+
+from .input_checks import check_input
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import PretrainedConfig
@@ -156,36 +158,24 @@ class FixedImageGrid:
         )
 
 
-def check_input(
-    condition: Tensor | bool, message: str | Callable[[], str], error_type: type[Exception] = ValueError
-) -> None:
-    """Raise `error_type` with `message` unless `condition` holds (for every element of a tensor).
-
-    In eager mode this is a plain check that always raises, as these input checks were before. While
-    `torch.export` or `torch.compile` traces, it is `torch_compilable_check`, a runtime assert in the program
-    (which `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off).
-    """
-    if torch.compiler.is_compiling() or torch.compiler.is_exporting():
-        torch_compilable_check(condition, message, error_type=error_type)
-    elif not bool(torch.as_tensor(condition).all()):
-        raise error_type(message() if callable(message) else message)
-
-
 def check_visible_images(input_ids: Tensor, attention_mask: Tensor, config: PretrainedConfig) -> None:
-    """Refuse an attention mask that hides an image, vision start or vision end token, or a whole row.
+    """Refuse an attention mask that hides more than padding at the ends of a row, or hides an image token.
 
     `qwen_image_rope_index` keeps every image on its own grid, while eager rope positions give the grids to the
-    visible images only, and fail on a row with no visible token. The policies' processors hide only padding,
-    where the two agree. `config` is the Qwen-VL config with the token ids. A refusal is a `ValueError` in eager
-    mode and a runtime assert in an exported program.
+    visible images only, join image runs that a hidden token separated, and fail on a row with no visible token.
+    The policies' processors hide only left or right padding, where the two agree. So each row's visible tokens
+    must be one run, and every image, vision start and vision end token must be visible. `config` is the Qwen-VL
+    config with the token ids. A refusal is a `ValueError` in eager mode and a runtime assert in an exported
+    program.
     """
     valid = attention_mask.bool()
+    run_starts = valid & ~torch.cat([torch.zeros_like(valid[:, :1]), valid[:, :-1]], dim=1)
     vision_token_ids = [config.image_token_id, config.vision_start_token_id, config.vision_end_token_id]
     hidden = ~valid & torch.isin(input_ids, input_ids.new_tensor(vision_token_ids))
     check_input(
-        valid.any(dim=1) & ~hidden.any(dim=1),
-        "To run on a fixed image grid, the attention mask must show every image, vision start and vision end "
-        "token, and a token of every row: eager rope positions differ or fail otherwise.",
+        (run_starts.sum(dim=1) == 1) & ~hidden.any(dim=1),
+        "To run on a fixed image grid, the attention mask must hide only padding at the ends of each row, and no "
+        "image, vision start or vision end token: eager rope positions differ or fail otherwise.",
     )
 
 

@@ -447,6 +447,19 @@ def test_diffusion_rejects_a_sample_without_its_state_token():
             )
 
 
+def test_diffusion_reads_the_action_hidden_states_in_token_order():
+    model = _tiny_diffusion_model()
+    batch = _diffusion_batch(3)
+    hidden_states, read = [], []
+    model.model.register_forward_hook(lambda module, args, output: hidden_states.append(output.last_hidden_state))
+    model.action_preprocessor.action_proj_back.register_forward_pre_hook(lambda module, args: read.append(args[0]))
+    model.predict(**batch, predict_mode="diffusion", pred_horizon=3, action_dim=3, num_inference_timesteps=2)
+    action_mask = batch["input_ids"] == 31
+    assert read
+    for hidden, actions in zip(hidden_states[-len(read) :], read, strict=True):
+        assert torch.equal(actions, hidden[action_mask].view(2, 3, -1).float())
+
+
 def test_diffusion_checks_the_action_token_count_per_sample():
     model = _tiny_diffusion_model()
     batch = _diffusion_batch(3)

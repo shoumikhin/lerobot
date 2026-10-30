@@ -180,10 +180,11 @@ def test_exported_program_rejects_a_changed_grid():
         program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
 
 
-def test_hidden_vision_tokens_and_empty_rows_are_refused_also_after_export():
+def test_masks_hiding_more_than_padding_are_refused_also_after_export():
     config = _tiny_config()
     image = [VISION_START_ID, *[IMAGE_TOKEN_ID] * 6, VISION_END_ID]
-    input_ids = torch.tensor([[0, 1, *image, 2], list(range(1, 12))])
+    # The second row has two images without boundary tokens, separated by one text token.
+    input_ids = torch.tensor([[0, 1, *image, 2], [5, *[IMAGE_TOKEN_ID] * 4, 6, *[IMAGE_TOKEN_ID] * 4, 0]])
     attention_mask = input_ids.ne(0).long()
 
     class CheckVisibleImages(torch.nn.Module):
@@ -192,13 +193,14 @@ def test_hidden_vision_tokens_and_empty_rows_are_refused_also_after_export():
             return attention_mask + 0
 
     program = torch.export.export(CheckVisibleImages(), (input_ids, attention_mask), strict=False).module()
-    text_hidden = attention_mask.clone()
-    text_hidden[:, 1] = 0
-    for mask in (attention_mask, text_hidden):
+    more_padding = attention_mask.clone()
+    more_padding[0, 1] = 0
+    for mask in (attention_mask, more_padding):
         check_visible_images(input_ids, mask, config)
         program(input_ids, mask)
-    # The vision start token, an image token, the vision end token, and the whole text-only row.
-    for row, columns in ((0, [2]), (0, [5]), (0, [9]), (1, list(range(11)))):
+    # The vision start token, an image token, the vision end token, the text token between the second row's
+    # images (eager would join them into one image), and a whole row.
+    for row, columns in ((0, [2]), (0, [5]), (0, [9]), (1, [5]), (1, list(range(11)))):
         hidden = attention_mask.clone()
         hidden[row, columns] = 0
         with pytest.raises(ValueError, match="must show every image"):

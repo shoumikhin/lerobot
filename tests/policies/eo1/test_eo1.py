@@ -798,8 +798,8 @@ def test_preparation_and_export_refuse_hidden_vision_tokens(monkeypatch):
         attention_mask[0, list(tokens)] = 0
         return {**batch, "attention_mask": attention_mask}
 
-    # A vision start token, an image token, a vision end token, and the whole prompt.
-    refused = (hide(2), hide(3), hide(5), hide(*range(input_ids.shape[1])))
+    # A vision start token, an image token, a vision end token, a text token inside the prompt, and every token.
+    refused = (hide(2), hide(3), hide(5), hide(11), hide(*range(input_ids.shape[1])))
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
         for inputs in refused:
@@ -809,6 +809,6 @@ def test_preparation_and_export_refuse_hidden_vision_tokens(monkeypatch):
     for inputs in refused:
         with torch.no_grad(), pytest.raises(RuntimeError):
             run(inputs)
-    text_hidden = hide(1)
-    expected = policy.predict_action_chunk(text_hidden, noise=noise.clone())
-    torch.testing.assert_close(run(text_hidden), expected, rtol=0, atol=0)
+    more_padding = hide(1)
+    expected = policy.predict_action_chunk(more_padding, noise=noise.clone())
+    torch.testing.assert_close(run(more_padding), expected, rtol=0, atol=0)

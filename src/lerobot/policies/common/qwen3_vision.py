@@ -30,7 +30,8 @@ from torch import Tensor
 
 from lerobot.utils.import_utils import _transformers_available
 
-from .qwen_vision import FixedImageGrid, check_input, replay_vision_block
+from .input_checks import check_input
+from .qwen_vision import FixedImageGrid, replay_vision_block
 
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (

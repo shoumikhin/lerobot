@@ -40,13 +40,8 @@ from ..common.flow_matching import (
     sample_time_beta,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_temporal_scale, qwen2_5_vision_forward
-from ..common.qwen_vision import (
-    check_input,
-    check_visible_images,
-    is_exporting,
-    is_preparing_image_grid,
-    qwen_image_rope_index,
-)
+from ..common.input_checks import check_input
+from ..common.qwen_vision import check_visible_images, is_exporting, is_preparing_image_grid, qwen_image_rope_index
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config

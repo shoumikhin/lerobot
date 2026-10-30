@@ -302,8 +302,9 @@ def test_n1_7_backbone_refuses_hidden_image_tokens_also_after_export(monkeypatch
         def forward(self, *tensors):
             return backbone(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
 
-    # One image token of the second prompt, and the whole second prompt.
-    refused = (hide(image_tokens[:1]), hide(slice(None)))
+    # In the second prompt: an image token, the text token between its images (eager would join them into one
+    # image), and every token.
+    refused = (hide(image_tokens[:1]), hide([image_tokens[3] + 1]), hide(slice(None)))
     with torch.no_grad():
         with prepare_image_grid():
             Backbone()(*(prompts[key] for key in keys))
@@ -314,8 +315,9 @@ def test_n1_7_backbone_refuses_hidden_image_tokens_also_after_export(monkeypatch
         for inputs in refused:
             with pytest.raises(RuntimeError):
                 program(*inputs)
-        text_hidden = hide([image_tokens[-1] + 1])
-        torch.testing.assert_close(program(*text_hidden), Backbone()(*text_hidden))
+        # Hiding the first token of the unpadded prompt only adds padding.
+        more_padding = hide([0])
+        torch.testing.assert_close(program(*more_padding), Backbone()(*more_padding))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

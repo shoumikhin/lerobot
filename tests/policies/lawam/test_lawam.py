@@ -63,6 +63,7 @@ from lerobot.policies.lawam.vlas.qwen3vl import (
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import NormalizerProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tests.utils import require_cuda
 
 
 def make_config() -> LaWAMConfig:
@@ -982,6 +983,18 @@ def _vlm_stage_setup(act_token: int = 10, flow_token: int = 11, num_queries: int
         "flow_query": flow_query,
     }
     return qwen, backend, inputs
+
+
+@require_cuda
+def test_vlm_stage_takes_placeholder_masks_on_the_host() -> None:
+    qwen, backend, inputs = _vlm_stage_setup()
+    qwen.cuda()
+    masks = ("act_placeholder_mask", "flow_placeholder_mask")
+    inputs = {key: value if key in masks else value.cuda() for key, value in inputs.items()}
+    with torch.no_grad():
+        output = backend()._run_vlm_stage(**inputs)
+    action_hidden = output["h_vlm"][inputs["act_placeholder_mask"].cuda()].view(2, 2, -1)
+    assert torch.equal(output["pred_latent"], action_hidden)
 
 
 def test_prepared_vlm_stage_exports_and_matches_stock_qwen(monkeypatch) -> None:
