@@ -1027,11 +1027,18 @@ def test_prepared_vlm_stage_exports_and_matches_stock_qwen(monkeypatch) -> None:
     # mode even with the switch that turns off the transformers checks.
     malformed = {**inputs, "act_placeholder_mask": inputs["act_placeholder_mask"].clone()}
     malformed["act_placeholder_mask"][1] = False
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        exported.module()(*(malformed[key] for key in keys))
+    # One placeholder moved from the second sample to the first: the total is right, the samples are not.
+    moved = {**inputs, "act_placeholder_mask": inputs["act_placeholder_mask"].clone()}
+    moved["act_placeholder_mask"][1, moved["act_placeholder_mask"][1].nonzero()[0, 0]] = False
+    moved["act_placeholder_mask"][0, 0] = True
+    for wrong in (malformed, moved):
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            exported.module()(*(wrong[key] for key in keys))
     monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     with torch.no_grad(), pytest.raises(ValueError, match="act_query placeholder count mismatch"):
         stock._run_vlm_stage(**malformed)
+    with torch.no_grad(), pytest.raises(ValueError, match="mismatch for sample 0"):
+        stock._run_vlm_stage(**moved)
     # Each sample's placeholders hold the queries in order, wherever the sample put its tokens.
     for name in ("act", "flow"):
         filled = text_inputs[0][inputs[f"{name}_placeholder_mask"]]
