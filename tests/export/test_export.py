@@ -29,7 +29,7 @@ from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
-from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
+from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
 from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
@@ -333,6 +333,49 @@ def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tm
     run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_tensorrt")
     manifest = Bundle.read(tmp_path / "b").manifest
     assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
+
+
+@needs_executorch_cuda
+def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
+    """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU, and only the
+    actions back."""
+    from lerobot.bundle.executorch import ExecuTorchProgram, prepare
+
+    # Before ExecuTorch loads: it reads the setting prepare() makes only once, when it loads.
+    prepare()
+    from executorch.runtime import ExecuTorchResult
+
+    use_plugins(monkeypatch, "noise_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_cuda")
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
+    # Every copy between the host and the GPU, also one that passes a program's output to the next program.
+    copies = []
+    to_gpu, to_host = ExecuTorchResult.from_host, ExecuTorchResult.to_host
+    monkeypatch.setattr(
+        ExecuTorchResult,
+        "from_host",
+        lambda value, device: copies.append(("to GPU", value.shape)) or to_gpu(value, device),
+    )
+    monkeypatch.setattr(
+        ExecuTorchResult,
+        "to_host",
+        lambda value: copies.append(("to host", tuple(value.shape))) or to_host(value),
+    )
+    engine = BundleEngine(bundle)
+    loaded = len(copies)
+    first = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
+    second = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
+    assert not np.array_equal(first, second)
+    assert copies[loaded:] == [("to GPU", (32, 32, 3)), ("to GPU", (3,)), ("to host", (4, 3))] * 2
+    # The policy samples from a standard normal, so the noise program must too.
+    files = bundle.manifest.programs[NOISE]
+    noise = ExecuTorchProgram(
+        bundle.path / files.file, None if files.data is None else bundle.path / files.data
+    )
+    count = 4000 // int(np.prod(bundle.manifest.noise_shape)) + 1
+    draws = np.concatenate([noise.to_numpy(noise()[0]).ravel() for _ in range(count)])
+    assert abs(draws.mean()) < 0.1 and abs(draws.std() - 1) < 0.1
 
 
 @pytest.mark.skipif(

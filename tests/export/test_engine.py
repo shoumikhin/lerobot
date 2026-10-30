@@ -153,6 +153,31 @@ def test_engine_feeds_the_test_case_noise_and_samples_its_own_after(tmp_path):
         BundleEngine(bundle)
 
 
+class DrawNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.randn(3, 3)
+
+
+def test_engine_runs_the_noise_draw_and_checks_with_the_recorded_noise(tmp_path, monkeypatch):
+    """A GPU bundle draws its noise in a run: a chunk then copies only the frame."""
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    torch.export.save(torch.export.export(DrawNoise(), ()), bundle.path / "noise.pt2")
+    manifest = json.loads((bundle.path / MANIFEST).read_text())
+    _edit(
+        bundle,
+        programs={**manifest["programs"], NOISE: {"file": "noise.pt2", "data": None}},
+        runs=[{"name": NOISE, "program": NOISE, "inputs": [], "outputs": [NOISE]}, *manifest["runs"]],
+    )
+    placed = record_places(monkeypatch)
+    # The check passes only with the test case's noise, so the draw did not run for it.
+    engine = BundleEngine(Bundle.read(bundle.path))
+    loaded = len(placed)
+    first = np.stack([engine.get_action(FRAME) for _ in range(3)])
+    second = np.stack([engine.get_action(FRAME) for _ in range(3)])
+    assert not np.array_equal(first, second)
+    assert placed[loaded:] == [(3,)] * 2
+
+
 def test_engine_applies_the_runtime_options_of_its_bundle(tmp_path, monkeypatch):
     applied = []
     monkeypatch.setitem(RUNTIMES, "torch_test", replace(RUNTIMES["torch_test"], configure=applied.append))
