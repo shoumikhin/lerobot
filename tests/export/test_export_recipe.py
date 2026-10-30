@@ -118,6 +118,26 @@ def test_recipe_measures_the_action_scale_from_the_postprocessor():
     np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
 
 
+class FirstTwoActions(ProcessorStep):
+    """Keeps the first two actions, as a postprocessor that crops a padded model width once unnormalized."""
+
+    def __call__(self, transition):
+        return {**transition, TransitionKey.ACTION: transition[TransitionKey.ACTION][..., :2]}
+
+    def transform_features(self, features):
+        return features
+
+
+def test_recipe_measures_the_action_scale_at_the_width_the_postprocessor_takes():
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    # Right after the unnormalizer, which needs all three actions.
+    postprocessor.steps.insert(1, FirstTwoActions())
+    recipe = ActionChunkRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config())
+    np.testing.assert_allclose(recipe.test_case().action_scale, [30.0, 3.0], rtol=1e-6)
+
+
 def test_recipe_takes_the_tolerance_and_the_seed_it_is_given():
     states = []
     for seed in (0, 7):
@@ -237,6 +257,22 @@ class NoChunkSpecACT(ACTPolicy):
 def test_recipe_refuses_a_checkpoint_whose_chunk_spec_fails():
     with pytest.raises(ValueError, match="checkpoint cannot be exported: n_action_steps is larger"):
         make(NoChunkSpecACT)
+
+
+class NonFiniteACT(ACTPolicy):
+    """ACT that adds `value`, NaN or infinity, to its actions. Only the finite check catches infinity."""
+
+    value = float("nan")
+
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        return super().predict_action_chunk(batch) + self.value
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_recipe_refuses_a_policy_whose_actions_are_not_finite(monkeypatch, value):
+    monkeypatch.setattr(NonFiniteACT, "value", value)
+    with pytest.raises(ValueError, match="computes actions that are not finite"):
+        make(NonFiniteACT)
 
 
 def test_replayed_draws_read_the_noise_in_order():
