@@ -23,7 +23,9 @@ from ..configs import ExportBackendConfig
 
 if TYPE_CHECKING:
     from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
-    from executorch.exir import ExecutorchBackendConfig
+    from executorch.exir import EdgeProgramManager, ExecutorchBackendConfig
+    from executorch.exir.backend.partitioner import Partitioner
+    from torch.export import ExportedProgram
 
 EXECUTORCH = "executorch>=1.6.0,<1.7.0"
 
@@ -38,6 +40,23 @@ class ExecuTorchConfig(ExportBackendConfig):
     packages = (EXECUTORCH,)
     min_torch = "2.15"
     torch_overrides = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
+
+
+def lower(program: ExportedProgram, partitioner: Partitioner) -> EdgeProgramManager:
+    """`program` lowered with `partitioner`, the values it computes from constants alone folded first.
+
+    A backend that takes only part of a program may lack an op that just builds a constant, such as position
+    ids, and an op left on the CPU splits the program in two. A backend may also take a linear layer only when
+    its weights are constants, while attention layers slice theirs at run time.
+    """
+    from executorch.exir import to_edge_transform_and_lower
+    from executorch.exir.passes.constant_prop_pass import constant_prop_pass
+
+    # Folding skips in-place ops, so a value written in place from constants, as `ids[mask] = ...`, needs the
+    # functional form first. No op is decomposed here.
+    return to_edge_transform_and_lower(
+        constant_prop_pass(program.run_decompositions({})), partitioner=[partitioner]
+    )
 
 
 def gpu_memory_config() -> ExecutorchBackendConfig:
