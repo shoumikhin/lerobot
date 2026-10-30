@@ -18,6 +18,8 @@ Each bundle is played next to the PyTorch policy in `lerobot-rollout`'s engines,
 same random draws, for more ticks than one chunk, so both the history and the noise are exercised.
 """
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -128,6 +130,38 @@ def diffusion_checkpoint(path, **sampler) -> None:
     _save(config, stats, path)
 
 
+def multi_task_dit_checkpoint(path, **sampler) -> None:
+    from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
+
+    config = MultiTaskDiTConfig(
+        input_features={
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        # Three, so the test case of two ticks also has a frame the first one stands in for.
+        n_obs_steps=3,
+        horizon=8,
+        n_action_steps=4,
+        num_train_timesteps=10,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=2,
+        timestep_embed_dim=16,
+        # CLIP takes 224 x 224 images; the policy resizes the camera's.
+        image_resize_shape=(224, 224),
+        image_crop_shape=None,
+        device="cpu",
+        **sampler,
+    )
+    stats = {
+        IMAGE: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
+        OBS_STATE: _min_max(2),
+        ACTION: _min_max(2),
+    }
+    _save(config, stats, path)
+
+
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
     get_policy_class(config.type)(config).save_pretrained(path)
@@ -141,12 +175,32 @@ CHECKPOINTS = {
     "diffusion_ddim": lambda path: diffusion_checkpoint(
         path, noise_scheduler_type="DDIM", prediction_type="sample", num_inference_steps=5
     ),
+    "multi_task_dit": multi_task_dit_checkpoint,
+    "multi_task_dit_flow": lambda path: multi_task_dit_checkpoint(
+        path, objective="flow_matching", num_integration_steps=5
+    ),
 }
+
+
+# Multi-Task DiT loads its CLIP encoders from the Hub, so like its own tests it does not run in CI.
+CLIP = pytest.mark.skipif(
+    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="Multi-Task DiT downloads CLIP from the Hub",
+)
 
 
 # Diffusion Policy and Multi-Task DiT sample with the schedulers of diffusers, an optional package.
 DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="diffusers not installed")
-MARKS = {"diffusion": [DIFFUSERS], "diffusion_ddim": [DIFFUSERS]}
+# Multi-Task DiT also encodes the task and the images with CLIP from transformers.
+TRANSFORMERS = pytest.mark.skipif(
+    not is_package_available("transformers"), reason="transformers not installed"
+)
+MARKS = {
+    "diffusion": [DIFFUSERS],
+    "diffusion_ddim": [DIFFUSERS],
+    "multi_task_dit": [CLIP, DIFFUSERS, TRANSFORMERS],
+    "multi_task_dit_flow": [CLIP, DIFFUSERS, TRANSFORMERS],
+}
 
 
 @pytest.fixture(
@@ -162,7 +216,13 @@ def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
     """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws."""
     policy = get_policy_class(PreTrainedConfig.from_pretrained(checkpoint).type).from_pretrained(checkpoint)
     reference = SyncInferenceEngine(
-        policy, *make_pre_post_processors(policy.config, checkpoint), {}, [], "", "cpu", ""
+        policy,
+        *make_pre_post_processors(policy.config, checkpoint),
+        {},
+        [],
+        bundle.manifest.task or "",
+        "cpu",
+        "",
     )
     engine = BundleEngine(bundle)
     draws: list[np.ndarray] = []
@@ -192,7 +252,15 @@ def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(checkpoint, tmp_path, backend, monkeypatch):
-    export([f"--backend.type={backend}", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"])
+    export(
+        [
+            f"--backend.type={backend}",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={tmp_path / 'b'}",
+            # Multi-Task DiT reads the task; the others ignore it.
+            "--task=pick up the cube",
+        ]
+    )
     bundle = Bundle.read(tmp_path / "b")
     steps = PreTrainedConfig.from_pretrained(checkpoint).n_obs_steps
     assert bundle.manifest.history == {IMAGE: steps, OBS_STATE: steps}
