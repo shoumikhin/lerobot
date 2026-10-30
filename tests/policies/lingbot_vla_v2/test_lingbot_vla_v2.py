@@ -462,3 +462,22 @@ def test_sparse_moe_matches_per_token_reference():
 
     actual = experts._sparse_forward(weights, selected, hidden)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_a_given_noise_runs_in_the_model_dtype(tiny_backbone):
+    """A float32 starting noise, as callers draw it, runs in the dtype of a bfloat16 policy."""
+    cfg = _tiny_config(tiny_backbone, **_slot_kwargs(arm=[[0, 6]], effector=[[6, 7]]))
+    cfg.dtype = torch.bfloat16
+    meta = _ds_meta(7)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    raw = _raw_batch(7)
+    raw.pop(ACTION)
+    batch = preprocessor(raw)
+    noise = torch.randn(2, CHUNK, cfg.max_action_dim)
+
+    with torch.no_grad():
+        given = policy.predict_action_chunk(batch, noise=noise.clone())
+        cast = policy.predict_action_chunk(batch, noise=noise.to(torch.bfloat16))
+
+    torch.testing.assert_close(given, cast, rtol=0, atol=0)
