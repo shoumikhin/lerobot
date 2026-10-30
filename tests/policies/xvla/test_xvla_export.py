@@ -105,14 +105,14 @@ def test_export_with_a_padding_view_has_fixed_shapes():
 
     model = Predict()
     ep = torch.export.export(model, (ids, state, images, noise))
-    # Fixed-shape backends such as Torch-TensorRT cannot run sizes that depend on tensor values. The only
-    # data-dependent value allowed is the mask check, which export pins to true; a size would keep a range.
+    # Fixed-shape backends such as Torch-TensorRT cannot run sizes that depend on tensor values, and a check
+    # on a tensor value makes a GPU program read it back to the host on every run.
     assert not [n for n in ep.graph.nodes if "nonzero" in str(n.target)]
-    assert all(r.lower == r.upper for r in ep.range_constraints.values())
+    assert not ep.range_constraints
     assert torch.equal(ep.module()(ids, state, images, noise), model(ids, state, images, noise))
 
 
-def test_forward_vlm_checks_a_given_view_count_and_takes_any_mask_without_one():
+def test_forward_vlm_takes_the_first_views_given_a_count_and_any_mask_without_one():
     model = tiny_policy().model
     gen = torch.Generator().manual_seed(0)
     ids = torch.randint(3, 1000, (2, 8), generator=gen)
@@ -121,8 +121,8 @@ def test_forward_vlm_checks_a_given_view_count_and_takes_any_mask_without_one():
     counted = model.forward_vlm(ids, images, prefix, num_valid_views=2)
     read = model.forward_vlm(ids, images, prefix)
     assert counted.keys() == read.keys() and all(torch.equal(counted[k], read[k]) for k in read)
+    unread = model.forward_vlm(ids, images, torch.ones(2, 3), num_valid_views=2)
+    assert all(torch.equal(counted[k], unread[k]) for k in counted)
     model.forward_vlm(ids, images, torch.tensor([[1, 0, 1], [1, 1, 1]]))
-    with pytest.raises(ValueError, match="first 2 views"):
-        model.forward_vlm(ids, images, torch.tensor([[1, 1, 1], [1, 1, 0]]), num_valid_views=2)
     with pytest.raises(ValueError, match="At least one image view"):
         model.forward_vlm(ids, images, torch.zeros(2, 3), num_valid_views=0)
