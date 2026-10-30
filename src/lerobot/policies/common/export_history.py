@@ -38,9 +38,6 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
-# In normalized action units. Float32 rounding through 100 denoising steps measured 3e-8 on an A100.
-CHAIN_TOLERANCE = 1e-6
-
 
 class HistoryChunkRecipe(ActionChunkRecipe):
     """The default recipe's frame, task and checks, for a policy that reads its last `n_obs_steps` frames.
@@ -149,10 +146,10 @@ class HistoryChunkRecipe(ActionChunkRecipe):
         ):
             with torch.no_grad():
                 actions = run(*self._history_inputs(case_ticks, case_noise)).cpu().numpy()
-            # Not bit for bit: on a GPU, dividing by a CPU scalar, as a scheduler does, is a multiplication by
-            # its inverse, so a program that divides by a constant differs from the policy by an ulp.
+            # Not bit for bit: on a GPU the parts and the policy sum in other orders, so they drift apart by
+            # float32 rounding, as a compiled program does, and are held to the export's tolerance.
             difference = float((np.abs(actions - expected) / self._case.action_scale).max())
-            if difference > CHAIN_TOLERANCE:
+            if difference > self.tolerance:
                 raise ValueError(
                     f"The exported parts of the {self.policy.config.type} policy compute another chunk than "
                     f"the policy itself (largest difference {difference:.3g} of the actions' spread)."

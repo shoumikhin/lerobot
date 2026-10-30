@@ -29,9 +29,11 @@ from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import Bundle
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.export import worker
 from lerobot.export.recipe import ReplayDraws
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
+from lerobot.policies.common.export_history import HistoryChunkRecipe
 from lerobot.policies.factory import get_policy_class
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -305,3 +307,27 @@ def test_a_schedule_the_step_cannot_compute_is_refused(change, error):
     scheduler.set_timesteps(10)
     with pytest.raises(ValueError, match=error):
         scheduler_schedule(scheduler)
+
+
+# In normalized action units: how far diffusion's parts drifted from the policy on a Jetson Thor GPU, and ten
+# times float32's tolerance.
+@pytest.mark.parametrize(("offset", "passes"), [(1.8e-6, True), (2e-4, False)])
+def test_the_parts_are_held_to_the_export_tolerance(tmp_path, monkeypatch, offset, passes):
+    vqbet_checkpoint(tmp_path / "ckpt")
+    check = HistoryChunkRecipe._check_chain
+
+    def drifted(self, run):
+        scale = torch.as_tensor(self._case.action_scale)
+        return check(self, lambda *inputs: run(*inputs) + offset * scale)
+
+    monkeypatch.setattr(HistoryChunkRecipe, "_check_chain", drifted)
+    args = [
+        "--backend.type=torch_test",
+        f"--policy.path={tmp_path / 'ckpt'}",
+        f"--output_dir={tmp_path / 'b'}",
+    ]
+    if passes:
+        worker.trace_step({"step": "trace", "args": args})
+    else:
+        with pytest.raises(ValueError, match="compute another chunk"):
+            worker.trace_step({"step": "trace", "args": args})
