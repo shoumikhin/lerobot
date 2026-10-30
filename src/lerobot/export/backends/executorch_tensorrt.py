@@ -45,6 +45,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     device = "cuda"
     # Registers the TensorRT backend with the ExecuTorch runtime.
     runtime_imports = ("torch_tensorrt_executorch_runtime",)
+    runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
+    # TensorRT loads an engine only with the TensorRT version that built it, unless built version compatible.
+    exact_runtime_modules = ("tensorrt",)
     packages = (EXECUTORCH, "torch_tensorrt[executorch]")
 
     workspace_size: int | None = None

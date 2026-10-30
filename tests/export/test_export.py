@@ -371,6 +371,20 @@ def test_the_trace_step_records_only_action_names_a_robot_can_have(
     assert traced["manifest"].get("action_names") == recorded
 
 
+def test_the_trace_step_records_what_the_programs_were_built_for_and_with(checkpoint, tmp_path, monkeypatch):
+    from lerobot.bundle.manifest import Target
+
+    monkeypatch.setattr(TorchTestBackend, "target", lambda self: Target("cuda", "Orin", "8.7"))
+    monkeypatch.setattr(TorchTestBackend, "runtime_modules", ("numpy", "not_a_module"))
+    monkeypatch.setattr(TorchTestBackend, "exact_runtime_modules", ("numpy",))
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
+    manifest = worker.trace_step({"args": args, "folders": str(tmp_path / "folders.json")})["manifest"]
+    assert manifest["target"] == {"device": "cuda", "gpu": "Orin", "compute_capability": "8.7"}
+    assert manifest["runtime_versions"] == {"numpy": np.__version__}
+    assert manifest["exact_runtime_modules"] == ["numpy"]
+
+
 @pytest.mark.usefixtures("restore_torch_backend_flags")
 def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     seen = []
