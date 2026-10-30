@@ -20,6 +20,7 @@ from torch import nn
 
 transformers = pytest.importorskip("transformers")
 
+from lerobot.policies.factory import get_export_recipe_class  # noqa: E402
 from lerobot.policies.pi0_fast import modeling_pi0_fast  # noqa: E402
 from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig  # noqa: E402
 from lerobot.policies.pi_gemma import PaliGemmaForConditionalGenerationWithPiGemma  # noqa: E402
@@ -99,3 +100,10 @@ def test_greedy_decoding_exports_and_keeps_its_early_stop_under_torch_compile(mo
         # The exported loop runs every step: the tokens after the marker differ and decoding drops them.
         exported = torch.export.export(model, inputs, strict=False).module()(*inputs)
     assert exported[:, 0].tolist() == [END_OF_ACTION] * 2
+
+
+def test_lerobot_export_refuses_pi0_fast_before_loading_the_checkpoint():
+    recipe = get_export_recipe_class(PI0FastConfig())
+
+    with pytest.raises(ValueError, match="pi0-FAST cannot be exported: it decodes its actions"):
+        recipe.load(cfg=None)
