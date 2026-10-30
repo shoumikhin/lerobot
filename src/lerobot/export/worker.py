@@ -31,6 +31,7 @@ from typing import Any, cast
 
 import draccus
 import torch
+from torch._higher_order_ops.wrap import wrap_with_autocast
 
 from lerobot.bundle.manifest import (
     CONSTANTS,
@@ -53,6 +54,7 @@ from lerobot.utils.import_utils import PLUGIN_KINDS
 from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
+from .recipe import Part
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,17 @@ class _DrawNoise(torch.nn.Module):
 
     def forward(self) -> torch.Tensor:
         return torch.randn(self.shape, dtype=self.dtype, device=self.device)
+
+
+def export_part(part: Part) -> torch.export.ExportedProgram:
+    """The part traced by `torch.export`, ready to save for the compile step."""
+    with torch.no_grad():
+        program = torch.export.export(part.module, part.example_inputs)
+    if any(node.target is wrap_with_autocast for node in program.graph.nodes):
+        # PyTorch saves some programs with autocast regions that it then cannot load. With an empty table,
+        # run_decompositions only inlines the regions; no operator is decomposed.
+        program = program.run_decompositions({})
+    return program
 
 
 def trace_step(request: dict[str, Any]) -> dict[str, Any]:
@@ -94,8 +107,7 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
         runs: list[ProgramRun] = []
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
-            with torch.no_grad():
-                program = torch.export.export(part.module, part.example_inputs)
+            program = export_part(part)
             torch.export.save(program, traced / f"{part.name}.pt2")
             programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
