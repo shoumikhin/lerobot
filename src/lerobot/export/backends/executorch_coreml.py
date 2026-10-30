@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import ExecuTorchConfig
+from .executorch import ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -68,13 +68,10 @@ class ExecuTorchCoreMLConfig(ExecuTorchConfig):
         import coremltools as ct
         from executorch.backends.apple.coreml.compiler import CoreMLBackend
         from executorch.backends.apple.coreml.partition import CoreMLPartitioner
-        from executorch.exir import to_edge_transform_and_lower
 
         compile_specs = CoreMLBackend.generate_compile_specs(
             compute_unit=ct.ComputeUnit[self.compute_units.upper()],
             compute_precision=ct.precision[self.compute_precision.upper()],
         )
-        edge = to_edge_transform_and_lower(
-            program, partitioner=[CoreMLPartitioner(compile_specs=compile_specs)]
-        )
+        edge = lower(program, CoreMLPartitioner(compile_specs=compile_specs))
         path.write_bytes(edge.to_executorch().buffer)
