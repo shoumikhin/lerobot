@@ -22,6 +22,7 @@ import draccus
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version
 from safetensors.numpy import load_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -35,6 +36,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
@@ -272,7 +274,15 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
 
 
-BACKENDS = ["torch_test"]
+# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
+EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
+BACKENDS = [
+    "torch_test",
+    pytest.param(
+        "executorch_xnnpack",
+        marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
+    ),
+]
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
