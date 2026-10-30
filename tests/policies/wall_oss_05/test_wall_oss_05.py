@@ -973,6 +973,8 @@ def test_fixed_grid_positions_follow_eager_whatever_tokens_are_hidden():
     input_ids = torch.tensor([[4, 29, 28, 28, 30, 6, 29, 28, 28, 30, 7], [4, 7, 8, 9, 10, 11, 12, 29, 28, 28, 30]])
     grid = Qwen2_5VisionGrid.build(model.visual, grids)
     masks = hidden_token_masks(torch.ones_like(input_ids))
+    masks.append(torch.ones_like(input_ids))
+    masks[-1][1, -3:] = 0  # the last image's start token becomes the last visible token
     refused = count_refusals_where_eager_fails(
         lambda mask: model._position_ids(input_ids, mask, grids),
         lambda mask: model._position_ids(input_ids, mask, grids, grid),

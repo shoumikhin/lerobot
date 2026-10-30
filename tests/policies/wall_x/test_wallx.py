@@ -356,8 +356,16 @@ def test_fixed_grid_positions_follow_get_rope_index_whatever_tokens_are_hidden()
         return policy._static_grid_inputs(batch, grid)["position_ids"]
 
     masks = hidden_token_masks(torch.ones_like(input_ids))
+    masks.append(torch.ones_like(input_ids))
+    masks[-1][1, -3:] = 0  # the last image's start token becomes the last visible token
     refused = count_refusals_where_eager_fails(eager, fixed, masks, (IndexError, ValueError, RuntimeError), "lie within")
     assert 0 < refused < len(masks)
+    # More images than grids fails the eager code too.
+    with pytest.raises(IndexError):
+        model.get_rope_index(input_ids, grids[:2], attention_mask=torch.ones_like(input_ids))
+    batch = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "image_grid_thw": grids[:2]}
+    with pytest.raises(ValueError, match="have a grid"):
+        policy._static_grid_inputs(batch, Qwen2_5VisionGrid.build(model.visual, grids[:2]))
 
 
 @pytest.mark.skipif(
