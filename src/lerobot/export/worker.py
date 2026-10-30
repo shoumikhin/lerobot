@@ -32,7 +32,7 @@ from typing import Any, cast
 import draccus
 import torch
 
-from lerobot.bundle.manifest import CONSTANTS, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.manifest import CONSTANTS, NOISE, Bundle, BundleManifest, ProgramFiles, ProgramRun
 from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
@@ -56,6 +56,19 @@ def _robot_action_names(names: list[str] | None) -> list[str] | None:
     a PyTorch policy. A checkpoint can also save an empty list, which names no actions.
     """
     return names if names and all(name.endswith(MOTOR_CHANNEL_SUFFIXES) for name in names) else None
+
+
+class _DrawNoise(torch.nn.Module):
+    """The starting noise of the runs, standard normal, drawn on the device the program runs on."""
+
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype, device: str):
+        super().__init__()
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+
+    def forward(self) -> torch.Tensor:
+        return torch.randn(self.shape, dtype=self.dtype, device=self.device)
 
 
 def set_log_level(level: str) -> None:
@@ -124,13 +137,21 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             del part, program
         plan = recipe.plan()
         test_case = recipe.test_case()
+        runs = runs if plan.runs is None else plan.runs
+        if test_case.noise is not None and cfg.backend.device == "cuda":
+            # Drawn where the programs read it, so a chunk uploads only the robot's frame.
+            noise = torch.from_numpy(test_case.noise)
+            draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
+            torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
+            programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
+            runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
             runtime_imports=list(cfg.backend.runtime_imports),
             runtime_options=cfg.backend.runtime_options,
             programs=programs,
-            runs=runs if plan.runs is None else plan.runs,
+            runs=runs,
             constants=CONSTANTS if plan.constants else None,
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
             task=recipe.task,

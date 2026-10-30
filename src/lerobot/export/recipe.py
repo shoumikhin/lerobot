@@ -70,7 +70,7 @@ class Part:
 
     Args:
         name (`str`):
-            The program's name, such as `model`.
+            The program's name, such as `model`. Not `noise`, the name of the noise draw on CUDA.
         module (`nn.Module`):
             What the program computes, on the backend's device.
         example_inputs (`tuple[Tensor, ...]`):
@@ -88,10 +88,14 @@ class Part:
     outputs: list[str]
 
     def __post_init__(self) -> None:
-        """Refuse inputs without one name each or one tensor given for two.
+        """Refuse a reserved name, inputs without one name each or one tensor given for two.
 
         Keeps the example inputs contiguous.
         """
+        if self.name == NOISE:
+            raise ValueError(
+                f"A part cannot be named {NOISE}: on CUDA, a bundle draws its noise with a program so named."
+            )
         if len(self.inputs) != len(self.example_inputs):
             raise ValueError(
                 f"The part {self.name} has a different number of input names ({len(self.inputs)}) and "
@@ -135,6 +139,8 @@ class TestCase:
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
+    No run is named `noise` or runs a program so named: on CUDA, that is the noise draw.
+
     Args:
         runs (`list[ProgramRun]`, *optional*):
             The runs in order, each naming the part it runs as its program. A part may run several times, for
@@ -146,6 +152,14 @@ class RunPlan:
 
     runs: list[ProgramRun] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Refuse a run named like the one that draws a bundle's noise on CUDA, or a run of its program."""
+        if any(NOISE in (run.name, run.program) for run in self.runs or []):
+            raise ValueError(
+                f"A run cannot be named {NOISE} or run a program so named: on CUDA, a bundle draws its noise "
+                "with a run and a program so named."
+            )
 
 
 class ExportRecipe(abc.ABC):

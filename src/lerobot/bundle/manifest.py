@@ -117,7 +117,8 @@ class BundleManifest:
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
-            none.
+            none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
+            case's recorded noise replaces the draw when the bundle checks itself.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):

@@ -33,7 +33,7 @@ import torch
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
-from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
+from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
 from lerobot.export import worker
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
@@ -44,6 +44,7 @@ from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
 from tests.export.backends import (
     needs_executorch,
     needs_executorch_coreml,
+    needs_executorch_cuda,
     needs_executorch_openvino,
 )
 from tests.export.plugins import use_plugins
@@ -542,6 +543,13 @@ def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     assert seen == [(False, False, False)]
 
 
+def test_the_noise_program_draws_another_standard_normal_noise_each_run():
+    program = torch.export.export(worker._DrawNoise((4000,), torch.float32, "cpu"), ()).module()
+    first, second = program(), program()
+    assert first.shape == (4000,) and not torch.equal(first, second)
+    assert abs(first.mean()) < 0.1 and abs(first.std() - 1) < 0.1
+
+
 def test_the_compile_step_names_what_its_backend_needs_installed(tmp_path, monkeypatch):
     def compile_without_its_compiler(self, program, path):
         raise ModuleNotFoundError("No module named 'compiler'")
@@ -751,6 +759,62 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
     )
     with pytest.raises(RuntimeError, match="The bundle crashed with SIGSEGV"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+
+
+@needs_executorch_cuda
+def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
+    """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU, and only the
+    actions back."""
+    from executorch.runtime import ExecuTorchResult
+
+    from lerobot.bundle.executorch import ExecuTorchProgram
+
+    use_plugins(monkeypatch, "noise_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_cuda")
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
+    # Every copy between the host and the GPU, also one that passes a program's output to the next program.
+    copies = []
+    to_gpu, to_host = ExecuTorchResult.from_host, ExecuTorchResult.to_host
+    monkeypatch.setattr(
+        ExecuTorchResult,
+        "from_host",
+        lambda value, device: copies.append(("to GPU", value.shape)) or to_gpu(value, device),
+    )
+    monkeypatch.setattr(
+        ExecuTorchResult,
+        "to_host",
+        lambda value: copies.append(("to host", tuple(value.shape))) or to_host(value),
+    )
+    engine = BundleEngine(bundle)
+    loaded = len(copies)
+    first = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
+    second = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
+    assert not np.array_equal(first, second)
+    assert copies[loaded:] == [("to GPU", (32, 32, 3)), ("to GPU", (3,)), ("to host", (4, 3))] * 2
+    # The policy samples from a standard normal, so the noise program must too.
+    files = bundle.manifest.programs[NOISE]
+    noise = ExecuTorchProgram(
+        bundle.path / files.file, None if files.data is None else bundle.path / files.data
+    )
+    count = 4000 // int(np.prod(bundle.manifest.noise_shape)) + 1
+    draws = np.concatenate([noise.to_numpy(noise()[0]).ravel() for _ in range(count)])
+    assert abs(draws.mean()) < 0.1 and abs(draws.std() - 1) < 0.1
+
+
+@needs_executorch
+def test_the_compiled_noise_program_draws_another_noise_each_run(tmp_path):
+    """A compiler that folded the draw into a constant would play one noise forever."""
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
+
+    program = torch.export.export(worker._DrawNoise((4000,), torch.float32, "cpu"), ())
+    with torch.no_grad():
+        ExecuTorchXNNPACKConfig().compile(program, tmp_path / "noise.pte")
+    noise = ExecuTorchProgram(tmp_path / "noise.pte")
+    first, second = (noise.to_numpy(noise()[0]) for _ in range(2))
+    assert first.shape == (4000,) and not np.array_equal(first, second)
+    assert abs(first.mean()) < 0.1 and abs(first.std() - 1) < 0.1
 
 
 @needs_executorch_coreml

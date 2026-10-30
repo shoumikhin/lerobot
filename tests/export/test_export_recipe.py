@@ -181,6 +181,19 @@ def test_a_part_refuses_inputs_without_one_name_each():
         Part("p", torch.nn.Identity(), (torch.zeros(2), torch.ones(2)), ["a"], ["y"])
 
 
+def test_a_part_or_a_run_cannot_take_the_name_of_the_noise_draw():
+    from lerobot.bundle.manifest import ProgramRun
+    from lerobot.export.recipe import Part, RunPlan
+
+    with pytest.raises(ValueError, match="A part cannot be named noise"):
+        Part("noise", torch.nn.Identity(), (torch.zeros(2),), ["a"], ["y"])
+    named = ProgramRun("noise", "model", ["observation.state"], ["action"])
+    running = ProgramRun("draw", "noise", [], ["noise"])
+    for plan in ({"runs": [named]}, {"runs": [running]}):
+        with pytest.raises(ValueError, match="A run cannot be named noise or run a program so named"):
+            RunPlan(**plan)
+
+
 def test_recipe_asks_the_policy_for_its_noise_shape():
     recipe = make(NoisyACT)
     assert recipe.test_case().noise.shape == (4, 5)

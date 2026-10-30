@@ -214,6 +214,102 @@ def test_engine_feeds_the_test_case_noise_and_samples_its_own_after(tmp_path):
         BundleEngine(bundle)
 
 
+class DrawNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.randn(3, 3)
+
+
+def _draw_noise_in_a_run(bundle: Bundle, draw: nn.Module, inputs: tuple[str, ...] = ()) -> None:
+    """Make the bundle draw its noise with `draw` in a run of its own, as a bundle on a CUDA device does."""
+    torch.export.save(torch.export.export(draw, ()), bundle.path / "noise.pt2")
+    manifest = json.loads((bundle.path / MANIFEST).read_text())
+    _edit(
+        bundle,
+        programs={**manifest["programs"], NOISE: {"file": "noise.pt2", "data": None}},
+        runs=[
+            {"name": NOISE, "program": NOISE, "inputs": list(inputs), "outputs": [NOISE]},
+            *manifest["runs"],
+        ],
+    )
+
+
+def test_engine_runs_the_noise_draw_and_checks_with_the_recorded_noise(tmp_path, monkeypatch):
+    """A bundle on a CUDA device draws its noise in a run: a chunk then copies only the frame."""
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    _draw_noise_in_a_run(bundle, DrawNoise())
+    placed = record_places(monkeypatch)
+    # The check passes only with the test case's noise, so the draw did not run for it.
+    engine = BundleEngine(Bundle.read(bundle.path))
+    loaded = len(placed)
+    first = np.stack([engine.get_action(FRAME) for _ in range(3)])
+    second = np.stack([engine.get_action(FRAME) for _ in range(3)])
+    assert not np.array_equal(first, second)
+    assert placed[loaded:] == [(3,)] * 2
+
+
+class ConstantNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.full((3, 3), 1000.0)
+
+
+class ZeroNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.zeros(3, 3)
+
+
+class WideNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.randn(3, 4)
+
+
+class DoubleNoise(nn.Module):
+    def forward(self) -> Tensor:
+        return torch.randn(3, 3, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("draw", [ConstantNoise, ZeroNoise, WideNoise, DoubleNoise])
+def test_engine_refuses_a_noise_draw_that_is_not_standard_normal_noise(tmp_path, draw):
+    """The test case's noise stands in for the draw when the chunks replay, so the check runs it alone."""
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    _draw_noise_in_a_run(bundle, draw())
+    with pytest.raises(RuntimeError, match=r"not standard normal noise shaped \[3, 3\]"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_noise_draw_that_reads_a_value(tmp_path):
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    _draw_noise_in_a_run(bundle, DrawNoise(), inputs=(OBS_STATE,))
+    with pytest.raises(ValueError, match=r"draws the noise from \['observation.state'\]"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_noise_draw_when_the_bundle_gives_no_noise_shape(tmp_path):
+    """Without a shape the draw cannot be checked, and a live draw would decide the test case."""
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    _draw_noise_in_a_run(bundle, DrawNoise())
+    case = load_file(bundle.path / TEST_CASE)
+    del case[NOISE]
+    save_file(case, bundle.path / TEST_CASE)
+    _edit(bundle, noise_shape=None, tolerance=1e9)
+    with pytest.raises(RuntimeError, match="not standard normal noise shaped None"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_noise_draw_that_writes_more_than_the_noise(tmp_path):
+    bundle = _noisy_bundle(tmp_path / "bundle")
+    manifest = json.loads((bundle.path / MANIFEST).read_text())
+    _edit(
+        bundle,
+        programs={**manifest["programs"], NOISE: {"file": "noise.pt2", "data": None}},
+        runs=[
+            {"name": NOISE, "program": NOISE, "inputs": [], "outputs": [NOISE, "extra"]},
+            *manifest["runs"],
+        ],
+    )
+    with pytest.raises(ValueError, match=r"writes 'noise' and \['extra'\]"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
 def test_engine_applies_the_runtime_options_of_its_bundle(tmp_path, monkeypatch):
     applied = []
     monkeypatch.setitem(RUNTIMES, "torch_test", replace(RUNTIMES["torch_test"], configure=applied.append))
