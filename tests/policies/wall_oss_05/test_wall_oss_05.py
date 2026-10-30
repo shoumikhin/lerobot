@@ -52,12 +52,7 @@ from lerobot.processor import (
     transition_to_batch,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
-from tests.policies.common.fixed_grid_checks import (
-    count_grid_builds,
-    count_refusals_where_eager_fails,
-    data_dependent_nodes,
-    hidden_token_masks,
-)
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
 
 
 @pytest.fixture
@@ -964,32 +959,8 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
         policy.predict_action_chunk(malformed, noise=noise.clone())
 
 
-def test_fixed_grid_positions_follow_eager_whatever_tokens_are_hidden():
-    model = _tiny_policy().model
-    # Two shapes with one token count, and two images in a row, so a grid given to the wrong image, or an
-    # image block moved by a hidden token, changes the positions. An image block that runs past the last
-    # visible token makes the eager code fail, which hidden tokens at the end of the second row can cause.
-    grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
-    input_ids = torch.tensor(
-        [[4, 29, 28, 28, 30, 6, 29, 28, 28, 30, 7], [4, 7, 8, 9, 10, 11, 12, 29, 28, 28, 30]]
-    )
-    grid = Qwen2_5VisionGrid.build(model.visual, grids)
-    masks = hidden_token_masks(torch.ones_like(input_ids))
-    masks.append(torch.ones_like(input_ids))
-    masks[-1][1, -3:] = 0  # the last image's start token becomes the last visible token
-    refused = count_refusals_where_eager_fails(
-        lambda mask: model._position_ids(input_ids, mask, grids),
-        lambda mask: model._position_ids(input_ids, mask, grids, grid),
-        masks,
-        (IndexError, ValueError, RuntimeError),
-        "lie within",
-    )
-    assert 0 < refused < len(masks)
-
-
-def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
+def test_preparation_and_export_refuse_hidden_vision_tokens():
     policy = _tiny_policy()
-    # Two images per sample with the same token count but different shapes.
     image = [29, 28, 28, 30]
     ids = torch.tensor([[0, 0, 4, *image, *image, 6, 31, 31], [4, 5, 4, *image, *image, 6, 31, 31]])
     batch = {
@@ -1001,9 +972,20 @@ def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
         "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
     }
     noise = torch.randn(2, 2, policy.config.max_action_dim)
+    keys = sorted(batch)
+
+    def hide(tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[1, tokens] = False
+        return {**batch, "attention_mask": attention_mask}
+
+    # In the second prompt: the vision start token, an image token, the vision end token, and every token.
+    refused = (hide(3), hide(4), hide(6), hide(slice(None)))
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
-    keys = sorted(batch)
+        for inputs in refused:
+            with pytest.raises(ValueError, match="must show every image"):
+                policy.predict_action_chunk(inputs, noise=noise.clone())
 
     class PredictActionChunk(nn.Module):
         def forward(self, noise, *tensors):
@@ -1012,14 +994,10 @@ def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
     program = torch.export.export(
         PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
     ).module()
-    # In the second prompt: the whole first image, its start token (its tokens become text), its first or its
-    # last image token (its block then covers the end token too), and its end token, between the images.
-    for hidden in (slice(3, 7), 3, 4, 5, 6):
-        inputs = {**batch, "attention_mask": batch["attention_mask"].clone()}
-        inputs["attention_mask"][1, hidden] = False
-        expected = policy.predict_action_chunk(inputs, noise=noise.clone())
-        actions = program(noise.clone(), *(inputs[key] for key in keys))
-        torch.testing.assert_close(actions, expected, msg=f"hidden {hidden}")
+    for inputs in refused:
+        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            program(noise.clone(), *(inputs[key] for key in keys))
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

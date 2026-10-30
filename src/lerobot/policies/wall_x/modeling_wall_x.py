@@ -65,7 +65,13 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
+from ..common.qwen_vision import (
+    check_input,
+    check_visible_images,
+    is_exporting,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from ..pretrained import PreTrainedPolicy
 from ..utils import log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
@@ -1926,8 +1932,6 @@ class WallXPolicy(PreTrainedPolicy):
             vision_grid.grid_thw,
             self.model.config.vision_config.spatial_merge_size,
             self.model.config.image_token_id,
-            image_blocks="vision_starts",
-            vision_start_token_id=self.model.config.vision_start_token_id,
         )
         # WALL-X's own get_rope_index puts padding at position 1.
         position_ids = position_ids.masked_fill(batch["attention_mask"] == 0, 1)
@@ -2047,6 +2051,8 @@ class WallXPolicy(PreTrainedPolicy):
             vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
                 self._vision_grid, self.model.visual, batch["image_grid_thw"]
             )
+            if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
+                check_visible_images(batch["input_ids"], batch["attention_mask"], self.model.config)
             if vision_grid is not None and is_exporting():
                 batch.update(self._static_grid_inputs(batch, vision_grid))
             output = self.model(

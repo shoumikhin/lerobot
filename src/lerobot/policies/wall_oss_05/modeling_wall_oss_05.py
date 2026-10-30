@@ -27,7 +27,13 @@ import torch.nn.functional as functional
 from torch import Tensor, nn
 
 from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from lerobot.policies.common.qwen_vision import check_input, is_exporting, qwen_image_rope_index
+from lerobot.policies.common.qwen_vision import (
+    check_input,
+    check_visible_images,
+    is_exporting,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -467,13 +473,7 @@ class WallOSS05Model(nn.Module):
         merge_size = int(self.config.vision_config.spatial_merge_size)
         if vision_grid is not None:
             position_ids = qwen_image_rope_index(
-                input_ids,
-                attention_mask,
-                vision_grid.grid_thw,
-                merge_size,
-                int(self.config.image_token_id),
-                image_blocks="vision_starts",
-                vision_start_token_id=int(self.config.vision_start_token_id),
+                input_ids, attention_mask, vision_grid.grid_thw, merge_size, int(self.config.image_token_id)
             )
             return position_ids.masked_fill(attention_mask == 0, 1)
         position_ids = torch.ones(3, *input_ids.shape, device=input_ids.device, dtype=input_ids.dtype)
@@ -991,6 +991,8 @@ class WallOSS05Policy(PreTrainedPolicy):
         vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
             self._vision_grid, self.model.visual, inputs["image_grid_thw"]
         )
+        if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
+            check_visible_images(inputs["input_ids"], inputs["attention_mask"], self.model.config)
         if is_exporting():
             inputs["vision_grid"] = vision_grid
         output = self.model.generate_flow_action(

@@ -15,12 +15,8 @@
 # limitations under the License.
 """Checks shared by the fixed-grid Qwen-VL vision tests.
 
-Their exported programs must not depend on tensor values for any shape, and their rope positions must follow
-the eager ones whatever tokens the attention mask hides.
+Their exported programs must not depend on tensor values for any shape.
 """
-
-import itertools
-from collections.abc import Callable, Iterable
 
 import pytest
 import torch
@@ -76,39 +72,3 @@ def data_dependent_nodes(
                 if isinstance(tensor, torch.Tensor) and free_unbacked_symbols(tensor.shape):
                     found.append(f"{name} with a data-dependent shape")
     return found
-
-
-def hidden_token_masks(attention_mask: torch.Tensor) -> list[torch.Tensor]:
-    """`attention_mask` as it is, then with each visible token hidden, then with each pair hidden."""
-    cells = [tuple(cell) for cell in attention_mask.nonzero().tolist()]
-    masks = []
-    for hidden in itertools.chain([()], ((cell,) for cell in cells), itertools.combinations(cells, 2)):
-        mask = attention_mask.clone()
-        for cell in hidden:
-            mask[cell] = 0
-        masks.append(mask)
-    return masks
-
-
-def count_refusals_where_eager_fails(
-    eager: Callable[[torch.Tensor], torch.Tensor],
-    fixed: Callable[[torch.Tensor], torch.Tensor],
-    masks: Iterable[torch.Tensor],
-    eager_errors: tuple[type[Exception], ...],
-    refusal: str,
-) -> int:
-    """Check that `fixed(mask)` equals `eager(mask)` for every mask, or refuses it where eager fails.
-
-    A refusal is a `ValueError` matching `refusal`. Returns how many masks were refused.
-    """
-    refused = 0
-    for mask in masks:
-        try:
-            expected = eager(mask)
-        except eager_errors:
-            with pytest.raises(ValueError, match=refusal):
-                fixed(mask)
-            refused += 1
-            continue
-        assert torch.equal(fixed(mask), expected), mask
-    return refused

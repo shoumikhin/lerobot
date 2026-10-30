@@ -319,7 +319,6 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             grid_thw,
             vlm_cfg.vision_config.spatial_merge_size,
             vlm_cfg.image_token_id,
-            image_blocks="every_image",
         )
         return self._pad_positions_as_trained(position_ids, attention_mask)
 
@@ -958,6 +957,8 @@ class FlowMatchingV2(FlowMatchingV1):
                 flat_grid_thw == flat_grid_thw.new_tensor(cached_grid_thw),
                 "The image grid differs from the one cached for precompute_grid_thw.",
             )
+            # Eager rope positions fail on a sample with no visible token.
+            check_input(pad_masks.any(dim=1), "Every sample needs a visible prefix token.")
             prefix_position_ids = self.qwenvl_with_expert.build_fixed_grid_position_ids(
                 prefix_input_ids, pad_masks.long(), cached_grid_thw
             )

@@ -121,8 +121,7 @@ def test_image_rope_index_matches_get_rope_index(model):
     )
     assert torch.equal(position_ids, expected_ids)
 
-    # With "every_image", an image block hidden by the mask (a missing camera) keeps its grid entry here, as
-    # for eager code that drops the hidden camera's grid before get_rope_index.
+    # An image block hidden by the mask (a missing camera) keeps its grid entry here; get_rope_index skips it.
     merge = model.visual.spatial_merge_size
     hidden_mask = attention_mask.clone()
     block_length = IMAGE_GRIDS[0][1] * IMAGE_GRIDS[0][2] // merge**2
@@ -134,9 +133,7 @@ def test_image_rope_index_matches_get_rope_index(model):
         image_grid_thw=grid_thw[1:],
         attention_mask=hidden_mask,
     )
-    actual_hidden = qwen_image_rope_index(
-        input_ids, hidden_mask, grid_thw.tolist(), merge, IMAGE_TOKEN_ID, image_blocks="every_image"
-    )
+    actual_hidden = qwen_image_rope_index(input_ids, hidden_mask, grid_thw.tolist(), merge, IMAGE_TOKEN_ID)
     assert torch.equal(actual_hidden, expected_hidden)
 
     grid = Qwen3VisionGrid.build(model.visual, grid_thw)
@@ -173,9 +170,12 @@ def test_cached_grid_follows_learned_position_updates(model):
     # An ordinary grad-enabled export of the trainable tower, after a preparation in inference mode.
     exported = _export_vision(visual, grid, pixel_values, grid_thw)(pixel_values, grid_thw)
     exported.square().sum().backward()
-    torch.testing.assert_close(
-        exported, visual(pixel_values, grid_thw=grid_thw).pooler_output, rtol=0, atol=0
-    )
+    exported_grad = visual.pos_embed.weight.grad.clone()
+    visual.zero_grad()
+    stock = visual(pixel_values, grid_thw=grid_thw).pooler_output
+    stock.square().sum().backward()
+    torch.testing.assert_close(exported, stock, rtol=0, atol=0)
+    torch.testing.assert_close(exported_grad, visual.pos_embed.weight.grad, rtol=0, atol=0)
 
 
 def test_reused_grid_follows_dtype_changes(model):

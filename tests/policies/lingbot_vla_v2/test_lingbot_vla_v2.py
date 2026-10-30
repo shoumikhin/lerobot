@@ -27,7 +27,7 @@ import torch
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.lingbot_vla_v2.configuration_lingbot_vla_v2 import LingbotVLAV2Config, SlotMapping
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from tests.utils import skip_if_package_missing
 
 CAMERA = "observation.images.camera_top"
@@ -243,6 +243,12 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
         changed["image_grid_thw"][..., 1] += 2
         with pytest.raises(RuntimeError):
             run(exported.module(), changed)
+        # So does a sample with no visible prefix token, on which eager rope positions fail.
+        empty = {key: batch[key].clone() for key in ("img_masks", OBS_LANGUAGE_ATTENTION_MASK)}
+        for mask in empty.values():
+            mask[1] = False
+        with pytest.raises(RuntimeError):
+            run(exported.module(), {**batch, **empty})
     assert len(grid_builds) == 1
     assert data_dependent_nodes(exported) == []
 

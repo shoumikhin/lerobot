@@ -40,7 +40,13 @@ from ..common.flow_matching import (
     sample_time_beta,
 )
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_temporal_scale, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, is_exporting, is_preparing_image_grid, qwen_image_rope_index
+from ..common.qwen_vision import (
+    check_input,
+    check_visible_images,
+    is_exporting,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
@@ -660,20 +666,20 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
-        grid = None
-        if pixel_values is not None:
-            grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
+        grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
         if grid is not None and (is_preparing_image_grid() or is_exporting()):
-            # Computed in preparation too, so that it refuses the image layouts the export refuses.
+            check_visible_images(input_ids, attention_mask, vlm.config)
+            # Probed while preparing, because the export cannot run `get_rope_index`.
+            image_temporal_scale = self._rope_temporal_scale()
+        if grid is not None and pixel_values is not None and is_exporting():
             position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,
                 grid.grid_thw,
                 vlm.visual.spatial_merge_size,
                 vlm.config.image_token_id,
-                image_temporal_scale=self._rope_temporal_scale(),
+                image_temporal_scale=image_temporal_scale,
             )
-        if grid is not None and pixel_values is not None and is_exporting():
             image_embeds = qwen2_5_vision_forward(vlm.visual, pixel_values.type(vlm.visual.dtype), grid)
             image_mask = input_ids == vlm.config.image_token_id
             check_input(

@@ -37,7 +37,7 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
-from ..common.qwen_vision import is_exporting, is_preparing_image_grid, qwen_image_rope_index
+from ..common.qwen_vision import check_visible_images, is_exporting, is_preparing_image_grid, qwen_image_rope_index
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
@@ -465,8 +465,20 @@ class Qwen3Backbone(nn.Module):
             model_input["pixel_values"],
             grid,
             image_mask=input_ids == qwen.config.image_token_id,
-            position_ids=model_input["position_ids"],
+            position_ids=self._fixed_grid_position_ids(model_input, grid),
         )
+
+    def _fixed_grid_position_ids(self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid) -> torch.Tensor:
+        """The position ids of `_ensure_legacy_qwen3_position_ids`, from the prepared grid."""
+        qwen = getattr(self.model, "model", self.model)
+        position_ids = qwen_image_rope_index(
+            model_input["input_ids"],
+            model_input["attention_mask"],
+            grid.grid_thw,
+            qwen.visual.spatial_merge_size,
+            qwen.config.image_token_id,
+        )
+        return torch.cat([position_ids[:1], position_ids], dim=0)
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -479,17 +491,7 @@ class Qwen3Backbone(nn.Module):
             self._vision_grid, qwen.visual, model_input["image_grid_thw"]
         )
         if grid is not None and (is_preparing_image_grid() or is_exporting()):
-            # Computed in preparation too, so that it refuses the image layouts the export refuses.
-            fixed_position_ids = qwen_image_rope_index(
-                model_input["input_ids"],
-                model_input["attention_mask"],
-                grid.grid_thw,
-                qwen.visual.spatial_merge_size,
-                qwen.config.image_token_id,
-            )
-            if is_exporting():
-                # The legacy text position row, as `_ensure_legacy_qwen3_position_ids` adds it.
-                model_input["position_ids"] = torch.cat([fixed_position_ids[:1], fixed_position_ids], dim=0)
+            check_visible_images(model_input["input_ids"], model_input["attention_mask"], qwen.config)
         if not is_exporting():
             self._ensure_mm_token_type_ids(model_input)
             self._ensure_legacy_qwen3_position_ids(model_input)

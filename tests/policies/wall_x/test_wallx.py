@@ -56,12 +56,7 @@ from lerobot.processor import (  # noqa: E402
 )
 from lerobot.utils.constants import MESSAGES_RENDERED, QUERY_KIND, QUERY_TEXT  # noqa: E402
 from lerobot.utils.random_utils import set_seed  # noqa: E402
-from tests.policies.common.fixed_grid_checks import (  # noqa: E402
-    count_grid_builds,
-    count_refusals_where_eager_fails,
-    data_dependent_nodes,
-    hidden_token_masks,
-)
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes  # noqa: E402
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
 
 
@@ -338,56 +333,28 @@ def test_prepared_diffusion_prediction_exports_and_matches_eager(monkeypatch):
         policy.predict_action_chunk(malformed, noise=noise.clone())
 
 
-def test_fixed_grid_positions_follow_get_rope_index_whatever_tokens_are_hidden():
-    model = _tiny_diffusion_model(bfloat16=False)
-    policy = _diffusion_policy(model)
-    # Two shapes with one token count, and two images in a row, so a grid given to the wrong image, or an
-    # image block moved by a hidden token, changes the positions. An image block that runs past the last
-    # visible token makes the eager code fail, which hidden tokens at the end of the second row can cause.
-    grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
-    input_ids = torch.tensor(
-        [[5, 41, 40, 40, 42, 6, 41, 40, 40, 42, 7], [5, 7, 8, 9, 10, 11, 12, 41, 40, 40, 42]]
-    )
-    grid = Qwen2_5VisionGrid.build(model.visual, grids)
-
-    def eager(mask):
-        return model.get_rope_index(input_ids, grids, attention_mask=mask)[0]
-
-    def fixed(mask):
-        batch = {"input_ids": input_ids, "attention_mask": mask, "image_grid_thw": grids}
-        return policy._static_grid_inputs(batch, grid)["position_ids"]
-
-    masks = hidden_token_masks(torch.ones_like(input_ids))
-    masks.append(torch.ones_like(input_ids))
-    masks[-1][1, -3:] = 0  # the last image's start token becomes the last visible token
-    refused = count_refusals_where_eager_fails(
-        eager, fixed, masks, (IndexError, ValueError, RuntimeError), "lie within"
-    )
-    assert 0 < refused < len(masks)
-    # More images than grids fails the eager code too.
-    with pytest.raises(IndexError):
-        model.get_rope_index(input_ids, grids[:2], attention_mask=torch.ones_like(input_ids))
-    batch = {
-        "input_ids": input_ids,
-        "attention_mask": torch.ones_like(input_ids),
-        "image_grid_thw": grids[:2],
-    }
-    with pytest.raises(ValueError, match="have a grid"):
-        policy._static_grid_inputs(batch, Qwen2_5VisionGrid.build(model.visual, grids[:2]))
-
-
 @pytest.mark.skipif(
     version.parse(torch.__version__) < version.parse("2.9.0"),
     reason="torch.export before PyTorch 2.9 cannot trace transformers' causal mask with WALL-X's action mask function",
 )
-def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
+def test_preparation_and_export_refuse_hidden_vision_tokens():
     policy = _diffusion_policy(_tiny_diffusion_model())
-    # Same token count, different shapes: a hidden image gives its grid to the next one.
     batch = {**_diffusion_batch(3), "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]])}
     noise = torch.randn(2, 3, 3)
+    keys = sorted(batch)
+
+    def hide(tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[0, tokens] = 0
+        return {**batch, "attention_mask": attention_mask}
+
+    # In the first prompt: the vision start token, an image token, the vision end token, and every token.
+    refused = (hide(1), hide(2), hide(4), hide(slice(None)))
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
-    keys = sorted(batch)
+        for inputs in refused:
+            with pytest.raises(ValueError, match="must show every image"):
+                policy.predict_action_chunk(inputs, noise=noise.clone())
 
     class Predict(torch.nn.Module):
         def forward(self, noise, *tensors):
@@ -395,15 +362,9 @@ def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
 
     with torch.no_grad():
         program = torch.export.export(Predict(), (noise.clone(), *(batch[key] for key in keys)), strict=False)
-    # In the first prompt: the whole image, its start token (its tokens become text), its first or its last
-    # image token (its block then covers the end token too).
-    for hidden in (slice(1, 5), 1, 2, 3):
-        inputs = {**batch, "attention_mask": batch["attention_mask"].clone()}
-        inputs["attention_mask"][0, hidden] = 0
-        expected = policy.predict_action_chunk(inputs, noise=noise.clone())
-        with torch.no_grad():
-            actions = program.module()(noise.clone(), *(inputs[key] for key in keys))
-        torch.testing.assert_close(actions, expected, msg=f"hidden {hidden}")
+        for inputs in refused:
+            with pytest.raises(RuntimeError):
+                program.module()(noise.clone(), *(inputs[key] for key in keys))
 
 
 @require_cuda

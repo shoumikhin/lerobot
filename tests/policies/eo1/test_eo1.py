@@ -758,10 +758,9 @@ def test_preparation_follows_a_changed_grid(monkeypatch):
     torch.testing.assert_close(run(changed), expected)
 
 
-def test_exported_sampling_follows_eager_when_image_tokens_are_hidden(monkeypatch):
+def test_preparation_and_export_refuse_hidden_vision_tokens(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
     noise = _noise(policy)
-    # Two images with the same token count but different shapes: a hidden image gives its grid to the next.
     action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
     input_ids = torch.tensor([[0, 1, 41, 40, 40, 42, 41, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
     batch = {
@@ -778,19 +777,17 @@ def test_exported_sampling_follows_eager_when_image_tokens_are_hidden(monkeypatc
         attention_mask[0, list(tokens)] = 0
         return {**batch, "attention_mask": attention_mask}
 
-    # One image token, or the tokens between the images, which joins them into one run: eager positions fail,
-    # and preparation refuses these like the exported program.
-    refused = (hide(3), hide(5, 6))
+    # A vision start token, an image token, a vision end token, and the whole prompt.
+    refused = (hide(2), hide(3), hide(5), hide(*range(input_ids.shape[1])))
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
         for inputs in refused:
-            with pytest.raises(ValueError, match="one whole image"):
+            with pytest.raises(ValueError, match="must show every image"):
                 policy.predict_action_chunk(inputs, noise=noise.clone())
     _, run = _export_sampling(policy, batch, noise)
     for inputs in refused:
         with torch.no_grad(), pytest.raises(RuntimeError):
             run(inputs)
-    # The whole first or last image, and the first image's start or end token.
-    for inputs in (hide(2, 3, 4, 5), hide(6, 7, 8, 9), hide(2), hide(5)):
-        expected = policy.predict_action_chunk(inputs, noise=noise.clone())
-        torch.testing.assert_close(run(inputs), expected, rtol=0, atol=0)
+    text_hidden = hide(1)
+    expected = policy.predict_action_chunk(text_hidden, noise=noise.clone())
+    torch.testing.assert_close(run(text_hidden), expected, rtol=0, atol=0)
