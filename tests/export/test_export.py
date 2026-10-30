@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -31,6 +32,7 @@ from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
 from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
+from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -41,7 +43,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
-from tests.torch_free import assert_runs_without_torch
+from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
 
 IMAGE = "observation.images.front"
 
@@ -275,7 +277,13 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
 
 
-BACKENDS = ["torch_test"]
+# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
+EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
+needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+BACKENDS = [
+    "torch_test",
+    pytest.param("executorch_xnnpack", marks=needs_executorch),
+]
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -314,6 +322,45 @@ def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tm
     assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
 
 
+class MaskedPositions(torch.nn.Module):
+    """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(8, dtype=torch.bool)
+        ids = torch.zeros(8, dtype=torch.long)
+        ids[mask] = torch.arange(8)[mask]
+        return x + self.embedding(ids)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(ExecuTorchXNNPACKConfig, marks=needs_executorch),
+    ],
+)
+def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch, backend):
+    """The in-place write of the masked ids is folded too, so no indexing reaches the backend. On a GPU such
+    indexing makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    with torch.no_grad():
+        program = torch.export.export(MaskedPositions().eval(), (torch.randn(8, 4),))
+    backend().compile(program, tmp_path / "model.pte")
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 import tempfile
@@ -321,6 +368,13 @@ from lerobot.scripts.lerobot_export import export
 
 export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
+
+
+@needs_executorch
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
+    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+    assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
 
 
 def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(checkpoint, tmp_path):
