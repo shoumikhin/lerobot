@@ -278,6 +278,7 @@ class ActionChunkRecipe(ExportRecipe):
     def parts(self) -> Iterator[Part]:
         """The one part, after checking that it computes what PyTorch does for two different frames."""
         module = _ActionChunk(
+            self.predict_chunk,
             self.policy,
             self.preprocessor,
             self.postprocessor,
@@ -305,6 +306,16 @@ class ActionChunkRecipe(ExportRecipe):
     def test_case(self) -> TestCase:
         """The random frame and noise, and the actions PyTorch computes for them as `lerobot-rollout` does."""
         return self._case
+
+    @staticmethod
+    def predict_chunk(policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
+        """The `[1, chunk, action]` chunk the policy predicts for a preprocessed batch, as rollout gets it.
+
+        Without `noise` the policy draws its own. A recipe for a policy that predicts its actions another way
+        overrides this. The program and the test case both call it, so they compute the same thing.
+        """
+        output = policy.predict_action_chunk(batch, **({} if noise is None else {NOISE: noise}))
+        return transition_to_policy_action(policy_output_to_transition(output))
 
     def _task(self, frame: dict[str, np.ndarray]) -> str | None:
         """The task the program holds: the one given, or the dataset's first for a policy that reads text."""
@@ -334,7 +345,7 @@ class ActionChunkRecipe(ExportRecipe):
         shapes: list[tuple[int, ...]] = []
         self._reset()
         with torch.no_grad(), _RecordNormalDraws(shapes):
-            self.policy.predict_action_chunk(self.preprocessor(self._observation(frame, self.task)))
+            self.predict_chunk(self.policy, self.preprocessor(self._observation(frame, self.task)), None)
         if len(shapes) != 1 or shapes[0][0] != 1:
             raise ValueError(
                 f"The {self.policy.config.type} policy draws {len(shapes)} random tensors shaped {shapes} for "
@@ -359,11 +370,10 @@ class ActionChunkRecipe(ExportRecipe):
     def _reference(self, frame: dict[str, np.ndarray], noise: np.ndarray | None) -> np.ndarray:
         """The actions `lerobot-rollout` plays for one chunk with the PyTorch policy."""
         self._reset()
-        kwargs = {} if noise is None else {NOISE: torch.from_numpy(noise).to(self._device)[None]}
+        noise_tensor = None if noise is None else torch.from_numpy(noise).to(self._device)[None]
         with torch.no_grad():
             batch = self.preprocessor(self._observation(frame, self.task))
-            output = self.policy.predict_action_chunk(batch, **kwargs)
-            predicted = transition_to_policy_action(policy_output_to_transition(output))[:, : self._steps]
+            predicted = self.predict_chunk(self.policy, batch, noise_tensor)[:, : self._steps]
             actions = self.postprocessor(predicted)
         return actions[0].float().cpu().numpy()
 
@@ -377,6 +387,7 @@ class _ActionChunk(nn.Module):
 
     def __init__(
         self,
+        predict_chunk: Callable[[PreTrainedPolicy, dict[str, Any], Tensor | None], Tensor],
         policy: PreTrainedPolicy,
         preprocessor: PolicyProcessorPipeline,
         postprocessor: PolicyProcessorPipeline,
@@ -386,6 +397,7 @@ class _ActionChunk(nn.Module):
         execution_steps: int,
     ) -> None:
         super().__init__()
+        self.predict_chunk = predict_chunk
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
@@ -401,9 +413,8 @@ class _ActionChunk(nn.Module):
         }
         observation["task"] = self.task
         observation["robot_type"] = ""
-        kwargs = {NOISE: inputs[-1][None]} if len(inputs) > len(self.frame_names) else {}
-        output = self.policy.predict_action_chunk(self.preprocessor(observation), **kwargs)
-        actions = transition_to_policy_action(policy_output_to_transition(output))
+        noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else None
+        actions = self.predict_chunk(self.policy, self.preprocessor(observation), noise)
         return self.postprocessor(actions[:, : self.execution_steps])[0].float()
 
 
