@@ -183,7 +183,7 @@ def test_exported_program_rejects_a_changed_grid():
 def test_hidden_vision_tokens_and_empty_rows_are_refused_also_after_export():
     config = _tiny_config()
     image = [VISION_START_ID, *[IMAGE_TOKEN_ID] * 6, VISION_END_ID]
-    input_ids = torch.tensor([[0, 1, *image, 2], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    input_ids = torch.tensor([[0, 1, *image, 2], list(range(1, 12))])
     attention_mask = input_ids.ne(0).long()
 
     class CheckVisibleImages(torch.nn.Module):
@@ -198,7 +198,7 @@ def test_hidden_vision_tokens_and_empty_rows_are_refused_also_after_export():
         check_visible_images(input_ids, mask, config)
         program(input_ids, mask)
     # The vision start token, an image token, the vision end token, and the whole text-only row.
-    for row, columns in ((0, [2]), (0, [5]), (0, [9]), (1, list(range(10)))):
+    for row, columns in ((0, [2]), (0, [5]), (0, [9]), (1, list(range(11)))):
         hidden = attention_mask.clone()
         hidden[row, columns] = 0
         with pytest.raises(ValueError, match="must show every image"):

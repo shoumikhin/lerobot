@@ -37,7 +37,12 @@ from ..common.flow_matching import (
     sample_noise,
 )
 from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
-from ..common.qwen_vision import check_visible_images, is_exporting, is_preparing_image_grid, qwen_image_rope_index
+from ..common.qwen_vision import (
+    check_visible_images,
+    is_exporting,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
@@ -468,7 +473,9 @@ class Qwen3Backbone(nn.Module):
             position_ids=self._fixed_grid_position_ids(model_input, grid),
         )
 
-    def _fixed_grid_position_ids(self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid) -> torch.Tensor:
+    def _fixed_grid_position_ids(
+        self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid
+    ) -> torch.Tensor:
         """The position ids of `_ensure_legacy_qwen3_position_ids`, from the prepared grid."""
         qwen = getattr(self.model, "model", self.model)
         position_ids = qwen_image_rope_index(
