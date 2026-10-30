@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Run a bundle written by `lerobot-export` on a robot, without PyTorch: `lerobot-rollout --mode=bundle`.
+r"""Run a bundle written by `lerobot-export` on a robot, without PyTorch: `lerobot-rollout --bundle.path`.
 
 It reuses the robot and camera configs, the robot factory, the joint-order rule, the dispatch helpers, the
 interpolator, the cycle timer and the return to the starting pose of `lerobot-rollout`, and loads none of
@@ -20,7 +20,7 @@ the PyTorch packages. So it runs the base strategy only: recording, teleoperatio
 remote inference need those packages, and stay with `lerobot-rollout --policy.path`.
 
 ```bash
-lerobot-rollout --mode=bundle \\
+lerobot-rollout \\
     --bundle.path=outputs/export/act_executorch_tensorrt \\
     --robot.type=so101_follower --robot.port=/dev/ttyACM0 \\
     --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
@@ -90,7 +90,7 @@ class BundleConfig:
 
 @dataclass
 class BundleRolloutConfig:
-    """`lerobot-rollout --mode=bundle`. The fields mean what they mean for `lerobot-rollout`."""
+    """`lerobot-rollout --bundle.path`. The fields mean what they mean for `lerobot-rollout`."""
 
     bundle: BundleConfig
     robot: RobotConfig
@@ -207,7 +207,7 @@ def rollout(cfg: BundleRolloutConfig) -> None:
 
 
 def main(args: Sequence[str] | None = None) -> None:
-    """`lerobot-rollout --mode=bundle`, with the arguments after `--mode=bundle`."""
+    """`lerobot-rollout --bundle.path`, with the arguments of the command."""
     init_logging()
     args = sys.argv[1:] if args is None else list(args)
     # Only robots and cameras: policy, environment and strategy plugins may import PyTorch.

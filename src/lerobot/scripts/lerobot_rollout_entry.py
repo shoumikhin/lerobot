@@ -14,10 +14,13 @@
 
 """The `lerobot-rollout` command: choose the mode, then load only what that mode needs.
 
-- Without `--mode`: run a PyTorch policy, see `lerobot.scripts.lerobot_rollout`. The arguments reach it
-  unchanged.
-- `--mode=bundle`: run a bundle written by `lerobot-export`, see `lerobot.bundle.rollout`. It never imports
-  PyTorch, so this module imports nothing before the mode is known. `--mode=bundle --help` lists its options.
+- With `--bundle.path`: run a bundle written by `lerobot-export`, see `lerobot.bundle.rollout`. It never imports
+  PyTorch, so this module imports nothing before the mode is known. `--bundle.path=<folder> --help` lists its
+  options.
+- Without it: run a PyTorch policy, see `lerobot.scripts.lerobot_rollout`.
+
+Either mode gets the arguments unchanged. A `--bundle.path` set only in a `--config_path` file does not select
+the bundle mode.
 """
 
 import argparse
@@ -25,18 +28,18 @@ import argparse
 
 def main() -> None:
     """Entry point of `lerobot-rollout`."""
-    # No help and no abbreviations: every other argument, `--help` included, belongs to the chosen mode.
+    # No help and no abbreviations: every argument, `--help` included, belongs to the chosen mode.
     parser = argparse.ArgumentParser(prog="lerobot-rollout", add_help=False, allow_abbrev=False)
-    parser.add_argument("--mode", choices=["bundle"])
-    args, rest = parser.parse_known_args()
-    if args.mode == "bundle":
-        from lerobot.bundle.rollout import main as bundle_main
-
-        bundle_main(rest)
-    else:
+    parser.add_argument("--bundle.path", dest="bundle_path")
+    args, _ = parser.parse_known_args()
+    if args.bundle_path is None:
         from lerobot.scripts.lerobot_rollout import main as policy_main
 
         policy_main()
+    else:
+        from lerobot.bundle.rollout import main as bundle_main
+
+        bundle_main()
 
 
 if __name__ == "__main__":

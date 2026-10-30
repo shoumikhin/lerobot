@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`lerobot-rollout --mode=bundle`: a bundle on a robot, without PyTorch."""
+"""`lerobot-rollout --bundle.path`: a bundle on a robot, without PyTorch."""
 
 import sys
 from pathlib import Path
@@ -59,7 +59,6 @@ def test_the_command_runs_a_bundle_without_torch(tmp_path):
         events = [json.loads(line)[0] for line in open(sys.argv[-1].split("=", 1)[1])]
         assert events[0] == "connect" and events[-1] == "disconnect" and "action" in events, events
         """,
-        "--mode=bundle",
         f"--bundle.path={bundle}",
         "--robot.discover_packages_path=tests.export.recording_robot",
         "--robot.type=recording_robot",
@@ -167,22 +166,33 @@ def test_bundle_mode_refuses_the_options_it_does_not_have(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     ("argv", "mode"),
     [
-        (["--mode=bundle", "--bundle.path=b"], "bundle"),
-        (["--mode", "bundle", "--help"], "bundle"),
+        (["--bundle.path=b", "--robot.type=mock_robot"], "bundle"),
+        (["--robot.type=mock_robot", "--bundle.path", "b", "--help"], "bundle"),
         (["--policy.path=p", "--robot.type=mock_robot"], "policy"),
-        (["--mod=bundle", "--help"], "policy"),
+        (["--bundle.pathX=b", "--help"], "policy"),
+        (["--bundle.pat=b", "--help"], "policy"),
+        (["--bundle=b"], "policy"),
     ],
 )
-def test_the_command_picks_the_mode_from_mode_only(monkeypatch, argv, mode):
+def test_the_command_picks_the_mode_from_bundle_path_only(monkeypatch, argv, mode):
     chosen = []
     monkeypatch.setattr(sys, "argv", ["lerobot-rollout", *argv])
-    monkeypatch.setattr("lerobot.bundle.rollout.main", lambda args: chosen.append(("bundle", args)))
+    monkeypatch.setattr("lerobot.bundle.rollout.main", lambda: chosen.append(("bundle", sys.argv[1:])))
     monkeypatch.setattr(
         "lerobot.scripts.lerobot_rollout.main", lambda: chosen.append(("policy", sys.argv[1:]))
     )
     lerobot_rollout_entry.main()
-    expected_args = [arg for arg in argv if arg not in ("--mode=bundle", "--mode", "bundle")]
-    assert chosen == [(mode, expected_args if mode == "bundle" else argv)]
+    assert chosen == [(mode, argv)]
+
+
+def test_help_with_a_bundle_path_is_the_bundle_mode_help(monkeypatch, capsys):
+    monkeypatch.setattr(bundle_rollout, "register_third_party_plugins", lambda kinds=(): None)
+    monkeypatch.setattr(sys, "argv", ["lerobot-rollout", "--bundle.path=b", "--help"])
+    with pytest.raises(SystemExit) as stop:
+        lerobot_rollout_entry.main()
+    assert stop.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--bundle.path" in help_text and "--policy.path" not in help_text
 
 
 def test_the_policy_mode_points_a_bundle_to_the_bundle_mode(tmp_path, monkeypatch):
@@ -191,5 +201,5 @@ def test_the_policy_mode_points_a_bundle_to_the_bundle_mode(tmp_path, monkeypatc
 
     bundle = make_numpy_bundle(tmp_path / "bundle")
     monkeypatch.setattr(sys, "argv", ["lerobot-rollout", f"--policy.path={bundle}"])
-    with pytest.raises(ValueError, match="--mode=bundle"):
+    with pytest.raises(ValueError, match="lerobot-rollout --bundle.path="):
         RolloutConfig(robot=MockRobotConfig())

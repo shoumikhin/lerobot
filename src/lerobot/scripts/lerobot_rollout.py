@@ -37,8 +37,7 @@ Inference backends
 
 Compiled bundles
 ----------------
-    --mode=bundle --bundle.path=<folder>
-                               Run a bundle written by ``lerobot-export`` without PyTorch,
+    --bundle.path=<folder>     Run a bundle written by ``lerobot-export`` without PyTorch,
                                base strategy only (see ``lerobot.bundle.rollout``)
 
 Usage examples

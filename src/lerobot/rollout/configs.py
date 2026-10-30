@@ -409,7 +409,7 @@ class RolloutConfig:
         if policy_path and is_bundle(policy_path):
             raise ValueError(
                 f"{policy_path} is a bundle written by lerobot-export. Run it with "
-                f"`lerobot-rollout --mode=bundle --bundle.path={policy_path} --robot.type=...`."
+                f"`lerobot-rollout --bundle.path={policy_path} --robot.type=...`."
             )
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")
