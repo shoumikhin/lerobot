@@ -352,6 +352,48 @@ def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
     np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
 
 
+class MaskedPositions(torch.nn.Module):
+    """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(8, dtype=torch.bool)
+        ids = torch.zeros(8, dtype=torch.long)
+        ids[mask] = torch.arange(8)[mask]
+        return x + self.embedding(ids)
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
+    """Indexing with a boolean mask makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    model = MaskedPositions().eval()
+    x = torch.randn(8, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchCUDAConfig().compile(torch.export.export(model, (x,)), path)
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+    program = ExecuTorchProgram(path, data=path.with_suffix(".ptd"))
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-6, atol=1e-6)
+
+
 class ConstantPositions(torch.nn.Module):
     """Adds embeddings of position ids that bucketize makes from constants alone, as SmolVLM's vision model does."""
 

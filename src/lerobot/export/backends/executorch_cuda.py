@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import ExecuTorchConfig, cuda_partitioner, gpu_memory_config
+from .executorch import ExecuTorchConfig, cuda_partitioner, gpu_memory_config, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -43,14 +43,10 @@ class ExecuTorchCUDAConfig(ExecuTorchConfig):
 
         Returns the data file that holds the compiled kernels and the weights.
         """
-        from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+        from executorch.exir import EdgeCompileConfig
 
         # The CUDA backend keeps every operator whole for its compiler, which the edge dialect check refuses.
-        edge = to_edge_transform_and_lower(
-            program,
-            partitioner=[cuda_partitioner(path.stem)],
-            compile_config=EdgeCompileConfig(_check_ir_validity=False),
-        )
+        edge = lower(program, cuda_partitioner(path.stem), EdgeCompileConfig(_check_ir_validity=False))
         compiled = edge.to_executorch(gpu_memory_config())
         path.write_bytes(compiled.buffer)
         compiled.write_tensor_data_to_file(str(path.parent))
