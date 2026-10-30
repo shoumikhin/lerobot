@@ -42,7 +42,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
-- On macOS, export the same way, from a second environment with PyTorch 2.15 and without Torch-TensorRT.
+- On macOS, export and run from such an environment too, without Torch-TensorRT: `uv pip install --override torch-overrides.txt lerobot "executorch>=1.6.0,<1.7.0"`. LeRobot's own pin keeps an older PyTorch for older macOS versions, so this needs a macOS version that PyTorch 2.15 supports.
 
 <Tip warning={true}>
 
