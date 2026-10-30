@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -37,6 +38,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
@@ -326,7 +328,15 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
 
 
-BACKENDS = ["torch_test"]
+# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
+EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
+BACKENDS = [
+    "torch_test",
+    pytest.param(
+        "executorch_xnnpack",
+        marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
+    ),
+]
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -348,6 +358,41 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
 
 
+class MaskedPositions(torch.nn.Module):
+    """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(8, dtype=torch.bool)
+        ids = torch.zeros(8, dtype=torch.long)
+        ids[mask] = torch.arange(8)[mask]
+        return x + self.embedding(ids)
+
+
+@pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+def test_lower_folds_what_a_program_computes_from_constants(monkeypatch):
+    """The in-place write of the masked ids is folded too, so no indexing reaches the backend."""
+    import executorch.exir
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+
+    from lerobot.export.backends.executorch import lower
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    with torch.no_grad():
+        lower(torch.export.export(MaskedPositions().eval(), (torch.randn(8, 4),)), XnnpackPartitioner())
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 import tempfile
@@ -355,6 +400,22 @@ from lerobot.scripts.lerobot_export import export
 
 export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
+
+
+@pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
+    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+    assert_runs_without_torch(
+        """
+        import runpy
+        import sys
+
+        sys.argv = ["lerobot.bundle", sys.argv[1]]
+        runpy.run_module("lerobot.bundle", run_name="__main__")
+        """,
+        str(tmp_path / "b"),
+    )
 
 
 def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
