@@ -151,6 +151,14 @@ def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
     assert frame_shapes(features) == {IMAGE: (32, 32, 3), OBS_STATE: (3,)}
 
 
+def test_an_image_recorded_channels_last_keeps_its_shape():
+    features = {
+        IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 24, 32)),
+        f"{IMAGE}_hwc": PolicyFeature(type=FeatureType.VISUAL, shape=(24, 32, 3)),
+    }
+    assert frame_shapes(features) == {IMAGE: (24, 32, 3), f"{IMAGE}_hwc": (24, 32, 3)}
+
+
 def test_a_policy_without_an_export_module_gets_the_one_program_recipe():
     assert factory.get_export_recipe_class(act_config()) is ActionChunkRecipe
 

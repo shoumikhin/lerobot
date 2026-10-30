@@ -19,7 +19,7 @@ from __future__ import annotations
 import abc
 import inspect
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -253,14 +253,7 @@ class ActionChunkRecipe(ExportRecipe):
         self._device = torch.device(cfg.backend.device)
         policy.to(self._device)
         self._generator = torch.Generator().manual_seed(cfg.seed)
-        self._metadata: LeRobotDatasetMetadata | None = None
-        if cfg.dataset is not None:
-            from lerobot.datasets import LeRobotDatasetMetadata
-
-            dataset = cfg.dataset
-            self._metadata = LeRobotDatasetMetadata(
-                dataset.repo_id, root=dataset.root, revision=dataset.revision
-            )
+        self._metadata = dataset_metadata(cfg)
         self._features = robot_features(policy.config, preprocessor, self._metadata)
         self._visual = {name for name, f in self._features.items() if f.type is FeatureType.VISUAL}
         self.config = copy(policy.config)
@@ -270,7 +263,10 @@ class ActionChunkRecipe(ExportRecipe):
         self._noise_shape = self._sampled_noise_shape(frame)
         noise = self._random_noise()
         actions = self._reference(frame, noise)
-        action_scale = measure_action_scale(self.postprocessor, actions.shape[-1], self._device)
+        width = actions.shape[-1]
+        action_scale = measure_action_scale(
+            lambda value: self.postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
+        )
         if not np.array_equal(actions, self._reference(frame, noise)):
             raise ValueError(
                 f"This {policy_type} policy computes another chunk from the same frame and noise each time, "
@@ -311,20 +307,9 @@ class ActionChunkRecipe(ExportRecipe):
 
     def _task(self, frame: dict[str, np.ndarray]) -> str | None:
         """The task the program holds: the one given, or the dataset's first for a policy that reads text."""
-        if self.cfg.task:
-            return self.cfg.task
-        if not self._reads_task(frame):
+        if not self.cfg.task and not self._reads_task(frame):
             return None
-        if self._metadata is None:
-            raise ValueError(
-                f"This {self.policy.config.type} policy reads the task: give the one to export with --task."
-            )
-        tasks = [str(task) for task in self._metadata.tasks.index]
-        if len(tasks) > 1:
-            logger.warning(
-                "No --task given: exporting the dataset's first task, %r, of %d.", tasks[0], len(tasks)
-            )
-        return tasks[0]
+        return export_task(self.cfg, self._metadata, self.policy.config.type)
 
     def _reads_task(self, frame: dict[str, np.ndarray]) -> bool:
         # Not inference_mode: tensors the processors cache here end up in the program, and a compiler
@@ -478,12 +463,50 @@ def robot_features(
     return kept
 
 
+def dataset_metadata(cfg: ExportConfig) -> LeRobotDatasetMetadata | None:
+    """The metadata of the dataset `--dataset.repo_id` names, if any."""
+    if cfg.dataset is None:
+        return None
+    from lerobot.datasets import LeRobotDatasetMetadata
+
+    dataset = cfg.dataset
+    return LeRobotDatasetMetadata(dataset.repo_id, root=dataset.root, revision=dataset.revision)
+
+
+def export_task(cfg: ExportConfig, metadata: LeRobotDatasetMetadata | None, policy_type: str) -> str:
+    """The task to export for a policy that reads one: the one given, or the dataset's first."""
+    if cfg.task:
+        return cfg.task
+    if metadata is None:
+        raise ValueError(
+            f"This {policy_type} policy reads the task: give the one to export with --task, or its dataset "
+            "with --dataset.repo_id."
+        )
+    tasks = [str(task) for task in metadata.tasks.index]
+    if len(tasks) > 1:
+        logger.warning(
+            "No --task given: exporting the dataset's first task, %r, of %d.", tasks[0], len(tasks)
+        )
+    return tasks[0]
+
+
 def frame_shapes(features: dict[str, PolicyFeature]) -> dict[str, tuple[int, ...]]:
-    """The shape of each array of the robot's frame: height, width and channels for an image."""
+    """The shape of each array of the robot's frame: height, width and channels for an image.
+
+    An image feature is channels first, except in the checkpoints that record it channels last, as its shape
+    shows.
+    """
     return {
-        name: (f.shape[1], f.shape[2], f.shape[0]) if f.type is FeatureType.VISUAL else tuple(f.shape)
+        name: _image_shape(f.shape) if f.type is FeatureType.VISUAL else tuple(f.shape)
         for name, f in features.items()
     }
+
+
+def _image_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if shape[-1] in (1, 3) and shape[0] not in (1, 3):
+        return tuple(shape)
+    channels, height, width = shape
+    return height, width, channels
 
 
 def random_frame(features: dict[str, PolicyFeature], generator: torch.Generator) -> dict[str, np.ndarray]:
@@ -505,15 +528,14 @@ def to_policy_input(x: Tensor, visual: bool) -> Tensor:
     return ((x.float() / 255).permute(2, 0, 1).contiguous() if visual else x).unsqueeze(0)
 
 
-def measure_action_scale(
-    postprocessor: PolicyProcessorPipeline, width: int, device: torch.device
-) -> np.ndarray:
-    """Robot units per normalized unit for each of `width` actions, measured on `postprocessor`."""
+def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
+    """Robot units per normalized unit for each action.
+
+    `actions_at(value)` gives the robot actions for normalized actions that all equal `value`; it is asked for 0
+    and 1.
+    """
     with torch.no_grad():
-        low, high = (
-            postprocessor(torch.full((1, 1, width), value, device=device))[0, 0].float().cpu().numpy()
-            for value in (0.0, 1.0)
-        )
+        low, high = (actions_at(value).float().cpu().numpy() for value in (0.0, 1.0))
     # A joint that never moved in the training data has almost no spread, and float32 rounding of its
     # value would then read as a large difference.
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
@@ -523,7 +545,7 @@ def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
     """The whole trained policy, in eval mode on the CPU, and its processors set to the backend's device."""
-    from lerobot.policies.factory import load_pretrained_policy, make_pre_post_processors
+    from lerobot.policies.factory import load_pretrained_policy
 
     config = cast(PreTrainedConfig, cfg.policy)
     # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
@@ -537,12 +559,18 @@ def load_policy(
         policy = policy.merge_and_unload()
     policy.eval()
     config.device = cfg.backend.device
+    return policy, *load_processors(config)
+
+
+def load_processors(config: PreTrainedConfig) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """The checkpoint's saved processors, with their device steps on `config.device`."""
+    from lerobot.policies.factory import make_pre_post_processors
+
     overrides = {"device_processor": {"device": config.device}}
-    preprocessor, postprocessor = make_pre_post_processors(
+    return make_pre_post_processors(
         config,
         pretrained_path=config.pretrained_path,
         pretrained_revision=config.pretrained_revision,
         preprocessor_overrides=overrides,
         postprocessor_overrides=overrides,
     )
-    return policy, preprocessor, postprocessor
