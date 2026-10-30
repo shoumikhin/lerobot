@@ -85,6 +85,7 @@ def run_without_torch(program, data, x, tmp_path):
 
 def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
     from executorch.exir._serialize._program import deserialize_pte_binary
+    from executorch.exir.schema import DeviceType
 
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
@@ -96,11 +97,14 @@ def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
 
     data = ExecuTorchTensorRTConfig().compile(program, tmp_path / "model.pte")
 
-    pte = deserialize_pte_binary((tmp_path / "model.pte").read_bytes()).program
-    delegates = {delegate.id for plan in pte.execution_plan for delegate in plan.delegates}
-    operators = [operator.name for plan in pte.execution_plan for operator in plan.operators]
-    assert delegates == {"TensorRTBackend", "CudaBackend"}
-    assert not any("erfinv" in name for name in operators), operators
+    (plan,) = deserialize_pte_binary((tmp_path / "model.pte").read_bytes()).program.execution_plan
+    assert {delegate.id for delegate in plan.delegates} == {"TensorRTBackend", "CudaBackend"}
+    # Nothing runs on the CPU, and no input or output is copied to or from the host.
+    assert [operator.name for operator in plan.operators] == []
+    devices = [
+        plan.values[index].val.extra_tensor_info.device_type for index in [*plan.inputs, *plan.outputs]
+    ]
+    assert devices == [DeviceType.CUDA] * 2
     actual = run_without_torch(tmp_path / "model.pte", data, x, tmp_path)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
