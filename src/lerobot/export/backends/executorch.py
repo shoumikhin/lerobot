@@ -35,6 +35,8 @@ class ExecuTorchConfig(ExportBackendConfig):
     runtime = "executorch"
     file_suffix = ".pte"
     packages = (EXECUTORCH,)
+    min_torch = "2.15"
+    torch_overrides = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
 
 
 def gpu_memory_config() -> ExecutorchBackendConfig:
