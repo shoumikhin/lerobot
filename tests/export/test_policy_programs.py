@@ -45,6 +45,10 @@ class Recipe:
 RECIPES = {
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
     "lawam": Recipe("tests.policies.lawam.export_stand_in", untraceable=(Exception, "data-dependent")),
+    "wall_x": Recipe(
+        "tests.policies.wall_x.export_stand_in",
+        untraceable=(Exception, "data-dependent|GuardOnDataDependentSymNode"),
+    ),
 }
 
 
