@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import functools
 import math
 from collections import deque
 from typing import Any, Unpack
@@ -680,7 +681,10 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
-        embs = torch.cat(embs, dim=1)
+        # The VLM embeds in bfloat16 and the state projection in float32. Cast to the dtype torch.cat would promote
+        # to, because ExecuTorch's edge dialect does not promote dtypes when it concatenates.
+        dtype = functools.reduce(torch.promote_types, (emb.dtype for emb in embs))
+        embs = torch.cat([emb.to(dtype) for emb in embs], dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :]
