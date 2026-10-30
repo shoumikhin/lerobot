@@ -309,7 +309,7 @@ def test_n1_7_backbone_refuses_hidden_image_tokens_also_after_export(monkeypatch
         with prepare_image_grid():
             Backbone()(*(prompts[key] for key in keys))
             for inputs in refused:
-                with pytest.raises(ValueError, match="must show every image"):
+                with pytest.raises(ValueError, match="must hide only padding"):
                     Backbone()(*inputs)
         program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False).module()
         for inputs in refused:

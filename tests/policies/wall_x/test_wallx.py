@@ -353,7 +353,7 @@ def test_preparation_and_export_refuse_hidden_vision_tokens():
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
         for inputs in refused:
-            with pytest.raises(ValueError, match="must show every image"):
+            with pytest.raises(ValueError, match="must hide only padding"):
                 policy.predict_action_chunk(inputs, noise=noise.clone())
 
     class Predict(torch.nn.Module):
