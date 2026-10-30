@@ -32,14 +32,19 @@ OLD_TORCH = pytest.mark.skipif(Version(torch.__version__).release < (2, 15), rea
 
 @dataclass
 class Recipe:
-    """A policy's recipe, which `make_recipe` in `module` builds."""
+    """A policy's recipe, which `make_recipe` in `module` builds.
+
+    `untraceable` is the error that tracing the saved preprocessor gives, for a recipe made to avoid it.
+    """
 
     module: str
+    untraceable: tuple[type[Exception], str] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
 RECIPES = {
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
+    "lawam": Recipe("tests.policies.lawam.export_stand_in", untraceable=(Exception, "data-dependent")),
 }
 
 
@@ -62,3 +67,12 @@ def test_the_exported_program_computes_what_the_policy_does(name):
     inputs = tuple(torch.from_numpy(x) for x in (*frame.values(), noise))
     with torch.no_grad():
         torch.testing.assert_close(program(*inputs), part.module(*inputs), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("name", [name for name, recipe in RECIPES.items() if recipe.untraceable])
+def test_the_saved_preprocessor_cannot_be_traced(name):
+    error, message = RECIPES[name].untraceable
+    [part] = make_recipe(name, recipe_class=ActionChunkRecipe).parts()
+
+    with pytest.raises(error, match=message):
+        torch.export.export(part.module, part.example_inputs)
