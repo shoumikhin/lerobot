@@ -499,6 +499,31 @@ def test_default_vision_attention_exports_on_the_cpu():
     torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
 
 
+class _LoadedPolicyError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("tensorrt", "configured", "built"),
+    [(True, "auto", "sdpa"), (True, "varlen", "varlen"), (False, "auto", "auto")],
+    ids=["tensorrt", "tensorrt_configured", "other_backend"],
+)
+def test_export_builds_the_vision_attention_on_sdpa_for_tensorrt(monkeypatch, tensorrt, configured, built):
+    from lerobot.export import recipe as export_recipe
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+    from lerobot.policies.wall_x.export_wall_x import WallXExportRecipe
+
+    def load_policy(cfg):
+        assert cfg.policy.vision_attn_implementation == built
+        raise _LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+    backend = ExecuTorchTensorRTConfig() if tensorrt else SimpleNamespace(device="cpu")
+    config = WallXConfig(device="cpu", vision_attn_implementation=configured)
+    with pytest.raises(_LoadedPolicyError):
+        WallXExportRecipe.load(SimpleNamespace(policy=config, backend=backend))
+
+
 @require_cuda
 @pytest.mark.skipif(
     version.parse(torch.__version__).release < (2, 10),
