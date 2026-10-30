@@ -158,6 +158,11 @@ class BundleManifest:
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
             case's recorded noise replaces the draw when the bundle checks itself.
+        history (`dict[str, int]`, *optional*):
+            For each key of the robot's frame that the programs read with its past values, how many: the
+            programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
+            reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
+            only.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -174,7 +179,9 @@ class BundleManifest:
             The version of each Python module the programs were built with and need to load, such as
             `executorch`, by module name.
         test_case (`str`, *optional*, defaults to `"test.safetensors"`):
-            The test case file: a frame, the noise, and the expected actions under `action`.
+            The test case file: a frame, the noise, and the expected actions under `action`. With `history`,
+            each frame value holds the frames of several control ticks, oldest first, and the actions are those
+            computed at the last one.
     """
 
     format_version: int = FORMAT_VERSION
@@ -186,6 +193,7 @@ class BundleManifest:
     constants: str | None = None
     task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
+    history: dict[str, int] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -204,6 +212,8 @@ class BundleManifest:
             raise ValueError("The manifest names a different number of actions than it scales.")
         if not self.runs:
             raise ValueError("The manifest lists no run.")
+        if not all(type(n) is int and n > 0 for n in self.history.values()):
+            raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
         names = [run.name for run in self.runs]
         if len(set(names)) != len(names):
             raise ValueError(f"The manifest names a run twice: {names}.")
