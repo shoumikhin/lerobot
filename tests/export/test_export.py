@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -41,6 +42,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
 from tests.export.torch_backend import TorchTestBackend
@@ -628,6 +630,78 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
     )
     with pytest.raises(RuntimeError, match="The bundle crashed with SIGSEGV"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+
+
+# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
+EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
+needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+
+
+class MaskedPositions(torch.nn.Module):
+    """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones(8, dtype=torch.bool)
+        ids = torch.zeros(8, dtype=torch.long)
+        ids[mask] = torch.arange(8)[mask]
+        return x + self.embedding(ids)
+
+
+@needs_executorch
+def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
+    """The in-place write of the masked ids is folded too, so no indexing reaches the backend. On a GPU such
+    indexing makes a tensor whose size the GPU would read back to the host on every run."""
+    import executorch.exir
+
+    from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
+
+    lowered = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+    monkeypatch.setattr(
+        executorch.exir,
+        "to_edge_transform_and_lower",
+        lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
+    )
+    with torch.no_grad():
+        program = torch.export.export(MaskedPositions().eval(), (torch.randn(8, 4),))
+    ExecuTorchXNNPACKConfig().compile(program, tmp_path / "model.pte")
+    ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
+    assert not [op for op in ops if "nonzero" in op or "index" in op], ops
+
+
+@needs_executorch
+def test_executorch_xnnpack_takes_the_linear_layers_of_a_bfloat16_program(tmp_path, monkeypatch):
+    """XNNPACK takes bfloat16 ops only when asked to, and the portable kernels run them many times slower."""
+    import executorch.exir
+    from executorch.runtime import Runtime
+
+    from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
+
+    ops = []
+    to_edge = executorch.exir.to_edge_transform_and_lower
+
+    def lower(program, **kwargs):
+        edge = to_edge(program, **kwargs)
+        ops.extend(
+            str(node.target) for node in edge.exported_program().graph.nodes if node.op == "call_function"
+        )
+        return edge
+
+    monkeypatch.setattr(executorch.exir, "to_edge_transform_and_lower", lower)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2))
+    model = model.to(torch.bfloat16).eval()
+    x = torch.randn(3, 4, dtype=torch.bfloat16)
+    path = tmp_path / "model.pte"
+    with torch.no_grad():
+        ExecuTorchXNNPACKConfig().compile(torch.export.export(model, (x,)), path)
+        expected = model(x)
+    assert not [op for op in ops if "executorch_call_delegate" not in op and "getitem" not in op], ops
+    (actual,) = Runtime.get().load_program(path).load_method("forward").execute([x])
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 EXPORT_WITHOUT_TORCH = """
