@@ -33,7 +33,6 @@ table.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterator
 from copy import copy
 from dataclasses import replace
@@ -54,12 +53,16 @@ from lerobot.export.recipe import (
     RunPlan,
     TaskTokenData,
     TestCase,
+    dataset_metadata,
+    export_task,
     frame_shapes,
+    load_processors,
     measure_action_scale,
     preprocessor_renames,
     random_frame,
     robot_features,
     to_policy_input,
+    whole_policy_fits,
 )
 from lerobot.policies import prepare_observation_for_inference
 from lerobot.policies.common.meta_load import load_checkpoint_modules
@@ -86,7 +89,6 @@ if TYPE_CHECKING or _transformers_available:
 
 if TYPE_CHECKING:
     from lerobot.configs import PolicyFeature
-    from lerobot.datasets import LeRobotDatasetMetadata
     from lerobot.export.configs import ExportConfig
 
     from .configuration_pi05 import PI05Config
@@ -439,8 +441,6 @@ class PI05ExportRecipe(ExportRecipe):
     def __init__(self, cfg: ExportConfig) -> None:  # noqa: D107
         from transformers.utils import cached_file
 
-        from lerobot.policies.factory import make_pre_post_processors
-
         policy_config = cast("PI05Config", cfg.policy)
         self.cfg = cfg
         self._device = torch.device(cfg.backend.device)
@@ -455,14 +455,7 @@ class PI05ExportRecipe(ExportRecipe):
         )
         # The policy without weights checks that it can run one chunk from the current frame.
         self._steps = self._load().chunk_inference_spec().execution_steps
-        overrides = {"device_processor": {"device": cfg.backend.device}}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            policy_config,
-            pretrained_path=policy_config.pretrained_path,
-            pretrained_revision=policy_config.pretrained_revision,
-            preprocessor_overrides=overrides,
-            postprocessor_overrides=overrides,
-        )
+        self.preprocessor, self.postprocessor = load_processors(policy_config)
         self.tolerance = (
             cfg.tolerance
             if cfg.tolerance is not None
@@ -471,14 +464,7 @@ class PI05ExportRecipe(ExportRecipe):
             else FLOAT32_TOLERANCE
         )
         self._generator = torch.Generator().manual_seed(cfg.seed)
-        self._metadata: LeRobotDatasetMetadata | None = None
-        if cfg.dataset is not None:
-            from lerobot.datasets import LeRobotDatasetMetadata
-
-            dataset = cfg.dataset
-            self._metadata = LeRobotDatasetMetadata(
-                dataset.repo_id, root=dataset.root, revision=dataset.revision
-            )
+        self._metadata = dataset_metadata(cfg)
         self._features = robot_features(policy_config, self.preprocessor, self._metadata)
         self._visual = {name for name, f in self._features.items() if f.type is FeatureType.VISUAL}
         self.config = copy(policy_config)
@@ -486,7 +472,7 @@ class PI05ExportRecipe(ExportRecipe):
         renames = preprocessor_renames(self.preprocessor)
         self._state_name = next(name for name in self._features if renames.get(name, name) == OBS_STATE)
         self._state_dim = frame_shapes(self._features)[self._state_name][0]
-        exported = self.task = self._task()
+        exported = self.task = export_task(cfg, self._metadata, "pi0.5")
         dataset_tasks = [] if self._metadata is None else [str(t) for t in self._metadata.tasks.index]
         known_tasks = list(dict.fromkeys([exported, *dataset_tasks]))
         for task in known_tasks:
@@ -635,7 +621,10 @@ class PI05ExportRecipe(ExportRecipe):
         if self._actions is None:
             raise RuntimeError("The test case is made by `parts`, which has not run yet.")
         postprocessor, _ = _split_absolute_step(self.postprocessor)
-        action_scale = measure_action_scale(postprocessor, self._actions.shape[-1], self._device)
+        width = self._actions.shape[-1]
+        action_scale = measure_action_scale(
+            lambda value: postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
+        )
         case = TestCase(self._frame, self._noise.numpy(), self._actions, action_scale)
         self._check_against_policy(case)
         return case
@@ -670,15 +659,6 @@ class PI05ExportRecipe(ExportRecipe):
     def _load(self, *modules: str) -> PI05Policy:
         """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
         return load_checkpoint_modules(PI05Policy, str(self._model_file), self._policy_config, list(modules))
-
-    def _task(self) -> str:
-        if self.cfg.task:
-            return self.cfg.task
-        if self._metadata is None:
-            raise ValueError(
-                "pi0.5 reads the task: give the one to export with --task, or its dataset with --dataset.repo_id."
-            )
-        return str(self._metadata.tasks.index[0])
 
     def _tensor_preprocessor(self) -> PolicyProcessorPipeline:
         """The preprocessor without the steps that make the prompt text and tokenize it, which StatePrompt does."""
@@ -755,19 +735,7 @@ class PI05ExportRecipe(ExportRecipe):
 
     def _check_against_policy(self, case: TestCase) -> None:
         """Compare the test case with the whole policy's `predict_action_chunk`, when the policy fits in memory."""
-        size = self._model_file.stat().st_size
-        if self._device.type == "cuda":
-            available = torch.cuda.mem_get_info(self._device)[0]
-        else:
-            available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        # Room for the activations and for what the export already holds.
-        if 2 * size > available:
-            logger.info(
-                "Not comparing the test case with the whole policy: its %.1f GiB of weights do not fit twice in "
-                "the %.1f GiB this device has free.",
-                size / 2**30,
-                available / 2**30,
-            )
+        if not whole_policy_fits(self._model_file, self._device):
             return
         policy = PI05Policy.from_pretrained(
             str(self._policy_config.pretrained_path),
