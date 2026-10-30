@@ -768,6 +768,7 @@ def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkey
     ("backend", "refused", "allowed", "error"),
     [
         ("executorch_coreml", ["linux", "win32"], "darwin", "exports only on a Mac"),
+        ("executorch_mlx", ["linux", "win32"], "darwin", "compiles only on a Mac"),
         ("executorch_openvino", ["darwin"], "linux", "does not export on a Mac"),
     ],
 )
