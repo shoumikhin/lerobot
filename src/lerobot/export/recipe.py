@@ -359,6 +359,10 @@ class ActionChunkRecipe(ExportRecipe):
         """
         if NOISE not in inspect.signature(self.policy.predict_action_chunk).parameters:
             return None
+        return self._recorded_noise_shape(frame)
+
+    def _recorded_noise_shape(self, frame: dict[str, np.ndarray]) -> tuple[int, ...]:
+        """The shape of the one random normal tensor `predict_chunk` draws for one sample."""
         self._reset()
         with torch.no_grad(), ReplayDraws() as draws:
             self.predict_chunk(self.policy, self.preprocessor(self._observation(frame, self.task)), None)
