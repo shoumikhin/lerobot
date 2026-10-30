@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import EXECUTORCH, ExecuTorchConfig
+from .executorch import EXECUTORCH, ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -41,9 +41,7 @@ class ExecuTorchOpenVINOConfig(ExecuTorchConfig):
     def compile(self, program: ExportedProgram, path: Path) -> None:
         """Lower `program` to OpenVINO and save it as an ExecuTorch program."""
         from executorch.backends.openvino.partitioner import OpenvinoPartitioner
-        from executorch.exir import to_edge_transform_and_lower
         from executorch.exir.backend.compile_spec_schema import CompileSpec
 
-        partitioner = OpenvinoPartitioner([CompileSpec("device", b"CPU")])
-        edge = to_edge_transform_and_lower(program, partitioner=[partitioner])
+        edge = lower(program, OpenvinoPartitioner([CompileSpec("device", b"CPU")]))
         path.write_bytes(edge.to_executorch().buffer)
