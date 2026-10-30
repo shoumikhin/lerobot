@@ -528,3 +528,14 @@ def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(
         # The permissions of a new folder, not the private ones of the temporary folder the bundle was.
         assert stat.S_IMODE(bundle.path.stat().st_mode) == stat.S_IMODE((tmp_path / "new").stat().st_mode)
         assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
+
+
+def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path, monkeypatch):
+    """ACT exported to act on the older of its last two frames: the bundle's own check sees the order."""
+    use_plugins(monkeypatch, "history_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.history == {IMAGE: 2, OBS_STATE: 2}
+    case = load_file(bundle.path / bundle.manifest.test_case)
+    assert case[IMAGE].shape == (2, 32, 32, 3) and case[OBS_STATE].shape == (2, 3)
+    BundleEngine(bundle).check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])
