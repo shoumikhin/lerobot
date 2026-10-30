@@ -363,6 +363,10 @@ def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
         ({"programs": {"model": {"file": "model.pt2", "shards": 2}}}, r"\['shards'\].*Upgrade LeRobot"),
         ({"runs": [{**MODEL_RUN, "device": "cuda"}]}, r"\['device'\].*Upgrade LeRobot"),
         (
+            {"target": {"device": "cuda", "gpu": "A100", "compute_capability": "8.0", "driver": "580"}},
+            r"\['driver'\].*Upgrade LeRobot",
+        ),
+        (
             {"runs": [{"name": "model", "program": "other", "inputs": [], "outputs": []}]},
             r"runs the programs \['other'\]",
         ),
@@ -386,6 +390,7 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ({"programs": {"model": "model.pt2"}}, "programs"),
         ({"runs": ["model"]}, "runs"),
         ({"runtime_imports": [123]}, "runtime_imports"),
+        ({"target": "cuda"}, "target"),
     ],
 )
 def test_bundle_refuses_a_manifest_in_a_form_it_does_not_read(tmp_path, change, wrong):
