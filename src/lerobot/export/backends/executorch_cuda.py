@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -66,7 +65,13 @@ class ExecuTorchCUDAConfig(ExportBackendConfig):
                 'The executorch_cuda backend needs the CUDA build of ExecuTorch: pip install "executorch>=1.6.0,<1.7.0"'
             ) from error
 
-        partitioner = CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])
+        # The data file takes the part's name, so parts saved into one folder keep their own.
+        partitioner = CudaPartitioner(
+            [
+                CudaBackend.generate_method_name_compile_spec("forward"),
+                CudaBackend.generate_data_name_compile_spec(path.stem),
+            ]
+        )
         # Inductor's convolution kernels follow this flag, and in TF32 they drift several times further from
         # PyTorch than PyTorch's own GPU kernels do, so the kernels are compiled in full float32.
         allow_tf32 = torch.backends.cudnn.allow_tf32
@@ -89,8 +94,5 @@ class ExecuTorchCUDAConfig(ExportBackendConfig):
             )
         )
         path.write_bytes(compiled.buffer)
-        # The CUDA backend gives its data file the same name for every program, so it is renamed after this one.
-        with tempfile.TemporaryDirectory(dir=path.parent) as folder:
-            compiled.write_tensor_data_to_file(folder)
-            (written,) = Path(folder).iterdir()
-            return written.replace(path.with_suffix(".ptd"))
+        compiled.write_tensor_data_to_file(str(path.parent))
+        return path.with_suffix(".ptd")

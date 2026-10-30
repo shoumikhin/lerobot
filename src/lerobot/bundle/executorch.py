@@ -25,9 +25,9 @@ import numpy as np
 
 
 def prepare() -> None:
-    """Make ExecuTorch return its own results rather than torch tensors.
+    """Opt in to ExecuTorch's own result type, so running a program never loads PyTorch.
 
-    ExecuTorch reads this once, when its bindings load, so it is set before any module imports them.
+    ExecuTorch returns torch tensors by default. It reads this setting once, when its bindings load.
     """
     os.environ["EXECUTORCH_PYBINDINGS_TENSOR_OUTPUT"] = "executorch"
 
@@ -47,7 +47,6 @@ class ExecuTorchProgram:
 
     def __init__(self, path: Path, data: Path | None = None):
         """Load the program at `path`."""
-        prepare()
         try:
             from executorch.runtime import ExecuTorchResult, Runtime
         except ImportError as error:
@@ -71,7 +70,7 @@ class ExecuTorchProgram:
 
     def to_numpy(self, value: Any) -> np.ndarray:
         """An output as a host array."""
-        return np.asarray(value if value.device == "cpu" else value.to_host())
+        return np.asarray(value if str(value.device) == "cpu" else value.to_host())
 
     def place(self, index: int, value: np.ndarray) -> Any:
         """`value` copied where input `index` reads it, once."""
@@ -79,7 +78,7 @@ class ExecuTorchProgram:
 
     def _place(self, value: Any, device: str) -> Any:
         if not isinstance(value, np.ndarray):
-            if value.device == device:
+            if str(value.device) == device:
                 return value
             # The runtime hands a program whatever memory an input is in, so an output of another
             # program on another device is copied through the host first.

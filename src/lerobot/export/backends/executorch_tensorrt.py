@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -97,36 +96,31 @@ class ExecuTorchTensorRTConfig(ExportBackendConfig):
             options["workspace_size"] = self.workspace_size
         args, _ = program.example_inputs
         engine = torch_tensorrt.dynamo.compile(program, arg_inputs=args, **options)
-        # The CUDA backend writes its weights under a fixed file name beside the program, so each part saves
-        # into a folder of its own and the weights take the part's name.
-        with tempfile.TemporaryDirectory(dir=path.parent) as scratch:
-            staged = Path(scratch) / path.name
-            torch_tensorrt.save(
-                engine,
-                str(staged),
-                output_format="executorch",
-                # Tracing the compiled module again would drop the engines it holds.
-                retrace=False,
-                use_cuda_graphs=True,
-                # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
-                partitioners=[CudaPartitioner([CudaBackend.generate_method_name_compile_spec("forward")])],
-                backend_config=ExecutorchBackendConfig(
-                    # Inputs and outputs stay in GPU memory, so a program reads an earlier one's outputs in place.
-                    propagate_device_config=PropagateDeviceConfig(
-                        skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
-                    ),
-                    enable_non_cpu_memory_planning=True,
-                    memory_planning_pass=MemoryPlanningPass(
-                        alloc_graph_input=False, alloc_graph_output=False
-                    ),
+        torch_tensorrt.save(
+            engine,
+            str(path),
+            output_format="executorch",
+            # Tracing the compiled module again would drop the engines it holds.
+            retrace=False,
+            use_cuda_graphs=True,
+            # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts. Its weights
+            # file takes the part's name, so parts saved into one folder keep their own.
+            partitioners=[
+                CudaPartitioner(
+                    [
+                        CudaBackend.generate_method_name_compile_spec("forward"),
+                        CudaBackend.generate_data_name_compile_spec(path.stem),
+                    ]
+                )
+            ],
+            backend_config=ExecutorchBackendConfig(
+                # Inputs and outputs stay in GPU memory, so a program reads an earlier one's outputs in place.
+                propagate_device_config=PropagateDeviceConfig(
+                    skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
                 ),
-            )
-            staged.replace(path)
-            data_files = list(Path(scratch).glob("*.ptd"))
-            if not data_files:
-                return None
-            if len(data_files) > 1:
-                raise RuntimeError(f"Expected one data file beside {path.name}, got {sorted(data_files)}.")
-            data = path.with_suffix(".ptd")
-            data_files[0].replace(data)
-            return data
+                enable_non_cpu_memory_planning=True,
+                memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
+            ),
+        )
+        data = path.with_suffix(".ptd")
+        return data if data.exists() else None

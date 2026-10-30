@@ -307,7 +307,7 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     not (sys.platform == "darwin" and EXECUTORCH), reason="needs ExecuTorch and PyTorch 2.15 on macOS"
 )
 def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
-    """Not end to end on ACT: Core ML takes no uint8 camera frames until pytorch/executorch#11686 is fixed."""
+    """Core ML compiles a small program, and ExecuTorch runs it like PyTorch."""
     from lerobot.bundle.executorch import ExecuTorchProgram
     from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
 

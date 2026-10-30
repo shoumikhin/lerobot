@@ -42,7 +42,6 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
-- Core ML takes no 8-bit camera images yet ([pytorch/executorch#11686](https://github.com/pytorch/executorch/issues/11686)), so with `executorch_coreml` a policy that reads cameras does not export yet.
 - On macOS, export the same way, from a second environment with PyTorch 2.15 and without Torch-TensorRT. Running an MLX or Core ML bundle with the older PyTorch that LeRobot installs on macOS has not been tested: TODO(version).
 
 <Tip warning={true}>
