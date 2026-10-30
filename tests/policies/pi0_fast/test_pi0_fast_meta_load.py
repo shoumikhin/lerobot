@@ -52,7 +52,7 @@ class Tokenizer:
 @pytest.fixture
 def config(monkeypatch):
     use_tiny_backbone(monkeypatch, modeling_pi0_fast)
-    monkeypatch.setattr(modeling_pi0_fast, "AutoProcessor", Tokenizer)
+    monkeypatch.setattr(modeling_pi0_fast, "load_action_tokenizer", Tokenizer.from_pretrained)
     monkeypatch.setattr(modeling_pi0_fast, "AutoTokenizer", Tokenizer)
     config = PI0FastConfig(image_resolution=(28, 28), device="cpu", dtype=torch.bfloat16)
     config.input_features = {
