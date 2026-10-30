@@ -1238,6 +1238,8 @@ class FastWAM(torch.nn.Module):
         self.vae._apply(fn)
         if self.text_encoder is not None:
             self.text_encoder._apply(fn)
+        # The inputs the model moves itself, such as the prompt's token ids, go where its weights now are.
+        self.device = next(self.parameters()).device
         return self
 
     @staticmethod

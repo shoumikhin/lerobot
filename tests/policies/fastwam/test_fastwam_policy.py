@@ -213,8 +213,7 @@ def test_policy_forward_and_predict_action_adapt_lerobot_batches(monkeypatch):
     assert all(item["compile_action_infer"] for item in captured)
 
 
-def test_cached_inference_paths_support_fullgraph_compile():
-    torch.manual_seed(0)
+def _tiny_fastwam() -> FastWAM:
     expert_kwargs = {
         "hidden_dim": 8,
         "action_dim": 3,
@@ -232,14 +231,20 @@ def test_cached_inference_paths_support_fullgraph_compile():
     mot = MoT(
         mixtures={"video": video_expert, "action": action_expert},
         mot_checkpoint_mixed_attn=False,
-    ).eval()
-    model = FastWAM(
+    )
+    return FastWAM(
         video_expert=video_expert,
         action_expert=action_expert,
         mot=mot,
         vae=nn.Identity(),
         text_dim=8,
-    ).eval()
+    )
+
+
+def test_cached_inference_paths_support_fullgraph_compile():
+    torch.manual_seed(0)
+    model = _tiny_fastwam().eval()
+    video_expert, mot = model.video_expert, model.mot
     video_tokens = torch.randn(1, 3, 8)
     video_freqs = video_expert.freqs[:3].view(3, 1, -1)
     video_t_mod = torch.zeros(1, 6, 8)
@@ -404,6 +409,16 @@ def test_frozen_components_excluded_from_params_but_follow_device_moves(monkeypa
     assert policy.model.dit.weight.dtype == torch.float64  # registered
     assert policy.model.vae.weight.dtype == torch.float64  # unregistered, moved via _apply
     assert policy.model.text_encoder.weight.dtype == torch.float64
+
+
+def test_the_core_follows_its_weights_to_another_device():
+    model = _tiny_fastwam()
+    assert model.device == torch.device("cpu")
+
+    # The meta device stands in for a GPU on a CPU box.
+    model.to("meta")
+
+    assert model.device == torch.device("meta")
 
 
 def test_pretrained_config_round_trips_fastwam_features(tmp_path):
