@@ -3241,3 +3241,20 @@ def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     inference_inputs = {key: value for key, value in inputs.items() if key != "action"}
     action_output = model.get_action(inference_inputs)
     assert action_output["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+
+def test_action_encoder_takes_one_time_encoding_for_the_chunk():
+    from lerobot.policies.groot.groot_n1_7 import MultiEmbodimentActionEncoder
+
+    torch.manual_seed(0)
+    encoder = MultiEmbodimentActionEncoder(action_dim=3, hidden_size=8, num_embodiments=2)
+    actions = torch.randn(1, 5, 3)
+    cat_ids = torch.tensor([1])
+    timestep = torch.tensor([7])
+
+    time_encoding = encoder.pos_encoding(timestep[:, None])
+
+    assert time_encoding.shape == (1, 1, 8)
+    torch.testing.assert_close(
+        encoder.encode(actions, time_encoding, cat_ids), encoder(actions, timestep, cat_ids), atol=0, rtol=0
+    )
