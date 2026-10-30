@@ -18,6 +18,7 @@
 Tests for the TokenizerProcessorStep class.
 """
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -132,6 +133,154 @@ def test_action_tokenizer_can_reject_truncated_sequences():
 
     with pytest.raises(ValueError, match="max_action_tokens=4"):
         processor._tokenize_action(torch.zeros(1, 2, 1))
+
+
+_ACTION_PROCESSOR_CODE = """
+from transformers import ProcessorMixin
+
+
+class TinyActionProcessor(ProcessorMixin):
+    bpe_tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, bpe_tokenizer, scale=10):
+        self.scale = scale
+        super().__init__(bpe_tokenizer)
+"""
+
+_TWO_TOKENIZER_PROCESSOR_CODE = """
+from transformers import ProcessorMixin
+
+
+class TinyActionProcessor(ProcessorMixin):
+    def __init__(self, bpe_tokenizer, decoder_tokenizer):
+        super().__init__(bpe_tokenizer, decoder_tokenizer)
+"""
+
+
+def _save_tiny_tokenizer(folder: Path) -> None:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = Tokenizer(models.WordLevel({"a": 0, "b": 1, "[UNK]": 2}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer).save_pretrained(folder)
+
+
+def _save_action_processor(
+    folder: Path, tokenizer_subfolder: str, code: str = _ACTION_PROCESSOR_CODE
+) -> None:
+    """Saves a FAST-like remote-code processor whose BPE tokenizer sits in `tokenizer_subfolder`."""
+    folder.mkdir()
+    (folder / "processing_tiny.py").write_text(code)
+    auto_map = {"AutoProcessor": "processing_tiny.TinyActionProcessor"}
+    (folder / "processor_config.json").write_text(
+        json.dumps({"processor_class": "TinyActionProcessor", "auto_map": auto_map, "scale": 7})
+    )
+    _save_tiny_tokenizer(folder / tokenizer_subfolder)
+
+
+def _assert_tiny_action_processor(processor) -> None:
+    assert processor.scale == 7
+    assert processor.bpe_tokenizer.encode("b a", add_special_tokens=False) == [1, 0]
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_loads_processor_saved_by_transformers_4(tmp_path, monkeypatch):
+    """Transformers 4 saved the BPE tokenizer at the top level, as `physical-intelligence/fast` still has it."""
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    _save_action_processor(tmp_path / "legacy_fast", tokenizer_subfolder="")
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    step = ActionTokenizerProcessorStep(
+        action_tokenizer_name=str(tmp_path / "legacy_fast"), paligemma_tokenizer_name=str(tmp_path / "text")
+    )
+    _assert_tiny_action_processor(step.action_tokenizer)
+
+    artifact = step.save_artifacts(tmp_path / "saved")["action_tokenizer_name"]
+    saved = ActionTokenizerProcessorStep(
+        action_tokenizer_name=str(tmp_path / "saved" / artifact),
+        paligemma_tokenizer_name=str(tmp_path / "text"),
+    )
+    _assert_tiny_action_processor(saved.action_tokenizer)
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_respects_trust_remote_code_for_transformers_4_layout(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    _save_action_processor(tmp_path / "legacy_fast", tokenizer_subfolder="")
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        ActionTokenizerProcessorStep(
+            action_tokenizer_name=str(tmp_path / "legacy_fast"),
+            paligemma_tokenizer_name=str(tmp_path / "text"),
+            trust_remote_code=False,
+        )
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_loads_processor_saved_by_transformers_5(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    _save_action_processor(tmp_path / "current_fast", tokenizer_subfolder="bpe_tokenizer")
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    step = ActionTokenizerProcessorStep(
+        action_tokenizer_name=str(tmp_path / "current_fast"), paligemma_tokenizer_name=str(tmp_path / "text")
+    )
+    _assert_tiny_action_processor(step.action_tokenizer)
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_leaves_processors_with_more_attributes_to_auto_processor(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    folder = tmp_path / "two_tokenizers"
+    _save_action_processor(folder, tokenizer_subfolder="", code=_TWO_TOKENIZER_PROCESSOR_CODE)
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    with patch("lerobot.processor.tokenizer_processor.AutoProcessor") as auto_processor:
+        step = ActionTokenizerProcessorStep(
+            action_tokenizer_name=str(folder), paligemma_tokenizer_name=str(tmp_path / "text")
+        )
+
+    auto_processor.from_pretrained.assert_called_once_with(str(folder), trust_remote_code=True)
+    assert step.action_tokenizer is auto_processor.from_pretrained.return_value
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_loads_registered_processor_without_auto_map(tmp_path):
+    from transformers import AutoConfig, AutoProcessor, PretrainedConfig, ProcessorMixin
+
+    class LocalActionConfig(PretrainedConfig):
+        model_type = "local_action_test"
+
+    class LocalActionProcessor(ProcessorMixin):
+        def __init__(self, scale=10):
+            self.scale = scale
+            super().__init__()
+
+    AutoConfig.register("local_action_test", LocalActionConfig, exist_ok=True)
+    AutoProcessor.register(LocalActionConfig, LocalActionProcessor, exist_ok=True)
+    folder = tmp_path / "local_action"
+    folder.mkdir()
+    (folder / "processor_config.json").write_text(
+        json.dumps({"processor_class": "LocalActionProcessor", "scale": 7})
+    )
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    step = ActionTokenizerProcessorStep(
+        action_tokenizer_name=str(folder), paligemma_tokenizer_name=str(tmp_path / "text")
+    )
+
+    assert isinstance(step.action_tokenizer, LocalActionProcessor)
+    assert step.action_tokenizer.scale == 7
 
 
 @pytest.fixture
