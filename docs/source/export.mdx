@@ -271,7 +271,7 @@ A vision-language-action policy reads a task such as "pick up the cube". To read
 
 For an any-task bundle, the task's prompt must fit in `--max_task_tokens`. The prompt is the task plus a few fixed words the policy adds around it. By default, the budget is a little more than the longest prompt known at export.
 
-Change the task with `--task` when you start `lerobot-rollout --mode=bundle`.
+Change the task with `--task` when you start `lerobot-rollout --bundle.path=<folder>`.
 
 ### PyTorch at export and at run time
 
@@ -306,7 +306,7 @@ For GR00T N1.7, pass a GR00T checkpoint instead. Close other programs while it r
 ### 3. Run
 
 ```bash
-lerobot-rollout --mode=bundle \
+lerobot-rollout \
     --bundle.path=outputs/export/pi05_executorch_tensorrt \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
