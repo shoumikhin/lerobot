@@ -78,6 +78,8 @@ class BundleEngine:
         self._stop = stop_event or Event()
         self._constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
+        # A GPU bundle draws its noise in a run of its own; otherwise the engine draws it on the host.
+        self._draws_noise = any(NOISE in run.outputs for run in manifest.runs)
         self._action_names = manifest.action_names
         self._scale = np.asarray(manifest.action_scale, dtype=np.float32)
         if not (np.isfinite(self._scale) & (self._scale > 0)).all():
@@ -113,7 +115,7 @@ class BundleEngine:
             manifest,
             [*self._frame_spec, *self._task_values],
             list(self._constants),
-            manifest.noise_shape is not None,
+            manifest.noise_shape is not None and not self._draws_noise,
         )
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions)
@@ -172,11 +174,14 @@ class BundleEngine:
         noise: np.ndarray | None = None,
     ) -> np.ndarray:
         values: dict[str, Any] = {**{name: frame[name] for name in self._frame_spec}, **task_values}
-        if self._noise_shape is not None:
-            values[NOISE] = (
-                np.random.standard_normal(self._noise_shape).astype(np.float32) if noise is None else noise
-            )
+        if noise is None and self._noise_shape is not None and not self._draws_noise:
+            noise = np.random.standard_normal(self._noise_shape).astype(np.float32)
+        if noise is not None:
+            values[NOISE] = noise
         for (run, program), placed in zip(self._runs, self._placed, strict=True):
+            if NOISE in values and NOISE in run.outputs:
+                # The test case's recorded noise stands in for the draw.
+                continue
             inputs = []
             for index, name in enumerate(run.inputs):
                 if index in placed:
