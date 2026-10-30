@@ -256,6 +256,14 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
         hidden[0, start : end + 1] = 0
         stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
         assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
+        # With cameras of two shapes and one token count, the hidden camera must not hand its grid to another.
+        camera = [config.vision_start_token_id, *[config.image_token_id] * 6, config.vision_end_token_id]
+        input_ids = torch.tensor([[1, *camera, *camera, 2]] * 2)
+        hidden = torch.ones_like(input_ids)
+        hidden[0, 1:9] = 0
+        every_grid = [[1, 4, 6], [1, 6, 4]] * 2
+        stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
+        assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
 
 
 @pytest.mark.parametrize("precompute_grid_thw", [False, True], ids=["option-off", "option-on"])

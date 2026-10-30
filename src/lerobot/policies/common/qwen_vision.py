@@ -327,12 +327,10 @@ def _visible_run_blocks(
     first_token = torch.tensor([sum(counts[:i]) for i in range(len(counts))], device=valid.device)
     offset = is_image.flatten().cumsum(0).view_as(is_image) - 1 - first_token[grid_index]
     # Runs are numbered in order, so a run starts at its grid's first token when every earlier run ended on
-    # its grid's last one.
-    covers_grid = (runs < len(sizes)) & (
-        before_image | (offset == torch.tensor(counts, device=valid.device)[grid_index] - 1)
-    )
+    # its grid's last one; a run past the last grid then cannot end on that grid's last token either.
+    run_ends_on_grid_end = offset == torch.tensor(counts, device=valid.device)[grid_index] - 1
     check_input(
-        ~is_image | covers_grid,
+        ~is_image | before_image | run_ends_on_grid_end,
         "Each run of visible image tokens must be one whole image, with at most as many runs as images, to run "
         "on a fixed image grid: eager rope positions fail or misplace an image otherwise.",
     )
