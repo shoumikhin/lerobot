@@ -16,6 +16,7 @@
 """The default export recipe, on a tiny ACT built in memory."""
 
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +33,7 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.processor import ProcessorStep, TransitionKey
+from lerobot.processor import NormalizerProcessorStep, ProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 IMAGE = f"{OBS_IMAGES}.front"
@@ -296,3 +297,40 @@ def test_an_export_loads_the_policy_straight_onto_its_device(tmp_path):
     assert all(parameter.is_cuda for parameter in policy.parameters())
     assert peak[0] - start < weights / 2
     assert torch.cuda.max_memory_allocated() >> 20 < 1.5 * weights
+
+
+class SkipStepRecipe(ActionChunkRecipe):
+    """A recipe whose program runs the saved preprocessor without the step at `skip`."""
+
+    skip = None
+
+    def program_preprocessor(self):
+        steps = [step for i, step in enumerate(self.preprocessor.steps) if i != self.skip]
+        return replace(self.preprocessor, steps=steps)
+
+
+def test_the_program_runs_the_preprocessor_its_recipe_gives():
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    preprocessor.steps.insert(0, TaskCodes())
+    recipe = SkipStepRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config("pick"))
+    # ACT ignores the task codes, so the program computes the same without that step.
+    recipe.skip = 0
+
+    [part] = recipe.parts()
+
+    assert not any(isinstance(step, TaskCodes) for step in part.module.preprocessor.steps)
+
+
+def test_a_program_preprocessor_that_computes_something_else_is_refused():
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    recipe = SkipStepRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config())
+    recipe.skip = next(
+        i for i, step in enumerate(preprocessor.steps) if isinstance(step, NormalizerProcessorStep)
+    )
+
+    with pytest.raises(ValueError, match="computes something else"):
+        list(recipe.parts())
