@@ -72,6 +72,24 @@ class ProgramRun:
     outputs: list[str]
 
 
+@dataclass
+class Target:
+    """The GPU a bundle's programs were built on, when they run only on that kind of GPU.
+
+    Args:
+        device (`str`):
+            The kind of device, `cuda`.
+        gpu (`str`):
+            The GPU's name, such as `Orin`.
+        compute_capability (`str`):
+            Its compute capability, such as `"8.7"`.
+    """
+
+    device: str
+    gpu: str
+    compute_capability: str
+
+
 @dataclass(kw_only=True)
 class BundleManifest:
     """The contents of a bundle's `export.json`.
@@ -104,6 +122,12 @@ class BundleManifest:
         tolerance (`float`):
             The largest difference allowed between the actions the programs compute for the test case and
             the ones PyTorch computed, in normalized units: robot units divided by `action_scale`.
+        target (`Target`, *optional*):
+            The GPU the programs were built on, when they run only on that kind of GPU. `None` for programs
+            that run anywhere their runtime does.
+        runtime_versions (`dict[str, str]`, *optional*):
+            The version of each Python module the programs were built with and need to load, such as
+            `executorch`, by module name.
         test_case (`str`, *optional*, defaults to `"test.safetensors"`):
             The test case file: a frame, the noise, and the expected actions under `action`.
     """
@@ -120,6 +144,8 @@ class BundleManifest:
     action_names: list[str] | None = None
     action_scale: list[float]
     tolerance: float
+    target: Target | None = None
+    runtime_versions: dict[str, str] = field(default_factory=dict)
     test_case: str = TEST_CASE
 
     def __post_init__(self) -> None:
@@ -154,6 +180,7 @@ class BundleManifest:
             )
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
+        target = data.get("target")
         # A key added later can change how the programs run, so a reader that does not know it stops.
         unknown = (
             sorted(set(data) - {f.name for f in fields(cls)})
@@ -161,6 +188,7 @@ class BundleManifest:
                 {key for files in programs.values() for key in files} - {f.name for f in fields(ProgramFiles)}
             )
             + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
+            + sorted(set(target or {}) - {f.name for f in fields(Target)})
         )
         if unknown:
             raise ValueError(
@@ -171,6 +199,7 @@ class BundleManifest:
                 **data,
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
+                "target": None if target is None else Target(**target),
             }
         )
 
