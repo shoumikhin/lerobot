@@ -951,12 +951,20 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
     # and in eager mode even with the switch that turns off the transformers checks.
     malformed = {**batch, "input_ids": ids.clone()}
     malformed["input_ids"][0, -1] = 6
-    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        run(program.module(), malformed)
+    # Also an action token inside the prefix (marked as such), and an image token fewer.
+    inside = ids.clone()
+    inside[0, 2] = 31
+    inside = {**batch, "input_ids": inside, "moe_token_types": inside == 31}
+    fewer_images = {**batch, "input_ids": ids.clone()}
+    fewer_images["input_ids"][0, 4] = 4
+    for wrong in (malformed, inside, fewer_images):
+        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            run(program.module(), wrong)
     monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
-    with pytest.raises(ValueError, match="Flow inputs must end"):
-        policy.predict_action_chunk(malformed, noise=noise.clone())
+    for wrong in (malformed, inside):
+        with pytest.raises(ValueError, match="Flow inputs must end"):
+            policy.predict_action_chunk(wrong, noise=noise.clone())
 
 
 def test_preparation_and_export_refuse_hidden_vision_tokens():

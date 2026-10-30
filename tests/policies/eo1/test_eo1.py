@@ -726,12 +726,33 @@ def test_prepared_sampling_exports_and_matches_eager(monkeypatch):
     # even with the switch that turns off the transformers checks.
     malformed = {**batch, "input_ids": batch["input_ids"].clone()}
     malformed["input_ids"][0, -2] = 2
-    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        run(malformed)
+    # Also the action tokens out of one chunk at `action_token_start`, and an image token fewer.
+    split = {**batch, "input_ids": batch["input_ids"].clone()}
+    split["input_ids"][0, -2:] = torch.tensor([2, ACTION_TOKEN_ID])
+    fewer_images = {**batch, "input_ids": batch["input_ids"].clone()}
+    fewer_images["input_ids"][0, 4] = 1
+    for wrong in (malformed, split, fewer_images):
+        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            run(wrong)
     monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     with pytest.raises(ValueError, match="exactly 3 action tokens"):
         policy.predict_action_chunk(malformed)
+    with pytest.raises(ValueError, match="contiguous chunk"):
+        policy.predict_action_chunk(split)
+    # Samples whose action tokens sit at different places.
+    rows = torch.cat([batch["input_ids"], batch["input_ids"].roll(-1, dims=1)])
+    shifted = {
+        **{key: value for key, value in batch.items() if key != "action_token_start"},
+        OBS_STATE: batch[OBS_STATE].repeat(2, 1),
+        "input_ids": rows,
+        "attention_mask": rows.ne(0).long(),
+        "pixel_values": batch["pixel_values"].repeat(2, 1),
+        "image_grid_thw": batch["image_grid_thw"].repeat(2, 1),
+        "mm_token_type_ids": rows.eq(40).int(),
+    }
+    with pytest.raises(ValueError, match="share the same action token mask"):
+        policy.predict_action_chunk(shifted)
 
 
 def test_sampling_export_without_preparation_explains(monkeypatch):

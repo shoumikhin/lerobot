@@ -434,7 +434,26 @@ def test_diffusion_rejects_a_sample_without_its_state_token():
     batch["input_ids"] = batch["input_ids"].clone()
     assert batch["input_ids"][0, 6] == 32
     batch["input_ids"][0, 6] = 7  # sample 0 loses its state token; its state must not go to sample 1
-    with pytest.raises(ValueError, match="Proprioception features and state tokens do not match"):
+    moved = batch["input_ids"].clone()
+    moved[1, 5] = 32  # and sample 1 gets a second one, so only the per-sample count is wrong
+    for input_ids in (batch["input_ids"], moved):
+        with pytest.raises(ValueError, match="Proprioception features and state tokens do not match"):
+            model.predict(
+                **{**batch, "input_ids": input_ids},
+                predict_mode="diffusion",
+                pred_horizon=3,
+                action_dim=3,
+                num_inference_timesteps=2,
+            )
+
+
+def test_diffusion_checks_the_action_token_count_per_sample():
+    model = _tiny_diffusion_model()
+    batch = _diffusion_batch(3)
+    input_ids = batch["input_ids"].clone()
+    input_ids[0, 7], input_ids[1, 5] = 7, 31  # one action token moves from sample 0 to sample 1
+    batch = {**batch, "input_ids": input_ids, "moe_token_types": input_ids.eq(31)}
+    with pytest.raises(ValueError, match="Expected 3 action tokens per sample"):
         model.predict(
             **batch, predict_mode="diffusion", pred_horizon=3, action_dim=3, num_inference_timesteps=2
         )
