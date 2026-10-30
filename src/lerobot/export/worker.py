@@ -124,6 +124,7 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
                 task_tokens.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, task_tokens.max_tokens
             ),
             noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
+            history=plan.history,
             task=recipe.task,
             action_names=getattr(recipe.config, "action_feature_names", None),
             action_scale=test_case.action_scale.tolist(),

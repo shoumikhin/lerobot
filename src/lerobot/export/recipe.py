@@ -96,7 +96,9 @@ class TestCase:
 
     Args:
         frame (`dict[str, np.ndarray]`):
-            The frame as the robot sends it: uint8 HWC images and float32 arrays.
+            The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
+            `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
+            actions are those computed at the last one.
         noise (`np.ndarray`, *optional*):
             The starting noise, for a policy that takes one.
         actions (`np.ndarray`):
@@ -151,11 +153,15 @@ class RunPlan:
         task_tokens (`TaskTokenData`, *optional*):
             How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
             reads it.
+        history (`dict[str, int]`):
+            For each key of the frame the parts read with its past values, how many frames: the parts take it
+            as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
     """
 
     runs: list[ProgramRun] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
+    history: dict[str, int] = field(default_factory=dict)
 
 
 class ExportRecipe(abc.ABC):
