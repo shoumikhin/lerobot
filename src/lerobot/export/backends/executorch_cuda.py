@@ -45,7 +45,7 @@ class ExecuTorchCUDAConfig(ExecuTorchConfig):
         """
         from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 
-        # The CUDA backend keeps view operators such as split whole, which the edge dialect check refuses.
+        # The CUDA backend keeps every operator whole for its compiler, which the edge dialect check refuses.
         edge = to_edge_transform_and_lower(
             program,
             partitioner=[cuda_partitioner(path.stem)],
