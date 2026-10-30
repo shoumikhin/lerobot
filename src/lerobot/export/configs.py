@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, ClassVar
 import draccus
 from packaging.version import Version
 
+from lerobot.bundle.manifest import Target
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.default import DatasetConfig
 
@@ -50,6 +51,9 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         runtime_imports (`tuple[str, ...]`):
             Python modules the runtime imports before it loads the files, such as one that registers the
             compiler's kernels with the runtime.
+        runtime_modules (`tuple[str, ...]`):
+            Python modules the files need to load, such as `executorch`. The bundle records their versions as
+            its `runtime_versions`.
         packages (`tuple[str, ...]`):
             What to install beside LeRobot to export with this backend, such as `"executorch>=1.6.0,<1.7.0"`.
         min_torch (`str`, *optional*):
@@ -63,9 +67,22 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     file_suffix: ClassVar[str]
     device: ClassVar[str]
     runtime_imports: ClassVar[tuple[str, ...]] = ()
+    runtime_modules: ClassVar[tuple[str, ...]] = ()
     packages: ClassVar[tuple[str, ...]] = ()
     min_torch: ClassVar[str | None] = None
     torch_overrides: ClassVar[tuple[str, ...]] = ()
+
+    def target(self) -> Target | None:
+        """The GPU the files are built on when `device` is `cuda`, since they then run only on that kind of GPU.
+
+        `None` for files that run anywhere their runtime does.
+        """
+        if self.device != "cuda":
+            return None
+        import torch
+
+        major, minor = torch.cuda.get_device_capability()
+        return Target("cuda", torch.cuda.get_device_name(), f"{major}.{minor}")
 
     @property
     def type(self) -> str:
