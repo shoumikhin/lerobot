@@ -23,7 +23,6 @@ import pytest
 import torch
 from safetensors.numpy import load_file
 
-import tests.export.torch_backend  # noqa: F401  # registers the test backend
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -36,6 +35,7 @@ from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from tests.export.plugins import use_plugins
+from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
 
 IMAGE = "observation.images.front"
@@ -163,6 +163,26 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
     else:
         with pytest.raises(RuntimeError, match="failed its check"):
             run_export(*args)
+
+
+def test_a_backend_takes_a_pytorch_as_new_as_it_needs(monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
+    TorchTestBackend().check_torch()
+
+
+def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "99.0")
+    with pytest.raises(ValueError, match="needs PyTorch 99.0 or newer to export") as refusal:
+        TorchTestBackend().check_torch()
+    assert "torch-overrides.txt" not in str(refusal.value)
+
+    monkeypatch.setattr(TorchTestBackend, "packages", ("compiler>=99.0,<99.1",))
+    monkeypatch.setattr(TorchTestBackend, "torch_overrides", ("torch>=99.0,<99.1", "torchvision>=9.0,<9.1"))
+    with pytest.raises(ValueError) as refusal:
+        TorchTestBackend().check_torch()
+    message = str(refusal.value)
+    assert "printf 'torch>=99.0,<99.1\\ntorchvision>=9.0,<9.1\\n' > torch-overrides.txt" in message
+    assert 'uv pip install --override torch-overrides.txt lerobot "compiler>=99.0,<99.1"' in message
 
 
 @pytest.mark.parametrize("tolerance", ["nan", "inf", "-1"])
