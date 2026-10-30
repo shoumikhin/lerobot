@@ -19,12 +19,17 @@ checkpoint ─────────────────> bundle folder �
 
 You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs), and the compiler of the **backend** you choose. Install them on the machine that will run the policy.
 
-| `--backend.type`      | Runs the policy on            | Install                                                                           |
-| --------------------- | ----------------------------- | --------------------------------------------------------------------------------- |
-| `executorch_tensorrt` | NVIDIA GPUs, including Jetson | `pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"` |
+| `--backend.type`      | Runs the policy on                                | Install                                                                           |
+| --------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `executorch_tensorrt` | NVIDIA GPUs, including Jetson                     | `pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"` |
+| `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT   | `pip install "executorch>=1.6.0,<1.7.0"` (the CUDA build of ExecuTorch)           |
+| `executorch_xnnpack`  | Arm and x86 CPUs                                  | `pip install "executorch>=1.6.0,<1.7.0"` (XNNPACK ships with ExecuTorch)          |
+| `executorch_openvino` | Intel CPUs                                        | `pip install "executorch>=1.6.0,<1.7.0" openvino nncf`                            |
+| `executorch_mlx`      | Apple Silicon Macs (GPU, through MLX)             | `pip install "executorch>=1.6.0,<1.7.0"` (the macOS wheel includes MLX)           |
+| `executorch_coreml`   | Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install "executorch>=1.6.0,<1.7.0"` (the macOS wheel includes Core ML)       |
 
 - LeRobot has no `export` extra yet, so install these packages yourself.
-- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. LeRobot itself still pins an older PyTorch, while the ExecuTorch 1.6 package pins `torch==2.15.0`, so install them in a second environment that overrides LeRobot's pin, for example with [uv](https://docs.astral.sh/uv/):
+- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. This holds for every backend in the table. LeRobot itself still pins an older PyTorch, while the ExecuTorch 1.6 package pins `torch==2.15.0`, so install them in a second environment that overrides LeRobot's pin, for example with [uv](https://docs.astral.sh/uv/):
 
   ```bash
   printf 'torch>=2.15,<2.16\ntorchvision>=0.29.2,<0.30\n' > torch-overrides.txt
@@ -36,7 +41,8 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
-- `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so the export machine needs the CUDA compiler `nvcc` on its `PATH`.
+- `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
+- On macOS, export and run from such an environment too, without Torch-TensorRT: `uv pip install --override torch-overrides.txt lerobot "executorch>=1.6.0,<1.7.0"`. LeRobot's own pin keeps an older PyTorch for older macOS versions, so this needs a macOS version that PyTorch 2.15 supports.
 
 <Tip warning={true}>
 
@@ -119,17 +125,19 @@ Then the robot moves, as with any policy. While it runs, an action that is NaN o
 
 ### Options
 
-| Flag                       | What it does                                                                                                                         |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `--policy.path`            | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                             |
-| `--backend.type`           | The compiler, from the table above.                                                                                                  |
-| `--output_dir`             | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                 |
-| `--task`                   | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                |
-| `--dataset.repo_id`        | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                |
-| `--tolerance`              | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                        |
-| `--max_task_tokens`        | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                            |
-| `--seed`                   | Seeds the random test frame. Defaults to `1000`.                                                                                     |
-| `--backend.workspace_size` | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                      |
+| Flag                          | What it does                                                                                                                         |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `--policy.path`               | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                             |
+| `--backend.type`              | The compiler, from the table above.                                                                                                  |
+| `--output_dir`                | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                 |
+| `--task`                      | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                |
+| `--dataset.repo_id`           | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                |
+| `--tolerance`                 | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                        |
+| `--max_task_tokens`           | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                            |
+| `--seed`                      | Seeds the random test frame. Defaults to `1000`.                                                                                     |
+| `--backend.workspace_size`    | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                      |
+| `--backend.compute_units`     | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).  |
+| `--backend.compute_precision` | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`.                                           |
 
 With the default recipe, a checkpoint trained with a PEFT adapter (a small set of extra weights, such as LoRA) is exported with the adapter merged into the base weights.
 
@@ -326,17 +334,20 @@ This table lists what has been tested:
 - **No**: tested, and it does not work yet.
 - **-**: not tested.
 
-| Policy      | Recipe      | TensorRT                                |
-| ----------- | ----------- | --------------------------------------- |
-| ACT         | default     | Yes (data center GPU, Jetson Orin Nano) |
-| pi0.5       | own (chain) | Yes (data center GPU, Jetson Orin Nano) |
-| GR00T N1.7  | own (chain) | Yes (data center GPU, Jetson Orin Nano) |
-| SmolVLA     | default     | Yes (data center GPU, Jetson Orin Nano) |
-| pi0         | default     | Yes (data center GPU)                   |
-| FineART VLA | default     | Program                                 |
+| Policy      | Recipe      | TensorRT                                | CUDA                                   | XNNPACK               | OpenVINO      | MLX                     |
+| ----------- | ----------- | --------------------------------------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
+| ACT         | default     | Yes (data center GPU, Jetson Orin Nano) | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
+| pi0.5       | own (chain) | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
+| GR00T N1.7  | own (chain) | Yes (data center GPU, Jetson Orin Nano) | -                                      | -                     | -             | -                       |
+| SmolVLA     | default     | Yes (data center GPU, Jetson Orin Nano) | No                                     | No (bfloat16 weights) | Program       | -                       |
+| pi0         | default     | Yes (data center GPU)                   | Yes (data center GPU)                  | Program               | Program       | Program                 |
+| FineART VLA | default     | Program                                 | -                                      | Program               | Program       | -                       |
 
-- The ACT result on an x86 computer used PyTorch 2.15 with development builds of ExecuTorch 1.6 and Torch-TensorRT 2.15. The other results used development builds of PyTorch 2.16, ExecuTorch and Torch-TensorRT.
-- The pi0.5 and GR00T rows are for their chain recipes.
+- The ACT TensorRT, XNNPACK and OpenVINO results on an x86 computer used PyTorch 2.15 with development builds of ExecuTorch 1.6 and Torch-TensorRT 2.15. The other results used development builds of PyTorch 2.16, ExecuTorch and Torch-TensorRT.
+- The ACT MLX result used an Apple Silicon Mac with PyTorch 2.15 and a development build of ExecuTorch 1.6.
+- The pi0.5 and GR00T rows are for their chain recipes, which have only been tested with TensorRT so far.
+- SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its `executorch_cuda` export fails because SmolVLA computes its time embedding in float64, and ExecuTorch's CUDA backend cannot yet load float64 values. Use TensorRT or OpenVINO for SmolVLA.
+- `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images ([pytorch/executorch#11686](https://github.com/pytorch/executorch/issues/11686)).
 
 These policies also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes their vision model compute the layout of image patches once, instead of on every call: EO-1, WALL-X, Wall-OSS 0.5, LaWAM, LingBot-VLA v2 and VLA-JEPA. The option assumes that the camera layout does not change while the robot runs.
 
