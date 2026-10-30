@@ -501,6 +501,33 @@ class ActionChunkRecipe(ExportRecipe):
         """
         if NOISE not in inspect.signature(self.policy.predict_action_chunk).parameters:
             return None
+        shape = self._recorded_noise_shape(frame)
+        # The bundle draws a standard normal noise and gives it to the program, so the policy must compute the
+        # same chunk from that noise as when it draws it itself. One that draws `5 + 0.5 * randn` would not.
+        noise = torch.randn((1, *shape), generator=torch.Generator().manual_seed(0)).to(self._device)
+        chunks = []
+        # Both runs in a function mode, which turns off fused kernels such as PyTorch's transformer layers',
+        # since those round differently. The first reads a copy, or a policy that moves its draw in place
+        # would move the noise the second is given too.
+        for draws, argument in ((ReplayDraws(noise[None].clone()), None), (ReplayDraws(), noise)):
+            self._reset()
+            with torch.no_grad(), draws:
+                batch = self.preprocessor(self._observation(frame, self.task))
+                chunks.append(self.predict_chunk(self.policy, batch, argument)[:, : self._steps])
+        # NaN counts as equal here: the finite check that follows refuses NaN in the actions rollout plays.
+        drawn, given = (chunk.float() for chunk in chunks)
+        if drawn.shape != given.shape or not torch.allclose(drawn, given, rtol=0, atol=0, equal_nan=True):
+            raise ValueError(
+                f"The {self.policy.config.type} policy computes another chunk when it is given its starting "
+                "noise than when it draws that noise itself, as when it changes the noise it draws before "
+                "using it, or computes another chunk from the same noise each time. Its bundle draws a "
+                "standard normal noise and gives it to the program, so the policy needs its own export "
+                "recipe."
+            )
+        return shape
+
+    def _recorded_noise_shape(self, frame: dict[str, np.ndarray]) -> tuple[int, ...]:
+        """The shape of the one random normal tensor `predict_chunk` draws for one sample."""
         self._reset()
         with torch.no_grad(), ReplayDraws() as draws:
             self.predict_chunk(self.policy, self.preprocessor(self._observation(frame, self.task)), None)
@@ -594,7 +621,7 @@ class ReplayDraws(TorchFunctionMode):
     - a random integer tensor `torch.randint(low, high, size)` draws each value like a category of
       `high - low` equally likely ones, reading `noise[k]` shaped `[2, *size, high - low]`.
 
-    Without a noise, the draws are made as usual and `shapes` records the shape each would read.
+    Without a noise, the draws are made as usual, and `shapes` records the shape each would read.
 
     Args:
         noise (`Tensor` or `Sequence[Tensor]`, *optional*):
