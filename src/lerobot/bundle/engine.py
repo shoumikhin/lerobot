@@ -23,7 +23,7 @@ import logging
 from collections import deque
 from collections.abc import Mapping
 from threading import Event
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from safetensors.numpy import load_file
@@ -42,10 +42,11 @@ class BundleEngine:
     """Inline inference with a bundle: one run of its programs per action chunk.
 
     It plays the chunk one action per call, as [`SyncInferenceEngine`] plays the PyTorch policy's action
-    queue. Before it runs, it replays the bundle's test case and refuses to start if the actions differ
-    from the ones PyTorch computed by more than the bundle's tolerance. It is an
-    [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the
-    same helpers as `lerobot-rollout`.
+    queue, and keeps the past frames of a bundle with `history` the way the policy's own queues keep them.
+    Before it runs, it replays the bundle's test case and refuses to start if the actions differ from the ones
+    PyTorch computed by more than the bundle's tolerance. It is an
+    [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the same
+    helpers as `lerobot-rollout`.
 
     Args:
         bundle (`Bundle`):
@@ -109,7 +110,24 @@ class BundleEngine:
                 f"The bundle's test case holds noise shaped {None if noise is None else noise.shape}, but its "
                 f"programs take noise shaped {expected_noise}. Export the policy again."
             )
-        self._frame_spec = {name: value.shape for name, value in case.items()}
+        frames = [case]
+        if manifest.history:
+            ticks = {value.shape[0] if value.ndim else 0 for value in case.values()}
+            if len(ticks) != 1 or 0 in ticks:
+                raise ValueError(
+                    "The bundle keeps a frame history, but its test case does not hold the same number of "
+                    "frames for each key. Export the policy again."
+                )
+            frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
+        self._frame_spec = {name: value.shape for name, value in frames[-1].items()}
+        if unknown := sorted(set(manifest.history) - set(self._frame_spec)):
+            raise ValueError(
+                f"The bundle keeps the history of {unknown}, which its frame does not hold. Export the policy "
+                "again."
+            )
+        self._history: dict[str, deque[np.ndarray]] = {
+            name: deque(maxlen=size) for name, size in manifest.history.items()
+        }
         self._task_values = self._encode(task)
         _check_dataflow(
             manifest,
@@ -129,7 +147,7 @@ class BundleEngine:
         self._runs = [(run, programs[run.program]) for run in manifest.runs]
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
         self._placed = self._place(self._constants)
-        self._check(case, noise, expected, manifest.tolerance)
+        self._check(frames, noise, expected, manifest.tolerance)
         # The task stays the same for the whole run, so its values are placed once too, after the test case
         # ran its own task.
         for placed, task_placed in zip(self._placed, self._place(self._task_values), strict=True):
@@ -173,7 +191,11 @@ class BundleEngine:
         task_values: Mapping[str, np.ndarray],
         noise: np.ndarray | None = None,
     ) -> np.ndarray:
-        values: dict[str, Any] = {**{name: frame[name] for name in self._frame_spec}, **task_values}
+        values: dict[str, Any] = {
+            name: np.stack(self._history[name]) if name in self._history else frame[name]
+            for name in self._frame_spec
+        }
+        values.update(task_values)
         if noise is None and self._noise_shape is not None and not self._draws_noise:
             noise = np.random.standard_normal(self._noise_shape).astype(np.float32)
         if noise is not None:
@@ -202,8 +224,24 @@ class BundleEngine:
             raise RuntimeError("The exported policy returned NaN or infinite actions; they were not sent.")
         return actions
 
-    def _check(self, frame: dict, noise: np.ndarray | None, expected: np.ndarray, tolerance: float) -> None:
-        actual = self._run_chunk(frame, self._encode(self._fixed_task or ""), noise)
+    def _observe(self, frame: Mapping[str, np.ndarray]) -> None:
+        """Keep the frame's values that the programs read with their past ones, as `populate_queues` does."""
+        for name, frames in self._history.items():
+            # A copy, since a robot may write its next frame into the same array.
+            value = np.array(frame[name])
+            if frames:
+                frames.append(value)
+            else:
+                frames.extend([value] * cast(int, frames.maxlen))
+
+    def _check(
+        self, frames: list[dict], noise: np.ndarray | None, expected: np.ndarray, tolerance: float
+    ) -> None:
+        for frame in frames:
+            self._observe(frame)
+        actual = self._run_chunk(frames[-1], self._encode(self._fixed_task or ""), noise)
+        for history in self._history.values():
+            history.clear()
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -255,15 +293,18 @@ class BundleEngine:
         """Inline inference has nothing to do when an action reaches the robot."""
 
     def reset(self) -> None:
-        """Drop the queued actions."""
+        """Drop the queued actions and the past frames."""
         self._actions.clear()
+        for frames in self._history.values():
+            frames.clear()
 
     def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
         """The next action of the chunk, running the programs when the chunk is used up."""
         if obs_frame is None:
             return None
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
         if not self._actions:
-            frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
             self._actions.extend(self._run_chunk(frame, self._task_values))
         return self._actions.popleft()
 
