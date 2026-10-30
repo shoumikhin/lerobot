@@ -758,11 +758,10 @@ def test_preparation_follows_a_changed_grid(monkeypatch):
     torch.testing.assert_close(run(changed), expected)
 
 
-def test_export_refuses_a_hidden_image_of_another_size(monkeypatch):
+def test_exported_sampling_follows_eager_when_image_tokens_are_hidden(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
     noise = _noise(policy)
-    # Two images with the same token count but different shapes; eager rope positions would give a hidden
-    # image's grid to the next visible image.
+    # Two images with the same token count but different shapes: a hidden image gives its grid to the next.
     action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
     input_ids = torch.tensor([[0, 1, 41, 40, 40, 42, 41, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
     batch = {
@@ -773,13 +772,25 @@ def test_export_refuses_a_hidden_image_of_another_size(monkeypatch):
         "mm_token_type_ids": input_ids.eq(40).int(),
         "action_token_start": 12,
     }
-    hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
-    hidden["attention_mask"][0, 2:6] = 0
+
+    def hide(*tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[0, list(tokens)] = 0
+        return {**batch, "attention_mask": attention_mask}
+
+    # One image token, or the tokens between the images, which joins them into one run: eager positions fail,
+    # and preparation refuses these like the exported program.
+    refused = (hide(3), hide(5, 6))
     with prepare_image_grid():
         policy.predict_action_chunk(batch, noise=noise.clone())
-        with pytest.raises(ValueError, match="must all be visible"):
-            policy.predict_action_chunk(hidden, noise=noise.clone())
+        for inputs in refused:
+            with pytest.raises(ValueError, match="one whole image"):
+                policy.predict_action_chunk(inputs, noise=noise.clone())
     _, run = _export_sampling(policy, batch, noise)
-    run(batch)
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        run(hidden)
+    for inputs in refused:
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            run(inputs)
+    # The whole first or last image, and the first image's start or end token.
+    for inputs in (hide(2, 3, 4, 5), hide(6, 7, 8, 9), hide(2), hide(5)):
+        expected = policy.predict_action_chunk(inputs, noise=noise.clone())
+        torch.testing.assert_close(run(inputs), expected, rtol=0, atol=0)

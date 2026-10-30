@@ -319,6 +319,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             grid_thw,
             vlm_cfg.vision_config.spatial_merge_size,
             vlm_cfg.image_token_id,
+            image_blocks="every_image",
         )
         return self._pad_positions_as_trained(position_ids, attention_mask)
 

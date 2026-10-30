@@ -52,7 +52,12 @@ from lerobot.processor import (
     transition_to_batch,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
-from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+from tests.policies.common.fixed_grid_checks import (
+    count_grid_builds,
+    count_refusals_where_eager_fails,
+    data_dependent_nodes,
+    hidden_token_masks,
+)
 
 
 @pytest.fixture
@@ -888,11 +893,16 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
+def _tiny_policy():
     processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
     torch.manual_seed(19)
     policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
     policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    return policy
+
+
+def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
+    policy = _tiny_policy()
     ids = torch.tensor(
         [[0, 0, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31], [4, 5, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31]]
     )
@@ -954,11 +964,26 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
         policy.predict_action_chunk(malformed, noise=noise.clone())
 
 
-def test_export_refuses_hidden_vision_tokens():
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
-    torch.manual_seed(19)
-    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
-    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+def test_fixed_grid_positions_follow_eager_whatever_tokens_are_hidden():
+    model = _tiny_policy().model
+    # Two shapes with one token count, and two images in a row, so a grid given to the wrong image, or an
+    # image block moved by a hidden token, changes the positions.
+    grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
+    input_ids = torch.tensor([[4, 29, 28, 28, 30, 6, 29, 28, 28, 30, 7], [4, 29, 28, 28, 30, 7, 8, 9, 10, 11, 12]])
+    grid = Qwen2_5VisionGrid.build(model.visual, grids)
+    masks = hidden_token_masks(torch.ones_like(input_ids))
+    refused = count_refusals_where_eager_fails(
+        lambda mask: model._position_ids(input_ids, mask, grids),
+        lambda mask: model._position_ids(input_ids, mask, grids, grid),
+        masks,
+        (IndexError, ValueError, RuntimeError),
+        "lie within",
+    )
+    assert 0 < refused < len(masks)
+
+
+def test_exported_prediction_follows_eager_when_vision_tokens_are_hidden():
+    policy = _tiny_policy()
     # Two images per sample with the same token count but different shapes.
     image = [29, 28, 28, 30]
     ids = torch.tensor([[0, 0, 4, *image, *image, 6, 31, 31], [4, 5, 4, *image, *image, 6, 31, 31]])
@@ -970,19 +995,8 @@ def test_export_refuses_hidden_vision_tokens():
         "moe_token_types": ids == 31,
         "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
     }
-    hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
-    hidden["attention_mask"][1, 3:7] = False
-    # Wall-OSS's eager positions count images by their visible start tokens, so even one hidden start token
-    # changes them, whatever the image sizes.
-    start_hidden = {**batch, "attention_mask": batch["attention_mask"].clone()}
-    start_hidden["attention_mask"][1, 3] = False
-    same_size_start_hidden = {**start_hidden, "image_grid_thw": torch.tensor([[1, 2, 4]] * 4)}
     noise = torch.randn(2, 2, policy.config.max_action_dim)
     with prepare_image_grid():
-        policy.predict_action_chunk(batch, noise=noise.clone())
-        for refused in (hidden, same_size_start_hidden):
-            with pytest.raises(ValueError, match="must all be visible"):
-                policy.predict_action_chunk(refused, noise=noise.clone())
         policy.predict_action_chunk(batch, noise=noise.clone())
     keys = sorted(batch)
 
@@ -993,11 +1007,14 @@ def test_export_refuses_hidden_vision_tokens():
     program = torch.export.export(
         PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
     ).module()
-    program(noise.clone(), *(batch[key] for key in keys))
-    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-    for refused in (hidden, start_hidden):
-        with torch.no_grad(), pytest.raises(RuntimeError):
-            program(noise.clone(), *(refused[key] for key in keys))
+    # In the second prompt: the whole first image, its start token (its tokens become text), its first or its
+    # last image token (its block then covers the end token too), and its end token, between the images.
+    for hidden in (slice(3, 7), 3, 4, 5, 6):
+        inputs = {**batch, "attention_mask": batch["attention_mask"].clone()}
+        inputs["attention_mask"][1, hidden] = False
+        expected = policy.predict_action_chunk(inputs, noise=noise.clone())
+        actions = program(noise.clone(), *(inputs[key] for key in keys))
+        torch.testing.assert_close(actions, expected, msg=f"hidden {hidden}")
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

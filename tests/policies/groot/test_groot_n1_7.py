@@ -280,7 +280,7 @@ def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monke
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
 
 
-def test_n1_7_backbone_refuses_hidden_images_of_different_sizes_also_after_export(monkeypatch):
+def test_n1_7_backbone_follows_eager_when_image_tokens_are_hidden(monkeypatch):
     pytest.importorskip("transformers")
 
     from transformers.feature_extraction_utils import BatchFeature
@@ -290,26 +290,35 @@ def test_n1_7_backbone_refuses_hidden_images_of_different_sizes_also_after_expor
 
     backbone = _tiny_n1_7_backbone(monkeypatch)
     prompts = image_prompts(backbone.model.config)
-    # Eager rope positions would give the hidden first image's grid to the second image, of another size.
-    hidden = {**prompts, "attention_mask": prompts["attention_mask"].clone()}
-    first_image_tokens = int(prompts["image_grid_thw"][0].prod()) // backbone.visual.spatial_merge_size**2
-    first_image = (prompts["input_ids"][1] == IMAGE_TOKEN_ID).nonzero()[:first_image_tokens, 0]
-    hidden["attention_mask"][1, first_image] = 0
     keys = sorted(prompts)
+    image_tokens = (prompts["input_ids"][1] == IMAGE_TOKEN_ID).nonzero()[:, 0].tolist()
+    first_image, last_image = image_tokens[:4], image_tokens[4:]
+
+    def hide(tokens):
+        attention_mask = prompts["attention_mask"].clone()
+        attention_mask[1, tokens] = 0
+        return tuple({**prompts, "attention_mask": attention_mask}[key] for key in keys)
 
     class Backbone(torch.nn.Module):
         def forward(self, *tensors):
             return backbone(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
 
+    # The second prompt's first image, which hands its grid, of another size, to the last image, or one image
+    # token: eager positions fail, and preparation refuses these like the exported program.
+    refused = (hide(first_image), hide(first_image[:1]))
     with torch.no_grad():
         with prepare_image_grid():
             Backbone()(*(prompts[key] for key in keys))
-            with pytest.raises(ValueError, match="must all be visible"):
-                Backbone()(*(hidden[key] for key in keys))
+            for inputs in refused:
+                with pytest.raises(ValueError, match="one whole image"):
+                    Backbone()(*inputs)
         program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False).module()
-        program(*(prompts[key] for key in keys))
-        with pytest.raises(RuntimeError):
-            program(*(hidden[key] for key in keys))
+        for inputs in refused:
+            with pytest.raises(RuntimeError):
+                program(*inputs)
+        # The last image of the last prompt, and the text token after it.
+        for inputs in (hide(last_image), hide([last_image[-1] + 1])):
+            torch.testing.assert_close(program(*inputs), Backbone()(*inputs))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):

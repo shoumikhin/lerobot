@@ -660,22 +660,22 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
+        fixed_position_ids = None
         if pixel_values is not None:
             grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
-            if is_preparing_image_grid():
-                self._rope_temporal_scale()
             if grid is not None and (is_preparing_image_grid() or is_exporting()):
-                grid.check_visible_images(input_ids, attention_mask, vlm.config.image_token_id)
+                # Computed in preparation too, so that it refuses the image layouts the export refuses.
+                fixed_position_ids = qwen_image_rope_index(
+                    input_ids,
+                    attention_mask,
+                    grid.grid_thw,
+                    vlm.visual.spatial_merge_size,
+                    vlm.config.image_token_id,
+                    image_temporal_scale=self._rope_temporal_scale(),
+                )
         vision_grid = self._vision_grid
         if vision_grid is not None and pixel_values is not None and is_exporting():
-            position_ids = qwen_image_rope_index(
-                input_ids,
-                attention_mask,
-                vision_grid.grid_thw,
-                vlm.visual.spatial_merge_size,
-                vlm.config.image_token_id,
-                image_temporal_scale=self._rope_temporal_scale(),
-            )
+            position_ids = fixed_position_ids
             image_embeds = qwen2_5_vision_forward(
                 vlm.visual, pixel_values.type(vlm.visual.dtype), vision_grid
             )

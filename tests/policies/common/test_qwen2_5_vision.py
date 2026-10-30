@@ -16,6 +16,7 @@
 
 """The fixed-grid Qwen2.5-VL helpers must give exactly what the stock transformers code gives."""
 
+import itertools
 from copy import deepcopy
 
 import pytest
@@ -39,9 +40,14 @@ from lerobot.policies.common.qwen_vision import (  # noqa: E402
     prepare_image_grid,
     qwen_image_rope_index,
 )
-from tests.policies.common.fixed_grid_checks import data_dependent_nodes  # noqa: E402
+from tests.policies.common.fixed_grid_checks import (  # noqa: E402
+    count_refusals_where_eager_fails,
+    data_dependent_nodes,
+    hidden_token_masks,
+)
 
 IMAGE_TOKEN_ID = 99
+VISION_START_ID, VISION_END_ID = 97, 98
 GRID = [[1, 8, 12]]
 
 
@@ -169,29 +175,83 @@ def test_exported_program_rejects_a_changed_grid():
         program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
 
 
-def test_hidden_images_of_different_sizes_are_refused_also_after_export():
-    visual = _tiny_visual()
-    mixed = Qwen2_5VisionGrid.build(visual, torch.tensor([[1, 4, 6], [1, 6, 4]]))
-    one_size = Qwen2_5VisionGrid.build(visual, torch.tensor([[1, 4, 6], [1, 4, 6]]))
-    image = [IMAGE_TOKEN_ID] * 6
-    input_ids = torch.tensor([[1, *image, 2, *image, 3]])
-    visible = torch.ones_like(input_ids)
-    hidden = visible.clone()
-    hidden[0, 1:7] = 0
+def _two_rows_of_images(grids_per_row):
+    """Prompts with `<start> image <end>` blocks between text tokens, right padded to one length."""
+    rows = []
+    for grids in grids_per_row:
+        row = [1, 2]
+        for _, h, w in grids:
+            row += [VISION_START_ID, *[IMAGE_TOKEN_ID] * (h * w // 4), VISION_END_ID, 3]
+        rows.append(row)
+    input_ids = torch.zeros(len(rows), max(map(len, rows)), dtype=torch.long)
+    for i, row in enumerate(rows):
+        input_ids[i, : len(row)] = torch.tensor(row)
+    return input_ids, input_ids.ne(0).long()
 
-    class CheckVisibleImages(torch.nn.Module):
-        def forward(self, input_ids, attention_mask):
-            mixed.check_visible_images(input_ids, attention_mask, IMAGE_TOKEN_ID)
-            return attention_mask + 0
 
-    # With one image size, eager and fixed-grid positions agree, so a hidden image is fine.
-    one_size.check_visible_images(input_ids, hidden, IMAGE_TOKEN_ID)
-    with pytest.raises(ValueError, match="must all be visible"):
-        mixed.check_visible_images(input_ids, hidden, IMAGE_TOKEN_ID)
-    program = torch.export.export(CheckVisibleImages(), (input_ids, visible), strict=False).module()
-    program(input_ids, visible)
-    with pytest.raises(RuntimeError):
-        program(input_ids, hidden)
+class ImageRopeIndex(torch.nn.Module):
+    def __init__(self, grids, **kwargs):
+        super().__init__()
+        self.grids = grids
+        self.kwargs = kwargs
+
+    def forward(self, input_ids, attention_mask):
+        return qwen_image_rope_index(input_ids, attention_mask, self.grids, 2, IMAGE_TOKEN_ID, **self.kwargs)
+
+
+def test_image_rope_index_follows_get_rope_index_whatever_tokens_are_hidden():
+    model = Qwen2_5_VLModel._from_config(_tiny_config())
+    # Images of two shapes with one token count, so a grid given to the wrong image changes the positions.
+    grids_per_row = [[[1, 4, 6], [1, 6, 4]], [[1, 4, 6]]]
+    grids = [grid for row in grids_per_row for grid in row]
+    input_ids, attention_mask = _two_rows_of_images(grids_per_row)
+    program = torch.export.export(ImageRopeIndex(grids), (input_ids, attention_mask), strict=False).module()
+    masks = hidden_token_masks(attention_mask)
+    for row, start in ((0, 2), (0, 11), (1, 2)):  # the first, the second and the last image, all hidden
+        masks.append(attention_mask.clone())
+        masks[-1][row, start : start + 8] = 0
+
+    def eager(mask):
+        mm_token_type_ids = input_ids.eq(IMAGE_TOKEN_ID).int()
+        return model.get_rope_index(input_ids, mm_token_type_ids, torch.tensor(grids), attention_mask=mask)[0]
+
+    def fixed(mask):
+        try:
+            position_ids = qwen_image_rope_index(input_ids, mask, grids, 2, IMAGE_TOKEN_ID)
+        except ValueError:
+            with pytest.raises(RuntimeError):
+                program(input_ids, mask)
+            raise
+        assert torch.equal(program(input_ids, mask), position_ids)
+        return position_ids
+
+    # transformers fails when a visible run of image tokens does not cover exactly its grid.
+    refused = count_refusals_where_eager_fails(eager, fixed, masks, (RuntimeError, StopIteration), "whole image")
+    assert 0 < refused < len(masks)
+
+
+def test_every_image_keeps_its_grid_when_others_are_hidden():
+    model = Qwen2_5_VLModel._from_config(_tiny_config())
+    grids_per_row = [[[1, 4, 6], [1, 6, 4]], [[1, 4, 4], [1, 4, 6]]]
+    grids = [grid for row in grids_per_row for grid in row]
+    input_ids, attention_mask = _two_rows_of_images(grids_per_row)
+    blocks = [(0, slice(2, 10)), (0, slice(11, 19)), (1, slice(2, 8)), (1, slice(9, 17))]
+    for hidden in itertools.product([False, True], repeat=len(blocks)):
+        if all(hidden):
+            continue
+        mask = attention_mask.clone()
+        for (row, block), hide in zip(blocks, hidden, strict=True):
+            if hide:
+                mask[row, block] = 0
+        # As for eager code that drops the grids of hidden images before `get_rope_index`.
+        visible_grids = [grid for grid, hide in zip(grids, hidden, strict=True) if not hide]
+        expected, _ = model.get_rope_index(
+            input_ids, input_ids.eq(IMAGE_TOKEN_ID).int(), torch.tensor(visible_grids), attention_mask=mask
+        )
+        position_ids = qwen_image_rope_index(
+            input_ids, mask, grids, 2, IMAGE_TOKEN_ID, image_blocks="every_image"
+        )
+        assert torch.equal(position_ids, expected), hidden
 
 
 def test_image_rope_index_matches_stock():

@@ -458,25 +458,14 @@ class Qwen3Backbone(nn.Module):
             raise ValueError("GR00T exports image inputs only.")
         qwen = getattr(self.model, "model", self.model)
         input_ids = model_input["input_ids"]
-        attention_mask = model_input["attention_mask"]
-        pixel_values = model_input["pixel_values"]
-        position_ids = qwen_image_rope_index(
-            input_ids,
-            attention_mask,
-            grid.grid_thw,
-            qwen.visual.spatial_merge_size,
-            qwen.config.image_token_id,
-        )
-        # The legacy text position row, as `_ensure_legacy_qwen3_position_ids` adds it.
-        position_ids = torch.cat([position_ids[:1], position_ids], dim=0)
         qwen3_vl_forward(
             qwen,
             qwen.get_input_embeddings()(input_ids),
-            attention_mask,
-            pixel_values,
+            model_input["attention_mask"],
+            model_input["pixel_values"],
             grid,
             image_mask=input_ids == qwen.config.image_token_id,
-            position_ids=position_ids,
+            position_ids=model_input["position_ids"],
         )
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
@@ -490,9 +479,17 @@ class Qwen3Backbone(nn.Module):
             self._vision_grid, qwen.visual, model_input["image_grid_thw"]
         )
         if grid is not None and (is_preparing_image_grid() or is_exporting()):
-            grid.check_visible_images(
-                model_input["input_ids"], model_input["attention_mask"], qwen.config.image_token_id
+            # Computed in preparation too, so that it refuses the image layouts the export refuses.
+            fixed_position_ids = qwen_image_rope_index(
+                model_input["input_ids"],
+                model_input["attention_mask"],
+                grid.grid_thw,
+                qwen.visual.spatial_merge_size,
+                qwen.config.image_token_id,
             )
+            if is_exporting():
+                # The legacy text position row, as `_ensure_legacy_qwen3_position_ids` adds it.
+                model_input["position_ids"] = torch.cat([fixed_position_ids[:1], fixed_position_ids], dim=0)
         if not is_exporting():
             self._ensure_mm_token_type_ids(model_input)
             self._ensure_legacy_qwen3_position_ids(model_input)
