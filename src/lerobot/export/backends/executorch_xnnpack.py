@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import ExecuTorchConfig
+from .executorch import ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -38,10 +38,6 @@ class ExecuTorchXNNPACKConfig(ExecuTorchConfig):
     def compile(self, program: ExportedProgram, path: Path) -> None:
         """Lower `program` to XNNPACK and save it as an ExecuTorch program."""
         from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-        from executorch.exir import to_edge_transform_and_lower
-        from executorch.exir.passes.constant_prop_pass import constant_prop_pass
 
-        # Attention layers slice their weights at run time; XNNPACK takes a linear layer only when its weights
-        # are constants, so the slices are computed now.
-        edge = to_edge_transform_and_lower(constant_prop_pass(program), partitioner=[XnnpackPartitioner()])
+        edge = lower(program, XnnpackPartitioner())
         path.write_bytes(edge.to_executorch().buffer)
