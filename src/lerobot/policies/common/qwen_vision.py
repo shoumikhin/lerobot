@@ -249,8 +249,9 @@ def qwen_image_rope_index(
       eager code fail (or place the image's positions on other tokens) and is refused.
     - `"vision_starts"`, as the transformers 4.x `get_rope_index` that WALL-X and Wall-OSS keep: each visible
       `vision_start_token_id` followed by a visible image token counts an image, which takes the next grid and
-      covers that many visible tokens from the next visible image token on. Layouts the eager code fails on
-      (more images than grids, a block running past the visible tokens, a start token last) are refused.
+      covers as many visible tokens as the grid has, from the next visible image token on. Layouts the eager
+      code fails on (more images than grids, a block running past the visible tokens, a start token last) are
+      refused.
     - `"every_image"`: every image block keeps its own grid, hidden or not, as for eager code that drops the
       grids of hidden images before calling `get_rope_index`.
 
@@ -375,6 +376,6 @@ def _vision_start_blocks(
     rank = (valid.cumsum(dim=1) - 1)[:, None]
     begins, ends = torch.stack(begins, dim=1)[..., None], torch.stack(ends, dim=1)[..., None]
     inside = valid[:, None] & (rank >= begins) & (rank < ends)
-    block = inside.long().argmax(dim=1, keepdim=True)
-    offset = rank[:, 0] - begins[..., 0].gather(1, block[:, 0])
-    return inside.any(dim=1), first_grid[:, None] + block[:, 0], offset
+    block = inside.long().argmax(dim=1)
+    offset = rank[:, 0] - begins[..., 0].gather(1, block)
+    return inside.any(dim=1), first_grid[:, None] + block, offset
