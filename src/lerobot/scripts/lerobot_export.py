@@ -24,7 +24,7 @@ Export on the kind of board that will run the policy, then run the bundle with `
         --policy.path=outputs/train/act_so101/checkpoints/last/pretrained_model \\
         --backend.type=executorch_tensorrt
 
-    lerobot-rollout --mode=bundle \\
+    lerobot-rollout \\
         --bundle.path=outputs/export/act_executorch_tensorrt \\
         --robot.type=so101_follower --robot.port=/dev/ttyACM0 --duration=30
 
