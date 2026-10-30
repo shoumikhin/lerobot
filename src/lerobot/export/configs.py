@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import abc
+import importlib.metadata
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 import draccus
+from packaging.version import Version
 
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.default import DatasetConfig
@@ -50,6 +52,11 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
             compiler's kernels with the runtime.
         packages (`tuple[str, ...]`):
             What to install beside LeRobot to export with this backend, such as `"executorch>=1.6.0,<1.7.0"`.
+        min_torch (`str`, *optional*):
+            The oldest PyTorch whose traced programs the compiler reads, such as `"2.15"`. `None` takes any.
+        torch_overrides (`tuple[str, ...]`):
+            The PyTorch pins that replace LeRobot's in an environment for exporting with this backend, such as
+            `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`.
     """
 
     runtime: ClassVar[str]
@@ -57,11 +64,36 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     device: ClassVar[str]
     runtime_imports: ClassVar[tuple[str, ...]] = ()
     packages: ClassVar[tuple[str, ...]] = ()
+    min_torch: ClassVar[str | None] = None
+    torch_overrides: ClassVar[tuple[str, ...]] = ()
 
     @property
     def type(self) -> str:
         """The `--backend.type` name of this backend."""
         return self.get_choice_name(self.__class__)
+
+    def check_torch(self) -> None:
+        """Refuse a PyTorch older than `min_torch` before anything is traced, and say how to export."""
+        if self.min_torch is None:
+            return
+        installed = importlib.metadata.version("torch")
+        if Version(installed).release >= Version(self.min_torch).release:
+            return
+        message = (
+            f"The {self.type} backend needs PyTorch {self.min_torch} or newer to export, but PyTorch {installed} "
+            "is installed."
+        )
+        if self.torch_overrides:
+            overrides = "\\n".join(self.torch_overrides)
+            packages = " ".join(f'"{package}"' for package in self.packages)
+            message += (
+                " LeRobot pins an older PyTorch, so export from a second environment that overrides the pin:\n\n"
+                f"    printf '{overrides}\\n' > torch-overrides.txt\n"
+                f"    uv pip install --override torch-overrides.txt lerobot {packages}\n\n"
+                "The override replaces every PyTorch pin, so the packages after lerobot are pinned to that PyTorch "
+                "by hand."
+            )
+        raise ValueError(f"{message} See https://huggingface.co/docs/lerobot/export.")
 
     @abc.abstractmethod
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
@@ -98,7 +130,8 @@ class ExportConfig:
     seed: int = 1000
 
     def __post_init__(self) -> None:
-        """Load the policy config from `--policy.path` and pick the bundle folder."""
+        """Check the PyTorch version, load the policy config from `--policy.path` and pick the bundle folder."""
+        self.backend.check_torch()
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")
