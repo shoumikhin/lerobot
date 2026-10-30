@@ -26,7 +26,7 @@ from torch import Tensor
 import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export.recipe import ActionChunkRecipe, frame_shapes, robot_features
+from lerobot.export.recipe import ActionChunkRecipe, ReplayDraws, frame_shapes, robot_features
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -142,6 +142,69 @@ class UniformDrawACT(ACTPolicy):
 def test_recipe_refuses_a_policy_that_computes_another_chunk_each_time():
     with pytest.raises(ValueError, match="computes another chunk from the same frame and noise"):
         make(UniformDrawACT)
+
+
+def test_replayed_draws_read_the_noise_in_order():
+    noise = torch.arange(6.0).reshape(3, 1, 2)
+    with ReplayDraws(noise) as draws:
+        drawn = [torch.randn(1, 2), torch.randn_like(torch.ones(1, 2)), torch.ones(1, 2).normal_()]
+    assert torch.equal(torch.stack(drawn), noise) and draws.shapes == [(1, 2)] * 3
+    with pytest.raises(ValueError, match=r"Draw 0 reads noise shaped \[1, 3\]"), ReplayDraws(noise):
+        torch.randn(1, 3)
+    with pytest.raises(ValueError, match="Draw 3"), ReplayDraws(noise):
+        for _ in range(4):
+            torch.randn(1, 2)
+
+
+def test_replayed_categories_follow_the_probabilities():
+    probs = torch.tensor([[0.1, 0.2, 0.7]]).expand(20000, 3)
+    noise = torch.randn(1, 2, 20000, 3, generator=torch.Generator().manual_seed(0))
+    with ReplayDraws(noise):
+        sampled = torch.multinomial(probs, num_samples=1)
+    counts = torch.bincount(sampled[:, 0], minlength=3) / 20000
+    torch.testing.assert_close(counts, probs[0], atol=0.01, rtol=0)
+
+
+def test_replayed_normal_draws_keep_their_mean_and_std():
+    noise = torch.tensor([0.5, -1.0, 2.0]).expand(4, 3)
+    filled = torch.zeros(3)
+    with ReplayDraws(noise):
+        drawn = [
+            torch.normal(torch.full((3,), 5.0), torch.full((3,), 2.0)),
+            torch.normal(5.0, 2.0, size=(3,)),
+            torch.distributions.Normal(torch.tensor(5.0), torch.tensor(2.0)).sample((3,)),
+            filled.normal_(5.0, std=2.0),
+        ]
+    for value in drawn:
+        assert torch.equal(value, torch.tensor([6.0, 3.0, 9.0])), value
+    assert drawn[-1] is filled
+
+
+class Draws(torch.nn.Module):
+    """`draw` of its input, with the random draws reading its noise input."""
+
+    def __init__(self, draw):
+        super().__init__()
+        self.draw = draw
+
+    def forward(self, x: Tensor, noise: Tensor) -> Tensor:
+        with ReplayDraws(noise):
+            return self.draw(x)
+
+
+@pytest.mark.parametrize(
+    ("draw", "shape", "noise_shape", "op"),
+    [
+        (lambda logits: torch.multinomial(logits.softmax(-1), 1), (4, 8), (1, 2, 4, 8), "multinomial"),
+        (lambda x: x + torch.empty_like(x).normal_(5.0, 2.0), (2, 3), (1, 2, 3), "normal"),
+    ],
+)
+def test_a_program_draws_from_its_noise_input(draw, shape, noise_shape, op):
+    x, noise = torch.randn(shape), torch.randn(noise_shape)
+    program = torch.export.export(Draws(draw), (x, noise), strict=False)
+    # ExecuTorch cannot lower these random operations left in a program.
+    assert op not in str(program.graph)
+    assert torch.equal(program.module()(x, noise), Draws(draw)(x, noise))
 
 
 def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
