@@ -388,11 +388,7 @@ class ActionChunkRecipe(ExportRecipe):
     ) -> None:
         """Check that the policy can be exported this way, and make the test case."""
         super().__init__(policy, preprocessor, postprocessor, cfg)
-        policy_type = policy.config.type
-        try:
-            self._steps = policy.chunk_inference_spec().execution_steps
-        except ValueError as error:
-            raise ValueError(f"This {policy_type} checkpoint cannot be exported: {error}") from error
+        self._steps = self._execution_steps()
         self._device = torch.device(cfg.backend.device)
         policy.to(self._device)
         self._generator = torch.Generator().manual_seed(cfg.seed)
@@ -403,19 +399,7 @@ class ActionChunkRecipe(ExportRecipe):
         self.config.input_features = self._features
         frame = random_frame(self._features, self._generator)
         self.task = self._task(frame)
-        self._noise_shape = self._sampled_noise_shape(frame)
-        noise = self._random_noise()
-        actions = self._reference(frame, noise)
-        width = actions.shape[-1]
-        action_scale = measure_action_scale(
-            lambda value: self.postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
-        )
-        if not np.array_equal(actions, self._reference(frame, noise)):
-            raise ValueError(
-                f"This {policy_type} policy computes another chunk from the same frame and noise each time, "
-                "so a compiled copy cannot be checked against it."
-            )
-        self._case = TestCase(frame, noise, actions, action_scale)
+        self._case = self._make_case(frame)
 
     def parts(self) -> Iterator[Part]:
         """The one part, after checking that it computes what PyTorch does for two different frames."""
@@ -457,6 +441,37 @@ class ActionChunkRecipe(ExportRecipe):
         """
         output = policy.predict_action_chunk(batch, **({} if noise is None else {NOISE: noise}))
         return transition_to_policy_action(policy_output_to_transition(output))
+
+    def _execution_steps(self) -> int:
+        """How many actions of a chunk `lerobot-rollout` plays, once the policy is known to fit this recipe."""
+        try:
+            return self.policy.chunk_inference_spec().execution_steps
+        except ValueError as error:
+            raise ValueError(
+                f"This {self.policy.config.type} checkpoint cannot be exported: {error}"
+            ) from error
+
+    def _make_case(self, frame: dict[str, np.ndarray]) -> TestCase:
+        """The test case of `frame`: a random noise, if the policy takes one, and the actions PyTorch computes."""
+        self._noise_shape = self._sampled_noise_shape(frame)
+        noise = self._random_noise()
+        actions = self._reference(frame, noise)
+        if not np.isfinite(actions).all():
+            raise ValueError(
+                f"This {self.policy.config.type} policy computes actions that are not finite for a random frame, "
+                "so a compiled copy cannot be checked against it."
+            )
+        if not np.array_equal(actions, self._reference(frame, noise)):
+            raise ValueError(
+                f"This {self.policy.config.type} policy computes another chunk from the same frame and noise "
+                "each time, so a compiled copy cannot be checked against it."
+            )
+        return TestCase(frame, noise, actions, self._action_scale(self._predicted_width))
+
+    def _action_scale(self, width: int) -> np.ndarray:
+        return measure_action_scale(
+            lambda value: self.postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
+        )
 
     def _task(self, frame: dict[str, np.ndarray]) -> str | None:
         """The task the program holds: the one given, or the dataset's first for a policy that reads text.
@@ -519,6 +534,8 @@ class ActionChunkRecipe(ExportRecipe):
         with torch.no_grad():
             batch = self.preprocessor(self._observation(frame, self.task))
             predicted = self.predict_chunk(self.policy, batch, noise_tensor)[:, : self._steps]
+            # The action scale is measured at this width: a policy may pad its actions, as EVO1 does.
+            self._predicted_width = predicted.shape[-1]
             actions = self.postprocessor(predicted)
         return actions[0].float().cpu().numpy()
 

@@ -124,8 +124,24 @@ def test_the_relative_to_absolute_step_must_be_last_and_know_its_relative_step()
         split_absolute_step(SimpleNamespace(steps=[AbsoluteActionsProcessorStep(enabled=True)]), 3)
 
 
-def test_recipe_measures_the_action_scale_from_the_postprocessor():
-    np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
+class FirstTwoActions(ProcessorStep):
+    """Keeps the first two actions, as a postprocessor that crops a padded model width once unnormalized."""
+
+    def __call__(self, transition):
+        return {**transition, TransitionKey.ACTION: transition[TransitionKey.ACTION][..., :2]}
+
+    def transform_features(self, features):
+        return features
+
+
+def test_recipe_measures_the_action_scale_at_the_width_the_postprocessor_takes():
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    # Right after the unnormalizer, which needs all three actions.
+    postprocessor.steps.insert(1, FirstTwoActions())
+    recipe = ActionChunkRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config())
+    np.testing.assert_allclose(recipe.test_case().action_scale, [30.0, 3.0], rtol=1e-6)
 
 
 def test_recipe_takes_the_tolerance_and_the_seed_it_is_given():
@@ -277,6 +293,22 @@ class NoChunkSpecACT(ACTPolicy):
 def test_recipe_refuses_a_checkpoint_whose_chunk_spec_fails():
     with pytest.raises(ValueError, match="checkpoint cannot be exported: n_action_steps is larger"):
         make(NoChunkSpecACT)
+
+
+class NonFiniteACT(NoisyACT):
+    """ACT that draws a starting noise and adds `value`, NaN or infinity, to its actions."""
+
+    value = float("nan")
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        return super().predict_action_chunk(batch, noise=noise) + self.value
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_recipe_refuses_a_policy_whose_actions_are_not_finite(monkeypatch, value):
+    monkeypatch.setattr(NonFiniteACT, "value", value)
+    with pytest.raises(ValueError, match="computes actions that are not finite"):
+        make(NonFiniteACT)
 
 
 def test_replayed_draws_read_the_noise_in_order():
