@@ -342,9 +342,10 @@ def test_fixed_grid_positions_follow_get_rope_index_whatever_tokens_are_hidden()
     model = _tiny_diffusion_model(bfloat16=False)
     policy = _diffusion_policy(model)
     # Two shapes with one token count, and two images in a row, so a grid given to the wrong image, or an
-    # image block moved by a hidden token, changes the positions.
+    # image block moved by a hidden token, changes the positions. An image block that runs past the last
+    # visible token makes the eager code fail, which hidden tokens at the end of the second row can cause.
     grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
-    input_ids = torch.tensor([[5, 41, 40, 40, 42, 6, 41, 40, 40, 42, 7], [5, 41, 40, 40, 42, 7, 8, 9, 10, 11, 12]])
+    input_ids = torch.tensor([[5, 41, 40, 40, 42, 6, 41, 40, 40, 42, 7], [5, 7, 8, 9, 10, 11, 12, 41, 40, 40, 42]])
     grid = Qwen2_5VisionGrid.build(model.visual, grids)
 
     def eager(mask):

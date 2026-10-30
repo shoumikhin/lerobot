@@ -967,9 +967,10 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
 def test_fixed_grid_positions_follow_eager_whatever_tokens_are_hidden():
     model = _tiny_policy().model
     # Two shapes with one token count, and two images in a row, so a grid given to the wrong image, or an
-    # image block moved by a hidden token, changes the positions.
+    # image block moved by a hidden token, changes the positions. An image block that runs past the last
+    # visible token makes the eager code fail, which hidden tokens at the end of the second row can cause.
     grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
-    input_ids = torch.tensor([[4, 29, 28, 28, 30, 6, 29, 28, 28, 30, 7], [4, 29, 28, 28, 30, 7, 8, 9, 10, 11, 12]])
+    input_ids = torch.tensor([[4, 29, 28, 28, 30, 6, 29, 28, 28, 30, 7], [4, 7, 8, 9, 10, 11, 12, 29, 28, 28, 30]])
     grid = Qwen2_5VisionGrid.build(model.visual, grids)
     masks = hidden_token_masks(torch.ones_like(input_ids))
     refused = count_refusals_where_eager_fails(

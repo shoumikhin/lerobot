@@ -121,7 +121,8 @@ def test_image_rope_index_matches_get_rope_index(model):
     )
     assert torch.equal(position_ids, expected_ids)
 
-    # An image block hidden by the mask (a missing camera) keeps its grid entry here; get_rope_index skips it.
+    # With "every_image", an image block hidden by the mask (a missing camera) keeps its grid entry here, as
+    # for eager code that drops the hidden camera's grid before get_rope_index.
     merge = model.visual.spatial_merge_size
     hidden_mask = attention_mask.clone()
     block_length = IMAGE_GRIDS[0][1] * IMAGE_GRIDS[0][2] // merge**2
@@ -133,7 +134,9 @@ def test_image_rope_index_matches_get_rope_index(model):
         image_grid_thw=grid_thw[1:],
         attention_mask=hidden_mask,
     )
-    actual_hidden = qwen_image_rope_index(input_ids, hidden_mask, grid_thw.tolist(), merge, IMAGE_TOKEN_ID)
+    actual_hidden = qwen_image_rope_index(
+        input_ids, hidden_mask, grid_thw.tolist(), merge, IMAGE_TOKEN_ID, image_blocks="every_image"
+    )
     assert torch.equal(actual_hidden, expected_hidden)
 
     grid = Qwen3VisionGrid.build(model.visual, grid_thw)
