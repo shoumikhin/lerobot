@@ -18,6 +18,7 @@ Each bundle is played next to the PyTorch policy in `lerobot-rollout`'s engines,
 same random draws, for more ticks than one chunk, so both the history and the noise are exercised.
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,7 @@ IMAGE = "observation.images.front"
 # would not change the actions.
 FRAME = (96, 96)
 CROP = (84, 84)
+TASK = "pick up the cube"
 TICKS = 20
 BACKENDS = {"torch_test": [], **{name: [mark] for name, mark in EXECUTORCH_BACKENDS.items()}}
 
@@ -123,9 +125,47 @@ def diffusion_checkpoint(path, **sampler) -> None:
     _save(config, stats, path)
 
 
+def multi_task_dit_checkpoint(path, **sampler) -> None:
+    from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
+
+    config = MultiTaskDiTConfig(
+        input_features={
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *FRAME)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        # Three, so the test case of two ticks also has a frame the first one stands in for.
+        n_obs_steps=3,
+        horizon=8,
+        n_action_steps=4,
+        num_train_timesteps=10,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=2,
+        timestep_embed_dim=16,
+        # CLIP takes 224 x 224 images; the policy resizes the camera's.
+        image_resize_shape=(224, 224),
+        image_crop_shape=None,
+        device="cpu",
+        **sampler,
+    )
+    stats = {
+        IMAGE: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
+        OBS_STATE: _min_max(2),
+        ACTION: _min_max(2),
+    }
+    _save(config, stats, path)
+
+
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
-    get_policy_class(config.type)(config).save_pretrained(path)
+    policy = get_policy_class(config.type)(config)
+    if config.type == "multi_task_dit":
+        # Untrained, its adaLN gates are zero, so the denoiser would ignore the frames, the task and the timestep.
+        for name, parameter in policy.named_parameters():
+            if "adaLN_modulation" in name:
+                torch.nn.init.normal_(parameter, std=0.1)
+    policy.save_pretrained(path)
     for processor in make_pre_post_processors(config, dataset_stats=stats):
         processor.save_pretrained(path)
 
@@ -139,8 +179,17 @@ class Checkpoint:
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
+# Multi-Task DiT loads its CLIP encoders from the Hub, so like its own tests it does not run in CI.
+CLIP = pytest.mark.skipif(
+    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="Multi-Task DiT downloads CLIP from the Hub",
+)
 # Diffusion Policy and Multi-Task DiT sample with the schedulers of diffusers, an optional package.
 DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="diffusers not installed")
+# Multi-Task DiT also encodes the task and the images with CLIP from transformers.
+TRANSFORMERS = pytest.mark.skipif(
+    not is_package_available("transformers"), reason="transformers not installed"
+)
 CHECKPOINTS = {
     "vqbet": Checkpoint(vqbet_checkpoint),
     # Two code draws from one noise input, the second picked from the first.
@@ -155,6 +204,10 @@ CHECKPOINTS = {
         programs=["actions", "encoder", "step"],
         marks=(DIFFUSERS,),
     ),
+    "multi_task_dit_flow": Checkpoint(
+        lambda path: multi_task_dit_checkpoint(path, objective="flow_matching", num_integration_steps=5),
+        marks=(CLIP, DIFFUSERS, TRANSFORMERS),
+    ),
 }
 
 
@@ -163,7 +216,7 @@ def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
     normalized action units."""
     policy = get_policy_class(PreTrainedConfig.from_pretrained(path).type).from_pretrained(path)
     reference = SyncInferenceEngine(
-        policy, *make_pre_post_processors(policy.config, path), {}, [], "", "cpu", ""
+        policy, *make_pre_post_processors(policy.config, path), {}, [], bundle.manifest.task or "", "cpu", ""
     )
     rng = np.random.default_rng(0)
     features = policy.config.input_features
@@ -212,7 +265,15 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
     checkpoint, path = CHECKPOINTS[name], tmp_path / "checkpoint"
     checkpoint.save(path)
     use_plugins(monkeypatch, "torch_backend")
-    export([f"--backend.type={backend}", f"--policy.path={path}", f"--output_dir={tmp_path / 'b'}"])
+    export(
+        [
+            f"--backend.type={backend}",
+            f"--policy.path={path}",
+            f"--output_dir={tmp_path / 'b'}",
+            # Multi-Task DiT reads the task; the others ignore it.
+            f"--task={TASK}",
+        ]
+    )
     bundle = Bundle.read(tmp_path / "b")
     if backend in GPU_BACKENDS:
         # The GPU draws the noise, which the PyTorch policy cannot replay, so the export's own check of the
@@ -223,6 +284,31 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
         assert sorted(bundle.manifest.programs) == checkpoint.programs
     # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
     assert max(play(path, bundle, monkeypatch)) <= bundle.manifest.tolerance
+
+
+@DIFFUSERS
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+@pytest.mark.parametrize("kind", ["DDPMScheduler", "DDIMScheduler"])
+def test_a_schedule_reads_a_scheduler_built_on_the_gpu(kind):
+    import diffusers
+
+    from lerobot.policies.common.export_denoising import scheduler_schedule
+
+    schedules = []
+    # An export builds the policy, and so its scheduler, on its device.
+    for device in ("cpu", "cuda"):
+        with torch.device(device):
+            scheduler = getattr(diffusers, kind)(num_train_timesteps=10)
+        scheduler.set_timesteps(10)
+        schedules.append(scheduler_schedule(scheduler))
+    # `add_noise` moves only `alphas_cumprod` to the samples' device, so the scheduler's other tensors stay on the GPU.
+    sample = torch.zeros(1)
+    scheduler.add_noise(sample, sample, torch.zeros(1, dtype=torch.long))
+    schedules.append(scheduler_schedule(scheduler))
+    cpu, gpu, mixed = schedules
+    np.testing.assert_allclose(np.stack(gpu.coefficients), np.stack(cpu.coefficients), rtol=1e-6)
+    np.testing.assert_allclose(np.stack(mixed.coefficients), np.stack(cpu.coefficients), rtol=1e-6)
 
 
 @DIFFUSERS
