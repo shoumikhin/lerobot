@@ -202,6 +202,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
   "constants": null,
   "task_tokens": null,
   "noise_shape": null,
+  "history": {},
   "task": null,
   "action_names": null,
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
@@ -224,7 +225,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
 - `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
 - For a policy that starts from random noise, on a CUDA device (`executorch_cuda`, `executorch_tensorrt`) the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
-- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `task_tokens` names the files that turn a task into vectors (see [Tasks](#tasks)).
+- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history` is for policies that read past frames (see [Past frames](#past-frames)). `task_tokens` names the files that turn a task into vectors (see [Tasks](#tasks)).
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too. Engines that share the buffer take turns on the GPU, even when two bundles run on two threads, because the TensorRT delegate makes each wait for the one before ([pytorch/TensorRT#4739](https://github.com/pytorch/TensorRT/pull/4739), in Torch-TensorRT 2.15). Load such bundles one at a time, since loading one changes an environment variable and the module search path of the process while it runs.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
@@ -279,6 +280,10 @@ for processor in make_pre_post_processors(config, pretrained_path=adapter):
 ```
 
 The export also compares the chain's actions with the whole policy's own, which needs three times the size of the policy's checkpoint in memory. Both run in PyTorch, so this comparison keeps its own tolerance, 2e-05 in float32 and 0.075 in bfloat16, whatever `--tolerance` says. On a board that does not have that memory, such as an 8 GB board for pi0.5, the export skips that comparison and logs a line saying so. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
+
+### Past frames
+
+VQ-BeT reads past frames, not only the current one. In PyTorch the policy keeps them in queues that fill on every control tick. A compiled program keeps nothing between runs, so the bundle names those frames in its manifest under `history`, with how many to keep. The bundle then keeps them on every tick and passes them to the programs, oldest first. A policy that samples random numbers inside its steps reads them from the bundle's `noise`, so the compiled policy samples like the PyTorch one.
 
 ### Tasks
 
@@ -345,14 +350,16 @@ Two tables list what has been tested. In both:
 
 [pytorch/executorch#24353](https://github.com/pytorch/executorch/issues/24353) tracks these results, with the speed of each policy and each known problem with the pull request that fixes it.
 
-| Policy     | Recipe      | H100 | A100 | Jetson AGX Thor | Jetson Orin Nano |
-| ---------- | ----------- | ---- | ---- | --------------- | ---------------- |
-| ACT        | default     | Yes  | Yes  | Yes             | Yes              |
-| pi0.5      | own (chain) | Yes  | Yes  | Yes             | Yes              |
-| GR00T N1.7 | own (chain) | Yes  | Yes  | Yes             | Yes              |
+| Policy     | Recipe            | H100 | A100 | Jetson AGX Thor | Jetson Orin Nano |
+| ---------- | ----------------- | ---- | ---- | --------------- | ---------------- |
+| ACT        | default           | Yes  | Yes  | Yes             | Yes              |
+| pi0.5      | own (chain)       | Yes  | Yes  | Yes             | Yes              |
+| GR00T N1.7 | own (chain)       | Yes  | Yes  | Yes             | Yes              |
+| VQ-BeT     | own (past frames) | Yes  | Yes  | Yes             | Yes              |
 
 - These results used PyTorch 2.15, with builds of ExecuTorch 1.6 and Torch-TensorRT 2.15 that have the fixes from [Install](#install) and other fixes still in review, all listed in pytorch/executorch#24353. In every **Yes** run, the bundle ran without loading PyTorch, and no operation ran on the CPU.
 - The pi0.5 and GR00T results are for their chain recipes.
+- VQ-BeT ran with random weights. That checks the compiler and the runtime, not a trained policy.
 
 ### Other backends
 
@@ -424,7 +431,8 @@ Two optional methods cover bigger policies:
 - `plan()` returns a `RunPlan`, which can hold:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree. For a part that runs once per step, such as a denoising step, `repeated_runs` builds its runs and the constants each run reads;
   - `constants`: named arrays the runs read, such as time values;
-  - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task.
+  - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;
+  - `history`: how many past frames of each frame key the programs take.
 
 `policies/pi05/export_pi05.py` and `policies/groot/export_groot.py` are full examples of a chain.
 
