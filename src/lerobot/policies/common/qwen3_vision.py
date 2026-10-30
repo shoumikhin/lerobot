@@ -17,9 +17,7 @@
 """Run a transformers Qwen3-VL model on one fixed image grid (see `qwen_vision.py`).
 
 `Qwen3VisionGrid` calls the tower's `rot_pos_emb`, which transformers removed in 5.17, while LeRobot pins
-it below 5.6, so this module needs updating before the pin moves past 5.16. That release also lets callers
-pass precomputed vision tensors to the tower, which is the natural replacement for this cache once the pin
-allows it.
+it below 5.6, so this module needs updating before the pin moves past 5.16.
 """
 
 from dataclasses import dataclass
