@@ -144,15 +144,12 @@ class BundleEngine:
         }
         self._runs = [(run, programs[run.program]) for run in manifest.runs]
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
-        self._placed = [
-            {
-                index: program.place(index, self._constants[name])
-                for index, name in enumerate(run.inputs)
-                if name in self._constants
-            }
-            for run, program in self._runs
-        ]
+        self._placed = self._place(self._constants)
         self._check(frames, noise, expected, manifest.tolerance)
+        # The task stays the same for the whole run, so its values are placed once too, after the test case
+        # ran its own task.
+        for placed, task_placed in zip(self._placed, self._place(self._task_values), strict=True):
+            placed.update(task_placed)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_robot(self, observation_shapes: Mapping[str, tuple[int, ...]], action_names: list[str]) -> None:
@@ -252,6 +249,17 @@ class BundleEngine:
                 f"The exported policy does not reproduce its test case ({error:.2e} > {tolerance}). "
                 "Export it again on this device."
             )
+
+    def _place(self, values: Mapping[str, np.ndarray]) -> list[dict[int, Any]]:
+        """`values` copied, for each run, where its program reads them."""
+        return [
+            {
+                index: program.place(index, values[name])
+                for index, name in enumerate(run.inputs)
+                if name in values
+            }
+            for run, program in self._runs
+        ]
 
     def _encode(self, task: str) -> dict[str, np.ndarray]:
         """The values the programs take for `task`: none for a bundle without task tokens."""

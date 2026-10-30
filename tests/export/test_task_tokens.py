@@ -186,3 +186,23 @@ def test_engine_runs_the_task_it_is_given(tmp_path):
     np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), state * place + 5, rtol=1e-5)
     with pytest.raises(ValueError, match="tokens long"):
         BundleEngine(Bundle.read(path), task="pick the cube and then place it")
+
+
+def test_engine_places_the_task_values_once(tmp_path, monkeypatch):
+    from tests.export import torch_backend
+
+    path, _ = task_bundle(tmp_path)
+    placed = []
+    place = torch_backend.TorchProgram.place
+    monkeypatch.setattr(
+        torch_backend.TorchProgram,
+        "place",
+        lambda self, index, value: placed.append(value.shape) or place(self, index, value),
+    )
+    engine = BundleEngine(Bundle.read(path), task="place_the box")
+    loaded = len(placed)
+    for _ in range(3):
+        engine.reset()
+        engine.get_action({OBS_STATE: np.array([1.0, 2.0], np.float32)})
+    # At load: the test case's state and task, then the run's task once. Each chunk copies only the state.
+    assert placed[loaded - 2 : loaded] == [(6, 4), (1,)] and placed[loaded:] == [(2,)] * 3
