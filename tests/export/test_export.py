@@ -15,6 +15,7 @@
 """`lerobot-export` and the bundle it writes, end to end on a tiny ACT, with the test backend."""
 
 import json
+import platform
 import shutil
 import stat
 import subprocess
@@ -288,6 +289,13 @@ BACKENDS = [
     "torch_test",
     pytest.param("executorch_xnnpack", marks=needs_executorch),
     pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+    pytest.param(
+        "executorch_mlx",
+        marks=pytest.mark.skipif(
+            not (sys.platform == "darwin" and platform.machine() == "arm64" and EXECUTORCH),
+            reason="needs ExecuTorch and PyTorch 2.15 on an Apple Silicon Mac",
+        ),
+    ),
 ]
 
 
