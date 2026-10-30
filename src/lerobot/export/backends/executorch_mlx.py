@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import ExecuTorchConfig
+from .executorch import ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -37,10 +37,6 @@ class ExecuTorchMLXConfig(ExecuTorchConfig):
     def compile(self, program: ExportedProgram, path: Path) -> None:
         """Lower `program` to MLX and save it as an ExecuTorch program."""
         from executorch.backends.mlx import MLXPartitioner
-        from executorch.exir import to_edge_transform_and_lower
-        from executorch.exir.passes.constant_prop_pass import constant_prop_pass
 
-        # Values computed from constants alone, such as position embeddings, are folded now: MLX lacks some ops
-        # that build them (a number raised to a tensor power), and one left on the CPU splits the program in two.
-        edge = to_edge_transform_and_lower(constant_prop_pass(program), partitioner=[MLXPartitioner()])
+        edge = lower(program, MLXPartitioner())
         path.write_bytes(edge.to_executorch().buffer)
