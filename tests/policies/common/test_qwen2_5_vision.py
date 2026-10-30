@@ -226,7 +226,9 @@ def test_image_rope_index_follows_get_rope_index_whatever_tokens_are_hidden():
         return position_ids
 
     # transformers fails when a visible run of image tokens does not cover exactly its grid.
-    refused = count_refusals_where_eager_fails(eager, fixed, masks, (RuntimeError, StopIteration), "whole image")
+    refused = count_refusals_where_eager_fails(
+        eager, fixed, masks, (RuntimeError, StopIteration), "whole image"
+    )
     assert 0 < refused < len(masks)
 
 

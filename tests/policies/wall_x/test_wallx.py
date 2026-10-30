@@ -345,7 +345,9 @@ def test_fixed_grid_positions_follow_get_rope_index_whatever_tokens_are_hidden()
     # image block moved by a hidden token, changes the positions. An image block that runs past the last
     # visible token makes the eager code fail, which hidden tokens at the end of the second row can cause.
     grids = torch.tensor([[1, 2, 4], [1, 4, 2], [1, 2, 4]])
-    input_ids = torch.tensor([[5, 41, 40, 40, 42, 6, 41, 40, 40, 42, 7], [5, 7, 8, 9, 10, 11, 12, 41, 40, 40, 42]])
+    input_ids = torch.tensor(
+        [[5, 41, 40, 40, 42, 6, 41, 40, 40, 42, 7], [5, 7, 8, 9, 10, 11, 12, 41, 40, 40, 42]]
+    )
     grid = Qwen2_5VisionGrid.build(model.visual, grids)
 
     def eager(mask):
@@ -358,12 +360,18 @@ def test_fixed_grid_positions_follow_get_rope_index_whatever_tokens_are_hidden()
     masks = hidden_token_masks(torch.ones_like(input_ids))
     masks.append(torch.ones_like(input_ids))
     masks[-1][1, -3:] = 0  # the last image's start token becomes the last visible token
-    refused = count_refusals_where_eager_fails(eager, fixed, masks, (IndexError, ValueError, RuntimeError), "lie within")
+    refused = count_refusals_where_eager_fails(
+        eager, fixed, masks, (IndexError, ValueError, RuntimeError), "lie within"
+    )
     assert 0 < refused < len(masks)
     # More images than grids fails the eager code too.
     with pytest.raises(IndexError):
         model.get_rope_index(input_ids, grids[:2], attention_mask=torch.ones_like(input_ids))
-    batch = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "image_grid_thw": grids[:2]}
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "image_grid_thw": grids[:2],
+    }
     with pytest.raises(ValueError, match="have a grid"):
         policy._static_grid_inputs(batch, Qwen2_5VisionGrid.build(model.visual, grids[:2]))
 

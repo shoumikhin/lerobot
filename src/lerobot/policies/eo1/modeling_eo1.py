@@ -660,25 +660,21 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
-        fixed_position_ids = None
+        grid = None
         if pixel_values is not None:
             grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
-            if grid is not None and (is_preparing_image_grid() or is_exporting()):
-                # Computed in preparation too, so that it refuses the image layouts the export refuses.
-                fixed_position_ids = qwen_image_rope_index(
-                    input_ids,
-                    attention_mask,
-                    grid.grid_thw,
-                    vlm.visual.spatial_merge_size,
-                    vlm.config.image_token_id,
-                    image_temporal_scale=self._rope_temporal_scale(),
-                )
-        vision_grid = self._vision_grid
-        if vision_grid is not None and pixel_values is not None and is_exporting():
-            position_ids = fixed_position_ids
-            image_embeds = qwen2_5_vision_forward(
-                vlm.visual, pixel_values.type(vlm.visual.dtype), vision_grid
+        if grid is not None and (is_preparing_image_grid() or is_exporting()):
+            # Computed in preparation too, so that it refuses the image layouts the export refuses.
+            position_ids = qwen_image_rope_index(
+                input_ids,
+                attention_mask,
+                grid.grid_thw,
+                vlm.visual.spatial_merge_size,
+                vlm.config.image_token_id,
+                image_temporal_scale=self._rope_temporal_scale(),
             )
+        if grid is not None and pixel_values is not None and is_exporting():
+            image_embeds = qwen2_5_vision_forward(vlm.visual, pixel_values.type(vlm.visual.dtype), grid)
             image_mask = input_ids == vlm.config.image_token_id
             check_input(
                 image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
