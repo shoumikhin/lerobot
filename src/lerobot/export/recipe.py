@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import numpy as np
 import torch
@@ -578,6 +578,35 @@ class ActionChunkRecipe(ExportRecipe):
     def _inputs(self, frame: dict[str, np.ndarray], noise: np.ndarray | None) -> tuple[Tensor, ...]:
         arrays = [*frame.values(), *([] if noise is None else [noise])]
         return tuple(torch.from_numpy(x).to(self._device) for x in arrays)
+
+
+class VisionGridRecipe(ActionChunkRecipe):
+    """[`ActionChunkRecipe`] for a policy whose vision tower exports on a fixed image grid.
+
+    A Qwen-VL vision tower reads its image grid (`image_grid_thw`) on the host, which `torch.export` cannot
+    trace, so the policy takes what the tower derives from the grid as `vision_grid`. The recipe builds it from
+    the first preprocessed batch, in the eager runs before the export (the test case and the checks), and
+    passes it on every call; the policy refuses a frame with another grid.
+    """
+
+    grid_type: ClassVar[Any]
+    """The policy's `FixedImageGrid` subclass, such as `Qwen2_5VisionGrid`."""
+    _vision_grid: Any = None
+
+    @abc.abstractmethod
+    def vision_tower(self, policy: PreTrainedPolicy) -> nn.Module:
+        """The vision tower that `grid_type.build` reads."""
+
+    def predict_chunk(self, policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
+        """The default recipe's chunk, with the policy's vision tower on the grid of the first batch."""
+        if self._vision_grid is None:
+            self._vision_grid = self.grid_type.build(self.vision_tower(policy), batch["image_grid_thw"])
+        options: dict[str, Any] = {
+            "vision_grid": self._vision_grid,
+            **({} if noise is None else {NOISE: noise}),
+        }
+        output = policy.predict_action_chunk(batch, **options)
+        return transition_to_policy_action(policy_output_to_transition(output))
 
 
 class _ActionChunk(nn.Module):

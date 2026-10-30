@@ -352,6 +352,48 @@ class LatentWorldPolicyBackend(nn.Module):
         # Fills the placeholders in row-major order, which repeats the queries once per sample.
         inputs_embeds.masked_scatter_(placeholder_mask.unsqueeze(-1), queries.repeat(bsz, 1))
 
+    def _query_embeds(
+        self,
+        input_ids: torch.LongTensor,
+        act_placeholder_mask: torch.BoolTensor,
+        flow_placeholder_mask: torch.BoolTensor,
+        act_query: torch.Tensor,
+        flow_query: torch.Tensor,
+    ) -> torch.Tensor:
+        """The prompt's token embeddings with the action and flow queries at their placeholders."""
+        embed = self.vlm.get_input_embeddings()
+        if embed is None:
+            raise RuntimeError("[LatentWorldPolicyBackend] VLM does not expose input embeddings.")
+        inputs_embeds = embed(input_ids)
+
+        self._inject_queries(
+            inputs_embeds=inputs_embeds,
+            placeholder_mask=act_placeholder_mask,
+            queries=act_query,
+            num_queries=int(self.num_action_queries),
+            name="act_query",
+        )
+        self._inject_queries(
+            inputs_embeds=inputs_embeds,
+            placeholder_mask=flow_placeholder_mask,
+            queries=flow_query,
+            num_queries=int(flow_query.shape[0]),
+            name="flow_query",
+        )
+        return inputs_embeds
+
+    def _action_query_states(
+        self, hidden: torch.Tensor, act_placeholder_mask: torch.BoolTensor
+    ) -> torch.Tensor:
+        """The hidden states at the action-query placeholders, in order: `[B, num_action_queries, H]`."""
+        q = int(self.num_action_queries)
+        # `_inject_queries` checked that every sample has exactly q action placeholders. The j-th one
+        # sits after every token whose running placeholder count is still at most j.
+        query_ids = torch.arange(q, device=hidden.device).view(1, q, 1)
+        counts = act_placeholder_mask.to(hidden.device).cumsum(dim=1)
+        positions = (counts.unsqueeze(1) <= query_ids).sum(dim=-1)
+        return hidden.gather(1, positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+
     def _run_vlm_stage(
         self,
         *,
@@ -379,24 +421,8 @@ class LatentWorldPolicyBackend(nn.Module):
                 "the Qwen3-VL model): transformers' flash attention unpads the rows by the attention mask "
                 "values, which torch.export cannot trace."
             )
-        embed = self.vlm.get_input_embeddings()
-        if embed is None:
-            raise RuntimeError("[LatentWorldPolicyBackend] VLM does not expose input embeddings.")
-        inputs_embeds = embed(input_ids)
-
-        self._inject_queries(
-            inputs_embeds=inputs_embeds,
-            placeholder_mask=act_placeholder_mask,
-            queries=act_query,
-            num_queries=q,
-            name="act_query",
-        )
-        self._inject_queries(
-            inputs_embeds=inputs_embeds,
-            placeholder_mask=flow_placeholder_mask,
-            queries=flow_query,
-            num_queries=int(flow_query.shape[0]),
-            name="flow_query",
+        inputs_embeds = self._query_embeds(
+            input_ids, act_placeholder_mask, flow_placeholder_mask, act_query, flow_query
         )
 
         if vision_grid is not None:
@@ -437,14 +463,7 @@ class LatentWorldPolicyBackend(nn.Module):
                     "`last_hidden_state`. "
                     f"output_type={type(vlm_out).__name__}, output_keys={output_keys}."
                 )
-        # `_inject_queries` checked that every sample has exactly q action placeholders. The j-th one
-        # sits after every token whose running placeholder count is still at most j.
-        query_ids = torch.arange(q, device=hidden.device).view(1, q, 1)
-        counts = act_placeholder_mask.to(hidden.device).cumsum(dim=1)
-        positions = (counts.unsqueeze(1) <= query_ids).sum(dim=-1)
-        h_act = hidden.gather(1, positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
-
-        pred_latent = self.vlm_to_lam(h_act)
+        pred_latent = self.vlm_to_lam(self._action_query_states(hidden, act_placeholder_mask))
         return {
             "h_vlm": hidden,
             "pred_latent": pred_latent,
