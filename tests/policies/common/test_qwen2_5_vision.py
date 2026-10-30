@@ -205,7 +205,9 @@ def test_image_rope_index_follows_get_rope_index_whatever_tokens_are_hidden():
     grids_per_row = [[[1, 4, 6], [1, 6, 4]], [[1, 4, 6]]]
     grids = [grid for row in grids_per_row for grid in row]
     input_ids, attention_mask = _two_rows_of_images(grids_per_row)
-    program = torch.export.export(ImageRopeIndex(grids), (input_ids, attention_mask), strict=False).module()
+    # transformers 5.4.0 to 5.5.3 scale the temporal position of still images; the probe reads the scale.
+    rope_index = ImageRopeIndex(grids, image_temporal_scale=qwen2_5_image_temporal_scale(model))
+    program = torch.export.export(rope_index, (input_ids, attention_mask), strict=False).module()
     masks = hidden_token_masks(attention_mask)
     for row, start in ((0, 2), (0, 11), (1, 2)):  # the first, the second and the last image, all hidden
         masks.append(attention_mask.clone())
@@ -217,7 +219,7 @@ def test_image_rope_index_follows_get_rope_index_whatever_tokens_are_hidden():
 
     def fixed(mask):
         try:
-            position_ids = qwen_image_rope_index(input_ids, mask, grids, 2, IMAGE_TOKEN_ID)
+            position_ids = rope_index(input_ids, mask)
         except ValueError:
             with pytest.raises(RuntimeError):
                 program(input_ids, mask)
@@ -238,6 +240,7 @@ def test_every_image_keeps_its_grid_when_others_are_hidden():
     grids = [grid for row in grids_per_row for grid in row]
     input_ids, attention_mask = _two_rows_of_images(grids_per_row)
     blocks = [(0, slice(2, 10)), (0, slice(11, 19)), (1, slice(2, 8)), (1, slice(9, 17))]
+    scale = qwen2_5_image_temporal_scale(model)
     for hidden in itertools.product([False, True], repeat=len(blocks)):
         if all(hidden):
             continue
@@ -251,7 +254,7 @@ def test_every_image_keeps_its_grid_when_others_are_hidden():
             input_ids, input_ids.eq(IMAGE_TOKEN_ID).int(), torch.tensor(visible_grids), attention_mask=mask
         )
         position_ids = qwen_image_rope_index(
-            input_ids, mask, grids, 2, IMAGE_TOKEN_ID, image_blocks="every_image"
+            input_ids, mask, grids, 2, IMAGE_TOKEN_ID, scale, image_blocks="every_image"
         )
         assert torch.equal(position_ids, expected), hidden
 
