@@ -60,6 +60,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _scipy_available, _transformers_available, require_package
 
+from ..common.export_utils import is_non_strict_exporting
 from .configuration_molmoact2 import MolmoAct2Config
 from .utils_molmoact2 import (
     hf_token as _hf_token,
@@ -644,6 +645,9 @@ class _MolmoAct2MaskedNormalizationMixin(_MaskedNormalizationBase):
 
     @staticmethod
     def _validate_masked_passthrough_range(tensor: Tensor, mask: Tensor, key: str) -> None:
+        # A program cannot branch on its inputs' values; an export checks this on its eager frames instead.
+        if is_non_strict_exporting():
+            return
         passthrough_mask = ~mask.expand_as(tensor)
         if not bool(passthrough_mask.any()):
             return
@@ -699,6 +703,9 @@ class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
 
     @staticmethod
     def _validate_masked_passthrough_range(tensor: Tensor, mask: Tensor, key: str) -> None:
+        # A program cannot branch on its inputs' values; an export checks this on its eager frames instead.
+        if is_non_strict_exporting():
+            return
         passthrough_mask = ~mask.expand_as(tensor)
         if not bool(passthrough_mask.any()):
             return
