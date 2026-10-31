@@ -95,6 +95,13 @@ RECIPES = {
         cuda=True,
         bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
     ),
+    "molmoact2": Recipe(
+        "tests.policies.molmoact2.export_stand_in",
+        ("tmp_path",),
+        cuda=True,
+        untraceable=NUMPY_PIXELS,
+        bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
+    ),
 }
 
 
@@ -154,6 +161,7 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
             id="wall_oss_05-tokenizer",
         ),
         pytest.param("wall_oss_05", {"size": 224}, "long side is 448 pixels", id="wall_oss_05-camera"),
+        pytest.param("molmoact2", {"side": 32}, "32x32 becomes 28x28", id="molmoact2-camera"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
