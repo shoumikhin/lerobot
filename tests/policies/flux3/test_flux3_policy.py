@@ -48,6 +48,7 @@ from lerobot.policies.flux3.f3 import (
     packing,
     sampling,
     stream_of_key,
+    video_vae,
 )
 from lerobot.policies.flux3.f3.text_encoder import TEXT_PAD_MULTIPLE
 from lerobot.policies.flux3.f3.wiring import (
@@ -531,6 +532,26 @@ def test_valid_windows_stay_on_batch_device(device):
     assert keep.device == batch["action_is_pad"].device and keep.tolist() == [True, False, False]
     keep = Flux3Policy._valid_windows({}, 3, device)
     assert keep.device == batch["action_is_pad"].device and keep.tolist() == [True, True, True]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_video_vae_attention_gives_natten_one_dtype_under_cuda_autocast(monkeypatch):
+    """CUDA autocast runs rms_norm in float32 since PyTorch 2.12, and NATTEN refuses mixed dtypes."""
+    dtypes = []
+
+    def natten(q, k, v, **kwargs):
+        dtypes.append((q.dtype, k.dtype, v.dtype))
+        return v
+
+    monkeypatch.setattr(video_vae, "na2d", natten, raising=False)
+    monkeypatch.setattr(video_vae, "na3d", natten, raising=False)
+    monkeypatch.setattr(video_vae, "_natten_attention_kwargs", lambda q, k, v: {})
+    attention = video_vae.Natten3D(16, [2, 3, 3], num_heads=2, qk_norm=True).to("cuda", torch.bfloat16)
+    frames = torch.randn(1, 2, 4, 4, 16, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        attention(frames)
+        attention(frames[:, :1])
+    assert dtypes == [(torch.bfloat16,) * 3] * 2
 
 
 @pytest.mark.parametrize(
