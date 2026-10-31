@@ -551,14 +551,21 @@ class GrootExportRecipe(ExportRecipe):
         return [] if self._metadata is None else [str(task) for task in self._metadata.tasks.index]
 
     def _action_scale(self) -> np.ndarray:
-        """Robot units per normalized unit for each action, measured on the actions part."""
+        """Robot units per normalized unit for each action, measured on the actions part.
+
+        The actions of a relative end-effector rotation are components of unit vectors, so their scale is 1: the
+        constant actions that measure the others are not a rotation.
+        """
         width = self._model_config.max_action_dim
         state = torch.from_numpy(self._frame[self._images.state_name]).to(self._device)
-        return measure_action_scale(
+        scale = measure_action_scale(
             lambda value: self._chunk_actions(
                 torch.full((self._steps, width), value, device=self._device), state
             )[0]
         )
+        if isinstance(self._chunk_actions, _N17ChunkActions):
+            scale[[i for i in self._chunk_actions.decode.rotations if i < len(scale)]] = 1
+        return scale
 
     def _check_n17_decode(self, actions: Tensor) -> None:
         """`N17ActionDecode` must decode the test chunk as `GrootN17ActionDecodeStep` does."""
@@ -1225,6 +1232,8 @@ class N17ActionDecode(nn.Module):
         self.env_action_dim = decode.env_action_dim
         self.groups: list[tuple[str, int, int]] = []
         self.relative: list[tuple[str, str, str]] = []
+        # The decoded actions that are the rotation of a relative end-effector pose.
+        self.rotations: list[int] = []
         start = 0
         for index, key in enumerate(keys):
             entry = raw_stats.get("action", {}).get(key) if isinstance(key, str) else None
@@ -1251,6 +1260,9 @@ class N17ActionDecode(nn.Module):
                 if kind[0] != "non_eef" and kind != ("eef", "xyz+rot6d"):
                     raise ValueError(f"Unsupported relative N1.7 action config for {key!r}: {config}")
                 self.relative.append((key, config.get("state_key") or key, kind[0]))
+                if kind[0] == "eef":
+                    # The group's actions end at `start`, and its rotation follows its xyz.
+                    self.rotations += range(start - dim + 3, start)
         self.state_groups: dict[str, tuple[int, int]] = {}
         state_start = 0
         for key in (pack.modality_config or {}).get("state", {}).get("modality_keys", []):
