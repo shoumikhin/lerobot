@@ -118,7 +118,7 @@ def diffusion_checkpoint(path, **sampler) -> None:
 
     config = DiffusionConfig(
         input_features={
-            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *FRAME)),
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
         },
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
@@ -126,7 +126,7 @@ def diffusion_checkpoint(path, **sampler) -> None:
         horizon=8,
         n_action_steps=4,
         drop_n_last_frames=2,
-        crop_shape=(28, 28),
+        crop_shape=CROP,
         pretrained_backbone_weights=None,
         use_group_norm=True,
         spatial_softmax_num_keypoints=8,
