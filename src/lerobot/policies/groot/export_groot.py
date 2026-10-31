@@ -52,7 +52,6 @@ from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
     ACTION_OUTPUTS,
-    BFLOAT16_TOLERANCE,
     FLOAT32_TOLERANCE,
     ChainRecipe,
     ChunkActions,
@@ -176,7 +175,7 @@ class GrootExportRecipe(ChainRecipe):
         self._metadata = dataset_metadata(cfg)
         self._generator = torch.Generator().manual_seed(cfg.seed)
         bfloat16 = config.use_bf16 or config.dtype == torch.bfloat16
-        default_tolerance = BFLOAT16_TOLERANCE if bfloat16 else FLOAT32_TOLERANCE
+        default_tolerance = self.bfloat16_tolerance if bfloat16 else FLOAT32_TOLERANCE
         self.tolerance = cfg.tolerance if cfg.tolerance is not None else default_tolerance
         self.task = export_task(cfg, self._metadata, "GR00T")
         features = self._robot_features(config)
@@ -955,9 +954,9 @@ class _VisionTower(nn.Module):
         """The merged image features, then one tensor per deepstack layer."""
         from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
 
-        # Added in float32 under bfloat16 autocast, so the residual stream stays float32 as in NVIDIA's GR00T
-        # (transformers 4.57). Transformers 5.9 rounds the sum to bfloat16, nearly doubling the features' error.
-        hidden = self.patch_embed(pixel_values) + self.pos_embeds
+        # In the patch embedding's dtype, as the tower's own forward adds them.
+        patches = self.patch_embed(pixel_values)
+        hidden = patches + self.pos_embeds.to(patches.dtype)
         deepstack = []
         for layer, block in enumerate(self.blocks):
             attn = block.attn
