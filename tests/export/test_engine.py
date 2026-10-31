@@ -15,6 +15,7 @@
 """The engine that runs a bundle, on bundles of small modules run by the test runtime."""
 
 import json
+from dataclasses import replace
 from threading import Event
 
 import numpy as np
@@ -25,6 +26,7 @@ from torch import Tensor, nn
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle
+from lerobot.bundle.runtime import RUNTIMES
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle
 
@@ -144,6 +146,15 @@ def test_engine_runs_the_noise_draw_and_checks_with_the_recorded_noise(tmp_path,
     second = np.stack([engine.get_action(FRAME) for _ in range(3)])
     assert not np.array_equal(first, second)
     assert placed[loaded:] == [(3,)] * 2
+
+
+def test_engine_applies_the_runtime_options_of_its_bundle(tmp_path, monkeypatch):
+    applied = []
+    monkeypatch.setitem(RUNTIMES, "torch_test", replace(RUNTIMES["torch_test"], configure=applied.append))
+    bundle = make_bundle(tmp_path / "bundle", Chunk(), FRAME)
+    _edit(bundle, runtime_options={"TestBackend": {"shared": True}})
+    BundleEngine(Bundle.read(bundle.path))
+    assert applied == [{"TestBackend": {"shared": True}}]
 
 
 def test_engine_loads_the_data_file_a_program_names(tmp_path):
