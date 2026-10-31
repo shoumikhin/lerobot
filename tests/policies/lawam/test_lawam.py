@@ -601,6 +601,9 @@ def test_lam_constructs_without_checkpoint_or_pretrained_dino() -> None:
 
     assert isinstance(loaded_model, LatentLAMModel)
     assert all(not parameter.requires_grad for parameter in loaded_model.parameters())
+    # Built where the caller builds the policy, as an export does on its device.
+    with torch.device("meta"):
+        assert all(parameter.is_meta for parameter in build_latent_action_model(model_config).parameters())
 
 
 def test_action_horizon_is_independent_of_control_frequency() -> None:
@@ -829,10 +832,10 @@ def test_saved_policy_uses_safetensors_without_torch_load(tmp_path, monkeypatch)
     assert torch.equal(loaded_policy.model.weight, policy.model.weight)
 
 
-def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -> None:
+def test_pretrained_load_maps_lawam_checkpoint_on_cpu_and_moves_once(tmp_path, monkeypatch) -> None:
     cfg = make_config()
     cfg.device = "cuda"
-    events = {}
+    events = {"moves": []}
 
     def fake_load(cls, model, model_file, map_location, strict):
         del cls, model_file, strict
@@ -841,7 +844,7 @@ def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -
         return model
 
     def fake_to(self, device):
-        events["final_device"] = str(device)
+        events["moves"].append(str(device))
         if str(device).startswith("cpu"):
             return nn.Module.to(self, device)
         return self
@@ -860,7 +863,7 @@ def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -
     assert events == {
         "load_device": "cpu",
         "parameter_device_during_load": "cpu",
-        "final_device": "cuda",
+        "moves": ["cuda"],
     }
     assert cfg.device == "cuda"
     assert policy.config.device == "cuda"
