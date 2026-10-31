@@ -847,14 +847,15 @@ def test_parts_are_built_on_the_default_device(monkeypatch):
 
         return build
 
-    for name in ("build_action_dit", "load_video_vae", "load_text_encoder"):
+    builders = ("build_action_dit", "load_video_vae", "load_text_encoder")
+    for name in builders:
         monkeypatch.setattr(modeling_flux3, name, recorder(name))
     builder = SimpleNamespace(dit_params=None, modality="action", dtype_=torch.float32)
     with torch.device("meta"):
         Flux3Policy._build_dit(builder, droid_config())
         Flux3Policy._build_video_vae(builder, droid_config())
         Flux3Policy._build_text_encoder(builder, droid_config())
-    assert devices == dict.fromkeys(("build_action_dit", "load_video_vae", "load_text_encoder"), torch.device("meta"))
+    assert devices == dict.fromkeys(builders, torch.device("meta"))
 
 
 @pytest.mark.gpu
