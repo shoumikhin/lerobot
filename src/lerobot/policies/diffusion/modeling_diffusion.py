@@ -230,8 +230,9 @@ class DiffusionModel(nn.Module):
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
-            # common in diffusion inference.
-            self.unet = torch.compile(self.unet, mode=config.compile_mode)
+            # common in diffusion inference. Compiling in place keeps the names of its weights, so a
+            # checkpoint loads whatever `compile_model` is.
+            self.unet.compile(mode=config.compile_mode)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -248,6 +249,16 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+    def _load_from_state_dict(
+        self, state_dict: dict[str, Tensor], prefix: str, *args: Any, **kwargs: Any
+    ) -> None:
+        # Checkpoints trained with `compile_model` before the U-Net was compiled in place name its weights
+        # `unet._orig_mod.*`, after the torch.compile wrapper.
+        wrapped = f"{prefix}unet._orig_mod."
+        for key in [key for key in state_dict if key.startswith(wrapped)]:
+            state_dict[f"{prefix}unet.{key.removeprefix(wrapped)}"] = state_dict.pop(key)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     # ========= inference  ============
     def conditional_sample(
