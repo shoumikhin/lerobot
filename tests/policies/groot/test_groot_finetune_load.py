@@ -699,9 +699,14 @@ def test_constructor_accepts_a_base_path_that_is_not_here(tmp_path):
     assert policy._base_config_files == {}
 
 
-def test_save_that_stops_halfway_leaves_no_copies_in_use(tmp_path, monkeypatch):
+@pytest.mark.parametrize("over_an_earlier_save", [False, True])
+def test_save_that_stops_halfway_leaves_no_copies_in_use(tmp_path, monkeypatch, over_an_earlier_save):
     base = _write_tiny_base(tmp_path)
-    _cap_action_horizon(base, [0, 1])
+    _cap_action_horizon(base, [0])
+    if over_an_earlier_save:
+        other_base = shutil.copytree(base, tmp_path / "other_base")
+        _cap_action_horizon(other_base, [0, 1, 2])
+        GrootPolicy(_policy_config(other_base)).save_pretrained(tmp_path / "finetune")
     policy = GrootPolicy(_policy_config(base))
     write_bytes = Path.write_bytes
 
@@ -717,8 +722,8 @@ def test_save_that_stops_halfway_leaves_no_copies_in_use(tmp_path, monkeypatch):
 
     loaded = GrootPolicy.from_pretrained(tmp_path / "finetune")
     assert loaded._base_config_path == str(base)
-    assert loaded._action_queue_steps == 2
-    assert loaded.config.action_delta_indices == [0, 1]
+    assert loaded._action_queue_steps == 1
+    assert loaded.config.action_delta_indices == [0]
 
 
 def test_save_does_not_copy_a_file_that_links_out_of_the_checkpoint(tmp_path, caplog):
