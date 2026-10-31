@@ -42,6 +42,7 @@ from conftest import (  # noqa: E402
     N_ACTION_STEPS,
     QWEN_HIDDEN_SIZE,
     STATE_DIM,
+    TINY_QWEN_IMAGE_SIZE,
     make_config,
     make_inference_batch,
     make_train_batch,
@@ -183,6 +184,27 @@ def test_predict_action_chunk_always_finite(patch_vla_jepa_external_models: None
         set_seed_all(seed)
         chunk = policy.predict_action_chunk(make_inference_batch())
         assert torch.isfinite(chunk).all(), f"non-finite actions with seed={seed}"
+
+
+@torch.no_grad()
+def test_predict_action_chunk_runs_on_the_qwen_inputs_of_its_batch(
+    tiny_qwen_config: VLAJEPAConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_seed_all(0)
+    policy = VLAJEPAPolicy(tiny_qwen_config).eval()
+    batch = make_inference_batch(batch_size=1, image_size=TINY_QWEN_IMAGE_SIZE)
+    noise = torch.randn(1, ACTION_HORIZON, ACTION_DIM)
+    expected = policy.predict_action_chunk(batch, noise=noise)
+    qwen_inputs = policy.qwen_inputs(batch)
+
+    def no_processor(*args, **kwargs):
+        raise AssertionError("The Qwen processor ran although the batch holds its tensors.")
+
+    monkeypatch.setattr(policy.model.qwen, "build_inputs", no_processor)
+    assert torch.equal(policy.predict_action_chunk({**batch, **qwen_inputs}, noise=noise), expected)
+    # Other pixel values in the batch move the actions: Qwen reads the batch's tensors.
+    other = {**batch, **qwen_inputs, "pixel_values": qwen_inputs["pixel_values"].flip(0)}
+    assert not torch.equal(policy.predict_action_chunk(other, noise=noise), expected)
 
 
 # ---------------------------------------------------------------------------
