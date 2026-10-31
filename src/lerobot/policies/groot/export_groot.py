@@ -821,7 +821,7 @@ def _separable_map(transform, shape: tuple[int, int]) -> tuple[Tensor, Tensor]:
     column_responses: list[np.ndarray] = []
     for first in range(0, height, batch):
         index = np.arange(first, min(first + batch, height))
-        lines = np.zeros((len(index), height, width), np.float32)
+        lines: np.ndarray = np.zeros((len(index), height, width), np.float32)
         lines[np.arange(len(index)), index, :] = 1
         row_responses.append(transform(lines)[:, :, j0])
     for first in range(0, width, batch):
