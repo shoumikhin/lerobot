@@ -31,11 +31,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from lerobot.utils.import_utils import _datasets_available, _transformers_available, require_package
+from lerobot.processor.tokenizer_processor import load_action_tokenizer
+from lerobot.utils.import_utils import _datasets_available, require_package
 
-if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoProcessor
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 # pyarrow ships with the dataset extra; tokenizer fitting reads training parquet shards.
 if TYPE_CHECKING or _datasets_available:
     import pyarrow as pa
@@ -200,23 +198,6 @@ def _validate_fast_reconstruction(
             f"max_dim_rmse={max_observed_dim_rmse:.4f} (max {max_dim_rmse:.4f})."
         )
     return report, decoded
-
-
-def _load_fast_fitter(base_tokenizer_name: str) -> Any:
-    """Load FAST's fitting implementation without requiring its universal BPE weights."""
-    try:
-        return AutoProcessor.from_pretrained(base_tokenizer_name, trust_remote_code=True)
-    except ValueError as error:
-        if base_tokenizer_name != "physical-intelligence/fast":
-            raise
-        logger.warning(
-            "Could not load the universal FAST tokenizer backend; loading its fitting class directly: %s",
-            error,
-        )
-        return get_class_from_dynamic_module(
-            "processing_action_tokenizer.UniversalActionProcessor",
-            base_tokenizer_name,
-        )
 
 
 def fit_fast_tokenizer(
@@ -430,7 +411,7 @@ def fit_fast_tokenizer(
 
     actions = _normalize_actions(actions, normalization_mode, action_stats)
 
-    base = _load_fast_fitter(base_tokenizer_name)
+    base = load_action_tokenizer(base_tokenizer_name, trust_remote_code=True)
     if not hasattr(base, "fit"):
         raise ImportError(
             f"Base FAST tokenizer {base_tokenizer_name!r} has no ``.fit()`` "

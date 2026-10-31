@@ -40,11 +40,13 @@ from lerobot.policies import (  # noqa: E402
 from lerobot.policies.fineart_vla.modeling_fineart_vla import FineARTVLAPolicy  # noqa: E402
 from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: E402
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy  # noqa: E402
+from lerobot.processor.tokenizer_processor import load_action_tokenizer  # noqa: E402
 from lerobot.utils.constants import (  # noqa: E402
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
 )
+from tests.processor.test_tokenizer_processor import _save_action_processor  # noqa: E402
 from tests.utils import require_cuda  # noqa: E402
 
 
@@ -281,3 +283,62 @@ def test_loader_converts_only_pi05_format_checkpoints(tmp_path, native):
     assert policy.converted is not native
     torch.testing.assert_close(policy.model.weight, source.weight)
     torch.testing.assert_close(policy.model.bias, source.bias)
+
+
+_FAST_FITTER_CODE = """
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast, ProcessorMixin
+
+
+class TinyActionProcessor(ProcessorMixin):
+    bpe_tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, bpe_tokenizer, scale=10):
+        self.scale = scale
+        super().__init__(bpe_tokenizer)
+
+    def __call__(self, actions):
+        return actions
+
+    def decode(self, tokens):
+        return tokens
+
+    @classmethod
+    def fit(cls, actions):
+        tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "fitted": 1}, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        return cls(PreTrainedTokenizerFast(tokenizer_object=tokenizer), scale=3)
+"""
+
+
+@pytest.mark.dataset
+def test_fineart_vla_fits_fast_tokenizer_from_base_saved_by_transformers_4(tmp_path, monkeypatch):
+    pytest.importorskip("datasets", reason="tokenizer fitting requires lerobot[dataset]")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import transformers.dynamic_module_utils
+
+    from lerobot.policies.fineart_vla.fit_fast_tokenizer import fit_fast_tokenizer
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    _save_action_processor(tmp_path / "legacy_fast", tokenizer_subfolder="", code=_FAST_FITTER_CODE)
+    shard = tmp_path / "dataset" / "data" / "chunk-000"
+    shard.mkdir(parents=True)
+    actions = [[0.1 * index, 0.5] for index in range(8)]
+    pq.write_table(pa.table({"episode_index": [0] * 8, "action": actions}), shard / "file-000.parquet")
+
+    fitted = fit_fast_tokenizer(
+        dataset_repo_id="local/tiny",
+        cache_dir=tmp_path / "cache",
+        base_tokenizer_name=str(tmp_path / "legacy_fast"),
+        n_samples=2,
+        chunk_size=2,
+        dataset_root=tmp_path / "dataset",
+        normalization_mode="IDENTITY",
+        validation_samples=2,
+    )
+
+    # Training loads the fitted tokenizer with this loader, through ActionTokenizerProcessorStep.
+    processor = load_action_tokenizer(fitted, trust_remote_code=True)
+    assert processor.scale == 3
+    assert processor.bpe_tokenizer.encode("fitted", add_special_tokens=False) == [1]
