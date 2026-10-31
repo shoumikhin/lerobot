@@ -26,13 +26,16 @@ import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 
+from lerobot.bundle.engine import BundleEngine
+from lerobot.bundle.manifest import Bundle, is_bundle
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference import ExecutionMode, ObservationSnapshot, PolicyRunner
+from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
 from lerobot.policies import PreTrainedPolicy, get_policy_class, make_pre_post_processors
 from lerobot.policies.factory import has_peft_adapter_config
 from lerobot.processor import RenderRuntimeMessagesStep
 from lerobot.utils.import_utils import _peft_available, require_package
 
+from .bundle import BundleRunner
 from .configs import ServerConfig
 
 if TYPE_CHECKING or _peft_available:
@@ -67,11 +70,15 @@ def artifact_identity(paths: dict[str, Path], effective: dict) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _inference_identity(cfg: ServerConfig, policy_cfg: PreTrainedConfig) -> dict:
-    """Pin checkpoint contents and inference semantics independently of deployment location."""
-    policy = asdict(policy_cfg)
-    policy.pop("pretrained_path", None)
-    policy.pop("device", None)
+def _inference_identity(cfg: ServerConfig, policy_cfg: PreTrainedConfig | None) -> dict:
+    """Pin checkpoint contents and inference semantics independently of deployment location.
+
+    A bundle passes no `policy_cfg`: its hashed files already record what was exported.
+    """
+    policy = None if policy_cfg is None else asdict(policy_cfg)
+    if policy is not None:
+        policy.pop("pretrained_path", None)
+        policy.pop("device", None)
     uses_rtc = any(mode != ExecutionMode.CHUNK for mode in cfg.execution.supported_modes)
     return {
         "policy": policy,
@@ -114,13 +121,61 @@ def _subtask_prompt_unavailable_reason(runner: PolicyRunner) -> str | None:
     return None
 
 
-def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner, str]:
-    """Resolve contents, load canonical processors and reset all warmed model paths."""
+def _warmup_observation(cfg: ServerConfig, task: str) -> ObservationSnapshot:
+    return ObservationSnapshot(
+        {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in cfg.features},
+        0.0,
+        task,
+        observation_id="warmup",
+    )
+
+
+def _load_bundle(cfg: ServerConfig, path: Path, action_feature: FeatureSpec) -> tuple[BundleRunner, str]:
+    """Load a bundle from `lerobot-export`, which runs as it was compiled, and refuse what would change it."""
+    if any(mode != ExecutionMode.CHUNK for mode in cfg.execution.supported_modes):
+        raise ValueError(
+            "A bundle serves plain chunks only: RTC needs the PyTorch policy. Serve the checkpoint for RTC."
+        )
+    if cfg.execution.n_action_steps is not None:
+        raise ValueError(
+            "A bundle plays the chunk it was exported with, so execution.n_action_steps does not apply."
+        )
+    if cfg.language.enabled:
+        raise ValueError("A bundle holds no text model. Serve the checkpoint for language.enabled.")
+    bundle = Bundle.read(path)
+    if bundle.manifest.history:
+        raise ValueError(
+            "This bundle reads the frames of past control ticks, but a server sees one frame per chunk. "
+            "Run it with lerobot-rollout."
+        )
+    runner = BundleRunner(
+        BundleEngine(bundle),
+        action_interval=1 / cfg.execution.action_fps,
+        features=tuple(cfg.features),
+        action_feature=action_feature,
+    )
+    identity = artifact_identity({"bundle": path}, _inference_identity(cfg, None))
+    try:
+        for _ in range(cfg.execution.warmup_calls):
+            # An empty task runs the bundle's own, which is the only one some bundles take.
+            runner.predict(_warmup_observation(cfg, ""))
+    finally:
+        runner.reset(full=True)
+    return runner, identity
+
+
+def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner | BundleRunner, str]:
+    """Resolve contents, load canonical processors and reset all warmed model paths.
+
+    A folder written by `lerobot-export` is served as a bundle.
+    """
     action_feature = cfg.action_feature
     if action_feature is None:
         # ServerConfig.__post_init__ already rejects this; the check only narrows the type.
         raise ValueError("Explicit canonical features and action_feature are required")
     path = resolve_artifact(cfg.model.repo_or_path, cfg.model.revision)
+    if is_bundle(path):
+        return _load_bundle(cfg, path, action_feature)
     artifacts = {"checkpoint": path}
     policy_cfg = PreTrainedConfig.from_pretrained(path)
     execution_steps = cfg.execution.n_action_steps
@@ -179,12 +234,7 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner, str]:
     if execution_steps is not None and runner.capabilities.execution_steps != execution_steps:
         raise ValueError("Loaded policy does not honor the requested execution.n_action_steps slice")
     identity = artifact_identity(artifacts, _inference_identity(cfg, policy_cfg))
-    warmup = ObservationSnapshot(
-        {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in cfg.features},
-        0.0,
-        "warmup",
-        observation_id="warmup",
-    )
+    warmup = _warmup_observation(cfg, "warmup")
     try:
         for mode in runner.capabilities.modes:
             previous = None
