@@ -338,6 +338,32 @@ def test_save_pretrained_single_file_artifact(dummy_dataset_metadata, tmp_path):
     torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
 
 
+@pytest.mark.skipif("diffusion" not in AVAILABLE_POLICIES, reason="needs diffusers")
+@pytest.mark.parametrize("compiled", [True, False])
+def test_diffusion_weights_load_whatever_compile_model(dummy_dataset_metadata, tmp_path, compiled):
+    features = dataset_to_policy_features(dummy_dataset_metadata.features)
+    actions = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    inputs = {key: ft for key, ft in features.items() if key not in actions}
+    saved, loaded = (
+        make_policy_config("diffusion", compile_model=c, input_features=inputs, output_features=actions)
+        for c in (compiled, not compiled)
+    )
+    policy_cls = get_policy_class("diffusion")
+    policy = policy_cls(saved)
+    policy.to(saved.device)
+    policy.save_pretrained(tmp_path)
+    loaded_policy = policy_cls.from_pretrained(tmp_path, config=loaded)
+    torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
+    # Checkpoints trained with compile_model before name the U-Net's weights after the torch.compile wrapper.
+    wrapped = {
+        key.replace("diffusion.unet.", "diffusion.unet._orig_mod."): value
+        for key, value in policy.state_dict().items()
+    }
+    loaded_policy = policy_cls(loaded)
+    loaded_policy.load_state_dict(wrapped)
+    torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("multikey", [True, False])
 def test_multikey_construction(multikey: bool):
     """
