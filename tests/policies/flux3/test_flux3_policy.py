@@ -432,15 +432,14 @@ def test_timestep_sampler_and_augmentation():
 
 def test_cosmos_unipc_schedule_and_solver():
     sigmas, ticks = sampling.cosmos_unipc_schedule(4, 5.0)
-    assert ticks.tolist() == [999, 937, 833, 624]
+    assert ticks == [999, 937, 833, 624]
     assert sigmas.shape == (5,) and sigmas[-1] == 0 and sigmas[0] > 0.999
     x0 = {"x_video": torch.randn(1, 6, 2), "x_a": torch.randn(1, 3, 2)}
     torch.manual_seed(0)
     samples = {k: torch.randn_like(v) for k, v in x0.items()}
-    tick_list = ticks.tolist()
 
     def predict(s, tick):  # a perfect velocity model of one sample
-        sigma = sigmas[tick_list.index(int(tick))]
+        sigma = sigmas[ticks.index(tick)]
         return {k: (s[k] - x0[k]) / sigma for k in s}
 
     out = sampling.cosmos_unipc_order2(samples, predict, n_steps=4, shift=5.0)
