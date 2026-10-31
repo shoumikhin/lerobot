@@ -44,14 +44,17 @@ class Recipe:
 
     `state` is the state of the frame the program is compared on, for a policy that writes the state into its
     prompt: its numbers take other widths there than in the frames the recipe checked. `cuda` also runs the
-    recipe on a GPU, where its pixels must still be the processor's bit for bit. `untraceable` is the error
-    that tracing the saved preprocessor gives, for a recipe made to avoid it.
+    recipe on a GPU, where its pixels must still be the processor's bit for bit. `seeded` is for a policy that
+    seeds its own noise, which the program holds, and `reads_task` for one whose bundle holds the task.
+    `untraceable` is the error that tracing the saved preprocessor gives, for a recipe made to avoid it.
     """
 
     module: str
     uses: tuple[str, ...] = ()
     state: list[float] | None = None
     cuda: bool = False
+    seeded: bool = False
+    reads_task: bool = False
     untraceable: tuple[type[Exception], str] | None = None
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE
     marks: tuple[pytest.MarkDecorator, ...] = ()
@@ -102,6 +105,7 @@ RECIPES = {
         untraceable=NUMPY_PIXELS,
         bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
     ),
+    "flux3": Recipe("tests.policies.flux3.export_stand_in", ("monkeypatch",), seeded=True, reads_task=True),
 }
 
 
@@ -127,14 +131,15 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
     [part] = built.parts()
     program = torch.export.export(part.module, part.example_inputs).module()
 
-    assert NOISE in part.inputs
+    assert (NOISE not in part.inputs) == (built.test_case().noise is None) == recipe.seeded
     assert built.bfloat16_tolerance == recipe.bfloat16_tolerance
     # A third frame and another noise, which the program must read rather than hold.
     frame = random_frame(built.config.input_features, torch.Generator().manual_seed(1))
     if recipe.state is not None:
         frame[OBS_STATE] = np.array(recipe.state, dtype=np.float32)
-    noise = np.random.default_rng(2).standard_normal(built.test_case().noise.shape, np.float32)
-    inputs = tuple(torch.from_numpy(x).to(device) for x in (*frame.values(), noise))
+    shape = None if recipe.seeded else built.test_case().noise.shape
+    noise = [] if shape is None else [np.random.default_rng(2).standard_normal(shape, np.float32)]
+    inputs = tuple(torch.from_numpy(x).to(device) for x in (*frame.values(), *noise))
     with torch.no_grad():
         torch.testing.assert_close(program(*inputs), part.module(*inputs), rtol=0, atol=0)
 
@@ -167,6 +172,15 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
     with pytest.raises(ValueError, match=error):
         list(make_recipe(request, name, **change).parts())
+
+
+@pytest.mark.parametrize("name", [name for name, recipe in RECIPES.items() if recipe.reads_task])
+def test_the_bundle_holds_the_task_the_policy_reads(request, name):
+    with pytest.raises(ValueError, match="reads the task"):
+        make_recipe(request, name, task="")
+    cube, stop = (make_recipe(request, name, task=task) for task in ("pick up the cube", "stop"))
+    assert cube.task == "pick up the cube"
+    assert not np.array_equal(cube.test_case().actions, stop.test_case().actions)
 
 
 @pytest.mark.parametrize("name", [name for name, recipe in RECIPES.items() if recipe.untraceable])
