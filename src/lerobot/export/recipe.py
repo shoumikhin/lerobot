@@ -654,7 +654,8 @@ def load_policy(
         config.compile_model = False
     # Built on the device, so the checkpoint is copied there once and its weights are never on the CPU as well.
     with torch.device(cfg.backend.device):
-        policy = load_pretrained_policy(config)
+        # Strict: a weight the checkpoint does not fill would stay random, and no later check could tell.
+        policy = load_pretrained_policy(config, strict=True)
     if hasattr(policy, "merge_and_unload"):
         # A PEFT adapter: compile the base weights with the adapter folded in.
         policy = policy.merge_and_unload()

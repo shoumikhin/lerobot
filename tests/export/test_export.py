@@ -16,6 +16,7 @@
 
 import json
 import platform
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,7 +26,7 @@ import numpy as np
 import pytest
 import torch
 from packaging.version import Version
-from safetensors.numpy import load_file
+from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
@@ -199,15 +200,26 @@ def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, t
     assert "--tolerance must be a finite number" in capfd.readouterr().err
 
 
+def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
+    partial = tmp_path / "partial"
+    shutil.copytree(checkpoint, partial)
+    weights = load_file(partial / "model.safetensors")
+    del weights["model.action_head.weight"]
+    save_file(weights, partial / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={partial}", f"--output_dir={tmp_path / 'b'}")
+    assert "model.action_head.weight" in capfd.readouterr().err
+
+
 def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
     import lerobot.policies.factory as factory
 
     seen = []
     load, make = factory.load_pretrained_policy, factory.make_pre_post_processors
 
-    def load_pretrained_policy(config):
+    def load_pretrained_policy(config, **kwargs):
         seen.append(config.pretrained_revision)
-        return load(config)
+        return load(config, **kwargs)
 
     def make_pre_post_processors(*args, **kwargs):
         seen.append(kwargs["pretrained_revision"])

@@ -253,11 +253,13 @@ def has_peft_adapter_config(
     return True
 
 
-def load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
+def load_pretrained_policy(policy_config: PreTrainedConfig, strict: bool | None = None) -> PreTrainedPolicy:
     """Load a trained policy for inference, or the base policy with its PEFT adapter applied.
 
-    The adapter and the base model keep their own revisions.
+    The adapter and the base model keep their own revisions. `strict` is passed to the policy's
+    `from_pretrained`; `None` keeps the policy's own default.
     """
+    load_options = {} if strict is None else {"strict": strict}
     pretrained_path = policy_config.pretrained_path
     if pretrained_path is None:
         raise ValueError("The policy config names no checkpoint to load (pretrained_path is not set).")
@@ -270,6 +272,7 @@ def load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
             pretrained_path,
             config=policy_config,
             revision=pretrained_revision,
+            **load_options,
         )
 
     require_package("peft", extra="peft")
@@ -279,6 +282,7 @@ def load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
         pretrained_name_or_path=peft_config.base_model_name_or_path,
         config=policy_config,
         revision=peft_config.revision,
+        **load_options,
     )
     return PeftModel.from_pretrained(
         policy,
