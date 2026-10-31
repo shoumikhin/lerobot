@@ -369,6 +369,10 @@ Two tables list what has been tested. In both:
 | Gaussian actor   | own (one action)       | Yes         | Yes         | Yes             | Yes              |
 | X-VLA            | default                | Yes         | Yes         | Yes             | Yes              |
 | LingBot-VLA v2   | own (vision grid)      | Yes         | Yes         | No              | Too big          |
+| FineART VLA      | own (state in prompt)  | Yes         | Yes         | Yes             | Too big          |
+| DM05             | own (state in prompt)  | PyTorch fix | PyTorch fix | PyTorch fix     | Too big          |
+| Wall-OSS 0.5     | own (state in prompt)  | Yes         | Yes         | Yes             | Too big          |
+| MolmoAct2        | own (state in prompt)  | PyTorch fix | PyTorch fix | PyTorch fix     | Too big          |
 | EO-1             | own (prompt made once) | Yes         | Yes         | Yes             | Too big          |
 | VLA-JEPA         | own (chain)            | Yes         | Yes         | Yes             | Too big          |
 | LaWAM            | own (chain)            | PyTorch fix | PyTorch fix | PyTorch fix     | Too big          |
@@ -376,32 +380,33 @@ Two tables list what has been tested. In both:
 
 - These results used PyTorch 2.15, with builds of ExecuTorch 1.6 and Torch-TensorRT 2.15 that have the fixes from [Install](#install) and other fixes still in review, all listed in pytorch/executorch#24353. In every **Yes** run, the bundle ran without loading PyTorch, and no operation ran on the CPU.
 - The pi0.5, GR00T and SmolVLA results are for their chain recipes. The LaWAM and VLA-JEPA results were measured when each was exported as one program, before its chain recipe.
-- **PyTorch fix**: `lerobot-export` saves each traced program and loads it again to compile it. PyTorch 2.15 cannot save the attention masks of WALL-X, nor load the autocast regions of LaWAM back. [pytorch/pytorch#202785](https://github.com/pytorch/pytorch/pull/202785) fixes the masks and [pytorch/pytorch#202925](https://github.com/pytorch/pytorch/pull/202925) the autocast regions, and neither is in a release yet. These results used a PyTorch 2.15 build that adds them.
+- **PyTorch fix**: `lerobot-export` saves each traced program and loads it again to compile it. PyTorch 2.15 cannot save the attention masks of DM05 and WALL-X, nor load the autocast regions of MolmoAct2 and LaWAM back. [pytorch/pytorch#202785](https://github.com/pytorch/pytorch/pull/202785) fixes the masks and [pytorch/pytorch#202925](https://github.com/pytorch/pytorch/pull/202925) the autocast regions, and neither is in a release yet. These results used a PyTorch 2.15 build that adds them.
 - WALL-X's bundle lands between 0.060 and 0.125 from PyTorch on the A100, depending on which kernels TensorRT picks, and up to 0.22 on the DGX Spark. Eager PyTorch alone moves it by up to 0.092 on the A100 and 0.12 on the Spark, so its recipe's tolerance is 0.5: a broken program moved its actions by 1.1 or more.
 - **Too big**: most of these policies are bigger than the Orin Nano's 8 GB. LaWAM and VLA-JEPA would fit when they run, but their export does not fit yet. X-VLA ran on the Orin Nano in bfloat16 (`--policy.dtype=bfloat16`), because its float32 export does not fit.
 - On the Jetson AGX Thor only, the bfloat16 bundle of LingBot-VLA v2 misses its check against PyTorch. The cause is TensorRT's fused attention kernel, which on the Thor only rounds the attention scores to bfloat16 whenever the attention has a mask; on the H100, A100 and Orin Nano it keeps them in float32.
 - LingBot-VLA v2's recipe computes the layout of image patches of the export's frames once, so it assumes that the camera layout does not change while the robot runs. Its results above were measured with an export that used `--policy.precompute_grid_thw=true` for the same purpose.
-- Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
+- Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
 
 ### Other backends
 
-| Policy   | CUDA                                   | XNNPACK               | OpenVINO      | MLX                     |
-| -------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
-| ACT      | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
-| SmolVLA  | No                                     | No (bfloat16 weights) | Program       | -                       |
-| X-VLA    | -                                      | Yes (x86 CPU)         | Yes (x86 CPU) | -                       |
-| EO-1     | Yes (data center GPU)                  | -                     | -             | -                       |
-| VLA-JEPA | No                                     | No                    | -             | -                       |
-| WALL-X   | No                                     | No                    | -             | -                       |
+| Policy      | CUDA                                   | XNNPACK               | OpenVINO      | MLX                     |
+| ----------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
+| ACT         | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
+| SmolVLA     | No                                     | No (bfloat16 weights) | Program       | -                       |
+| X-VLA       | -                                      | Yes (x86 CPU)         | Yes (x86 CPU) | -                       |
+| FineART VLA | Yes (data center GPU)                  | -                     | -             | -                       |
+| EO-1        | Yes (data center GPU)                  | -                     | -             | -                       |
+| VLA-JEPA    | No                                     | No                    | -             | -                       |
+| WALL-X      | No                                     | No                    | -             | -                       |
 
 The policies missing from this table have not been tested on these backends.
 
-- The ACT XNNPACK and OpenVINO results, and the EO-1, VLA-JEPA and WALL-X results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA and SmolVLA results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
+- The ACT XNNPACK and OpenVINO results, and the FineART VLA, EO-1, VLA-JEPA and WALL-X results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA and SmolVLA results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
 - The ACT MLX result used an Apple Silicon Mac with PyTorch 2.15 and a development build of ExecuTorch 1.6.
 - The SmolVLA results here were measured when it was exported as one program, before its chain recipe. The chain needs about half the memory of one program, as checked on a Jetson AGX Thor.
 - SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its one-program `executorch_cuda` export failed because SmolVLA computes its time embedding in float64, which the development build of ExecuTorch's CUDA backend used then could not load. With ExecuTorch 1.6.0, the chain recipe exports and runs on `executorch_cuda` in LeRobot's tests, which use a tiny SmolVLA; the full policy is still to be measured there.
 - `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images, [pytorch/executorch#24317](https://github.com/pytorch/executorch/pull/24317), which came after ExecuTorch 1.6.0.
-- EO-1 and VLA-JEPA were checked with random weights.
+- FineART VLA, EO-1 and VLA-JEPA were checked with random weights. FineART VLA's `executorch_cuda` result used a PyTorch 2.15 build with pytorch/pytorch#202785.
 - WALL-X does not export with PyTorch 2.15 (see **PyTorch fix** above), and its `executorch_cuda` export also needs the attention kernel from [pytorch/executorch#24326](https://github.com/pytorch/executorch/pull/24326).
 - WALL-X, for every camera size, and VLA-JEPA, for camera sizes its image processor resizes, do not compile on XNNPACK or Core ML: they resize the pixels in the program with an antialiased bicubic filter, `aten._upsample_bicubic2d_aa`, which ExecuTorch's CPU backends do not take yet. OpenVINO and MLX do not list this operation either (not run).
 - VLA-JEPA's `executorch_cuda` export stops inside PyTorch's compiler: while it tunes a kernel, it runs a gather on placeholder inputs, and the gather fails its own bounds check. With TensorRT, VLA-JEPA passes.
