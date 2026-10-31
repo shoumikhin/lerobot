@@ -333,8 +333,8 @@ class GrootExportRecipe(ExportRecipe):
 
         module = self._chunk_actions
         inputs, names = (
-            (actions, torch.from_numpy(self._frame[OBS_STATE]).to(device)),
-            [x_names[-1], OBS_STATE],
+            (actions, torch.from_numpy(self._frame[self._images.state_name]).to(device)),
+            [x_names[-1], self._images.state_name],
         )
         if not module.reads_state:
             # A program takes only the inputs it reads.
@@ -550,7 +550,7 @@ class GrootExportRecipe(ExportRecipe):
     def _action_scale(self) -> np.ndarray:
         """Robot units per normalized unit for each action, measured on the actions part."""
         width = self._model_config.max_action_dim
-        state = torch.from_numpy(self._frame[OBS_STATE]).to(self._device)
+        state = torch.from_numpy(self._frame[self._images.state_name]).to(self._device)
         return measure_action_scale(
             lambda value: self._chunk_actions(
                 torch.full((self._steps, width), value, device=self._device), state
@@ -642,7 +642,8 @@ class _ImagesAndState(nn.Module):
             raise ValueError("The frame has no camera the policy reads.")
         renames = preprocessor_renames(self.preprocessor)
         robot_names = {renames.get(name, name): name for name in frame}
-        self.frame_names = [n for n in frame if renames.get(n, n) in self.cameras or n == OBS_STATE]
+        self.state_name = robot_names[OBS_STATE]
+        self.frame_names = [n for n in frame if renames.get(n, n) in self.cameras or n == self.state_name]
         grids = batch["image_grid_thw"].tolist()
         if len(grids) != len(self.cameras) or any(g != grids[0] for g in grids) or grids[0][0] != 1:
             raise ValueError("GR00T export needs one image grid, the same for every camera.")
@@ -673,7 +674,7 @@ class _ImagesAndState(nn.Module):
         scale = 1 / ip.rescale_factor if self.rescale else 1
         self.register_buffer("image_mean", (torch.tensor(ip.image_mean) * scale)[None, :, None, None])
         self.register_buffer("image_std", (torch.tensor(ip.image_std) * scale)[None, :, None, None])
-        dim = frame[OBS_STATE].size
+        dim = frame[self.state_name].size
         if dim > pack.max_state_dim:
             raise ValueError("The frame's state exceeds the checkpoint's state width.")
         self.max_state_dim = pack.max_state_dim
