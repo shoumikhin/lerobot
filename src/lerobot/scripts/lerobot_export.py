@@ -75,7 +75,11 @@ def export(args: Sequence[str]) -> Path:
             raise SystemExit(0)
         folder, output_dir = Path(traced["folder"]), Path(traced["output_dir"])
         # The trace step loaded these from the command line; a compile step needs the backend's.
-        plugins = [path for key, path in parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, args).items() if key.startswith("backend.")]
+        plugins = [
+            path
+            for key, path in parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, args).items()
+            if key.startswith("backend.")
+        ]
         try:
             manifest = BundleManifest.from_dict(traced["manifest"])
             for name, files in manifest.programs.items():
