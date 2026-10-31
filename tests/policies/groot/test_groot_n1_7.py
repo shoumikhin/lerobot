@@ -1929,6 +1929,84 @@ def test_groot_n1_7_vlm_encode_builds_frames_on_target_device(device):
 
 
 @pytest.mark.parametrize(
+    ("saved_device", "frames_device", "processor_device"),
+    [("cuda", "meta", None), ("mps", "meta", None), ("cpu", "cpu", "cpu")],
+)
+def test_groot_n1_7_vlm_encode_uses_its_saved_device_or_falls_back(
+    monkeypatch, caplog, saved_device, frames_device, processor_device
+):
+    # A checkpoint trained on a GPU or a Mac saves this step with that device and may load without it.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    class FakeProcessor:
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, **kwargs):
+            self.image_devices = {image.device.type for image in images}
+            self.kwargs = kwargs
+            return {"input_ids": torch.zeros(len(text), 1, dtype=torch.long)}
+
+    fake_proc = FakeProcessor()
+    step = GrootN17VLMEncodeStep(device=saved_device)
+    step._proc = fake_proc
+    # Frames on the meta device show that the fallback leaves them where they are.
+    video = torch.zeros((1, 1, 1, 2, 2, 3), dtype=torch.uint8, device=frames_device)
+
+    for _ in range(2):  # the warning is logged once, not on every call
+        transition = {
+            TransitionKey.OBSERVATION: {"video": video},
+            TransitionKey.COMPLEMENTARY_DATA: {"language": ["task"]},
+        }
+        step(transition)
+
+    assert fake_proc.image_devices == {frames_device}
+    assert fake_proc.kwargs.get("device") == processor_device
+    assert caplog.text.count(f"saved with device {saved_device!r}") == int(processor_device is None)
+
+
+def test_reloaded_n1_7_vlm_encode_step_preprocesses_on_the_policy_device(tmp_path):
+    # A pipeline saved on a GPU machine keeps "cuda" in its VLM encode and device steps.
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = _raw_n1_7_libero_config(model_path)
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
+    save_dir = tmp_path / "saved_on_a_gpu"
+    config.save_pretrained(save_dir)
+    preprocessor.save_pretrained(save_dir)
+    postprocessor.save_pretrained(save_dir)
+    preprocessor_config_path = save_dir / "policy_preprocessor.json"
+    preprocessor_config = json.loads(preprocessor_config_path.read_text())
+    for step in preprocessor_config["steps"]:
+        if step["registry_name"] in ("groot_n1_7_vlm_encode_v1", "device_processor"):
+            step["config"]["device"] = "cuda"
+    preprocessor_config_path.write_text(json.dumps(preprocessor_config))
+    config.device = "meta"  # stands in for this machine's policy device: neither the saved one nor the CPU
+
+    def reloaded_device(**step_overrides):
+        # lerobot's entry points set the device step's device, which has no fallback for a missing device.
+        overrides = {
+            "rename_observations_processor": {"rename_map": {}},
+            "device_processor": {"device": "cpu"},
+            **step_overrides,
+        }
+        loaded, _ = make_pre_post_processors(
+            config, pretrained_path=str(save_dir), preprocessor_overrides=overrides
+        )
+        return next(step for step in loaded.steps if isinstance(step, GrootN17VLMEncodeStep)).device
+
+    assert reloaded_device() == "meta"
+    assert reloaded_device(groot_n1_7_vlm_encode_v1={"device": "cpu"}) == "cpu"
+
+
+def test_groot_n1_7_vlm_encode_rejects_a_device_torch_cannot_parse():
+    # Only a missing device falls back; a malformed device string is an error.
+    with pytest.raises(RuntimeError, match="gpu"):
+        GrootN17VLMEncodeStep(device="gpu")
+
+
+@pytest.mark.parametrize(
     "device",
     [
         "cpu",
