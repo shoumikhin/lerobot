@@ -383,6 +383,26 @@ def test_image_stages_reproduce_the_processor_pixels(mode, height, width, geomet
             assert np.abs(actual - on_gpu).max() <= 1
 
 
+
+def test_resize_matrices_are_read_off_a_few_lines_at_a_time():
+    """All the lines of a full-size camera at once would take gigabytes."""
+    from lerobot.policies.groot.export_groot import LINE_BATCH_PIXELS, _separable_map
+
+    rng = np.random.default_rng(0)
+    height, width = 320, 320
+    rows, columns = rng.random((16, height)), rng.random((12, width))
+    sizes = []
+
+    def transform(lines):
+        sizes.append(lines.size)
+        return (rows @ lines @ columns.T).astype(np.float32)
+
+    read_rows, read_columns = _separable_map(transform, (height, width))
+    assert max(sizes) <= LINE_BATCH_PIXELS < height * height * width
+    image = rng.random((height, width))
+    actual = read_rows.double() @ torch.from_numpy(image) @ read_columns.double().T
+    np.testing.assert_allclose(actual.numpy(), rows @ image @ columns.T, rtol=1e-4)
+
 def test_n17_action_decode_matches_the_processor_step():
     """Unnormalizing, a relative joint group, a relative end-effector pose, and the LIBERO gripper."""
     from lerobot.policies.groot.export_groot import N17ActionDecode

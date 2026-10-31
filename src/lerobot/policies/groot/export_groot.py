@@ -117,6 +117,9 @@ EDGE_CASE_TASKS = ("", "!!!", "Pick UP the Red cube, then STOP.", "put_the  bowl
 # pixel by up to one level, and torchvision's 8-bit CPU kernel, which also rounds between its two passes, by up
 # to two on noise; its GPU path converts to float32 and rounds once, as the program does.
 PIXEL_TOLERANCE = 2.0
+# The most pixels of line images handed to the processor's transform at once. All the lines of a 1080x1920
+# camera at once would take 23 GiB.
+LINE_BATCH_PIXELS = 2**24
 
 
 class GrootExportRecipe(ExportRecipe):
@@ -806,12 +809,21 @@ def _separable_map(transform, shape: tuple[int, int]) -> tuple[Tensor, Tensor]:
     height, width = shape
     ones = transform(np.ones((1, height, width), np.float32))[0].astype(np.float64)
     i0, j0 = np.unravel_index(np.argmax(np.abs(ones)), ones.shape)
-    row_lines: np.ndarray = np.zeros((height, height, width), np.float32)
-    row_lines[np.arange(height), np.arange(height), :] = 1
-    column_lines: np.ndarray = np.zeros((width, height, width), np.float32)
-    column_lines[np.arange(width), :, np.arange(width)] = 1
-    rows = transform(row_lines)[:, :, j0].astype(np.float64).T
-    columns = transform(column_lines)[:, i0, :].astype(np.float64).T / ones[i0, j0]
+    batch = max(1, LINE_BATCH_PIXELS // (height * width))
+    row_responses: list[np.ndarray] = []
+    column_responses: list[np.ndarray] = []
+    for first in range(0, height, batch):
+        index = np.arange(first, min(first + batch, height))
+        lines = np.zeros((len(index), height, width), np.float32)
+        lines[np.arange(len(index)), index, :] = 1
+        row_responses.append(transform(lines)[:, :, j0])
+    for first in range(0, width, batch):
+        index = np.arange(first, min(first + batch, width))
+        lines = np.zeros((len(index), height, width), np.float32)
+        lines[np.arange(len(index)), :, index] = 1
+        column_responses.append(transform(lines)[:, i0, :])
+    rows = np.concatenate(row_responses).astype(np.float64).T
+    columns = np.concatenate(column_responses).astype(np.float64).T / ones[i0, j0]
     return torch.from_numpy(rows).float(), torch.from_numpy(columns).float()
 
 
