@@ -52,6 +52,9 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         runtime_imports (`tuple[str, ...]`):
             Python modules the runtime imports before it loads the files, such as one that registers the
             compiler's kernels with the runtime.
+        runtime_options (`dict[str, dict[str, bool | int | str]]`):
+            Settings the runtime applies before it loads the files. For ExecuTorch, the options of its
+            backends, by backend name.
         runtime_modules (`tuple[str, ...]`):
             Python modules the files need to load, such as `executorch`. The bundle records their versions as
             its `runtime_versions`.
@@ -72,6 +75,7 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     file_suffix: ClassVar[str]
     device: ClassVar[str]
     runtime_imports: ClassVar[tuple[str, ...]] = ()
+    runtime_options: ClassVar[dict[str, dict[str, bool | int | str]]] = {}
     runtime_modules: ClassVar[tuple[str, ...]] = ()
     exact_runtime_modules: ClassVar[tuple[str, ...]] = ()
     packages: ClassVar[tuple[str, ...]] = ()

@@ -16,10 +16,11 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from lerobot.bundle import runtime as bundle_runtime
+from lerobot.bundle import executorch, runtime as bundle_runtime
 from lerobot.bundle.runtime import RUNTIMES, Runtime, prepare_runtime, register_runtime
 
 
@@ -40,13 +41,20 @@ def _runtime(events: list[str], name: str) -> Runtime:
     return Runtime(
         load=lambda path, data: events.append(f"load {name}"),
         prepare=lambda: events.append(f"prepare {name}"),
+        configure=lambda options: events.append(f"configure {options}"),
     )
 
 
 def test_a_registered_runtime_prepares_before_its_modules(events):
     register_runtime("fake", _runtime(events, "fake"))
-    prepare_runtime("fake", ["delegate"])
-    assert events == ["prepare fake", "import delegate"]
+    # Its options apply after the modules import and before the programs load.
+    prepare_runtime("fake", ["delegate"], {"Accelerator": {"shared": True}}).load(Path("model.bin"), None)
+    assert events == [
+        "prepare fake",
+        "import delegate",
+        "configure {'Accelerator': {'shared': True}}",
+        "load fake",
+    ]
 
 
 def test_a_runtime_a_module_registers_prepares_before_it_loads(events, monkeypatch):
@@ -55,8 +63,13 @@ def test_a_runtime_a_module_registers_prepares_before_it_loads(events, monkeypat
         register_runtime("fake", _runtime(events, "fake"))
 
     monkeypatch.setattr(bundle_runtime.importlib, "import_module", import_registering)
-    prepare_runtime("fake", ["provider"]).load(Path("model.bin"), None)
-    assert events == ["import provider", "prepare fake", "load fake"]
+    prepare_runtime("fake", ["provider"], {"Accelerator": {"shared": True}}).load(Path("model.bin"), None)
+    assert events == [
+        "import provider",
+        "prepare fake",
+        "configure {'Accelerator': {'shared': True}}",
+        "load fake",
+    ]
 
 
 def test_the_bundle_folder_is_off_the_search_path_until_the_runtime_is_ready(events, monkeypatch, tmp_path):
@@ -82,3 +95,37 @@ def test_an_unknown_runtime_names_the_ones_there_are(events):
 def test_a_runtime_name_registers_once(events):
     with pytest.raises(ValueError, match="already registered"):
         register_runtime("executorch", Runtime(load=lambda path, data: None))
+
+
+def test_a_runtime_that_takes_no_options_refuses_a_bundle_that_sets_some(events):
+    register_runtime("fake", Runtime(load=lambda path, data: None))
+    with pytest.raises(ValueError, match="sets options of the 'fake' runtime, which takes none"):
+        prepare_runtime("fake", [], {"Accelerator": {"shared": True}})
+
+
+def test_executorch_gives_each_backend_its_options_only_when_it_has_every_backend(monkeypatch):
+    calls = []
+    registry = SimpleNamespace(
+        is_available=lambda backend: backend != "NoSuchBackend",
+        set_option=lambda backend, values: calls.append((backend, values)),
+    )
+    runtime = SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry))
+    monkeypatch.setitem(
+        sys.modules, "executorch.runtime", SimpleNamespace(ExecuTorchResult=object, Runtime=runtime)
+    )
+    options = {"TensorRTBackend": {"use_shared_activation_scratch": True}, "XnnpackBackend": {"x": 2}}
+    with pytest.raises(ValueError, match=r"this machine does not have: \['NoSuchBackend'\]"):
+        executorch.configure({**options, "NoSuchBackend": {}})
+    assert calls == []
+    executorch.configure(options)
+    assert calls == list(options.items())
+
+
+def test_an_executorch_older_than_1_6_gets_the_install_hint(monkeypatch):
+    # Its `executorch.runtime` imports, without the result type that ExecuTorch 1.6 added.
+    runtime = SimpleNamespace(get=lambda: None)
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=runtime))
+    with pytest.raises(ImportError, match="ExecuTorch 1.6"):
+        executorch.ExecuTorchProgram(Path("model.pte"))
+    with pytest.raises(ImportError, match="ExecuTorch 1.6"):
+        executorch.configure({"TensorRTBackend": {"use_shared_activation_scratch": True}})

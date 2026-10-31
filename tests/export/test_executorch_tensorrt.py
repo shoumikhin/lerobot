@@ -28,6 +28,7 @@ from tests.torch_free import assert_runs_without_torch
 
 # Loads the program the way a bundle does.
 RUN = """
+import json
 import sys
 from pathlib import Path
 
@@ -35,8 +36,9 @@ import numpy as np
 
 from lerobot.bundle.runtime import prepare_runtime
 
-path, data, inputs, outputs, imports = sys.argv[1:]
-program = prepare_runtime("executorch", json.loads(imports)).load(Path(path), Path(data) if data else None)
+path, data, inputs, outputs, imports, options = sys.argv[1:]
+runtime = prepare_runtime("executorch", json.loads(imports), json.loads(options))
+program = runtime.load(Path(path), Path(data) if data else None)
 (result,) = program(np.load(inputs))
 np.save(outputs, program.to_numpy(result))
 """
@@ -66,6 +68,7 @@ def run_without_torch(program, data, x, tmp_path):
         str(tmp_path / "x.npy"),
         str(tmp_path / "y.npy"),
         json.dumps(ExecuTorchTensorRTConfig.runtime_imports),
+        json.dumps(ExecuTorchTensorRTConfig.runtime_options),
     )
     return np.load(tmp_path / "y.npy")
 
