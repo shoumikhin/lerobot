@@ -115,6 +115,7 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
             runtime_imports=list(cfg.backend.runtime_imports),
+            runtime_options=cfg.backend.runtime_options,
             programs=programs,
             runs=runs,
             constants=CONSTANTS if plan.constants else None,

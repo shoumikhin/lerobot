@@ -14,11 +14,13 @@
 
 """How a bundle finds its runtime, and in which order it gets the runtime ready."""
 
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from lerobot.bundle import runtime as bundle_runtime
+from lerobot.bundle import executorch, runtime as bundle_runtime
 from lerobot.bundle.runtime import RUNTIMES, Runtime, prepare_runtime, register_runtime
 
 
@@ -80,3 +82,60 @@ def test_an_unknown_runtime_names_the_ones_there_are(events, monkeypatch):
 def test_a_runtime_name_registers_once(events):
     with pytest.raises(ValueError, match="already registered"):
         register_runtime("executorch", Runtime(load=lambda path, data: None))
+
+
+def test_options_apply_after_the_modules_import_and_before_the_programs_load(events, monkeypatch):
+    monkeypatch.setattr(bundle_runtime, "register_third_party_plugins", lambda kinds: None)
+    register_runtime(
+        "fake",
+        Runtime(
+            load=lambda path, data: events.append("load fake"),
+            prepare=lambda: events.append("prepare fake"),
+            configure=lambda options: events.append(f"configure {options}"),
+        ),
+    )
+    prepare_runtime("fake", ["delegate"], {"Accelerator": {"shared": True}}).load(Path("model.bin"), None)
+    assert events == [
+        "prepare fake",
+        "import delegate",
+        "configure {'Accelerator': {'shared': True}}",
+        "load fake",
+    ]
+
+
+def test_a_runtime_that_takes_no_options_refuses_a_bundle_that_sets_some(events, monkeypatch):
+    monkeypatch.setattr(bundle_runtime, "register_third_party_plugins", lambda kinds: None)
+    register_runtime("fake", _runtime(events, "fake"))
+    with pytest.raises(ValueError, match="sets options of the 'fake' runtime, which takes none"):
+        prepare_runtime("fake", [], {"Accelerator": {"shared": True}})
+
+
+def test_executorch_gives_each_backend_its_options(monkeypatch):
+    calls = []
+    registry = SimpleNamespace(
+        is_available=lambda backend: True, set_option=lambda backend, values: calls.append((backend, values))
+    )
+    runtime = SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=runtime))
+    executorch.configure(
+        {"TensorRTBackend": {"use_shared_activation_scratch": True}, "XnnpackBackend": {"x": 2}}
+    )
+    assert calls == [
+        ("TensorRTBackend", {"use_shared_activation_scratch": True}),
+        ("XnnpackBackend", {"x": 2}),
+    ]
+
+
+def test_executorch_sets_no_option_when_a_backend_is_missing(monkeypatch):
+    calls = []
+    registry = SimpleNamespace(
+        is_available=lambda backend: backend == "TensorRTBackend",
+        set_option=lambda backend, values: calls.append((backend, values)),
+    )
+    runtime = SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=runtime))
+    with pytest.raises(ValueError, match=r"this machine does not have: \['NoSuchBackend'\]"):
+        executorch.configure(
+            {"TensorRTBackend": {"use_shared_activation_scratch": True}, "NoSuchBackend": {}}
+        )
+    assert calls == []
