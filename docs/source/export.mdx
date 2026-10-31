@@ -147,6 +147,8 @@ With the default recipe, a checkpoint trained with a PEFT adapter (a small set o
 
 A bundle on the Hub must be downloaded first, for example with `hf download <repo> --local-dir <folder>`. A bundle passed to `lerobot-rollout` as `--policy.path` is refused with a pointer to `--bundle.path`.
 
+Run only bundles you trust, as you would any program. A bundle's programs are compiled code (a program for a GPU can carry a native library that loads with it), and its manifest names Python modules to import. Check a downloaded bundle by its path from another folder, because a Python command started inside a folder can also load modules from that folder.
+
 ## How it works
 
 ### Recipe and backend
