@@ -13,8 +13,16 @@ For training a new robot embodiment from the base model or full finetuning, use 
 
 ## Installation
 
-The Video VAE requires **NATTEN** 0.21.6 or newer, as a wheel built for your exact torch and CUDA versions, from https://whl.natten.org.
-NATTEN publishes wheels for torch 2.10 to 2.13, but not yet for the torch 2.15 LeRobot installs by default, so install a supported torch first. For example, from the LeRobot checkout, torch 2.13 with CUDA 13.0 together with the training, policy, PEFT and EMA dependencies. As in the [installation guide](./installation#pytorch-cuda-variant-linux-only), TorchCodec comes from the CPU index:
+From the LeRobot checkout, install the training, policy, PEFT and EMA dependencies:
+
+```bash
+pip install -e ".[training,flux3,peft,diffusion]"
+```
+
+The Video VAE runs faster with **NATTEN** 0.21.6 or newer, as a wheel built for your exact torch and CUDA versions, from https://whl.natten.org.
+Without NATTEN it computes the same neighborhood attention in plain PyTorch, which is slower and needs
+more memory for long videos. NATTEN publishes wheels for torch 2.10 to 2.13, but not yet for the torch 2.15 LeRobot installs by default, so a default install takes the plain PyTorch path. Building NATTEN yourself does not help there: its build uses C++17, and the headers of torch 2.14 and newer require C++20.
+To use NATTEN, install a supported torch first. For example, torch 2.13 with CUDA 13.0. As in the [installation guide](./installation#pytorch-cuda-variant-linux-only), TorchCodec comes from the CPU index:
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu130 \
