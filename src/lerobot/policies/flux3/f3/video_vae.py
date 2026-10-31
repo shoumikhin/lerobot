@@ -56,7 +56,7 @@ _PERSISTENT_KERNEL_BACKENDS = ("blackwell-fna", "hopper-fna")
 _natten_backends: dict[int, str] = {}
 
 
-def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
+def _natten_kernel_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
     backend = _natten_backends.get(q.ndim)
     if backend is None:
         backend = os.environ.get(_NATTEN_BACKEND_ENV)
@@ -437,14 +437,7 @@ class Natten3D(nn.Module):
         # NATTEN's kernels are fast but no export backend can run them.
         if _natten_available and not is_exporting():
             na = na2d if t == 1 else na3d
-            out = na(
-                q,
-                k,
-                v,
-                kernel_size=kernel_size,
-                is_causal=is_causal,
-                attention_kwargs=_natten_attention_kwargs(q, k, v),
-            )
+            out = na(q, k, v, kernel_size=kernel_size, is_causal=is_causal, **_natten_kernel_kwargs(q, k, v))
         else:
             out = neighborhood_attention(q, k, v, kernel_size, is_causal)
         out = out.reshape(b, t, h, w, c)
