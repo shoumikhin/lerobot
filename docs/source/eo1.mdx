@@ -212,6 +212,34 @@ lerobot-eval \
   --rename_map='{"observation.images.image2":"observation.images.wrist_image"}'
 ```
 
+## Export with torch.export
+
+`torch.export` cannot trace the stock vision tower, because it reads the image grid (`image_grid_thw`) into
+Python numbers. Build the grid data once from a preprocessed batch with the camera layout you deploy, and
+pass it to `predict_action_chunk`:
+
+```python
+import torch
+
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
+
+grid = Qwen2_5VisionGrid.build(policy.model.vlm_backbone.model.visual, batch["image_grid_thw"])
+tensors = {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
+
+
+class Predict(torch.nn.Module):
+    def forward(self, tensors):
+        return policy.predict_action_chunk({**batch, **tensors}, vision_grid=grid)
+
+
+with torch.no_grad():
+    program = torch.export.export(Predict(), (tensors,), strict=False)
+```
+
+The program refuses inputs whose image grid differs from the one `grid` was built for, and attention masks
+that hide more than padding. An eager call with `vision_grid=grid` runs the same code as the program, so
+comparing it with a call without `vision_grid` checks the export path. EO-1 exports prompts with images, and needs the `action_token_start` that its processor reports for left-padded prompts.
+
 ## Configuration Notes
 
 ### Image Processing

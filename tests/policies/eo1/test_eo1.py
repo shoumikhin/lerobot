@@ -27,12 +27,15 @@ from torch import nn
 pytest.importorskip("transformers")
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy
-from lerobot.policies.eo1.processor_eo1 import make_eo1_pre_post_processors
+from lerobot.policies.eo1.processor_eo1 import EO1QwenProcessorStep, make_eo1_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
+from lerobot.processor.converters import create_transition
 from lerobot.utils.constants import ACTION, OBS_STATE, QUERY_KIND, QUERY_TEXT
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load
 
 HIDDEN_SIZE = 8
 STATE_DIM = 4
@@ -525,7 +528,7 @@ def test_training_and_generation_share_state_conditioned_prefix(query_kind, incl
     assert runtime["target_message_indices"] == [[]]
 
 
-def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+def make_tiny_qwen_backbone(vision_depth: int = 1):
     from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
 
     qwen_config = Qwen2_5_VLConfig(
@@ -542,7 +545,7 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
             "pad_token_id": 0,
         },
         vision_config={
-            "depth": 1,
+            "depth": vision_depth,
             "hidden_size": 32,
             "intermediate_size": 64,
             "num_heads": 4,
@@ -558,7 +561,11 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         vision_start_token_id=41,
         vision_end_token_id=42,
     )
-    backbone = Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+    return Qwen2_5_VLForConditionalGeneration(qwen_config).eval()
+
+
+def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monkeypatch):
+    backbone = make_tiny_qwen_backbone()
     monkeypatch.setattr(
         "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
         lambda *args, **kwargs: backbone,
@@ -626,3 +633,242 @@ def test_real_qwen_generation_uses_projected_state_and_cached_image_prefix(monke
         torch.testing.assert_close(full_output[:, :7], input_ids)
         torch.testing.assert_close(decoded_tokens, full_output[:, 7:])
         assert decoded_tokens.shape == (1, 3)
+
+
+def test_rollout_processor_reports_where_the_action_tokens_start(monkeypatch):
+    class LeftPaddedProcessor(DummyTextProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["processor_kwargs"]["padding_side"] == "left"
+            prompt = [1, STATE_TOKEN_ID, *[ACTION_TOKEN_ID] * CHUNK_SIZE, 2]
+            input_ids = torch.tensor([[0, 0, *prompt], [1, 1, *prompt]])
+            return {
+                "input_ids": input_ids,
+                "attention_mask": input_ids.ne(0).long(),
+                "pixel_values": torch.zeros(2, 3, 2, 2),
+                "image_grid_thw": torch.ones(2, 3, dtype=torch.long),
+                "mm_token_type_ids": torch.zeros_like(input_ids),
+            }
+
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: LeftPaddedProcessor(),
+    )
+    step = EO1QwenProcessorStep()
+    messages = [[{"role": "user", "content": "clear the table"}]] * 2
+    processed = step(create_transition(complementary_data={"messages": messages}))
+
+    assert processed["complementary_data"]["action_token_start"] == 4
+
+
+def _sampling_policy_and_batch(monkeypatch):
+    # A second vision block attends by windows, so both attention splits are checked.
+    backbone = make_tiny_qwen_backbone(vision_depth=2)
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.modeling_eo1.Qwen2_5_VLForConditionalGeneration.from_pretrained",
+        lambda *args, **kwargs: backbone,
+    )
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        OBS_STATE: torch.randn(1, STATE_DIM),
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "pixel_values": torch.randn(16, 12),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "state_token_id": STATE_TOKEN_ID,
+        "action_token_id": ACTION_TOKEN_ID,
+    }
+    return EO1Policy(make_eo1_config()), batch
+
+
+def _export_sampling(policy, batch, noise, grid):
+    keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    class SampleActions(nn.Module):
+        def forward(self, noise, *tensors):
+            inputs = {**batch, **dict(zip(keys, tensors, strict=True))}
+            return policy.predict_action_chunk(inputs, noise=noise, vision_grid=grid)
+
+    with torch.no_grad():
+        program = torch.export.export(
+            SampleActions(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+        )
+
+    def run(inputs, lowered=program):
+        return lowered.module()(noise.clone(), *(inputs[key] for key in keys))
+
+    return program, run
+
+
+def _grid(policy, batch):
+    return Qwen2_5VisionGrid.build(policy.model.vlm_backbone.model.visual, batch["image_grid_thw"])
+
+
+def _noise(policy):
+    torch.manual_seed(0)
+    return torch.randn(1, CHUNK_SIZE, policy.config.max_action_dim)
+
+
+def test_sampling_on_a_vision_grid_exports_and_matches_eager(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    grid = _grid(policy, batch)
+    batch["action_token_start"] = 10
+    assert torch.equal(policy.predict_action_chunk(batch, noise=noise.clone(), vision_grid=grid), expected)
+    # The switch that turns off the transformers checks must leave the exported checks in place.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    program, run = _export_sampling(policy, batch, noise, grid)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+    assert data_dependent_nodes(program) == []
+    # Each malformed prompt trips one check, since the exported program raises without the check's message:
+    # one action token too many, right before the chunk; the action tokens out of one chunk at
+    # `action_token_start`; an image token fewer, and one more; and a second state token.
+    malformed = {**batch, "input_ids": batch["input_ids"].clone()}
+    malformed["input_ids"][0, 9] = ACTION_TOKEN_ID
+    split = {**batch, "input_ids": batch["input_ids"].clone()}
+    split["input_ids"][0, -2:] = torch.tensor([2, ACTION_TOKEN_ID])
+    fewer_images = {**batch, "input_ids": batch["input_ids"].clone()}
+    fewer_images["input_ids"][0, 4] = 1
+    more_images = {**batch, "input_ids": batch["input_ids"].clone()}
+    more_images["input_ids"][0, 9] = 40
+    two_states = {**batch, "input_ids": batch["input_ids"].clone()}
+    two_states["input_ids"][0, 9] = STATE_TOKEN_ID
+    lowered_programs = (program, save_and_load(program), program.run_decompositions())
+    for lowered in lowered_programs[1:]:
+        torch.testing.assert_close(run(batch, lowered), expected)
+    for lowered in lowered_programs:
+        for wrong in (malformed, split, fewer_images, more_images, two_states):
+            with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                run(wrong, lowered)
+    # The eager checks raise with the switch set, too.
+    with pytest.raises(ValueError, match="exactly 3 action tokens"):
+        policy.predict_action_chunk(malformed)
+    with pytest.raises(ValueError, match="contiguous chunk"):
+        policy.predict_action_chunk(split)
+    with pytest.raises(ValueError, match="State features and state tokens do not match"):
+        policy.predict_action_chunk(two_states)
+    # Samples whose action tokens sit at different places.
+    rows = torch.cat([batch["input_ids"], batch["input_ids"].roll(-1, dims=1)])
+    shifted = {
+        **{key: value for key, value in batch.items() if key != "action_token_start"},
+        OBS_STATE: batch[OBS_STATE].repeat(2, 1),
+        "input_ids": rows,
+        "attention_mask": rows.ne(0).long(),
+        "pixel_values": batch["pixel_values"].repeat(2, 1),
+        "image_grid_thw": batch["image_grid_thw"].repeat(2, 1),
+        "mm_token_type_ids": rows.eq(40).int(),
+    }
+    with pytest.raises(ValueError, match="share the same action token mask"):
+        policy.predict_action_chunk(shifted)
+
+
+def test_sampling_refuses_an_action_start_outside_the_prompt(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    # -4 finds the real action tokens from the end, but the cache crop would then count from the end too.
+    for start in (-4, -1, batch["input_ids"].shape[1]):
+        with pytest.raises(ValueError, match="action_token_start"):
+            policy.predict_action_chunk({**batch, "action_token_start": start}, noise=noise.clone())
+
+
+def test_sampling_refuses_a_vision_grid_built_for_another_grid(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    batch["action_token_start"] = 10
+    # Same image count and token count, different shape: other positions and windows.
+    changed = {**batch, "image_grid_thw": torch.tensor([[1, 2, 8]])}
+    with pytest.raises(ValueError, match="differs from the one the vision grid was built for"):
+        policy.predict_action_chunk(changed, noise=noise.clone(), vision_grid=_grid(policy, batch))
+    expected = policy.predict_action_chunk(changed, noise=noise.clone())
+    _, run = _export_sampling(policy, changed, noise, _grid(policy, changed))
+    torch.testing.assert_close(run(changed), expected, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+        run(batch)
+
+
+def test_vision_grid_and_export_refuse_hidden_vision_tokens(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 42, 41, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        **batch,
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "action_token_start": 12,
+    }
+    grid = _grid(policy, batch)
+
+    def hide(*tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[0, list(tokens)] = 0
+        return {**batch, "attention_mask": attention_mask}
+
+    # A vision start token, an image token, a vision end token, a text token inside the prompt, and every token.
+    refused = (hide(2), hide(3), hide(5), hide(11), hide(*range(input_ids.shape[1])))
+    for inputs in refused:
+        with pytest.raises(ValueError, match="must hide only padding"):
+            policy.predict_action_chunk(inputs, noise=noise.clone(), vision_grid=grid)
+    _, run = _export_sampling(policy, batch, noise, grid)
+    for inputs in refused:
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+            run(inputs)
+    more_padding = hide(1)
+    expected = policy.predict_action_chunk(more_padding, noise=noise.clone())
+    torch.testing.assert_close(run(more_padding), expected, rtol=0, atol=0)
+
+
+def test_export_follows_a_get_rope_index_that_scales_image_starts(monkeypatch):
+    # transformers 5.4.0 to 5.5.3 multiply the temporal start of an image by `tokens_per_second`; other
+    # versions pretend to be 5.5.3.
+    import transformers
+    from packaging.version import parse
+
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    vlm = policy.model.vlm_backbone.model
+    if not (5, 4) <= parse(transformers.__version__).release < (5, 5, 4):
+        stock = type(vlm).get_rope_index
+
+        def scaled(self, input_ids, *args, **kwargs):
+            positions, deltas = stock(self, input_ids, *args, **kwargs)
+            scale = self.config.vision_config.tokens_per_second
+            positions[0][input_ids == self.config.image_token_id] *= scale
+            return positions, deltas
+
+        monkeypatch.setattr(type(vlm), "get_rope_index", scaled)
+        monkeypatch.setattr(transformers, "__version__", "5.5.3")
+    assert vlm.config.vision_config.tokens_per_second > 1
+    noise = _noise(policy)
+    batch["action_token_start"] = 10
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    _, run = _export_sampling(policy, batch, noise, _grid(policy, batch))
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+
+
+def test_sampling_export_needs_the_action_start_the_images_and_a_vision_grid(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    grid = _grid(policy, batch)
+    with pytest.raises(ValueError, match="needs action_token_start"):
+        _export_sampling(policy, batch, noise, grid)
+
+    batch["action_token_start"] = 10
+    with pytest.raises(ValueError, match="needs images and a vision_grid"):
+        _export_sampling(policy, batch, noise, None)
+    text_ids = batch["input_ids"].masked_fill(torch.isin(batch["input_ids"], torch.tensor([40, 41, 42])), 1)
+    text_only = {
+        **batch,
+        "input_ids": text_ids,
+        "mm_token_type_ids": torch.zeros_like(text_ids, dtype=torch.int),
+        "pixel_values": None,
+        "image_grid_thw": None,
+    }
+    with pytest.raises(ValueError, match="needs images and a vision_grid"):
+        _export_sampling(policy, text_only, noise, None)
+    for inputs in ({**batch, "pixel_values": None}, text_only):
+        with pytest.raises(ValueError, match="vision_grid needs pixel_values and image_grid_thw"):
+            policy.predict_action_chunk(inputs, noise=noise.clone(), vision_grid=grid)
