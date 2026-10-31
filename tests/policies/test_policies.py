@@ -25,7 +25,7 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from packaging import version
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -335,6 +335,47 @@ def test_save_pretrained_single_file_artifact(dummy_dataset_metadata, tmp_path):
     assert not (save_dir / f"{SAFETENSORS_SINGLE_FILE}.index.json").exists()
 
     loaded_policy = policy_cls.from_pretrained(save_dir, config=policy_cfg)
+    torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
+
+
+@pytest.mark.skipif("diffusion" not in AVAILABLE_POLICIES, reason="needs diffusers")
+@pytest.mark.parametrize("compiled", [True, False])
+def test_diffusion_weights_load_whatever_compile_model(dummy_dataset_metadata, tmp_path, compiled):
+    features = dataset_to_policy_features(dummy_dataset_metadata.features)
+    actions = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    inputs = {key: ft for key, ft in features.items() if key not in actions}
+    # Two U-Net stages instead of three, to keep the compile short.
+    saved, loaded = (
+        make_policy_config(
+            "diffusion", compile_model=c, down_dims=(64, 128), input_features=inputs, output_features=actions
+        )
+        for c in (compiled, not compiled)
+    )
+    policy_cls = get_policy_class("diffusion")
+    policy = policy_cls(saved)
+    policy.to(saved.device)
+    policy.save_pretrained(tmp_path)
+    loaded_policy = policy_cls.from_pretrained(tmp_path, config=loaded)
+    torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
+    # One of the two compiles its U-Net on this first call, and must compute the loss of the eager one.
+    batch = {
+        OBS_STATE: torch.randn(2, saved.n_obs_steps, 6),
+        f"{OBS_IMAGES}.laptop": torch.rand(2, saved.n_obs_steps, 3, 84, 84),
+        ACTION: torch.randn(2, saved.horizon, 6),
+        "action_is_pad": torch.zeros(2, saved.horizon, dtype=torch.bool),
+    }
+    losses = []
+    for candidate in (policy.eval(), loaded_policy.eval()):
+        with torch.no_grad(), seeded_context(0):
+            losses.append(candidate.forward({key: value.to(saved.device) for key, value in batch.items()})[0])
+    torch.testing.assert_close(losses[0], losses[1], rtol=1e-5, atol=1e-5)
+    # Checkpoints trained with compile_model before name the U-Net's weights after the torch.compile wrapper.
+    wrapped = {
+        key.replace("diffusion.unet.", "diffusion.unet._orig_mod."): value.cpu()
+        for key, value in policy.state_dict().items()
+    }
+    save_file(wrapped, tmp_path / SAFETENSORS_SINGLE_FILE)
+    loaded_policy = policy_cls.from_pretrained(tmp_path, config=loaded)
     torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
 
 
