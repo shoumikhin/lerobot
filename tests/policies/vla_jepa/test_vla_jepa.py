@@ -144,6 +144,14 @@ def test_action_generation_shape(patch_vla_jepa_external_models: None) -> None:
     assert torch.isfinite(a1).all() and torch.isfinite(a2).all()
 
 
+def test_a_batch_with_some_of_the_qwen_inputs_is_refused(patch_vla_jepa_external_models: None) -> None:
+    """The policy would run on them in place of the ones it makes, without the rest."""
+    policy = VLAJEPAPolicy(make_config()).eval()
+    batch = make_inference_batch() | {"input_ids": torch.ones(BATCH_SIZE, 4, dtype=torch.long)}
+    with pytest.raises(ValueError, match="only some of the Qwen3-VL processor tensors"):
+        policy.predict_action_chunk(batch)
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("action_dim,state_dim", [(3, 4), (7, 0), (6, 8)])
 def test_action_generation_various_dims(
