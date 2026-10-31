@@ -15,6 +15,8 @@
 """The engine that runs a bundle, on bundles of small modules run by the test runtime."""
 
 import json
+import subprocess
+import sys
 from threading import Event
 
 import numpy as np
@@ -77,6 +79,23 @@ def test_engine_measures_the_difference_in_normalized_action_units(tmp_path):
     _edit(bundle, action_scale=[100.0, 100.0, 10.0])
     with pytest.raises(RuntimeError, match="1.00e-01 > 0.05"):
         BundleEngine(Bundle.read(bundle.path))
+
+
+def test_the_bundle_check_imports_nothing_the_bundle_ships(tmp_path):
+    bundle = make_bundle(tmp_path / "bundle", Chunk(), FRAME)
+    _edit(bundle, runtime_imports=["payload"])
+    ran = tmp_path / "ran"
+    (bundle.path / "payload.py").write_text(f"open({str(ran)!r}, 'w').close()\n")
+    # From inside the bundle folder, which `python -m` puts on the module search path.
+    result = subprocess.run(
+        [sys.executable, "-m", "lerobot.bundle", "."],
+        cwd=bundle.path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert not ran.exists()
+    assert "needs the Python module 'payload'" in result.stderr
 
 
 @pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -1.0])

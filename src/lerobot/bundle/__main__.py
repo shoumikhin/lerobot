@@ -19,6 +19,7 @@ It loads the programs and replays the test case as `lerobot-rollout` does before
 with an error if the actions differ by more than the bundle's tolerance.
 """
 
+import os
 import sys
 
 from lerobot.utils import init_logging
@@ -27,6 +28,10 @@ from .engine import BundleEngine
 from .manifest import Bundle
 
 if __name__ == "__main__":
+    # `python -m` looks for modules in the current folder first, so from inside a bundle folder a module the
+    # manifest names in `runtime_imports` would load from a file shipped with the bundle.
+    if sys.path[0] in ("", os.getcwd()):
+        sys.path.pop(0)
     if len(sys.argv) != 2:
         sys.exit("usage: python -m lerobot.bundle <bundle folder>")
     init_logging()
