@@ -17,7 +17,7 @@
 import logging
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -31,7 +31,8 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor
 
-from lerobot.utils.import_utils import _natten_available, require_package
+from lerobot.policies.common.qwen_vision import is_exporting
+from lerobot.utils.import_utils import _natten_available
 
 from ..utils import resolve_weights
 from .positional import prc_vid, scatter_ids, times_to_ids
@@ -332,6 +333,66 @@ class RotaryPositionEmbedding3D(nn.Module):
         return torch.cat([-x2, x1], dim=-1)
 
 
+# Gathered keys per chunk of query rows, in elements: bounds the memory long videos need.
+_NEIGHBORHOOD_CHUNK_ELEMENTS = 2**28
+
+
+def _window(size: int, kernel: int, causal: bool, device: torch.device) -> tuple[Tensor, Tensor]:
+    """The ``(size, kernel)`` key positions each query of one axis attends to, and which of them it sees.
+
+    These are NATTEN's rules with dilation 1: the window is centered on the query (an even window reaches
+    one key further back) and shifted inward at the borders. A causal window ends at the query, so the first
+    queries see fewer keys.
+    """
+    if size < kernel:
+        raise ValueError(f"A window of {kernel} keys needs at least {kernel} positions per axis, got {size}")
+    query = torch.arange(size, device=device)
+    start = (query - (kernel - 1 if causal else kernel // 2)).clamp(0, size - kernel)
+    keys = start[:, None] + torch.arange(kernel, device=device)
+    return keys, keys <= query[:, None] if causal else torch.ones_like(keys, dtype=torch.bool)
+
+
+def _neighbors(x: Tensor, windows: list[Tensor]) -> Tensor:
+    """Gather ``(batch, *spatial, heads, dim)`` into ``(batch, *queries, heads, window, dim)``."""
+    n = len(windows)
+    for axis, keys in enumerate(windows):
+        x = x.index_select(1 + 2 * axis, keys.flatten()).unflatten(1 + 2 * axis, keys.shape)
+    order = [0, *range(1, 2 * n, 2), 2 * n + 1, *range(2, 2 * n + 1, 2), 2 * n + 2]
+    return x.permute(order).flatten(n + 2, 2 * n + 1)
+
+
+def neighborhood_attention(
+    q: Tensor, k: Tensor, v: Tensor, kernel_size: Sequence[int], is_causal: Sequence[bool]
+) -> Tensor:
+    """NATTEN's neighborhood attention in plain PyTorch, so the VAE runs without NATTEN and exports.
+
+    ``q``, ``k`` and ``v`` are ``(batch, *spatial, heads, head_dim)``. Along every spatial axis each query
+    attends to the keys of its window (see ``_window``). Computed in float32, returned in the dtype of ``v``.
+    """
+    n = q.dim() - 3
+    windows = [_window(*axis, q.device) for axis in zip(q.shape[1:-2], kernel_size, is_causal, strict=True)]
+    visible = None
+    if any(is_causal):
+        visible = torch.ones((), dtype=torch.bool, device=q.device)
+        for axis, (_, seen) in enumerate(windows):
+            shape = [1] * 2 * n
+            shape[axis], shape[n + axis] = seen.shape
+            visible = visible & seen.view(shape)
+        visible = visible.flatten(n).unsqueeze(-2)  # (*spatial, 1, window), the same for every head
+    rows = max(1, _NEIGHBORHOOD_CHUNK_ELEMENTS // (q[:, :1].numel() * math.prod(kernel_size)))
+    dtype = v.dtype
+    q, k, v = q.float() * q.shape[-1] ** -0.5, k.float(), v.float()
+    out = []
+    for start in range(0, q.shape[1], rows):
+        keys = [w[start : start + rows] if axis == 0 else w for axis, (w, _) in enumerate(windows)]
+        query = q[:, start : start + rows].unsqueeze(-2)
+        logits = (query @ _neighbors(k, keys).transpose(-1, -2)).squeeze(-2)
+        if visible is not None:
+            logits = logits.masked_fill(~visible[start : start + rows], float("-inf"))
+        out.append((logits.softmax(-1).unsqueeze(-2) @ _neighbors(v, keys)).squeeze(-2))
+    return torch.cat(out, 1).to(dtype)
+
+
 class Natten3D(nn.Module):
     def __init__(
         self,
@@ -367,24 +428,25 @@ class Natten3D(nn.Module):
             k = self.k_norm(k)
         q, k = self.rope(q, k)
 
+        # A window cannot be longer than the input, so a single frame takes 2D attention.
         if t == 1:
-            q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
-            out = na2d(
-                q2,
-                k2,
-                v2,
-                kernel_size=self.window_size[1:],
-                attention_kwargs=_natten_attention_kwargs(q2, k2, v2),
-            ).unsqueeze(1)
+            q, k, v = q.squeeze(1), k.squeeze(1), v.squeeze(1)
+            kernel_size, is_causal = self.window_size[1:], [False, False]
         else:
-            out = na3d(
+            kernel_size, is_causal = self.window_size, [self.causal, False, False]
+        # NATTEN's kernels are fast but no export backend can run them.
+        if _natten_available and not is_exporting():
+            na = na2d if t == 1 else na3d
+            out = na(
                 q,
                 k,
                 v,
-                is_causal=[self.causal, False, False],
-                kernel_size=self.window_size,
+                kernel_size=kernel_size,
+                is_causal=is_causal,
                 attention_kwargs=_natten_attention_kwargs(q, k, v),
             )
+        else:
+            out = neighborhood_attention(q, k, v, kernel_size, is_causal)
         out = out.reshape(b, t, h, w, c)
         return self.proj(out)
 
@@ -995,15 +1057,9 @@ def load_video_vae(
 
     ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
     distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). Requires NATTEN to construct the model.
+    (default filename ``video_vae.safetensors``). Its attention runs NATTEN's kernels when NATTEN is
+    installed, and the same neighborhood attention in plain PyTorch otherwise.
     """
-    try:
-        require_package("natten", "flux3")
-    except ImportError as e:
-        raise ImportError(
-            "The FLUX3 video VAE requires NATTEN. Install a torch/CUDA-matched wheel from "
-            "https://whl.natten.org; see docs/source/flux3.mdx."
-        ) from e
     params = ViTNormInferenceParams(
         use_compile=compile_model,
         compile_decoder=compile_model,
