@@ -107,7 +107,9 @@ class BundleEngine:
         _check_dataflow(manifest, list(self._frame_spec), list(constants), manifest.noise_shape is not None)
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions, manifest.exact_runtime_modules)
-        runtime = prepare_runtime(manifest.runtime, manifest.runtime_imports, folder=bundle.path)
+        runtime = prepare_runtime(
+            manifest.runtime, manifest.runtime_imports, manifest.runtime_options, bundle.path
+        )
         programs = {
             name: runtime.load(
                 bundle.path / files.file, None if files.data is None else bundle.path / files.data

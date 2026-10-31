@@ -20,7 +20,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -63,13 +63,21 @@ class Runtime:
         prepare (`Callable[[], None]`, *optional*):
             Runs before the programs load, and before the manifest's `runtime_imports` import when the
             runtime is registered before them. It may run more than once.
+        configure (`Callable[[Mapping[str, Mapping[str, bool | int | str]]], None]`, *optional*):
+            Applies the manifest's `runtime_options`, after its `runtime_imports` import and before the
+            programs load. It runs on each load of a bundle that sets options, so it may run more than once,
+            with other options. It should check what it can before it applies any, such as that every backend
+            it names exists. `None` for a runtime that takes no options; it refuses a bundle that sets some.
     """
 
     load: Callable[[Path, Path | None], Program]
     prepare: Callable[[], None] = lambda: None
+    configure: Callable[[Mapping[str, Mapping[str, bool | int | str]]], None] | None = None
 
 
-RUNTIMES: dict[str, Runtime] = {"executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare)}
+RUNTIMES: dict[str, Runtime] = {
+    "executorch": Runtime(executorch.ExecuTorchProgram, executorch.prepare, executorch.configure)
+}
 """The runtimes by name: the ones LeRobot has, and the ones packages added with `register_runtime`."""
 
 
@@ -83,7 +91,12 @@ def register_runtime(name: str, runtime: Runtime) -> None:
     RUNTIMES[name] = runtime
 
 
-def prepare_runtime(runtime: str, modules: Sequence[str], folder: Path | None = None) -> Runtime:
+def prepare_runtime(
+    runtime: str,
+    modules: Sequence[str],
+    options: Mapping[str, Mapping[str, bool | int | str]] | None = None,
+    folder: Path | None = None,
+) -> Runtime:
     """Get the runtime named `runtime` ready, import the modules a bundle needs, and return the runtime.
 
     `folder`, the bundle's, is off the module search path the whole time, so that a file the bundle ships
@@ -93,7 +106,8 @@ def prepare_runtime(runtime: str, modules: Sequence[str], folder: Path | None = 
 
     The runtime prepares before the modules import, since a module may load native code that reads what
     `prepare` set. A runtime LeRobot does not have is looked for in the installed `lerobot_runtime_*`
-    packages; one that a module registers instead prepares once the modules are imported.
+    packages; one that a module registers instead prepares once the modules are imported. The bundle's
+    `options` apply last, since a module may add what they set.
     """
     folder = None if folder is None else folder.resolve()
     removed = [] if folder is None else _leave_search_path(folder)
@@ -124,6 +138,14 @@ def prepare_runtime(runtime: str, modules: Sequence[str], folder: Path | None = 
             )
         if not registered_early:
             RUNTIMES[runtime].prepare()
+        if options:
+            configure = RUNTIMES[runtime].configure
+            if configure is None:
+                raise ValueError(
+                    f"This bundle sets options of the {runtime!r} runtime, which takes none. Upgrade the "
+                    "package that adds the runtime."
+                )
+            configure(options)
     finally:
         for index, entry in removed:
             sys.path.insert(index, entry)

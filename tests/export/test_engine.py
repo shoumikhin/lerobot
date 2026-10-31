@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tomllib
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ from torch import Tensor, nn
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle, BundleManifest
+from lerobot.bundle.runtime import RUNTIMES
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import TorchProgram, make_bundle, record_places
 
@@ -210,6 +212,15 @@ def test_engine_feeds_the_test_case_noise_and_samples_its_own_after(tmp_path):
     _edit_test_case(bundle, **{NOISE: np.zeros((3, 3), np.float32)})
     with pytest.raises(RuntimeError, match="does not reproduce its test case"):
         BundleEngine(bundle)
+
+
+def test_engine_applies_the_runtime_options_of_its_bundle(tmp_path, monkeypatch):
+    applied = []
+    monkeypatch.setitem(RUNTIMES, "torch_test", replace(RUNTIMES["torch_test"], configure=applied.append))
+    bundle = _chunk_bundle(tmp_path / "bundle")
+    _edit(bundle, runtime_options={"TestBackend": {"shared": True}})
+    BundleEngine(Bundle.read(bundle.path))
+    assert applied == [{"TestBackend": {"shared": True}}]
 
 
 def test_engine_loads_the_data_file_a_program_names(tmp_path):
@@ -413,6 +424,9 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ({"programs": {"model": "model.pt2"}}, "programs"),
         ({"runs": ["model"]}, "runs"),
         ({"runtime_imports": [123]}, "runtime_imports"),
+        ({"runtime_options": "TensorRTBackend"}, "runtime_options"),
+        ({"runtime_options": {"XnnpackBackend": 5}}, "runtime_options"),
+        ({"runtime_options": {"XnnpackBackend": {"x": 1.5}}}, "runtime_options"),
         ({"target": "cuda"}, "target"),
         ({"target": {"device": "cuda", "gpu": "Orin", "compute_capability": 8.7}}, "target"),
         ({"runtime_versions": None}, "runtime_versions"),
@@ -440,7 +454,7 @@ def test_a_manifest_leaves_out_the_fields_at_their_default(tmp_path):
     # So a field a later version adds, which this one refuses, stops it only for a bundle that sets the field.
     bundle = _chunk_bundle(tmp_path / "bundle")
     data = json.loads((bundle.path / MANIFEST).read_text())
-    assert {"first_runs", "target", "history", "carry", "test_case"}.isdisjoint(data)
+    assert {"runtime_options", "first_runs", "target", "history", "carry", "test_case"}.isdisjoint(data)
     assert "data" not in data["programs"]["model"]
     assert data["format_version"] == 1
     assert BundleManifest.from_dict(data) == bundle.manifest

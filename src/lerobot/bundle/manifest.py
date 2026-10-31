@@ -104,6 +104,11 @@ class BundleManifest:
         runtime_imports (`list[str]`, *optional*):
             Python modules to import before the programs load, such as one that registers a compiler's
             kernels with the runtime.
+        runtime_options (`dict[str, dict[str, bool | int | str]]`, *optional*):
+            Settings the runtime applies before the programs load, chosen by the backend that compiled them.
+            For ExecuTorch, the options of its backends, by backend name. They hold for the rest of the
+            process, so bundles loaded after this one run with them too. LeRobot passes them on as they
+            are; what a backend does with an option it does not read is up to the backend.
         programs (`dict[str, ProgramFiles]`):
             The compiled programs, by name.
         runs (`list[ProgramRun]`):
@@ -138,6 +143,7 @@ class BundleManifest:
     backend: str
     runtime: str
     runtime_imports: list[str] = field(default_factory=list)
+    runtime_options: dict[str, dict[str, bool | int | str]] = field(default_factory=dict)
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
     constants: str | None = None
@@ -244,6 +250,8 @@ def _check_form(data: dict[str, Any]) -> None:
         "programs": _map_of(data.get("programs") or {}, dict),
         "runs": _list_of(data.get("runs") or [], dict),
         "runtime_imports": _list_of(data.get("runtime_imports", []), str),
+        "runtime_options": _map_of(data.get("runtime_options", {}), dict)
+        and all(_map_of(values, bool | int | str) for values in data.get("runtime_options", {}).values()),
         "runtime_versions": _map_of(data.get("runtime_versions", {}), str),
         "exact_runtime_modules": _list_of(data.get("exact_runtime_modules", []), str),
         "target": data.get("target") is None or _map_of(data["target"], str),

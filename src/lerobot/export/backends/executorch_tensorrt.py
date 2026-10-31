@@ -45,6 +45,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     device = "cuda"
     # Registers the TensorRT backend with the ExecuTorch runtime.
     runtime_imports = ("torch_tensorrt_executorch_runtime",)
+    # A bundle runs its TensorRT engines one after another, so they can share one scratch buffer for
+    # activations instead of holding one each.
+    runtime_options = {"TensorRTBackend": {"use_shared_activation_scratch": True}}
     runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
     # TensorRT loads an engine only with the TensorRT version that built it, unless built version compatible.
     exact_runtime_modules = ("tensorrt",)
