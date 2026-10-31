@@ -30,6 +30,7 @@ lerobot-rollout \\
 
 from __future__ import annotations
 
+import importlib
 import logging
 import sys
 import time
@@ -69,7 +70,7 @@ from lerobot.utils import ActionInterpolator, init_logging, register_third_party
 from lerobot.utils.action_dispatch import dispatch_tick
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.cycle_timer import CycleTimer
-from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, filter_arg, load_plugin, parse_plugin_args
+from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, filter_arg, parse_plugin_args
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import policy_features, return_to_position
 
@@ -215,6 +216,8 @@ def main(args: Sequence[str] | None = None) -> None:
     for arg, package in parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, args).items():
         if not arg.startswith("robot."):
             raise ValueError(f"--{arg}: bundle mode loads robot and camera plugins only.")
-        load_plugin(package)
+        # Only the package, which registers the robot: its other modules, such as a kinematics processor, may
+        # import PyTorch.
+        importlib.import_module(package)
         args = filter_arg(arg, args)
     rollout(draccus.parse(BundleRolloutConfig, args=args))
