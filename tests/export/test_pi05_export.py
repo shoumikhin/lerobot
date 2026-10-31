@@ -242,6 +242,12 @@ def test_recipe_refuses_a_prompt_with_other_tokens_than_the_processor(recipe_con
         list(export_pi05.PI05ExportRecipe(recipe_config).parts())
 
 
+def test_the_prompt_writes_the_processors_bin_for_a_nan_state(recipe_config, monkeypatch):
+    # The prompt check compares the program's prompt with the processor's for this state value too.
+    monkeypatch.setattr(export_pi05, "EXTREME_STATE", float("nan"))
+    next(export_pi05.PI05ExportRecipe(recipe_config).parts())
+
+
 @pytest.mark.parametrize(
     ("dtype", "float32_fits", "shift"),
     [
