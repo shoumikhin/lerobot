@@ -81,8 +81,9 @@ def tokenize(tokenizer_file: Path, texts: list[str]) -> list[list[int]]:
             "This task was not known when the policy was exported, and tokenizing it needs the tokenizers "
             'package: pip install "tokenizers>=0.22". Or use a task the bundle lists in known_tasks.json.'
         )
+    # The child sees the packages this process sees, without the current directory, which can be the bundle's.
     result = subprocess.run(  # nosec B603
-        [sys.executable, "-I", "-c", TOKENIZE, str(tokenizer_file)],
+        [sys.executable, "-P", "-c", TOKENIZE, str(tokenizer_file)],
         input=json.dumps(texts),
         capture_output=True,
         text=True,
