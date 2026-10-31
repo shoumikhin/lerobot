@@ -136,15 +136,23 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(checkpoint, bundle):
     assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
 
 
-def test_export_takes_a_singular_image_key(tmp_path):
-    save_checkpoint(tmp_path / "act", OBS_IMAGE)
-    run_export(f"--policy.path={tmp_path / 'act'}", f"--output_dir={tmp_path / 'bundle'}")
-    assert_plays_like_pytorch(tmp_path / "act", Bundle.read(tmp_path / "bundle"), OBS_IMAGE)
+@pytest.fixture(scope="module")
+def singular_image_key(tmp_path_factory):
+    """A checkpoint reading `observation.image`, and its bundle, exported with a task to keep."""
+    path = tmp_path_factory.mktemp("singular")
+    save_checkpoint(path / "act", OBS_IMAGE)
+    run_export(f"--policy.path={path / 'act'}", f"--output_dir={path / 'bundle'}", "--task=pick")
+    return path / "act", Bundle.read(path / "bundle")
 
 
-def test_export_keeps_a_task_given(checkpoint, tmp_path):
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'bundle'}", "--task=pick")
-    assert Bundle.read(tmp_path / "bundle").manifest.task == "pick"
+def test_export_takes_a_singular_image_key(singular_image_key):
+    checkpoint, bundle = singular_image_key
+    assert_plays_like_pytorch(checkpoint, bundle, OBS_IMAGE)
+
+
+def test_export_keeps_a_task_given(singular_image_key):
+    _, bundle = singular_image_key
+    assert bundle.manifest.task == "pick"
 
 
 # Robot units of the test checkpoint's actions, whose spread is 30: float32's measured drift between eager
@@ -238,7 +246,9 @@ def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
     folders = str(tmp_path / "folders.json")
     request.write_text(
-        json.dumps({"step": "trace", "args": args, "folders": folders, "result": str(tmp_path / "result.json")})
+        json.dumps(
+            {"step": "trace", "args": args, "folders": folders, "result": str(tmp_path / "result.json")}
+        )
     )
     monkeypatch.setattr(sys, "argv", ["worker", str(request)])
     flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
