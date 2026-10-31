@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tomllib
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ from torch import Tensor, nn
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle, BundleManifest
+from lerobot.bundle.runtime import RUNTIMES
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import TorchProgram, make_bundle, record_places
 
@@ -187,6 +189,15 @@ def test_engine_feeds_the_test_case_noise_and_samples_its_own_after(tmp_path):
     _edit_test_case(bundle, **{NOISE: np.zeros((3, 3), np.float32)})
     with pytest.raises(RuntimeError, match="does not reproduce its test case"):
         BundleEngine(bundle)
+
+
+def test_engine_applies_the_runtime_options_of_its_bundle(tmp_path, monkeypatch):
+    applied = []
+    monkeypatch.setitem(RUNTIMES, "torch_test", replace(RUNTIMES["torch_test"], configure=applied.append))
+    bundle = _chunk_bundle(tmp_path / "bundle")
+    _edit(bundle, runtime_options={"TestBackend": {"shared": True}})
+    BundleEngine(Bundle.read(bundle.path))
+    assert applied == [{"TestBackend": {"shared": True}}]
 
 
 def test_engine_loads_the_data_file_a_program_names(tmp_path):
