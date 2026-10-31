@@ -35,7 +35,10 @@ class DiffusionExportRecipe(DenoisingRecipe):
         return _UNet(self.policy.diffusion.unet)
 
     def _schedule(self) -> Schedule:
-        return scheduler_schedule(self.policy.diffusion.noise_scheduler)
+        diffusion = self.policy.diffusion
+        # As `DiffusionModel.conditional_sample` does before it samples.
+        diffusion.noise_scheduler.set_timesteps(diffusion.num_inference_steps)
+        return scheduler_schedule(diffusion.noise_scheduler)
 
 
 class _GlobalConditioning(nn.Module):
