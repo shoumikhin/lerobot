@@ -19,7 +19,8 @@ From the LeRobot checkout, install the training, policy, PEFT and EMA dependenci
 pip install -e ".[training,flux3,peft,diffusion]"
 ```
 
-The Video VAE also requires a torch/CUDA-compatible **NATTEN** wheel from https://whl.natten.org.
+On an NVIDIA GPU, a torch/CUDA-compatible **NATTEN** wheel from https://whl.natten.org makes the Video VAE
+about 11 times faster. NATTEN has wheels for Linux with CUDA only.
 For torch 2.11 with CUDA 12.8:
 
 ```bash
@@ -27,6 +28,11 @@ uv pip install natten==0.21.6+torch2110cu128 --find-links https://whl.natten.org
 ```
 
 Use `natten==0.21.6+torch2100cu128` for torch 2.10, or build for your environment.
+
+Without NATTEN, and on the CPU, the Video VAE computes the same neighborhood attention in plain PyTorch, so
+the policy can still encode its camera images. On the CPU this is slow: each policy step encodes the current
+frame as a 45-frame clip, which takes about 2 minutes for the default 256 × 512 canvas with 16 threads.
+Decoding videos, which the policy does not do, still needs a CUDA GPU.
 
 ## SO-101 task adaptation
 
