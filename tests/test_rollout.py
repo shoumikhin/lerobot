@@ -34,8 +34,9 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 # above already guards everything below it.
 from lerobot.inference import SyncInferenceEngine, sync  # noqa: E402
 from lerobot.processor import transition_to_prediction  # noqa: E402
-from lerobot.rollout import BaseStrategyConfig, status  # noqa: E402
+from lerobot.rollout import BaseStrategyConfig  # noqa: E402
 from lerobot.rollout.strategies import BaseStrategy  # noqa: E402
+from lerobot.utils import rollout_status as status  # noqa: E402
 from lerobot.utils.cycle_timer import CycleTimer  # noqa: E402
 from tests.interactive_helpers import _FakeEngine, _loop_ctx  # noqa: E402
 
