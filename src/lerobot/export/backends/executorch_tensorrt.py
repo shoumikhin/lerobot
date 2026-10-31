@@ -55,10 +55,19 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
 
         Returns the weights file of the CUDA backend's part, if it has one.
         """
+        import inspect
+
         import torch_tensorrt
 
+        if "fallback_pytorch_plugin_ops" not in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+            raise ImportError(
+                f"Torch-TensorRT {torch_tensorrt.__version__} lacks fallback_pytorch_plugin_ops, a "
+                "compile setting that ExecuTorch programs need (pytorch/TensorRT#4953)."
+            )
         options = {
             "min_block_size": 1,
+            # ExecuTorch programs run without libtorch, so a TensorRT plugin that needs it could never run.
+            "fallback_pytorch_plugin_ops": True,
             # Flow-matching time embeddings are computed in float64, which TensorRT does not support.
             "truncate_double": True,
             # The part's PyTorch weights wait in host memory while TensorRT builds; on an 8 GB Jetson this
