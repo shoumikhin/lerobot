@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, Unpack
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
 from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError, LocalEntryNotFoundError
 from safetensors import safe_open
 from torch import Tensor
 
@@ -73,8 +73,9 @@ _TIED_WEIGHT_NAMES = (
     "backbone.model.model.language_model.embed_tokens.weight",
 )
 
-# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR.
-_BASE_CONFIG_FILES = (CONFIG_NAME, "processor_config.json")
+# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR. config.json
+# comes last, as it marks a complete copy (see resolve_groot_base_config_path).
+_BASE_CONFIG_FILES = ("processor_config.json", CONFIG_NAME)
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -87,25 +88,13 @@ class GrootPolicy(PreTrainedPolicy):
     def supports_rtc(self) -> bool:
         return True
 
-    def __init__(
-        self,
-        config: GrootConfig,
-        *,
-        _groot_model: GR00TN17 | None = None,
-        _base_config_path: str | None = None,
-        **kwargs,
-    ):
+    def __init__(self, config: GrootConfig, *, _groot_model: GR00TN17 | None = None, **kwargs):
         """Initialize Groot policy wrapper."""
         require_package("transformers", extra="groot")
         super().__init__(config)
         config.validate_features()
         self.config = config
-        # Like GrootConfig.action_delta_indices, a local checkpoint's copies first: they describe its weights.
-        self._base_config_path = (
-            resolve_groot_base_config_path(config.pretrained_path, config.base_model_path)
-            if _base_config_path is None
-            else _base_config_path
-        )
+        self._base_config_path = config.base_config_path
 
         # Initialize GR00T model using ported components, unless from_pretrained built it from a checkpoint.
         self._groot_model = self._create_groot_model() if _groot_model is None else _groot_model
@@ -190,8 +179,8 @@ class GrootPolicy(PreTrainedPolicy):
             state_dict = {key.removeprefix(prefix): checkpoint.get_tensor(key) for key in keys}
             lm_head, embedding = _TIED_WEIGHT_NAMES
             if lm_head in state_dict and embedding in state_dict:
-                # A save keeps one name of a tied pair. With both, the regular load reports the embedding as
-                # unexpected (strict=False keeps lm_head), while the tie below would keep the embedding.
+                # A save keeps one name of a tied pair. Both names are unusual, and a strict regular load
+                # rejects the extra one, so the regular load decides.
                 logger.info("Checkpoint holds both tied weight names; loading the base weights first.")
                 return None
             if lm_head in state_dict:
@@ -271,11 +260,25 @@ class GrootPolicy(PreTrainedPolicy):
         if base_config_path is None:
             return {}
         if os.path.isdir(base_config_path):
-            files = [os.path.join(base_config_path, name) for name in _BASE_CONFIG_FILES]
+            folder = Path(base_config_path)
+            # A save writes these files into the next checkpoint, so a link out of the folder is not followed.
+            # The Hugging Face cache links the files of a snapshot into its repo folder.
+            snapshots = next((parent for parent in folder.parents if parent.name == "snapshots"), None)
+            root = folder if snapshots is None else snapshots.parent
+            files = []
+            for path in (folder / name for name in _BASE_CONFIG_FILES):
+                if path.resolve().is_relative_to(root.resolve()):
+                    files.append(path)
+                else:
+                    logger.warning("%s links outside %s, so a save does not copy it.", path, folder)
         else:
             # Only config.json, as a Hub base model's processor_config.json is never read. Building the model
             # already downloaded it, so the cache has it.
-            cached = try_to_load_from_cache(base_config_path, CONFIG_NAME)
+            try:
+                cached = try_to_load_from_cache(base_config_path, CONFIG_NAME)
+            except HFValidationError:
+                # Neither a folder nor a repo id, for example a folder on another machine.
+                cached = None
             files = [cached] if isinstance(cached, str) else []
         return {os.path.basename(file): Path(file).read_bytes() for file in files if os.path.isfile(file)}
 
@@ -288,6 +291,8 @@ class GrootPolicy(PreTrainedPolicy):
             return
         target = save_directory / _BASE_CONFIG_DIR
         target.mkdir(exist_ok=True)
+        # Written last, so a save that stops halfway leaves a folder that loading does not use.
+        (target / CONFIG_NAME).unlink(missing_ok=True)
         for name in _BASE_CONFIG_FILES:
             if name in self._base_config_files:
                 (target / name).write_bytes(self._base_config_files[name])
@@ -319,7 +324,8 @@ class GrootPolicy(PreTrainedPolicy):
 
         Args:
             pretrained_name_or_path: Path to the GR00T model or fine-tuned checkpoint
-            config: Optional GrootConfig. If None, loads from checkpoint or creates default
+            config: Optional GrootConfig. If None, loads from checkpoint or creates default. For a fine-tuned
+                checkpoint, it records the folder the base config files are read from (see base_config_path).
             force_download: Force download even if cached
             resume_download: Resume interrupted download
             proxies: Proxy settings
@@ -356,7 +362,7 @@ class GrootPolicy(PreTrainedPolicy):
                         filename=SAFETENSORS_SINGLE_FILE,
                         revision=revision,
                         cache_dir=cache_dir,
-                        force_download=False,  # Just check, don't force download
+                        force_download=False,  # A forced load downloads it again below.
                         proxies=proxies,
                         token=token,
                         local_files_only=local_files_only,
@@ -381,33 +387,35 @@ class GrootPolicy(PreTrainedPolicy):
                     revision=revision,
                     **kwargs,
                 )
-            elif config.pretrained_path is None:
-                # As in PreTrainedConfig.from_pretrained, so the config reads a local checkpoint's copies too.
-                config.pretrained_path = Path(model_id)
-            if os.path.isdir(model_id):
-                checkpoint_dir = model_id
-            else:
-                checkpoint_dir = snapshot_download(
-                    repo_id=model_id,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    token=token,
-                    local_files_only=local_files_only,
-                    allow_patterns=f"{_BASE_CONFIG_DIR}/*",
-                )
+            if not os.path.isdir(model_id):
+                try:
+                    # Fetched into the snapshot folder that holds the weights file found above.
+                    snapshot_download(
+                        repo_id=model_id,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        token=token,
+                        local_files_only=local_files_only,
+                        allow_patterns=[f"{_BASE_CONFIG_DIR}/{name}" for name in _BASE_CONFIG_FILES],
+                    )
+                except (LocalEntryNotFoundError, HfHubHTTPError):
+                    logger.warning("Could not get the checkpoint's base config copies; reading base_model_path.")
+            # Every way of building the policy below reads the base config files there, as does the config.
+            config._loaded_base_config_path = resolve_groot_base_config_path(
+                os.path.dirname(model_file), config.base_model_path
+            )
             if force_download and not os.path.isdir(model_id):
-                # The regular load below passes force_download on, as it did before. A local folder has
-                # nothing to download, so it does not need that.
+                # The weights above were downloaded without forcing, so only the regular load honors
+                # force_download. A local folder has nothing to download.
                 logger.info("force_download is set, so the checkpoint loads the regular way.")
             elif cls is GrootPolicy:
-                base_config_path = resolve_groot_base_config_path(checkpoint_dir, config.base_model_path)
-                groot_model = cls._build_groot_model_from_checkpoint(config, model_file, base_config_path)
+                groot_model = cls._build_groot_model_from_checkpoint(
+                    config, model_file, config._loaded_base_config_path
+                )
                 if groot_model is not None:
-                    policy = cls(
-                        config, _groot_model=groot_model, _base_config_path=base_config_path, **kwargs
-                    )
+                    policy = cls(config, _groot_model=groot_model, **kwargs)
                     policy.to(config.device)
                     policy.eval()
                     return policy
@@ -417,25 +425,19 @@ class GrootPolicy(PreTrainedPolicy):
                     "%s is a subclass, so it builds its own model from the base weights before loading.",
                     cls.__name__,
                 )
-            # The constructor finds the copies through pretrained_path, which may name a Hub repo id or
-            # another checkpoint, so like make_policy, point it at this checkpoint's folder while it builds.
-            pretrained_path, config.pretrained_path = config.pretrained_path, Path(checkpoint_dir)
-            try:
-                return super().from_pretrained(
-                    pretrained_name_or_path=pretrained_name_or_path,
-                    config=config,
-                    force_download=force_download,
-                    resume_download=resume_download,
-                    proxies=proxies,
-                    token=token,
-                    cache_dir=cache_dir,
-                    local_files_only=local_files_only,
-                    revision=revision,
-                    strict=strict,
-                    **kwargs,
-                )
-            finally:
-                config.pretrained_path = pretrained_path
+            return super().from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                config=config,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                strict=strict,
+                **kwargs,
+            )
 
         # This is a base GR00T model - load it fresh
         logger.info("Detected base GR00T model, loading from HuggingFace...")

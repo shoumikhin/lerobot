@@ -18,11 +18,13 @@
 
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 import torch
+from huggingface_hub.errors import LocalEntryNotFoundError
 from huggingface_hub.utils import filter_repo_objects
 
 pytest.importorskip("transformers")
@@ -116,6 +118,12 @@ def _policy_config(base, device="cpu", dtype=torch.float32):
     )
 
 
+def _cap_action_horizon(base, delta_indices):
+    action = {"delta_indices": delta_indices}
+    processor_kwargs = {"modality_configs": {"new_embodiment": {"action": action}}}
+    (base / "processor_config.json").write_text(json.dumps({"processor_kwargs": processor_kwargs}))
+
+
 def _save_finetune(tmp_path, device="cpu", dtype=torch.float32, tune_backbone=True):
     base = _write_tiny_base(tmp_path, tune_backbone)
     policy = GrootPolicy(_policy_config(base, device, dtype))
@@ -159,23 +167,30 @@ def _load_regular(finetune, monkeypatch, policy_cls=GrootPolicy, **kwargs):
 
 def _cache_as_hub_repo(monkeypatch, tmp_path, finetune):
     """Caches the fine-tune as the Hub repo someone/groot-finetune without its base config copies, which only
-    a snapshot_download that asks for them gets."""
+    a snapshot_download that asks for them gets. Returns the loading options and the files it fetched."""
     commit = "0" * 40
     repo = tmp_path / "hub" / "models--someone--groot-finetune"
     snapshot = repo / "snapshots" / commit
     shutil.copytree(finetune, snapshot, ignore=shutil.ignore_patterns(modeling_groot._BASE_CONFIG_DIR))
     (repo / "refs").mkdir()
     (repo / "refs" / "main").write_text(commit)
+    (repo / "blobs").mkdir()
     files = [path.relative_to(finetune).as_posix() for path in finetune.rglob("*") if path.is_file()]
+    fetched = []
 
     def snapshot_download(repo_id, allow_patterns=None, **kwargs):
         for name in filter_repo_objects(files, allow_patterns=allow_patterns):
+            fetched.append(name)
+            # Like the Hugging Face cache, the snapshot links to a blob of the repo.
+            blob = repo / "blobs" / name.replace("/", "--")
+            shutil.copyfile(finetune / name, blob)
             (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(finetune / name, snapshot / name)
+            (snapshot / name).unlink(missing_ok=True)
+            (snapshot / name).symlink_to(os.path.relpath(blob, (snapshot / name).parent))
         return str(snapshot)
 
     monkeypatch.setattr(modeling_groot, "snapshot_download", snapshot_download)
-    return {"cache_dir": tmp_path / "hub", "local_files_only": True}
+    return {"cache_dir": tmp_path / "hub", "local_files_only": True}, fetched
 
 
 def _record_builds(monkeypatch):
@@ -225,31 +240,80 @@ def test_finetune_matches_regular_load_on_cuda(tmp_path, monkeypatch):
 def test_finetune_loads_by_hub_repo_id(tmp_path, monkeypatch):
     base, finetune = _save_finetune(tmp_path)
     expected = _tensors(_load_regular(finetune, monkeypatch))
-    hub = _cache_as_hub_repo(monkeypatch, tmp_path, finetune)
+    hub, fetched = _cache_as_hub_repo(monkeypatch, tmp_path, finetune)
 
     shutil.rmtree(base)
     policy = GrootPolicy.from_pretrained("someone/groot-finetune", **hub)
 
     _assert_same(expected, _tensors(policy))
+    assert fetched == [f"{modeling_groot._BASE_CONFIG_DIR}/config.json"]
 
 
-@pytest.mark.parametrize("subclass", [False, True])
-def test_regular_load_by_hub_repo_id_reads_the_saved_copies(tmp_path, monkeypatch, subclass):
-    base, finetune = _save_finetune(tmp_path)
-    hub = _cache_as_hub_repo(monkeypatch, tmp_path, finetune)
+@pytest.mark.parametrize("route", ["fast", "fallback", "subclass"])
+def test_load_by_hub_repo_id_reads_the_saved_copies(tmp_path, monkeypatch, route):
+    base = _write_tiny_base(tmp_path)
+    _cap_action_horizon(base, [0, 1])
+    GrootPolicy(_policy_config(base)).save_pretrained(tmp_path / "finetune")
+    hub, _ = _cache_as_hub_repo(monkeypatch, tmp_path, tmp_path / "finetune")
     # The base changes after the save, so a load that reads it instead of the copies builds another model.
     model_config = json.loads((base / "config.json").read_text())
     (base / "config.json").write_text(json.dumps({**model_config, "action_horizon": 2}))
+    _cap_action_horizon(base, [0])
 
     class Subclass(GrootPolicy):
         pass
 
-    policy = _load_regular(
-        "someone/groot-finetune", monkeypatch, Subclass if subclass else GrootPolicy, **hub
-    )
+    if route == "fast":
+        policy = GrootPolicy.from_pretrained("someone/groot-finetune", **hub)
+    else:
+        policy_cls = Subclass if route == "subclass" else GrootPolicy
+        policy = _load_regular("someone/groot-finetune", monkeypatch, policy_cls, **hub)
+    policy.save_pretrained(tmp_path / "resaved")
+    shutil.rmtree(base)
 
     assert policy._groot_model.config.action_horizon == 4
+    assert policy._action_queue_steps == 2
+    assert policy.config.action_delta_indices == [0, 1]
     assert policy.config.pretrained_path == Path("someone/groot-finetune")
+    # A save after the load keeps the copies, not the changed base.
+    resaved = GrootPolicy.from_pretrained(tmp_path / "resaved")
+    assert resaved._groot_model.config.action_horizon == 4
+    assert resaved._action_queue_steps == 2
+
+
+def test_load_reads_the_copies_of_the_checkpoint_it_loads(tmp_path, monkeypatch):
+    base, finetune = _save_finetune(tmp_path)
+    # The base changes after the save, so a load that reads it instead of the copies builds another model.
+    model_config = json.loads((base / "config.json").read_text())
+    (base / "config.json").write_text(json.dumps({**model_config, "action_horizon": 2}))
+    config = GrootConfig.from_pretrained(finetune)
+    # As make_policy passes it to load a PEFT adapter's base policy.
+    config.pretrained_path = tmp_path / "adapter"
+
+    class Subclass(GrootPolicy):
+        pass
+
+    policy = Subclass.from_pretrained(finetune, config=config)
+
+    assert policy._groot_model.config.action_horizon == 4
+    assert config.pretrained_path == tmp_path / "adapter"
+
+
+def test_hub_checkpoint_without_cached_copies_reads_the_base_model(tmp_path, monkeypatch):
+    base, finetune = _save_finetune(tmp_path)
+    expected = _tensors(_load_regular(finetune, monkeypatch))
+    hub, _ = _cache_as_hub_repo(monkeypatch, tmp_path, finetune)
+
+    def snapshot_download(repo_id, **kwargs):
+        # What huggingface_hub raises offline when the cached repo listing names files that are not cached.
+        raise LocalEntryNotFoundError("Some files of the snapshot are not cached.")
+
+    monkeypatch.setattr(modeling_groot, "snapshot_download", snapshot_download)
+    (base / "model.safetensors").unlink()
+    policy = GrootPolicy.from_pretrained("someone/groot-finetune", **hub)
+
+    _assert_same(expected, _tensors(policy))
+    assert policy._base_config_path == str(base)
 
 
 @pytest.mark.parametrize("hand_built", [False, True])
@@ -289,9 +353,9 @@ def test_regular_load_agrees_with_the_config_on_the_horizon(tmp_path, monkeypatc
     processor_config = {"processor_kwargs": {"modality_configs": {"new_embodiment": {"action": action}}}}
     (base / "processor_config.json").write_text(json.dumps(processor_config))
     GrootPolicy(_policy_config(base)).save_pretrained(tmp_path / "finetune")
-    # A copy of the base that gives 3 steps, so a load that reads it instead disagrees with the config.
+    # A copy of the base that gives 1 step, fewer than the copies, so a load that reads it gives 1.
     other_base = shutil.copytree(base, tmp_path / "other_base")
-    action["delta_indices"] = [0, 1, 2]
+    action["delta_indices"] = [0]
     (other_base / "processor_config.json").write_text(json.dumps(processor_config))
     if hand_built:
         config = _policy_config(other_base)
@@ -373,7 +437,7 @@ def test_hub_base_model_saves_its_config(tmp_path, monkeypatch):
 def test_force_download_downloads_once_and_loads_the_regular_way(tmp_path, monkeypatch, caplog):
     base, finetune = _save_finetune(tmp_path)
     config = PreTrainedConfig.from_pretrained(
-        "someone/groot-finetune", **_cache_as_hub_repo(monkeypatch, tmp_path, finetune)
+        "someone/groot-finetune", **_cache_as_hub_repo(monkeypatch, tmp_path, finetune)[0]
     )
     # The base changes after the save, so a load that reads it instead of the copies builds another model.
     model_config = json.loads((base / "config.json").read_text())
@@ -594,3 +658,102 @@ def test_regular_construction_still_loads_the_base_weights(tmp_path):
     assert base_weights
     for name, tensor in base_weights.items():
         assert torch.equal(state[name], tensor.to(state[name].dtype)), name
+
+
+@pytest.mark.parametrize("load", ["construct", "fast", "regular"])
+def test_loader_options_reach_the_model(tmp_path, monkeypatch, load):
+    base, finetune = _save_finetune(tmp_path)
+    config = _policy_config(base)
+    # None of these are the defaults, nor the defaults of GR00TN17.from_pretrained.
+    config.tune_llm = True
+    config.tune_visual = False
+    config.tune_projector = False
+    config.tune_diffusion_model = False
+    config.tune_vlln = False
+    config.rtc_ramp_rate = 2.5
+    built = _record_builds(monkeypatch)
+
+    if load == "construct":
+        policy = GrootPolicy(config)
+    elif load == "fast":
+        policy = GrootPolicy.from_pretrained(finetune, config=config)
+    else:
+        policy = _load_regular(finetune, monkeypatch, config=config)
+
+    assert built == [None if load == "fast" else str(base)]
+    model = policy._groot_model
+    assert all(parameter.requires_grad for parameter in model.backbone.language_model.parameters())
+    assert not any(parameter.requires_grad for parameter in model.backbone.visual.parameters())
+    for module in (model.action_head.state_encoder, model.action_head.model, model.action_head.vlln):
+        assert not any(parameter.requires_grad for parameter in module.parameters())
+    assert model.config.rtc_ramp_rate == 2.5
+
+
+def test_constructor_accepts_a_base_path_that_is_not_here(tmp_path):
+    base = _write_tiny_base(tmp_path)
+    groot_model = GrootPolicy(_policy_config(base))._groot_model
+
+    # A folder on another machine, which is not a valid Hub repo id either.
+    policy = GrootPolicy(_policy_config(tmp_path / "elsewhere" / "base"), _groot_model=groot_model)
+
+    assert policy._base_config_files == {}
+
+
+def test_save_that_stops_halfway_leaves_no_copies_in_use(tmp_path, monkeypatch):
+    base = _write_tiny_base(tmp_path)
+    _cap_action_horizon(base, [0, 1])
+    policy = GrootPolicy(_policy_config(base))
+    write_bytes = Path.write_bytes
+
+    def fail_on_processor_copy(path, data):
+        if path.name == "processor_config.json":
+            raise OSError("No space left on device")
+        return write_bytes(path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_bytes", fail_on_processor_copy)
+        with pytest.raises(OSError, match="No space left"):
+            policy.save_pretrained(tmp_path / "finetune")
+
+    loaded = GrootPolicy.from_pretrained(tmp_path / "finetune")
+    assert loaded._base_config_path == str(base)
+    assert loaded._action_queue_steps == 2
+    assert loaded.config.action_delta_indices == [0, 1]
+
+
+def test_save_does_not_copy_a_file_that_links_out_of_the_checkpoint(tmp_path, caplog):
+    base, finetune = _save_finetune(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"secret": "do not publish"}))
+    (finetune / modeling_groot._BASE_CONFIG_DIR / "processor_config.json").symlink_to(outside)
+
+    with caplog.at_level(logging.WARNING):
+        GrootPolicy.from_pretrained(finetune).save_pretrained(tmp_path / "resaved")
+
+    saved = tmp_path / "resaved" / modeling_groot._BASE_CONFIG_DIR
+    assert sorted(path.name for path in saved.iterdir()) == ["config.json"]
+    assert "links outside" in caplog.text
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+def test_backbone_named_by_the_copies_runs_no_custom_code(tmp_path, subclass):
+    base, finetune = _save_finetune(tmp_path)
+    # A backbone folder whose config asks transformers to run a module that leaves a mark when imported.
+    backbone = shutil.copytree(base.parent / "backbone", tmp_path / "custom_backbone")
+    mark = tmp_path / "custom_code_ran"
+    (backbone / "custom_config.py").write_text(
+        f"from transformers import Qwen3VLConfig\nopen({str(mark)!r}, 'w').close()\n"
+        "class CustomConfig(Qwen3VLConfig):\n    pass\n"
+    )
+    backbone_config = json.loads((backbone / "config.json").read_text())
+    backbone_config["auto_map"] = {"AutoConfig": "custom_config.CustomConfig"}
+    (backbone / "config.json").write_text(json.dumps(backbone_config))
+    copy = finetune / modeling_groot._BASE_CONFIG_DIR / "config.json"
+    copy.write_text(json.dumps({**json.loads(copy.read_text()), "model_name": str(backbone)}))
+
+    class Subclass(GrootPolicy):
+        pass
+
+    (Subclass if subclass else GrootPolicy).from_pretrained(finetune)
+
+    assert not mark.exists()
