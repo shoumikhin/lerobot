@@ -40,7 +40,7 @@ from lerobot.optim.ema import EMA, ConstantEMAConfig
 from lerobot.optim.schedulers import FrozenWarmupConstantSchedulerConfig
 from lerobot.policies import factory
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors
+from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors, modeling_flux3
 from lerobot.policies.flux3.f3 import (
     JointSingleSeq,
     JointSingleSeqParams,
@@ -859,6 +859,38 @@ def test_frozen_components_stay_unregistered_eval_and_follow_device_moves(monkey
     policy.to(torch.float64)
     assert vae_module.weight.dtype == torch.float64  # _apply still moves them along
     assert policy.frozen is frozen
+
+
+def test_parts_are_built_on_the_default_device(monkeypatch):
+    # An export builds the policy under `torch.device(<its device>)`; a part made on the CPU would be copied.
+    devices = {}
+
+    def recorder(name):
+        def build(*args, device, **kwargs):
+            devices[name] = torch.device(device)
+
+        return build
+
+    builders = ("build_action_dit", "load_video_vae", "load_text_encoder")
+    for name in builders:
+        monkeypatch.setattr(modeling_flux3, name, recorder(name))
+    builder = SimpleNamespace(dit_params=None, modality="action", dtype_=torch.float32)
+    with torch.device("meta"):
+        Flux3Policy._build_dit(builder, droid_config())
+        Flux3Policy._build_video_vae(builder, droid_config())
+        Flux3Policy._build_text_encoder(builder, droid_config())
+    assert devices == dict.fromkeys(builders, torch.device("meta"))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_checkpoint_loads_into_the_policy_where_it_was_built(fake_vae, tmp_path):
+    policy = Flux3Policy(droid_config())
+    policy.save_pretrained(tmp_path)
+    policy.to("cuda")
+    # The loader leaves the policy where it was built, whatever device it is given; `from_pretrained` moves it.
+    loaded = Flux3Policy._load_as_safetensor(policy, str(tmp_path / "model.safetensors"), "cpu", True)
+    assert loaded.dit.emb_in["action"].weight.device.type == "cuda"
 
 
 def test_compile_model_wraps_the_inference_dit_forward_only(fake_vae, monkeypatch):
