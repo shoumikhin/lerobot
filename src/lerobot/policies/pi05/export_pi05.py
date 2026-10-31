@@ -47,6 +47,7 @@ from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Program
 from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
     FLOAT32_TOLERANCE,
     ExportRecipe,
     Part,
@@ -131,9 +132,6 @@ EDGE_CASE_TASKS = ("", "!!!", "pick_up_the_cube", "pick up\nthe cube", "  Pick u
 EXTREME_STATE = 1e6
 # Random frames whose prompt is compared with the policy's processor at export, beside the test frame.
 PROMPT_CHECK_FRAMES = 3
-# Ten bfloat16 denoising steps amplify rounding: the LIBERO checkpoint's TensorRT bundle differed from its test
-# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03.
-BFLOAT16_STEPS_TOLERANCE = 0.2
 
 
 class StatePrompt(nn.Module):
