@@ -61,7 +61,14 @@ def export(args: Sequence[str]) -> Path:
     """
     with tempfile.TemporaryDirectory(prefix="lerobot-export-") as requests:
         work = Path(requests)
-        traced = _run_step(work, "trace", {"step": "trace", "args": list(args)})
+        folders = work / "folders.json"
+        try:
+            traced = _run_step(work, "trace", {"step": "trace", "args": list(args), "folders": str(folders)})
+        except BaseException:
+            # A trace step that was killed could not remove the folders it made beside the output folder.
+            for path in json.loads(folders.read_text()) if folders.exists() else []:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
         if traced is None:
             # The command line asked for help, which the trace step printed.
             raise SystemExit(0)

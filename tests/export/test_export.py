@@ -16,8 +16,10 @@
 
 import json
 import platform
+import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -220,7 +222,7 @@ def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
         f"--output_dir={tmp_path / 'b'}",
         "--policy.pretrained_revision=pin123",
     ]
-    worker.trace_step({"step": "trace", "args": args})
+    worker.trace_step({"step": "trace", "args": args, "folders": str(tmp_path / "folders.json")})
     assert seen == ["pin123", "pin123"]
     # Later configs in this process read the command line, so the step gives it back.
     assert sys.argv == argv
@@ -262,6 +264,27 @@ def test_the_compile_step_runs_without_autograd(tmp_path, monkeypatch):
     request = {"backend": {"type": "torch_test"}, "program": str(tmp_path / "part.pt2")}
     worker.compile_step({**request, "path": str(tmp_path / "out.pt2")})
     assert seen == [False]
+
+
+def test_a_killed_trace_step_leaves_no_folders_behind(tmp_path, monkeypatch):
+    made = [tmp_path / ".b-1", tmp_path / ".b-traced-1"]
+
+    def killed_trace(args):
+        request = json.loads(Path(args[-1]).read_text())
+        for folder in made:
+            folder.mkdir()
+        Path(request["folders"]).write_text(json.dumps([str(folder) for folder in made]))
+        return subprocess.CompletedProcess(args, -9)
+
+    monkeypatch.setattr(lerobot_export.subprocess, "run", killed_trace)
+    with pytest.raises(RuntimeError, match="trace step crashed with SIGKILL"):
+        run_export(f"--output_dir={tmp_path / 'b'}")
+    assert not [folder for folder in made if folder.exists()]
+
+
+def test_a_bundle_folder_gets_the_permissions_of_a_new_folder(bundle, tmp_path):
+    (tmp_path / "new").mkdir()
+    assert stat.S_IMODE(bundle.path.stat().st_mode) == stat.S_IMODE((tmp_path / "new").stat().st_mode)
 
 
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
