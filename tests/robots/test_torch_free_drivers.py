@@ -18,7 +18,8 @@ import pytest
 
 from tests.torch_free import assert_runs_without_torch
 
-# Building an SO-101 needs the serial motor packages of the `hardware` extra.
+pytest.importorskip("rustypot", reason="rustypot is required (install lerobot[serial-motors])")
+
 pytestmark = pytest.mark.hardware
 
 
