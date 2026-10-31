@@ -151,7 +151,7 @@ def multi_task_dit_checkpoint(path, **sampler) -> None:
 
     config = MultiTaskDiTConfig(
         input_features={
-            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *FRAME)),
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
         },
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
