@@ -71,6 +71,7 @@ from lerobot.export.recipe import (
 )
 from lerobot.policies import prepare_observation_for_inference
 from lerobot.policies.common.openpi_checkpoint import load_checkpoint_modules
+from lerobot.policies.common.state_prompt import EXTREME_STATE, compact, uniform_bins
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.processor import (
@@ -130,8 +131,6 @@ PROMPT_END = ";\nAction: "
 TASK_TOKEN_MARGIN = 16
 # Tasks whose prompt text is compared with the policy's processor at export, beside the known tasks.
 EDGE_CASE_TASKS = ("", "!!!", "pick_up_the_cube", "pick up\nthe cube", "  Pick up the cube.  ")
-# States far outside the training data, so the prompt check covers the first and last bins.
-EXTREME_STATE = 1e6
 # Random frames whose prompt is compared with the policy's processor at export, beside the test frame.
 PROMPT_CHECK_FRAMES = 3
 # Loading the whole policy peaks at 2.45 times its checkpoint's size, since pi0.5 builds its policy in float32 and
@@ -182,7 +181,6 @@ class StatePrompt(nn.Module):
         self.pad = offset + local[pad_id]
         device = table.device
         self.register_buffer("rows", table.detach()[torch.tensor(ids, device=device)])
-        self.register_buffer("edges", -1 + torch.arange(256, dtype=torch.float32, device=device) / 128)
         self.register_buffer("end", torch.tensor([offset + local[i] for i in end], device=device))
         padded = [[offset + local[i] for i in piece] + [self.pad] * (width - len(piece)) for piece in pieces]
         self.register_buffer("pieces", torch.tensor(padded, device=device))
@@ -199,19 +197,15 @@ class StatePrompt(nn.Module):
 
     def indices(self, state: Tensor, task_length: Tensor) -> tuple[Tensor, Tensor]:
         """Which row each position of the prompt takes, and which positions are not padding."""
-        # np.digitize against 256 equal bins of [-1, 1], as the policy's processor does.
-        bins = (state.flatten()[..., None] >= self.edges).sum(-1) - 1
-        pieces = self.pieces[bins + 1].flatten()
-        valid = (self.piece_positions < self.lengths[bins + 1, None]).flatten()
+        # As the policy's processor bins the state: np.digitize against 256 equal bins of [-1, 1].
+        bins = uniform_bins(state, 256)
+        pieces = self.pieces[bins].flatten()
+        valid = (self.piece_positions < self.lengths[bins, None]).flatten()
         tokens = torch.cat((self.task_positions, pieces, self.end))
         valid = torch.cat(
             (self.task_positions < task_length, valid, torch.ones_like(self.end, dtype=torch.bool))
         )
-        # Each valid token owns one output position; unused task and piece slots own none.
-        compact = (valid.cumsum(0)[:, None] - 1 == self.positions) & valid[:, None]
-        indices = (tokens[:, None] * compact).sum(0)
-        mask = self.positions < valid.sum()
-        return torch.where(mask, indices, self.pad), mask
+        return compact(tokens, valid, self.positions, self.pad)
 
     def token_ids(self, state: Tensor, task_ids: list[int]) -> list[int]:
         """The token ids of the prompt's valid positions, as `forward` places their rows."""
