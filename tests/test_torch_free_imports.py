@@ -82,6 +82,7 @@ NEEDS_DATASETS = [
         "lerobot.scripts.lerobot_setup_can",
         "lerobot.scripts.lerobot_setup_motors",
         "lerobot.scripts.lerobot_teleoperate",
+        "lerobot.scripts.lerobot_policy_server",
         "lerobot.configs",
         "lerobot.policies",
         "lerobot.policies.rtc",

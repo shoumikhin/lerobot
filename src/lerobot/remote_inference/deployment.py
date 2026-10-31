@@ -14,6 +14,8 @@
 
 """Load, pin and warm one operator-described deployment before it is served."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -23,23 +25,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
-import torch
 from huggingface_hub import snapshot_download
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import Bundle, is_bundle
 from lerobot.configs import PreTrainedConfig
-from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
-from lerobot.policies import PreTrainedPolicy, get_policy_class, make_pre_post_processors
-from lerobot.policies.factory import has_peft_adapter_config
-from lerobot.processor import RenderRuntimeMessagesStep
-from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot
+from lerobot.utils.import_utils import register_third_party_plugins, require_package
 
 from .bundle import BundleRunner
 from .configs import ServerConfig
 
-if TYPE_CHECKING or _peft_available:
-    from peft import PeftConfig, PeftModel
+if TYPE_CHECKING:
+    from lerobot.inference import PolicyRunner
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +103,8 @@ def _subtask_prompt_unavailable_reason(runner: PolicyRunner) -> str | None:
     Custom language processors still need to pass normal next-subtask warmup.
     The protocol's language flag describes text generation, not every prompt kind.
     """
+    from lerobot.processor import RenderRuntimeMessagesStep
+
     if runner.language_processors is None:
         return None
     for step in runner.language_processors[0].steps:
@@ -176,6 +176,15 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner | BundleRunner, str
     path = resolve_artifact(cfg.model.repo_or_path, cfg.model.revision)
     if is_bundle(path):
         return _load_bundle(cfg, path, action_feature)
+    # A checkpoint runs in PyTorch, which a server of a bundle never imports. Its policy may come from a plugin,
+    # and plugins may import PyTorch too.
+    register_third_party_plugins()
+    import torch
+
+    from lerobot.inference import PolicyRunner
+    from lerobot.policies import PreTrainedPolicy, get_policy_class, make_pre_post_processors
+    from lerobot.policies.factory import has_peft_adapter_config
+
     artifacts = {"checkpoint": path}
     policy_cfg = PreTrainedConfig.from_pretrained(path)
     execution_steps = cfg.execution.n_action_steps
@@ -202,6 +211,8 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner | BundleRunner, str
     # A `use_peft=True` config can still point at a base model (see `has_peft_adapter_config`).
     if policy_cfg.use_peft and has_peft_adapter_config(path):
         require_package("peft", extra="peft")
+        from peft import PeftConfig, PeftModel
+
         adapter = PeftConfig.from_pretrained(str(path))
         base = resolve_artifact(adapter.base_model_name_or_path, adapter.revision)
         artifacts["base"] = base

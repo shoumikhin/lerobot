@@ -31,7 +31,7 @@ from lerobot.remote_inference import (
     load_deployment,
 )
 from lerobot.transport import ZenohTransport
-from lerobot.utils import init_logging, register_third_party_plugins
+from lerobot.utils import init_logging
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,7 @@ def serve(cfg: ServerConfig) -> None:
 
 
 def main() -> None:
-    """Register optional policy plugins and parse the server CLI."""
-    register_third_party_plugins()
+    """Parse the server CLI. Policy plugins load with a checkpoint, never with a bundle."""
     cast(Callable[[], None], serve)()
 
 

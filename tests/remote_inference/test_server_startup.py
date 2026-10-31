@@ -24,8 +24,8 @@ from types import SimpleNamespace
 import pytest
 
 from lerobot.inference import FeatureSpec
+from lerobot.policies import factory
 from lerobot.processor import RenderRuntimeMessagesStep
-from lerobot.remote_inference import deployment as serving
 from lerobot.remote_inference.configs import ExecutionConfig, LanguageConfig, ModelConfig, ServerConfig
 from lerobot.remote_inference.deployment import artifact_identity, load_deployment
 from lerobot.remote_inference.protocol import ErrorCode, MessageType
@@ -58,7 +58,7 @@ def _language_deployment(tmp_path, monkeypatch, *, recipe_kind="none"):
 
     monkeypatch.setattr(policy, "generate_text", generate_text)
     monkeypatch.setattr(
-        serving,
+        factory,
         "get_policy_class",
         lambda _: SimpleNamespace(from_pretrained=lambda *args, **kwargs: policy),
     )

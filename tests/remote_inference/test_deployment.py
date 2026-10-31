@@ -15,6 +15,7 @@
 """Deployment mode selection and portable artifact pins, without remote services."""
 
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from shutil import copytree
@@ -24,6 +25,7 @@ import pytest
 import torch
 
 from lerobot.inference import ExecutionMode, FeatureSpec
+from lerobot.policies import factory
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.remote_inference import deployment as serving
@@ -68,6 +70,21 @@ def test_server_loads_saved_act_and_processors_warms_and_resets(deployment):
     assert debug_identity == identity, "console verbosity must not invalidate a pinned artifact"
 
 
+def test_a_checkpoint_loads_the_installed_policy_plugins(deployment, monkeypatch, tmp_path):
+    # The command no longer loads plugins, so a checkpoint whose policy comes from one relies on this.
+    (tmp_path / "lerobot_policy_marker-1.0.dist-info").mkdir()
+    (tmp_path / "lerobot_policy_marker-1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: lerobot_policy_marker\nVersion: 1.0\n"
+    )
+    (tmp_path / "lerobot_policy_marker.py").write_text("")
+    monkeypatch.syspath_prepend(tmp_path)
+    try:
+        serving.load_deployment(deployment)
+        assert "lerobot_policy_marker" in sys.modules
+    finally:
+        sys.modules.pop("lerobot_policy_marker", None)
+
+
 def test_identical_checkpoint_pin_survives_host_path_and_transport_changes(deployment, tmp_path):
     _, original = serving.load_deployment(deployment)
     destination = tmp_path / "other-host-cache" / "checkpoint"
@@ -107,7 +124,7 @@ def test_requested_rtc_is_attached_without_a_saved_dataclass_field(deployment, m
         return ConformingPolicy(config)
 
     monkeypatch.setattr(
-        serving, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
+        factory, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
     )
     requested = replace(
         deployment,
@@ -172,7 +189,7 @@ def test_slice_override_is_restricted_to_plain_chunks(deployment):
 
 
 def test_oversized_slice_fails_before_loading_weights(deployment, monkeypatch):
-    monkeypatch.setattr(serving, "get_policy_class", lambda name: pytest.fail("must not load policy"))
+    monkeypatch.setattr(factory, "get_policy_class", lambda name: pytest.fail("must not load policy"))
     with pytest.raises(ValueError, match="prediction horizon"):
         serving.load_deployment(
             replace(deployment, execution=replace(deployment.execution, n_action_steps=9))
@@ -185,7 +202,7 @@ def test_native_loader_cannot_silently_replace_requested_slice(deployment, monke
         return ConformingPolicy(config)
 
     monkeypatch.setattr(
-        serving, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
+        factory, "get_policy_class", lambda name: SimpleNamespace(from_pretrained=load_policy)
     )
     with pytest.raises(ValueError, match="does not honor"):
         serving.load_deployment(

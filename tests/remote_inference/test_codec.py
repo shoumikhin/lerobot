@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import types
 from dataclasses import replace
 
 import numpy as np
@@ -71,6 +73,15 @@ def test_nested_torch_and_scalars():
     actual = decode_message(encode_message(message(body))).body
     np.testing.assert_array_equal(actual["features"]["state"], np.arange(6))
     assert actual["scalar"] == 1.5
+    assert actual["task"] == "move"
+
+
+def test_values_encode_while_another_thread_still_imports_torch(monkeypatch):
+    # The import puts the module in sys.modules before it defines `Tensor`.
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    body = {"state": np.arange(3, dtype=np.float32), "task": "move"}
+    actual = decode_message(encode_message(message(body))).body
+    np.testing.assert_array_equal(actual["state"], np.arange(3))
     assert actual["task"] == "move"
 
 

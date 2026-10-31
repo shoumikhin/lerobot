@@ -29,11 +29,10 @@ from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
-import torch
 
 from lerobot import __version__
 from lerobot.inference import (
@@ -42,7 +41,6 @@ from lerobot.inference import (
     ExecutionMode,
     FeatureSpec,
     ObservationSnapshot,
-    PolicyRunner,
     QueryKind,
 )
 from lerobot.transport import (
@@ -53,7 +51,6 @@ from lerobot.transport import (
     ZenohTransport,
 )
 
-from .bundle import BundleRunner
 from .chunk_contract import (
     CHUNK_ALIGNMENT,
     RTC_MODEL_SPACE,
@@ -72,6 +69,13 @@ from .protocol import (
     instance_prefix,
     session_prefix,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from lerobot.inference import PolicyRunner
+
+    from .bundle import BundleRunner
 
 logger = logging.getLogger(__name__)
 
@@ -613,7 +617,12 @@ class SessionWorker:
 
         def tensor(name: str) -> torch.Tensor | None:
             value = body.get(name)
-            return None if value is None else torch.from_numpy(value.copy())
+            # Only RTC reads a continuation, and only a checkpoint serves RTC.
+            if value is None or session.mode is ExecutionMode.CHUNK:
+                return None
+            import torch
+
+            return torch.from_numpy(value.copy())
 
         chunk = self.runner.predict(
             observation,

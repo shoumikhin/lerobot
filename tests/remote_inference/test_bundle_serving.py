@@ -34,21 +34,29 @@ from lerobot.transport.zenoh import ZenohConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.numpy_bundle import make_numpy_bundle
 from tests.remote_inference.network_helpers import free_port
+from tests.test_torch_free_imports import BLOCK_TORCH
 
 REPO = Path(__file__).parents[2]
 SEMANTICS = "test-units-v1"
 MOTORS = ("motor_1.pos", "motor_2.pos", "motor_3.pos")
 STATE = np.array([1.0, 2.0, 3.0], np.float32)
 
-# `lerobot-policy-server --config_path=argv[1]`.
-SERVE = """
-import sys
+# `lerobot-policy-server --config_path=argv[1]` in a process that refuses torch, with the policy plugin in
+# argv[2] installed: a server of a bundle loads neither.
+SERVE = (
+    BLOCK_TORCH
+    + """
+sys.path.insert(0, sys.argv[2])
+sys.argv = ["lerobot-policy-server", f"--config_path={sys.argv[1]}"]
 
 from lerobot.scripts import lerobot_policy_server
 
-sys.argv = ["lerobot-policy-server", f"--config_path={sys.argv[1]}"]
 lerobot_policy_server.main()
+if attempts:
+    sys.exit(attempts[0])
+assert "torch" not in sys.modules
 """
+)
 
 # `lerobot-rollout --inference.type=remote` on a mock robot, against the server at argv[1].
 REMOTE_ROLLOUT = f"""
@@ -194,18 +202,25 @@ def test_a_bundle_refuses_a_contract_it_cannot_serve(bundle, changes, message):
         load_deployment(server_config(bundle, **changes))
 
 
-def test_remote_rollout_plays_the_chunks_of_a_served_bundle(bundle, tmp_path):
-    """A robot client drives a mock robot with the chunks of a bundle that the server runs."""
+def test_remote_rollout_plays_the_chunks_of_a_bundle_served_without_torch(bundle, tmp_path):
+    """A robot client drives a mock robot with the chunks of a bundle that a server without torch runs."""
     pytest.importorskip("zenoh")
     pytest.importorskip("msgpack")
     endpoint = f"tcp/127.0.0.1:{free_port()}"
     config = tmp_path / "server.json"
     served = server_config(bundle, zenoh=ZenohConfig(listen_endpoints=[endpoint]))
     config.write_text(json.dumps(draccus.encode(served)))
+    # An installed policy plugin, which imports torch as policy plugins do.
+    plugins = tmp_path / "plugins"
+    (plugins / "lerobot_policy_needs_torch-1.0.dist-info").mkdir(parents=True)
+    (plugins / "lerobot_policy_needs_torch-1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: lerobot_policy_needs_torch\nVersion: 1.0\n"
+    )
+    (plugins / "lerobot_policy_needs_torch.py").write_text("import torch\n")
     log = tmp_path / "server.log"
     with log.open("w") as output:
         server = subprocess.Popen(
-            [sys.executable, "-c", SERVE, str(config)],
+            [sys.executable, "-c", SERVE, str(config), str(plugins)],
             stdout=output,
             stderr=subprocess.STDOUT,
             cwd=REPO,
