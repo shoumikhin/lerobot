@@ -25,5 +25,6 @@ import pytest
 
 def use_plugins(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
     """Let the export's steps, which run in processes of their own, find the test plugins `names`."""
-    paths = [str(Path(__file__).parent / name) for name in names]
+    # The plugins import from `tests`, and so does a test bundle's check, which skips the current folder.
+    paths = [str(Path(__file__).parents[3]), *(str(Path(__file__).parent / name) for name in names)]
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [*paths, os.environ.get("PYTHONPATH")])))
