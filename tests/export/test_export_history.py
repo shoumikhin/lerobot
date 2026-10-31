@@ -224,7 +224,8 @@ def checkpoint(request, tmp_path_factory):
 
 
 def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
-    """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws."""
+    """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws, in
+    normalized action units."""
     policy = get_policy_class(PreTrainedConfig.from_pretrained(checkpoint).type).from_pretrained(checkpoint)
     reference = SyncInferenceEngine(
         policy,
@@ -241,6 +242,7 @@ def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
     monkeypatch.setattr(
         np.random, "standard_normal", lambda shape: draws.append(standard_normal(shape)) or draws[-1]
     )
+    scale = np.asarray(bundle.manifest.action_scale, dtype=np.float32)
     rng = np.random.default_rng(0)
     differences = []
     for _ in range(TICKS):
@@ -257,7 +259,7 @@ def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
             with ReplayDraws(noise) as replay:
                 expected = reference.get_action(dict(frame))
             assert len(replay.shapes) == len(noise)
-        differences.append(float(np.abs(actual - expected.numpy()).max()))
+        differences.append(float((np.abs(actual - expected.numpy()) / scale).max()))
     return differences
 
 
@@ -275,8 +277,8 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(checkpoint, tmp_pa
     bundle = Bundle.read(tmp_path / "b")
     steps = PreTrainedConfig.from_pretrained(checkpoint).n_obs_steps
     assert bundle.manifest.history == {IMAGE: steps, OBS_STATE: steps}
-    # A compiled backend sums in another order than PyTorch, so a few float32 ulps of drift are expected.
-    assert max(play(checkpoint, bundle, monkeypatch)) < 1e-5
+    # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
+    assert max(play(checkpoint, bundle, monkeypatch)) <= bundle.manifest.tolerance
 
 
 @DIFFUSERS
