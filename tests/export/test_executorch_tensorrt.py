@@ -23,13 +23,15 @@ import pytest
 import torch
 from torch import nn
 
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.utils.import_utils import is_package_available
 
 needs_tensorrt = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not is_package_available("torch_tensorrt")
-    or not is_package_available("executorch"),
-    reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
+    or not is_package_available("executorch")
+    or not tensorrt_takes_the_plugin_setting(),
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
 )
 
 # Loads the program the way a bundle does, in a process without PyTorch.
