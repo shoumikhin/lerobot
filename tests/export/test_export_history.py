@@ -56,17 +56,6 @@ BACKENDS = [
             reason="needs ExecuTorch and PyTorch 2.15",
         ),
     ),
-    pytest.param(
-        "executorch_tensorrt",
-        marks=pytest.mark.skipif(
-            not (
-                torch.cuda.is_available()
-                and is_package_available("torch_tensorrt")
-                and is_package_available("executorch")
-            ),
-            reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
-        ),
-    ),
 ]
 
 
@@ -374,3 +363,26 @@ def test_the_parts_are_held_to_the_export_tolerance(tmp_path, monkeypatch, offse
     else:
         with pytest.raises(ValueError, match="compute another chunk"):
             worker.trace_step(request)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and is_package_available("torch_tensorrt")
+        and is_package_available("executorch")
+    ),
+    reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
+)
+def test_a_tensorrt_bundle_passes_its_check(checkpoint, tmp_path):
+    """A GPU bundle draws its noise on the GPU, where the PyTorch policy cannot replay it, so the export's own check
+    of the test case, made with the recorded noise, is the comparison."""
+    export(
+        [
+            "--backend.type=executorch_tensorrt",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={tmp_path / 'b'}",
+            "--task=pick up the cube",
+        ]
+    )
+    steps = PreTrainedConfig.from_pretrained(checkpoint).n_obs_steps
+    assert Bundle.read(tmp_path / "b").manifest.history == {IMAGE: steps, OBS_STATE: steps}
