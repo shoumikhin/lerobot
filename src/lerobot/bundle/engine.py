@@ -124,6 +124,7 @@ class BundleEngine:
                 )
             frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
         self._frame_spec = {name: value.shape for name, value in frames[-1].items()}
+        self._frame_dtypes = {name: str(value.dtype) for name, value in frames[-1].items()}
         if unknown := sorted(set(manifest.history) - set(self._frame_spec)):
             raise ValueError(
                 f"The bundle keeps the history of {unknown}, which its frame does not hold. Export the policy "
@@ -152,10 +153,9 @@ class BundleEngine:
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
         self._placed = self._place(self._constants)
         self._check(frames, noise, expected, manifest.tolerance)
-        # The task stays the same for the whole run, so its values are placed once too, after the test case
-        # ran its own task.
-        for placed, task_placed in zip(self._placed, self._place(self._task_values), strict=True):
-            placed.update(task_placed)
+        self.chunk_length = len(expected)
+        # Placed once, after the test case ran its own task.
+        self.set_task(task)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_robot(self, observation_shapes: Mapping[str, tuple[int, ...]], action_names: list[str]) -> None:
@@ -179,7 +179,11 @@ class BundleEngine:
             for name, shape in self._frame_spec.items()
             if shapes.get(name) != shape
         ]
-        hint = " Use --rename_map to map the robot's names to the bundle's." if problems else ""
+        hint = (
+            " Give the robot's observations the bundle's names (lerobot-rollout takes --rename_map)."
+            if problems
+            else ""
+        )
         if self._action_names is not None and list(action_names) != self._action_names:
             problems.append(f"the actions {self._action_names} (the robot takes {list(action_names)})")
         elif len(action_names) != len(self._scale):
@@ -295,6 +299,29 @@ class BundleEngine:
 
     def record_dispatch(self) -> None:
         """Inline inference has nothing to do when an action reaches the robot."""
+
+    @property
+    def frame_dtypes(self) -> dict[str, str]:
+        """The observations the bundle reads, by the bundle's names, with the dtype its programs take."""
+        return dict(self._frame_dtypes)
+
+    def set_task(self, task: str) -> None:
+        """Run `task` from the next chunk on. A bundle without `task_tokens` runs only its own task."""
+        self._check_task(task)
+        self._task_values = self._encode(task)
+        for placed, task_placed in zip(self._placed, self._place(self._task_values), strict=True):
+            placed.update(task_placed)
+        self.task = task
+
+    def predict_chunk(self, obs_frame: Mapping[str, np.ndarray]) -> np.ndarray:
+        """Run the programs once on a frame of the robot and return the whole chunk of actions.
+
+        For a caller that plays the chunk itself, such as a policy server. A bundle with `history` takes each
+        call as one control tick.
+        """
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
+        return self._run_chunk(frame, self._task_values)
 
     def reset(self) -> None:
         """Drop the queued actions and the past frames."""
