@@ -592,7 +592,7 @@ class Flux3Policy(PreTrainedPolicy):
         dit = self._inference_dit()
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
-            t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
+            t = t / 1000.0 if isinstance(t, int) else float(t)
             timesteps = {
                 "x_video_timesteps": torch.full((1, samples["x_video"].shape[1]), t, device=device),
                 f"{ak}_timesteps": torch.full((1, cfg.chunk_size), t, device=device),
@@ -614,9 +614,8 @@ class Flux3Policy(PreTrainedPolicy):
             return {k: v.float() for k, v in pred.items()}
 
         if cfg.sampler == "cosmos_unipc":
-            if is_non_strict_exporting():
-                raise RuntimeError('torch.export of flux3 works only with sampler="euler", not cosmos_unipc.')
-            self._euler_timesteps()  # keep the Euler grid current, so switching to Euler before export works
+            if not is_non_strict_exporting():
+                self._euler_timesteps()  # keep the Euler grid current, so switching to Euler before export works
             out = sampling.cosmos_unipc_order2(
                 flow, predict, n_steps=cfg.num_inference_steps, shift=cfg.sampler_shift
             )
@@ -638,10 +637,10 @@ class Flux3Policy(PreTrainedPolicy):
         ``noise`` is the starting action sample ``(B, action_dim, chunk_size)`` and ``video_noise`` the
         starting video latent ``(B, 96, n_pred, *latent_hw)``, where ``n_pred`` is the number of predicted
         latent frames. When None, each is drawn from a CPU generator seeded with ``inference_seed``.
-        torch.export needs both, so the exported program takes its noise as inputs. It also needs
-        ``sampler="euler"``, and one eager prediction with the task, after the last ``.to()`` or dtype cast,
-        so the text context is cached instead of traced. That context becomes a constant of the exported
-        program, so each program serves only the task it was exported with.
+        torch.export needs both, so the exported program takes its noise as inputs. It also needs one eager
+        prediction with the task, after the last ``.to()`` or dtype cast, so the text context is cached instead
+        of traced. That context becomes a constant of the exported program, so each program serves only the
+        task it was exported with.
         """
         if kwargs:
             raise NotImplementedError("flux3 does not implement RTC inference arguments yet")

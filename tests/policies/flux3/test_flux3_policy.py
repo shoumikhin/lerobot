@@ -430,15 +430,14 @@ def test_timestep_sampler_and_augmentation():
 
 def test_cosmos_unipc_schedule_and_solver():
     sigmas, ticks = sampling.cosmos_unipc_schedule(4, 5.0)
-    assert ticks.tolist() == [999, 937, 833, 624]
+    assert ticks == [999, 937, 833, 624]
     assert sigmas.shape == (5,) and sigmas[-1] == 0 and sigmas[0] > 0.999
     x0 = {"x_video": torch.randn(1, 6, 2), "x_a": torch.randn(1, 3, 2)}
     torch.manual_seed(0)
     samples = {k: torch.randn_like(v) for k, v in x0.items()}
-    tick_list = ticks.tolist()
 
     def predict(s, tick):  # a perfect velocity model of one sample
-        sigma = sigmas[tick_list.index(int(tick))]
+        sigma = sigmas[ticks.index(tick)]
         return {k: (s[k] - x0[k]) / sigma for k in s}
 
     out = sampling.cosmos_unipc_order2(samples, predict, n_steps=4, shift=5.0)
@@ -762,10 +761,11 @@ def test_exported_policy_takes_its_noise_as_inputs_and_leaves_eager_inference_in
         torch.export.export(model, (images, state), kwargs=noise, strict=False)
     expected = Predict(twin)(images, state, **noise)
     assert torch.equal(model(images, state, **noise), expected)
-    policy.config.sampler = "cosmos_unipc"
-    with pytest.raises(RuntimeError, match='only with sampler="euler"'):
-        torch.export.export(model, (images, state), kwargs=noise, strict=False)
-    policy.config.sampler = "euler"
+    # The default Cosmos UniPC sampler exports too.
+    policy.config.sampler = twin.config.sampler = "cosmos_unipc"
+    unipc = torch.export.export(model, (images, state), kwargs=noise, strict=False).module()
+    assert torch.equal(unipc(images, state, **noise), Predict(twin)(images, state, **noise))
+    policy.config.sampler = twin.config.sampler = "euler"
     exported = torch.export.export(model, (images, state), kwargs=noise, strict=False).module()
     assert torch.equal(exported(images, state, **noise), expected)
     assert torch.equal(exported(images, state, **noise), expected)
