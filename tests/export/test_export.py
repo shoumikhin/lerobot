@@ -383,6 +383,14 @@ def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypat
     second = np.stack([engine.get_action(dict(frame)) for _ in range(4)])
     assert not np.array_equal(first, second)
     assert placed[loaded:] == [(32, 32, 3), (3,)] * 2
+    # The policy samples from a standard normal, so the noise program must too.
+    files = bundle.manifest.programs[NOISE]
+    noise = ExecuTorchProgram(
+        bundle.path / files.file, None if files.data is None else bundle.path / files.data
+    )
+    count = 4000 // int(np.prod(bundle.manifest.noise_shape)) + 1
+    draws = np.concatenate([noise.to_numpy(noise()[0]).ravel() for _ in range(count)])
+    assert abs(draws.mean()) < 0.1 and abs(draws.std() - 1) < 0.1
 
 
 @pytest.mark.skipif(
