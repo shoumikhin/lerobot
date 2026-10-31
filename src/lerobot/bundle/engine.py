@@ -20,6 +20,7 @@ Like the rest of `lerobot.bundle`, this imports no PyTorch.
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from collections.abc import Mapping
 from threading import Event
@@ -29,6 +30,7 @@ import numpy as np
 from safetensors.numpy import load_file
 
 from lerobot.utils.constants import ACTION
+from lerobot.utils.latency import LatencyWindow
 
 from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
 from .runtime import prepare_runtime
@@ -46,7 +48,8 @@ class BundleEngine:
     Before it runs, it replays the bundle's test case and refuses to start if the actions differ from the ones
     PyTorch computed by more than the bundle's tolerance. It is an
     [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the same
-    helpers as `lerobot-rollout`.
+    helpers as `lerobot-rollout`, and like `SyncInferenceEngine` it times each run of its programs in
+    `latency` for the status log.
 
     Args:
         bundle (`Bundle`):
@@ -90,6 +93,7 @@ class BundleEngine:
             )
         self._rename = rename_map or {}
         self._actions: deque[np.ndarray] = deque()
+        self.latency = LatencyWindow()
         case = load_file(bundle.path / manifest.test_case)
         expected = case.pop(ACTION, None)
         noise = case.pop(NOISE, None)
@@ -305,7 +309,10 @@ class BundleEngine:
         frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
         self._observe(frame)
         if not self._actions:
+            started = time.monotonic()
             self._actions.extend(self._run_chunk(frame, self._task_values))
+            completed = time.monotonic()
+            self.latency.record(completed - started, completed)
         return self._actions.popleft()
 
 
