@@ -613,7 +613,7 @@ class Flux3Policy(PreTrainedPolicy):
         dit = self._inference_dit()
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
-            t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
+            t = t / 1000.0 if isinstance(t, int) else float(t)
             timesteps = {
                 "x_video_timesteps": torch.full((1, samples["x_video"].shape[1]), t, device=device),
                 f"{ak}_timesteps": torch.full((1, cfg.chunk_size), t, device=device),
