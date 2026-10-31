@@ -102,3 +102,18 @@ def test_attention_block_exports(frames):
     x = torch.randn(1, frames, 5, 6, 32)
     program = torch.export.export(block, (x,))
     torch.testing.assert_close(program.module()(x), block(x))
+
+
+def test_natten_backend_reaches_its_kernel(monkeypatch):
+    calls = []
+
+    def na3d(q, k, v, **kwargs):  # stands in for NATTEN's kernel and records how it is called
+        calls.append(kwargs)
+        return v
+
+    monkeypatch.setattr(video_vae, "_natten_available", True)
+    monkeypatch.setattr(video_vae, "na3d", na3d, raising=False)
+    monkeypatch.setattr(video_vae, "_natten_backends", {})
+    monkeypatch.setenv("F3_NATTEN_BACKEND", "flex-fna")
+    Natten3D(16, [3, 3, 3], 2)(torch.randn(1, 3, 4, 4, 16))
+    assert calls[0]["backend"] == "flex-fna"
