@@ -110,7 +110,7 @@ def scheduler_schedule(scheduler: Any) -> Schedule:
             current_alpha_t = alpha_prod_t / alpha_prod_t_prev
             current_beta_t = 1 - current_alpha_t
             # DDPM adds no noise at the last timestep, 0.
-            spread = scheduler._get_variance(t) ** 0.5 if t > 0 else torch.zeros(())
+            spread = scheduler._get_variance(t) ** 0.5 if t > 0 else torch.zeros_like(alpha_prod_t)
             noise_index.append(draw if t > 0 else 0)
             draw += t > 0
             values = (
@@ -121,7 +121,8 @@ def scheduler_schedule(scheduler: Any) -> Schedule:
                 spread,
             )
             timesteps.append(np.array([t], np.int64))
-            coefficients.append(torch.stack(values).float().numpy())
+            # A policy built on a GPU keeps its scheduler's tensors there.
+            coefficients.append(torch.stack(values).float().cpu().numpy())
         return Schedule(DDPM, timesteps, coefficients, noise_index, config.prediction_type, clip)
     if isinstance(scheduler, DDIMScheduler):
         for t in scheduler.timesteps.tolist():
@@ -138,7 +139,7 @@ def scheduler_schedule(scheduler: Any) -> Schedule:
                 (1 - alpha_prod_t_prev) ** 0.5,
             )
             timesteps.append(np.array([t], np.int64))
-            coefficients.append(torch.stack(roots).float().numpy())
+            coefficients.append(torch.stack(roots).float().cpu().numpy())
         return Schedule(DDIM, timesteps, coefficients, None, config.prediction_type, clip)
     raise ValueError(f"A {type(scheduler).__name__} cannot be exported; DDPM and DDIM can.")
 

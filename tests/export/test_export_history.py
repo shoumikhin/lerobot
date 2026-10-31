@@ -304,6 +304,26 @@ def test_diffusion_runs_its_denoising_step_once_per_timestep(tmp_path):
 
 
 @DIFFUSERS
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+@pytest.mark.parametrize("kind", ["DDPMScheduler", "DDIMScheduler"])
+def test_a_schedule_reads_a_scheduler_built_on_the_gpu(kind):
+    import diffusers
+
+    from lerobot.policies.common.export_denoising import scheduler_schedule
+
+    schedules = []
+    # An export builds the policy, and so its scheduler, on its device.
+    for device in ("cpu", "cuda"):
+        with torch.device(device):
+            scheduler = getattr(diffusers, kind)(num_train_timesteps=10)
+        scheduler.set_timesteps(10)
+        schedules.append(scheduler_schedule(scheduler))
+    cpu, gpu = schedules
+    np.testing.assert_allclose(np.stack(gpu.coefficients), np.stack(cpu.coefficients), rtol=1e-6)
+
+
+@DIFFUSERS
 @pytest.mark.parametrize(
     ("change", "error"),
     [
