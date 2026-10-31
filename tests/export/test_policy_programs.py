@@ -87,6 +87,14 @@ RECIPES = {
         state=[-2.0, -0.95, 1.0],
         bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
     ),
+    # Bins -1, 0 and 511: numbers of two, one and three tokens, so the padding before the prompt changes.
+    "wall_oss_05": Recipe(
+        "tests.policies.wall_oss_05.export_stand_in",
+        ("tmp_path",),
+        state=[-2.0, -0.999, 1.0],
+        cuda=True,
+        bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
+    ),
 }
 
 
@@ -139,6 +147,13 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
             "does not hold the state's numbers once",
             id="fineart_vla-tokenizer",
         ),
+        pytest.param(
+            "wall_oss_05",
+            {"split_words": False},
+            "does not hold the state's numbers once",
+            id="wall_oss_05-tokenizer",
+        ),
+        pytest.param("wall_oss_05", {"size": 224}, "long side is 448 pixels", id="wall_oss_05-camera"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
