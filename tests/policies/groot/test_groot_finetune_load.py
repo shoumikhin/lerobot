@@ -149,10 +149,10 @@ def _overwrite_weights_in_file(path):
         file.write(bytes(path.stat().st_size - 8 - header_size))
 
 
-def _load_regular(finetune, monkeypatch, policy_cls=GrootPolicy):
+def _load_regular(finetune, monkeypatch, policy_cls=GrootPolicy, **kwargs):
     with monkeypatch.context() as patch:
         patch.setattr(GrootPolicy, "_build_groot_model_from_checkpoint", classmethod(lambda cls, *args: None))
-        return policy_cls.from_pretrained(finetune)
+        return policy_cls.from_pretrained(finetune, **kwargs)
 
 
 def _record_builds(monkeypatch):
@@ -418,15 +418,21 @@ CHOSEN_MODULES = [
 ]
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_chosen_modules_load_as_in_the_full_load(tmp_path, monkeypatch, dtype):
-    base, finetune = _save_finetune(tmp_path, dtype=dtype)
-    full = _load_regular(finetune, monkeypatch)
+@pytest.mark.parametrize("saved", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("loaded_as", [torch.float32, torch.bfloat16])
+def test_chosen_modules_load_as_in_the_full_load(tmp_path, monkeypatch, saved, loaded_as):
+    base, finetune = _save_finetune(tmp_path, dtype=saved)
+
+    def config():
+        config = GrootConfig.from_pretrained(finetune)
+        # A checkpoint can load in another dtype than it was saved in, as an export to bfloat16 does.
+        config.dtype = loaded_as
+        return config
+
+    full = _load_regular(finetune, monkeypatch, config=config())
 
     (base / "model.safetensors").unlink()
-    policy = GrootPolicy.load_checkpoint_modules(
-        finetune, GrootConfig.from_pretrained(finetune), CHOSEN_MODULES
-    )
+    policy = GrootPolicy.load_checkpoint_modules(finetune, config(), CHOSEN_MODULES)
 
     assert not policy.training
     for name in CHOSEN_MODULES:

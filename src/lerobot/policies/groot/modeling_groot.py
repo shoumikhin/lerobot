@@ -265,7 +265,8 @@ class GrootPolicy(PreTrainedPolicy):
             )
         base_config_path = cls._find_base_config_path(model_id, config, revision=revision)
         with parameters_on_meta():
-            model = GR00TN17(
+            # Built in the dtypes `from_pretrained` gives the base model, as the regular load builds it.
+            model = GR00TN17._from_config(
                 GR00TN17Config.from_pretrained(base_config_path, **cls._groot_config_overrides(config)),
                 load_backbone_weights=False,
             )
@@ -275,13 +276,14 @@ class GrootPolicy(PreTrainedPolicy):
         tied = {lm_head: embedding, embedding: lm_head}
         with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
             keys = set(checkpoint.keys())
-        # As the regular load: a float32 policy casts every weight to float32, else each keeps the file's.
-        dtype = torch.float32 if config.dtype == torch.float32 else None
-        sources = {}
-        for name in policy.state_dict(keep_vars=True):
+        cast = config.dtype == torch.float32
+        sources: dict[str, tuple[str, torch.dtype]] = {}
+        for name, target in policy.state_dict(keep_vars=True).items():
             key = name if name in keys else tied.get(name)
-            if name.startswith(prefixes) and key in keys:
-                sources[name] = (key, dtype)
+            if name.startswith(prefixes) and key is not None and key in keys:
+                # As the regular load, which casts a float32 policy's parameters to float32 after building it.
+                float32 = cast and isinstance(target, torch.nn.Parameter) and target.is_floating_point()
+                sources[name] = (key, torch.float32 if float32 else target.dtype)
         return load_modules(policy, model_file, modules, sources, config.device)
 
     @staticmethod
