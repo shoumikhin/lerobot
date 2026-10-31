@@ -25,6 +25,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -73,25 +74,29 @@ class _DrawNoise(torch.nn.Module):
 def trace_step(request: dict[str, Any]) -> dict[str, Any]:
     """Parse the command line `request["args"]`, trace and save each part, and write the rest of the bundle.
 
-    The bundle goes into a new folder beside the output folder. Returns that folder, its manifest, and what is
-    left to compile.
+    The bundle goes into a new folder beside the output folder. The file `request["folders"]` names the folders
+    the step made there. Returns that folder, its manifest, and what is left to compile.
     """
     argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
     sys.argv = ["lerobot-export", *request["args"]]
     try:
-        return cast(Callable[[], dict[str, Any]], _trace)()
+        return cast(Callable[[dict[str, Any]], dict[str, Any]], _trace)(request)
     finally:
         sys.argv = argv
 
 
 @parser.wrap()
-def _trace(cfg: ExportConfig) -> dict[str, Any]:
+def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
     output_dir = cast(Path, cfg.output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    folder = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
+    # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
+    folder = output_dir.parent / f".{output_dir.name}-{uuid.uuid4().hex[:8]}"
+    folder.mkdir()
     # The traced parts wait here, beside the bundle, until they are compiled.
     traced = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-traced-", dir=output_dir.parent))
+    # Named before anything goes into them, so that lerobot-export removes them if this process is killed.
+    Path(request["folders"]).write_text(json.dumps([str(folder), str(traced)]))
     try:
         recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
         programs: dict[str, ProgramFiles] = {}
