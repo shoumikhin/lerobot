@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..configs import ExportBackendConfig
 
@@ -37,7 +37,7 @@ class ExecuTorchConfig(ExportBackendConfig):
     runtime = "executorch"
     file_suffix = ".pte"
     runtime_modules = ("executorch",)
-    packages = (EXECUTORCH,)
+    packages: ClassVar[tuple[str, ...]] = (EXECUTORCH,)
     min_torch = "2.15"
     torch_overrides = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
 
