@@ -299,6 +299,7 @@ Export on the Orin Nano itself, because a TensorRT engine runs only on the GPU m
 ```bash
 lerobot-export \
     --policy.path=<user>/<pi05_checkpoint> \
+    --policy.dtype=bfloat16 \
     --backend.type=executorch_tensorrt \
     --dataset.repo_id=<user>/<dataset> \
     --task="pick up the cube"
@@ -333,7 +334,7 @@ Measured on a Jetson Orin Nano 8 GB with SO-101 checkpoints, on the first export
 | Largest action error per frame, mean          | 0.58°   | 0.67°      |
 | Same error for PyTorch in bfloat16, for scale | 0.41°   | 0.79°      |
 
-The error is measured against the PyTorch policy in float32, on 50 dataset frames. The bundles stay close to the error that PyTorch itself makes when it runs the policy in bfloat16. These runs used a rollout process that never imported PyTorch, as `lerobot-rollout --mode=bundle` does. Loading the PyTorch library alone would take about 0.3 GiB more on an Orin Nano.
+The error is measured against the PyTorch policy in float32, on 50 dataset frames. The bundles stay close to the error that PyTorch itself makes when it runs the policy in bfloat16. These runs used a rollout process that never imported PyTorch, as `lerobot-rollout --bundle.path` does. Loading the PyTorch library alone would take about 0.3 GiB more on an Orin Nano.
 
 ## Supported policies and backends
 
