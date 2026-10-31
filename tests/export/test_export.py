@@ -363,6 +363,17 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
 
 
 @pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available() and is_package_available("torch_tensorrt")),
+    reason="needs ExecuTorch, Torch-TensorRT, PyTorch 2.15 and a CUDA GPU",
+)
+def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tmp_path):
+    """The export writes the option, and the bundle passes the export's own check in a fresh process."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_tensorrt")
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
+
+
+@pytest.mark.skipif(
     not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
 )
 def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
