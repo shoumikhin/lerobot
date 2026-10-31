@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A backend no installed package adds, for `--backend.discover_packages_path`: it registers `torch_test_discovered`."""
+"""A backend that no installed package adds, so only `--backend.discover_packages_path` loads it."""
 
 from dataclasses import dataclass
 
