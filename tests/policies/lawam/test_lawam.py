@@ -602,6 +602,9 @@ def test_lam_constructs_without_checkpoint_or_pretrained_dino() -> None:
 
     assert isinstance(loaded_model, LatentLAMModel)
     assert all(not parameter.requires_grad for parameter in loaded_model.parameters())
+    # Built where the caller builds the policy, as an export does on its device.
+    with torch.device("meta"):
+        assert all(parameter.is_meta for parameter in build_latent_action_model(model_config).parameters())
 
 
 def test_action_horizon_is_independent_of_control_frequency() -> None:
