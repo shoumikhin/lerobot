@@ -145,15 +145,14 @@ def test_a_stop_during_inference_sends_nothing_after_it(tmp_path, monkeypatch):
 
     def stop_while_running(engine, frame, task_values, noise=None):
         actions = run_chunk(engine, frame, task_values, noise)
-        if engine.task == "stop now":
-            chunks.append(actions)
-            # The first chunk is the test case, run while the bundle loads; the second is the first live one.
-            if len(chunks) == 2:
-                stop.set()
+        chunks.append(actions)
+        # The first chunk is the test case, run while the bundle loads; the second is the first live one.
+        if len(chunks) == 2:
+            stop.set()
         return actions
 
     monkeypatch.setattr(bundle_rollout.BundleEngine, "_run_chunk", stop_while_running)
-    rollout(_config(tmp_path, make_numpy_bundle(tmp_path / "bundle"), duration=0, task="stop now"))
+    rollout(_config(tmp_path, make_numpy_bundle(tmp_path / "bundle"), duration=0))
     assert len(chunks) == 2
     assert _actions(tmp_path) == []
     assert read_log(tmp_path / "robot.jsonl")[-1] == ["disconnect", None]
