@@ -213,7 +213,7 @@ def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
 
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     monkeypatch.setattr(factory, "make_pre_post_processors", make_pre_post_processors)
-    monkeypatch.setattr(sys, "argv", ["worker"])
+    argv = list(sys.argv)
     args = [
         "--backend.type=torch_test",
         f"--policy.path={checkpoint}",
@@ -222,6 +222,8 @@ def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
     ]
     worker.trace_step({"step": "trace", "args": args})
     assert seen == ["pin123", "pin123"]
+    # Later configs in this process read the command line, so the step gives it back.
+    assert sys.argv == argv
 
 
 def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
