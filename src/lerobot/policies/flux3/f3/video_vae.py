@@ -437,6 +437,8 @@ class Natten3D(nn.Module):
         # NATTEN's kernels are fast but no export backend can run them.
         if _natten_available and not is_exporting():
             na = na2d if t == 1 else na3d
+            # CUDA autocast keeps RMSNorm in float32, and NATTEN takes q, k and v in one dtype.
+            q, k = q.to(v.dtype), k.to(v.dtype)
             out = na(q, k, v, kernel_size=kernel_size, is_causal=is_causal, **_natten_kernel_kwargs(q, k, v))
         else:
             out = neighborhood_attention(q, k, v, kernel_size, is_causal)
