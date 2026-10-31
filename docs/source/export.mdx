@@ -40,6 +40,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
+- `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), which is not in a release yet. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load. `lerobot-export` refuses an older Torch-TensorRT.
 - A policy that starts from a random noise, such as pi0.5, SmolVLA or GR00T, draws that noise in a small program on the GPU. `executorch_tensorrt` can save that program only with a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), which is not in a release yet.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc` on its `PATH`. Like a TensorRT engine, the code `executorch_cuda` compiles is made for the GPU model that exports it.
@@ -366,7 +367,7 @@ This table lists what has been tested:
 - `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images ([pytorch/executorch#11686](https://github.com/pytorch/executorch/issues/11686)).
 - EVO1 does not export yet. It runs inside `torch.autocast`, and PyTorch saves its traced program but then refuses to load it (`wrap_with_autocast is missing val field`), which is a PyTorch bug.
 
-These policies also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes their vision model compute the layout of image patches once, instead of on every call: EO-1, WALL-X, Wall-OSS 0.5, LaWAM, LingBot-VLA v2 and VLA-JEPA. The option assumes that the camera layout does not change while the robot runs.
+LingBot-VLA v2 also passed the **Program** test with TensorRT, but only with `--policy.precompute_grid_thw=true`. It makes its vision model compute the layout of image patches once, instead of on every call, so it assumes that the camera layout does not change while the robot runs.
 
 Some policies do not fit the default recipe and would each need their own recipe:
 
