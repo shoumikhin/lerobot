@@ -138,6 +138,7 @@ Then the robot moves, as with any policy. While it runs, an action that is NaN o
 | `--tolerance`                 | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                        |
 | `--max_task_tokens`           | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                            |
 | `--seed`                      | Seeds the random test frame. Defaults to `1000`.                                                                                     |
+| `--skip_policy_check`         | Export without comparing a chain bundle with the whole policy. See [Big models](#big-models-bundles-with-several-programs).          |
 | `--backend.workspace_size`    | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                      |
 | `--backend.compute_units`     | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).  |
 | `--backend.compute_precision` | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`.                                           |
