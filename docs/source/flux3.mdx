@@ -19,7 +19,10 @@ From the LeRobot checkout, install the training, policy, PEFT and EMA dependenci
 pip install -e ".[training,flux3,peft,diffusion]"
 ```
 
-The Video VAE also requires a torch/CUDA-compatible **NATTEN** wheel from https://whl.natten.org.
+On an NVIDIA GPU, a torch/CUDA-compatible **NATTEN** wheel from https://whl.natten.org makes the Video VAE
+about 10 times faster. NATTEN has wheels for Linux with CUDA only. Without it (for example on macOS, Windows
+or a CPU-only machine), the Video VAE computes the same neighborhood attention in plain PyTorch, which is
+slower and needs more memory.
 For torch 2.11 with CUDA 12.8:
 
 ```bash
