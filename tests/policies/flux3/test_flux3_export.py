@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -54,3 +55,11 @@ def test_one_noise_input_takes_the_place_of_both_draws(recipe):
     torch.testing.assert_close(
         recipe.predict_chunk(policy, batch, noise[None]), policy.predict_action_chunk(batch), rtol=0, atol=0
     )
+
+
+def test_the_program_exports_with_the_default_sampler(recipe):
+    assert recipe.policy.config.sampler == "cosmos_unipc"
+    [part] = recipe.parts()
+    program = torch.export.export(part.module, part.example_inputs).module()
+    with torch.no_grad():
+        np.testing.assert_array_equal(program(*part.example_inputs).numpy(), recipe.test_case().actions)
