@@ -738,8 +738,9 @@ def test_save_does_not_copy_a_file_that_links_out_of_the_checkpoint(tmp_path, ca
 @pytest.mark.parametrize("subclass", [False, True])
 def test_backbone_named_by_the_copies_runs_no_custom_code(tmp_path, subclass):
     base, finetune = _save_finetune(tmp_path)
-    # A backbone folder whose config asks transformers to run a module that leaves a mark when imported.
-    backbone = shutil.copytree(base.parent / "backbone", tmp_path / "custom_backbone")
+    # A backbone folder whose config asks transformers to run a module that leaves a mark when imported. Its
+    # name is unique, as transformers imports a module of the same folder name only once per process.
+    backbone = shutil.copytree(base.parent / "backbone", tmp_path / f"backbone_{tmp_path.name}")
     mark = tmp_path / "custom_code_ran"
     (backbone / "custom_config.py").write_text(
         f"from transformers import Qwen3VLConfig\nopen({str(mark)!r}, 'w').close()\n"
