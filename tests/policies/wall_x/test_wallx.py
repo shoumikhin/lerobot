@@ -26,6 +26,9 @@ from packaging import version
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS  # noqa: E402
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import eager_attention_forward  # noqa: E402
+
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid  # noqa: E402
 from lerobot.policies.common.qwen_vision import prepare_image_grid  # noqa: E402
@@ -155,6 +158,45 @@ def test_moe_model_captures_requested_hidden_states_and_attentions():
 
     assert len(output.hidden_states) == config.num_hidden_layers + 1
     assert len(output.attentions) == config.num_hidden_layers
+
+
+def test_moe_model_attention_keeps_bfloat16_scores_in_float32():
+    hidden_size, num_heads = 128, 2
+    head_dim = hidden_size // num_heads
+    expert_config = {"hidden_size": hidden_size, "intermediate_size": 64, "hidden_act": "silu"}
+    config = Qwen2_5_VLTextConfig(
+        vocab_size=32,
+        hidden_size=hidden_size,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        max_position_embeddings=64,
+        layer_types=["full_attention"],
+        rope_parameters={"rope_type": "default", "rope_theta": 1_000_000.0, "mrope_section": [16, 8, 8]},
+        num_experts=2,
+        experts=[expert_config, expert_config],
+        dim_inputs=(hidden_size, hidden_size),
+        mlp_moe=True,
+    )
+    model = Qwen2_5_VLMoEModel(config)
+    module = model.layers[0].self_attn
+    # How the model's attention modules pick their attention function.
+    attention = ALL_ATTENTION_FUNCTIONS.get_interface(
+        model.config._attn_implementation, eager_attention_forward
+    )
+    torch.manual_seed(0)
+    # Large scores: rounding them to bfloat16 before the softmax moves the output by about 0.12 here.
+    query, key = (4 * torch.randn(1, num_heads, 32, head_dim).bfloat16() for _ in range(2))
+    value = torch.randn(1, num_heads, 32, head_dim).bfloat16()
+
+    output, _ = attention(module, query, key, value, None, head_dim**-0.5)
+    expected, _ = eager_attention_forward(
+        module, query.float(), key.float(), value.float(), None, head_dim**-0.5
+    )
+
+    assert output.dtype == torch.bfloat16
+    assert (output.float() - expected).abs().max() < 0.03
 
 
 def test_moe_block_with_token_counts_routes_like_the_token_mask():
