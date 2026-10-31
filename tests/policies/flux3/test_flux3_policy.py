@@ -936,6 +936,17 @@ def test_unsupported_relative_execution_and_rtc_arguments_fail_early(fake_vae):
             method({}, inference_delay=1, prev_chunk_left_over=None)
 
 
+def test_chunk_serving_takes_frame_checkpoints(fake_vae):
+    spec = Flux3Policy(droid_config(n_action_steps=8)).chunk_inference_spec()
+    assert (spec.prediction_steps, spec.execution_steps) == (32, 8)
+    assert spec.current_observation_only
+    history, relative = Flux3Policy(task_config()), Flux3Policy(single_config(use_relative_actions=True))
+    with pytest.raises(ValueError, match="requires frame conditioning"):
+        history.chunk_inference_spec()
+    with pytest.raises(ValueError, match="requires RTC"):
+        relative.chunk_inference_spec()
+
+
 def test_lora_update_ema_resume_and_reload(tmp_path, fake_vae):
     pytest.importorskip("peft")
     cfg = single_config(
