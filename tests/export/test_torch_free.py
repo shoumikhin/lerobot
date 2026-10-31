@@ -37,9 +37,9 @@ def test_executorch_loads_without_torch_once_prepared():
     pytest.importorskip("executorch.runtime")
     assert_runs_without_torch(
         """
-        from lerobot.bundle import executorch
+        from lerobot.bundle.runtime import prepare_runtime
 
-        executorch.prepare()
+        prepare_runtime("executorch", [])
         import executorch.runtime
         """
     )
