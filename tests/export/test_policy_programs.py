@@ -80,6 +80,13 @@ RECIPES = {
         cuda=True,
         bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
     ),
+    # Bins -1, 6 and 255: numbers of two, one and three tokens.
+    "fineart_vla": Recipe(
+        "tests.policies.fineart_vla.export_stand_in",
+        ("tmp_path",),
+        state=[-2.0, -0.95, 1.0],
+        bfloat16_tolerance=BFLOAT16_STEPS_TOLERANCE,
+    ),
 }
 
 
@@ -125,6 +132,12 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
         # own token there.
         pytest.param(
             "dm05", {"split_words": False}, "does not hold the state's numbers", id="dm05-tokenizer"
+        ),
+        pytest.param(
+            "fineart_vla",
+            {"split_words": False},
+            "does not hold the state's numbers once",
+            id="fineart_vla-tokenizer",
         ),
     ],
 )
