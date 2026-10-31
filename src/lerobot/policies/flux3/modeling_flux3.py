@@ -74,7 +74,7 @@ TRUNK_WEIGHTS_FILENAME = "dit.safetensors"
 
 
 def _is_exporting() -> bool:
-    # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
+    # torch.compile also reports is_exporting() on PyTorch 2.11, not 2.15; non-strict export skips Dynamo.
     return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
 
 
