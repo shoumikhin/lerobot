@@ -157,6 +157,8 @@ class _FakeQwenInnerModel(nn.Module):
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.language_model = _FakeLanguageModel(hidden_size)
+        # The fake prompts hold no images, so there is no vision tower to read an image grid.
+        self.visual = None
 
     def forward(self, input_ids: Tensor, **kwargs: object) -> SimpleNamespace:
         return self.language_model(input_ids)
