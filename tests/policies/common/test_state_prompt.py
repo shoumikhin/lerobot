@@ -55,6 +55,30 @@ def test_the_prompt_holds_the_processors_tokens_then_padding(bins):
     assert mask.tolist() == [True] * len(expected) + [False] * (20 - len(expected))
 
 
+@pytest.mark.parametrize("bins", [[7, 120, 0], [120, 120, 120], [3, 4, 5]])
+def test_a_left_padded_prompt_ends_with_the_processors_tokens(bins):
+    tokens = StatePromptTokens.around(
+        processor_prompt([42, 42, 42]), [42, 42, 42], PIECES, PAD, length=20, padding_side="left"
+    )
+
+    ids, mask = tokens(torch.tensor(bins))
+
+    expected = processor_prompt(bins)
+    assert ids.tolist() == [PAD] * (20 - len(expected)) + expected
+    assert mask.tolist() == [False] * (20 - len(expected)) + [True] * len(expected)
+
+
+def test_a_program_writes_any_states_numbers_left_padded():
+    tokens = StatePromptTokens(START, END, PIECES, PAD, state_dim=3, length=20, padding_side="left")
+    program = torch.export.export(StatePrompt(tokens), (torch.tensor([100, 110, 120]),), strict=False)
+
+    ids, mask = program.module()(torch.tensor([9, 0, 57]))
+
+    expected = processor_prompt([9, 0, 57])
+    assert ids.tolist() == [PAD] * (20 - len(expected)) + expected
+    assert mask.tolist() == [False] * (20 - len(expected)) + [True] * len(expected)
+
+
 def test_by_default_the_prompt_is_as_long_as_the_widest_state_makes_it():
     tokens = StatePromptTokens(START, END, PIECES, PAD, state_dim=3)
 
