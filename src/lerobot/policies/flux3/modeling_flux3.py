@@ -165,8 +165,9 @@ class Flux3Policy(PreTrainedPolicy):
         return policy
 
     # ------------------------------------------------------------------ construction hooks
-    # Construct on CPU; the factory/from_pretrained device move places the DiT and frozen encoders
-    # together via _apply. These loaders are never called from forward.
+    # Construct on the default device: the CPU, unless the caller builds under `torch.device`, as an export
+    # does. The factory/from_pretrained device move places the DiT and frozen encoders together via _apply.
+    # These loaders are never called from forward.
     def _dit_params(self, config: Flux3Config) -> JointSingleSeqParams:
         base = JointSingleSeqParams(**(config.dit_config or {}))
         base = restrict_content_streams(base, REQUIRED_CONTENT_STREAMS)
@@ -185,7 +186,7 @@ class Flux3Policy(PreTrainedPolicy):
             self.dit_params,
             ckpt,
             modality=self.modality,
-            device="cpu",
+            device=torch.get_default_device(),
             dtype=self.dtype_,
             strict_heads=False,
             head_seed=config.head_init_seed,
@@ -193,13 +194,15 @@ class Flux3Policy(PreTrainedPolicy):
 
     def _build_video_vae(self, config: Flux3Config):
         """Frozen Video VAE (needs NATTEN). Tests replace this hook with a shape-compatible fake."""
-        return load_video_vae(config.video_vae_id, device="cpu", compile_model=config.compile_model)
+        return load_video_vae(
+            config.video_vae_id, device=torch.get_default_device(), compile_model=config.compile_model
+        )
 
     def _build_text_encoder(self, config: Flux3Config) -> nn.Module:
         """Load the frozen Qwen3-VL text encoder."""
         return load_text_encoder(
             config.text_encoder_id,
-            device="cpu",
+            device=torch.get_default_device(),
             compile_model=config.compile_model,
         )
 
@@ -317,7 +320,7 @@ class Flux3Policy(PreTrainedPolicy):
             )
             state.update({k: fresh[k.removeprefix("dit.")] for k in fresh_missing})
         model.load_state_dict(state, strict=True)
-        return model.to(map_location)
+        return model
 
     # ------------------------------------------------------------------ batch helpers
     def _flip(self, x: Tensor) -> Tensor:
