@@ -427,6 +427,19 @@ def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, 
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
 
 
+@pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
+def test_executorch_cuda_names_no_data_file_for_a_program_without_one(tmp_path):
+    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+
+    path = tmp_path / "actions.pte"
+    # No weights and nothing for the GPU to compute, so ExecuTorch writes no data file.
+    program = torch.export.export(torch.nn.Identity(), (torch.randn(4, 3, device="cuda"),))
+    assert ExecuTorchCUDAConfig().compile(program, path) is None
+    assert path.is_file() and not path.with_suffix(".ptd").exists()
+
+
 class ConstantPositions(torch.nn.Module):
     """Adds embeddings of position ids that bucketize makes from constants alone, as SmolVLM's vision model does."""
 

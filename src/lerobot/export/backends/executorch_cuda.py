@@ -38,10 +38,11 @@ class ExecuTorchCUDAConfig(ExecuTorchConfig):
 
     device = "cuda"
 
-    def compile(self, program: ExportedProgram, path: Path) -> Path:
+    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Lower `program` with ExecuTorch's CUDA backend and save it as an ExecuTorch program.
 
-        Returns the data file that holds the compiled kernels and the weights.
+        Returns the data file that holds the compiled kernels and the weights, or `None` when ExecuTorch wrote
+        none, as for a program with nothing for the GPU to compute.
         """
         from executorch.exir import EdgeCompileConfig
 
@@ -50,4 +51,5 @@ class ExecuTorchCUDAConfig(ExecuTorchConfig):
         compiled = edge.to_executorch(gpu_memory_config())
         path.write_bytes(compiled.buffer)
         compiled.write_tensor_data_to_file(str(path.parent))
-        return path.with_suffix(".ptd")
+        data = path.with_suffix(".ptd")
+        return data if data.exists() else None
