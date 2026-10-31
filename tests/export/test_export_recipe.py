@@ -15,6 +15,7 @@
 
 """The default export recipe, on a tiny ACT built in memory."""
 
+import logging
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -229,22 +230,23 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
 
 
 def too_big_to_compare(tmp_path, monkeypatch):
-    """A checkpoint on a machine with less memory than twice its weights."""
+    """A 6.15 GB checkpoint (a sparse file) on a machine with 6.1 GB of memory."""
     model_file = tmp_path / "model.safetensors"
-    model_file.write_bytes(bytes(1024))
-    monkeypatch.setattr(recipe_module.os, "sysconf", lambda name: 1)
+    with open(model_file, "wb") as f:
+        f.truncate(6_150_000_000)
+    pages = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 1_489_258}
+    monkeypatch.setattr(recipe_module.os, "sysconf", pages.__getitem__)
     return model_file
 
 
-def test_a_policy_too_big_to_compare_is_refused(tmp_path, monkeypatch):
+def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(tmp_path, monkeypatch, caplog):
     model_file = too_big_to_compare(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match="--skip_policy_check=true"):
-        recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=False)
-
-
-def test_skip_policy_check_exports_a_policy_too_big_to_compare(tmp_path, monkeypatch):
-    model_file = too_big_to_compare(tmp_path, monkeypatch)
-    assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=True)
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
+    assert (
+        "Skipped the comparison with the whole pi0.5 policy: it needs about 12.3 GB, 6.1 GB free. The bundle's "
+        "own check against its test case still runs." in caplog.text
+    )
 
 
 def test_a_policy_without_an_export_module_gets_the_one_program_recipe():

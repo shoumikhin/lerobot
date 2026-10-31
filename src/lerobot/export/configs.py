@@ -144,9 +144,6 @@ class ExportConfig:
     # policy's normalized action units (robot units divided by the spread of each action in the training
     # data). Defaults to the recipe's.
     tolerance: float | None = None
-    # Export even when the whole policy does not fit in memory beside the export, so the actions of a recipe
-    # that builds its parts one at a time cannot be compared with the policy's own.
-    skip_policy_check: bool = False
     # For a policy that reads its task, the most tokens a task may take in the bundle. Defaults to the
     # recipe's, which fits the tasks known at export.
     max_task_tokens: int | None = None
