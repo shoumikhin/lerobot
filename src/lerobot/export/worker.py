@@ -142,6 +142,9 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             # default, and its Dynamo cannot run some policies' Python, such as ACT's.
             with torch.no_grad():
                 program = torch.export.export(part.module, part.example_inputs, strict=False)
+                # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
+                # flat_apply that Transformers' vmap attention masks trace to.
+                program = program.run_decompositions({})
             torch.export.save(program, traced / f"{part.name}.pt2")
             programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
