@@ -27,12 +27,13 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Iterator
+from typing import Any
 
 import torch
 from torch import Tensor
 
 from lerobot.processor import EnvTransition, ProcessorStep, TransitionKey
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 from .export_utils import is_non_strict_exporting
 
@@ -194,3 +195,71 @@ class StatePromptStep(ProcessorStep):
 
     def transform_features(self, features):
         return features
+
+
+class PI05StatePromptStep(StatePromptStep):
+    """A tokenizer step for one task that writes the state as pi0.5's prompt does, as tensor operations.
+
+    The prompt writes each state value's bin among 256 equal bins of [-1, 1] as a number, and the step gives its
+    token ids and mask as the observation's language tokens, padded to the saved steps' length. The prompt around
+    the state, and what the saved steps add to the complementary data, come from the first eager frame. A subclass
+    gives the saved steps (`_saved`) and names them in its error (`policy`, `saved_steps`).
+
+    Args:
+        tokenizer:
+            The Transformers tokenizer of the saved steps.
+    """
+
+    policy: str
+    saved_steps: str
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.pad_id = tokenizer.pad_token_id
+        # The bin numbers -1 to 255 of the prompt's state, each with the space before it.
+        self.pieces = [tokenizer.encode(f" {value}", add_special_tokens=False) for value in range(-1, 256)]
+        self.prompt: StatePromptTokens | None = None
+        self.complementary: dict[str, Any] = {}
+
+    @abstractmethod
+    def _saved(self, transition: EnvTransition) -> EnvTransition:
+        """The saved steps' output for this frame."""
+
+    def _apply(self, transition: EnvTransition) -> EnvTransition:
+        observation = dict(transition[TransitionKey.OBSERVATION] or {})
+        ids, mask = self._prompt_tokens(uniform_bins(observation[OBS_STATE], 256))
+        observation[OBS_LANGUAGE_TOKENS] = ids[None]
+        observation[OBS_LANGUAGE_ATTENTION_MASK] = mask[None]
+        complementary = {**(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}), **self.complementary}
+        return {
+            **transition,
+            TransitionKey.OBSERVATION: observation,
+            TransitionKey.COMPLEMENTARY_DATA: complementary,
+        }
+
+    def _fit(self, transition: EnvTransition) -> None:
+        """Take the prompt around the state, and what the saved steps add to the complementary data."""
+        saved = self._saved(transition)
+        tokens = saved[TransitionKey.OBSERVATION] or {}
+        ids, mask = tokens[OBS_LANGUAGE_TOKENS][0], tokens[OBS_LANGUAGE_ATTENTION_MASK][0]
+        bins = uniform_bins((transition[TransitionKey.OBSERVATION] or {})[OBS_STATE], 256)
+        self.prompt = StatePromptTokens.around(
+            ids[mask].tolist(), bins.tolist(), self.pieces, self.pad_id, len(ids), bins.device
+        )
+        given = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        added = saved.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        self.complementary = {key: value for key, value in added.items() if key not in given}
+
+    def _check(self, transition: EnvTransition) -> None:
+        """Refuse a prompt other than the saved steps' for this frame."""
+        program = self._apply(transition)[TransitionKey.OBSERVATION] or {}
+        saved = self._saved(transition)[TransitionKey.OBSERVATION] or {}
+        if not all(
+            torch.equal(program[key], saved[key].to(program[key].device))
+            for key in (OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK)
+        ):
+            state = (transition[TransitionKey.OBSERVATION] or {})[OBS_STATE].tolist()
+            raise ValueError(
+                f"The program writes another prompt than {self.policy}'s {self.saved_steps} for the normalized "
+                f"state {state}: this tokenizer splits the state's numbers differently inside the prompt, so "
+                f"{self.policy} cannot be exported this way."
+            )
