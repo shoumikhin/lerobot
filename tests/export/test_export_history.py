@@ -165,7 +165,13 @@ def multi_task_dit_checkpoint(path, **sampler) -> None:
 
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
-    get_policy_class(config.type)(config).save_pretrained(path)
+    policy = get_policy_class(config.type)(config)
+    if config.type == "multi_task_dit":
+        # Untrained, its adaLN gates are zero, so the denoiser would ignore the frames, the task and the timestep.
+        for name, parameter in policy.named_parameters():
+            if "adaLN_modulation" in name:
+                torch.nn.init.normal_(parameter, std=0.1)
+    policy.save_pretrained(path)
     for processor in make_pre_post_processors(config, dataset_stats=stats):
         processor.save_pretrained(path)
 
