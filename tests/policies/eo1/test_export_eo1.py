@@ -25,7 +25,7 @@ pytest.importorskip("torchvision")
 from transformers import Qwen2VLImageProcessorPil  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.export.recipe import ActionChunkRecipe, random_frame  # noqa: E402
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe, random_frame  # noqa: E402
 from lerobot.policies.eo1.configuration_eo1 import EO1Config  # noqa: E402
 from lerobot.policies.eo1.export_eo1 import EO1ExportRecipe  # noqa: E402
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy  # noqa: E402
@@ -152,3 +152,7 @@ def test_the_saved_preprocessor_cannot_be_traced(monkeypatch):
     # The NumPy image processor reads the traced pixels.
     with pytest.raises(RuntimeError, match=r"\.numpy\(\) is not supported for tensor subclasses"):
         torch.export.export(part.module, part.example_inputs, strict=False)
+
+
+def test_a_bfloat16_checkpoint_gets_the_tolerance_of_ten_denoising_steps():
+    assert EO1ExportRecipe.bfloat16_tolerance == BFLOAT16_STEPS_TOLERANCE
