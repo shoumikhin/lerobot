@@ -363,7 +363,7 @@ def test_the_parts_are_held_to_the_export_tolerance(tmp_path, monkeypatch, offse
     if passes:
         worker.trace_step(request)
     else:
-        with pytest.raises(ValueError, match="compute another chunk"):
+        with pytest.raises(ValueError, match="normalized units from the ones lerobot-rollout plays"):
             worker.trace_step(request)
 
 
@@ -410,7 +410,7 @@ def test_the_parts_are_checked_on_a_window_of_frames_that_all_differ(tmp_path, m
         f"--output_dir={tmp_path / 'b'}",
     ]
     request = {"step": "trace", "args": args, "folders": str(tmp_path / "folders.json")}
-    with pytest.raises(ValueError, match="compute another chunk"):
+    with pytest.raises(ValueError, match="normalized units from the ones lerobot-rollout plays"):
         worker.trace_step(request)
 
 

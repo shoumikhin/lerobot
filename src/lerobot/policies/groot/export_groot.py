@@ -68,6 +68,7 @@ from lerobot.export.recipe import (
     load_processors,
     measure_action_scale,
     preprocessor_renames,
+    program_actions,
     random_frame,
     refuse_depth_maps,
     refuse_peft_adapter,
@@ -381,11 +382,8 @@ class GrootExportRecipe(ChainRecipe):
             # A program takes only the inputs it reads.
             inputs, names = inputs[:1], names[:1]
         with torch.no_grad():
-            played = module(*inputs)
-        played = played if isinstance(played, tuple) else (played,)
-        self._actions, *continuous = (o.float().cpu().numpy() for o in played)
-        if continuous:
-            (self._continuous_actions,) = continuous
+            self._actions, self._continuous_actions = program_actions(module(*inputs))
+        if self._continuous_actions is not None:
 
             def play(shift: float) -> np.ndarray:
                 with torch.no_grad():

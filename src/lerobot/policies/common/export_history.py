@@ -29,7 +29,6 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from lerobot.bundle.engine import action_difference
 from lerobot.export.recipe import (
     ActionChunkRecipe,
     Part,
@@ -37,6 +36,7 @@ from lerobot.export.recipe import (
     RunPlan,
     TestCase,
     action_pipelines,
+    program_actions,
     random_frame,
     to_policy_input,
     with_continuous_actions,
@@ -58,6 +58,9 @@ class HistoryChunkRecipe(ActionChunkRecipe):
     own `predict_action_chunk` on its queues, filled tick by tick as `select_action` fills them, with the
     policy's random draws read from the test case's noise (see `ReplayDraws`). A subclass makes the parts.
     """
+
+    # On a GPU the parts and the policy sum in other orders, so they drift apart by float32 rounding.
+    exact = False
 
     def _execution_steps(self) -> int:
         return self.policy.config.n_action_steps
@@ -178,32 +181,13 @@ class HistoryChunkRecipe(ActionChunkRecipe):
         references = [
             self._history_reference(ticks, noise, p)[0] for p in action_pipelines(self.postprocessor)
         ]
-        for case_ticks, case_noise, (expected, expected_continuous) in (
-            (self._case.frame, self._case.noise, (self._case.actions, self._case.continuous_actions)),
-            (stacked, noise, (*references, None)[:2]),
+        for case_ticks, case_noise, expected, expected_continuous in (
+            (self._case.frame, self._case.noise, self._case.actions, self._case.continuous_actions),
+            (stacked, noise, references[0], references[1] if len(references) > 1 else None),
         ):
             with torch.no_grad():
-                outputs = run(*self._history_inputs(case_ticks, case_noise))
-            actions, continuous = (
-                *(o.cpu().numpy() for o in (outputs if isinstance(outputs, tuple) else (outputs,))),
-                None,
-            )[:2]
-            # Not bit for bit: on a GPU the parts and the policy sum in other orders, so they drift apart by
-            # float32 rounding, as a compiled program does, and are held to the export's tolerance. Thresholded
-            # actions are compared as `action_difference` says.
-            difference = action_difference(
-                actions,
-                expected,
-                self._case.action_scale,
-                expected_continuous,
-                None if expected_continuous is None else expected == expected_continuous,
-            )
-            # Not `>`: a NaN difference must fail too.
-            if not difference <= self.tolerance:
-                raise ValueError(
-                    f"The exported parts of the {self.policy.config.type} policy compute another chunk than "
-                    f"the policy itself (largest difference {difference:.3g} of the actions' spread)."
-                )
+                actions, continuous = program_actions(run(*self._history_inputs(case_ticks, case_noise)))
+            self._check_program(actions, expected, continuous, expected_continuous)
 
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:

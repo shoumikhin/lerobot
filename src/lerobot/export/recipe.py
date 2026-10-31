@@ -34,6 +34,7 @@ from safetensors import safe_open
 from torch import Tensor, nn
 from torch.overrides import TorchFunctionMode
 
+from lerobot.bundle.engine import action_difference
 from lerobot.bundle.manifest import CONTINUOUS_ACTIONS, NOISE, ProgramRun
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, is_depth_map
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
@@ -423,7 +424,16 @@ class ActionChunkRecipe(ExportRecipe):
     `PreTrainedPolicy.chunk_inference_spec`, draw a starting noise they take in exactly one random normal
     draw and compute the same chunk when given the standard normal draw behind it, and compute the same chunk
     twice from the same frame and noise.
+
+    **Attributes**:
+        - **exact** (`bool`) -- Whether the program must compute, in PyTorch, the actions lerobot-rollout plays
+          bit for bit, both with TF32 off as the export runs (rollout turns TF32 on by default, which moves a
+          float32 policy's actions on a GPU a little). A recipe whose program computes them in another
+          order, for example over a prompt padded to a fixed length, sets it to False, and the program is held
+          to the export's tolerance instead.
     """
+
+    exact: bool = True
 
     def __init__(
         self,
@@ -484,23 +494,44 @@ class ActionChunkRecipe(ExportRecipe):
         random frame.
         """
         frame, noise = random_frame(self._features, self._generator), self._random_noise()
-        pipelines = action_pipelines(self.postprocessor)
-        for case_frame, case_noise, expected in (
-            (self._case.frame, self._case.noise, [self._case.actions, self._case.continuous_actions]),
-            (frame, noise, [self._reference(frame, noise, pipeline) for pipeline in pipelines]),
+        references = [self._reference(frame, noise, p) for p in action_pipelines(self.postprocessor)]
+        for case_frame, case_noise, expected, expected_continuous in (
+            (self._case.frame, self._case.noise, self._case.actions, self._case.continuous_actions),
+            (frame, noise, references[0], references[1] if len(references) > 1 else None),
         ):
             with torch.no_grad():
-                outputs = run(*self._inputs(case_frame, case_noise))
-            outputs = outputs if isinstance(outputs, tuple) else (outputs,)
-            actions, continuous = (*(output.cpu().numpy() for output in outputs), None)[:2]
-            if not np.array_equal(actions, expected[0]) or (
-                continuous is not None and not np.array_equal(continuous, expected[1])
+                actions, continuous = program_actions(run(*self._inputs(case_frame, case_noise)))
+            self._check_program(
+                actions, expected, continuous, expected_continuous if continuous is not None else None
+            )
+
+    def _check_program(
+        self,
+        actions: np.ndarray,
+        expected: np.ndarray,
+        continuous: np.ndarray | None = None,
+        expected_continuous: np.ndarray | None = None,
+    ) -> None:
+        """Refuse `actions` (and `continuous`, for a postprocessor with thresholds) that differ from the expected."""
+        if self.exact:
+            if not np.array_equal(actions, expected) or (
+                expected_continuous is not None and not np.array_equal(continuous, expected_continuous)
             ):
                 raise ValueError(
                     f"The {self.policy.config.type} policy computes something else as exported programs than "
                     "it does in lerobot-rollout, for example because a preprocessor step reads the frame in "
                     "Python, so it cannot be exported this way."
                 )
+            return
+        # Without a stored mask, the played actions are compared where no threshold set them.
+        mask = None if expected_continuous is None else expected == expected_continuous
+        difference = action_difference(actions, expected, self._case.action_scale, expected_continuous, mask)
+        # Not `>`: a NaN difference must fail too.
+        if not difference <= self.tolerance:
+            raise ValueError(
+                f"The {self.policy.config.type} policy's program computes actions {difference:.3g} normalized "
+                f"units from the ones lerobot-rollout plays, more than the tolerance {self.tolerance}."
+            )
 
     def predict_chunk(self, policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
         """The `[1, chunk, action]` chunk the policy predicts for a preprocessed batch, as rollout gets it.
@@ -853,6 +884,12 @@ def actions_mask(
     `tolerance` either way leaves it as it is, so that a wrongly compiled threshold still fails.
     """
     return ((play(tolerance) == actions) & (play(-tolerance) == actions)) | (actions == continuous)
+
+
+def program_actions(outputs: Tensor | tuple[Tensor, ...]) -> tuple[np.ndarray, np.ndarray | None]:
+    """A program's actions and, for a postprocessor with threshold steps, its actions without them, on the CPU."""
+    actions, *continuous = (o.cpu().numpy() for o in (outputs if isinstance(outputs, tuple) else (outputs,)))
+    return actions, continuous[0] if continuous else None
 
 
 def with_continuous_actions(
