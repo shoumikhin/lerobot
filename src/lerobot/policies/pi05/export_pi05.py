@@ -735,7 +735,7 @@ class PI05ExportRecipe(ExportRecipe):
 
     def _check_against_policy(self, case: TestCase) -> None:
         """Compare the test case with the whole policy's `predict_action_chunk`, when the policy fits in memory."""
-        if not whole_policy_fits(self._model_file, self._device):
+        if not whole_policy_fits(self._model_file, self._device, self.cfg.skip_policy_check):
             return
         policy = PI05Policy.from_pretrained(
             str(self._policy_config.pretrained_path),

@@ -615,8 +615,11 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
 
 
-def whole_policy_fits(model_file: Path, device: torch.device) -> bool:
-    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it."""
+def whole_policy_fits(model_file: Path, device: torch.device, skip_policy_check: bool) -> bool:
+    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it.
+
+    When it does not, raises unless `skip_policy_check` allows exporting without that check.
+    """
     size = model_file.stat().st_size
     if device.type == "cuda":
         available = torch.cuda.mem_get_info(device)[0]
@@ -625,12 +628,16 @@ def whole_policy_fits(model_file: Path, device: torch.device) -> bool:
     # Room for the activations and for what the export already holds.
     if 2 * size <= available:
         return True
-    logger.info(
-        "Not comparing the test case with the whole policy: its %.1f GiB of weights do not fit twice in the "
-        "%.1f GiB this device has.",
-        size / 2**30,
-        available / 2**30,
+    reason = (
+        f"its {size / 2**30:.1f} GiB of weights do not fit twice in the {available / 2**30:.1f} GiB this "
+        "device has"
     )
+    if not skip_policy_check:
+        raise ValueError(
+            f"The exported parts cannot be compared with the whole policy: {reason}. Export on a machine "
+            "where it fits, or pass --skip_policy_check=true to export without that comparison."
+        )
+    logger.warning("Not comparing the test case with the whole policy: %s.", reason)
     return False
 
 
