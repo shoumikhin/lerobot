@@ -72,7 +72,9 @@ class PromptReader(FineARTVLAPolicy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(monkeypatch, device="cpu", text_recipe=True) -> FineARTVLAExportRecipe:
+def make_recipe(
+    monkeypatch, device="cpu", text_recipe=True, task="pick up the cube"
+) -> FineARTVLAExportRecipe:
     # Also the tokenizer of pi0.5's preprocessor, which a checkpoint without a text recipe has.
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer())
     if text_recipe:
@@ -95,6 +97,6 @@ def make_recipe(monkeypatch, device="cpu", text_recipe=True) -> FineARTVLAExport
     )
     preprocessor, postprocessor = make_fineart_vla_pre_post_processors(config)
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device=device), seed=0, dataset=None, task=task, tolerance=None
     )
     return FineARTVLAExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

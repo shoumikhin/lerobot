@@ -98,7 +98,7 @@ class PromptReader(MolmoAct2Policy):
 
 
 def make_recipe(
-    monkeypatch, device="cpu", width=SIDE, crop_mode="resize", state_mask=False
+    monkeypatch, device="cpu", width=SIDE, crop_mode="resize", state_mask=False, task="pick up the cube"
 ) -> MolmoAct2ExportRecipe:
     """The recipe on a stand-in policy. `state_mask` normalizes the state by quantiles with a gripper mask, as
     every published MolmoAct2 checkpoint's statistics do."""
@@ -127,6 +127,6 @@ def make_recipe(
         stats = {OBS_STATE: {"q01": low, "q99": high, "min": low, "max": high, "mask": [True, True, False]}}
     preprocessor, postprocessor = make_molmoact2_pre_post_processors(config, stats)
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device=device), seed=0, dataset=None, task=task, tolerance=None
     )
     return MolmoAct2ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)
