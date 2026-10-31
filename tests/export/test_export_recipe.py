@@ -15,6 +15,9 @@
 """The default export recipe, on a tiny ACT built in memory."""
 
 import logging
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,6 +27,7 @@ from torch import Tensor
 
 import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
+import lerobot.policies.pretrained as pretrained
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export.recipe import (
     ActionChunkRecipe,
@@ -36,6 +40,7 @@ from lerobot.export.recipe import (
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.processor import ProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
@@ -458,3 +463,96 @@ def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
     )
     with pytest.raises(ValueError, match="export_act must define the export recipe ACTExportRecipe"):
         factory.get_export_recipe_class(act_config())
+
+
+# In a process of its own, so that neither the CUDA tensors nor the freed host memory of earlier tests count.
+LOAD_ON_THE_GPU = """
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from lerobot.export.recipe import load_policy
+from lerobot.policies.act.configuration_act import ACTConfig
+
+
+def anonymous_mib():
+    # The memory of this process that no file backs, so not the pages of a memory-mapped checkpoint. Not
+    # RssAnon, which on a Jetson also counts the GPU's allocations.
+    with open("/proc/self/smaps_rollup") as smaps:
+        return next(int(line.split()[1]) // 1024 for line in smaps if line.startswith("Anonymous:"))
+
+
+path, weights = Path(sys.argv[1]), int(sys.argv[2])
+config = ACTConfig.from_pretrained(path)
+config.pretrained_path = path
+torch.zeros(1, device="cuda")
+torch.cuda.reset_peak_memory_stats()
+start = anonymous_mib()
+peak = [start]
+done = threading.Event()
+
+
+def sample():
+    while not done.wait(0.001):
+        peak[0] = max(peak[0], anonymous_mib())
+
+
+sampler = threading.Thread(target=sample)
+sampler.start()
+try:
+    policy, _, _ = load_policy(SimpleNamespace(policy=config, backend=SimpleNamespace(device="cuda")))
+finally:
+    done.set()
+    sampler.join()
+assert all(parameter.is_cuda for parameter in policy.parameters())
+assert peak[0] - start < weights / 2, f"{peak[0] - start} MiB more host memory, {weights} MiB of weights"
+cuda = torch.cuda.max_memory_allocated() >> 20
+assert cuda < 1.5 * weights, f"{cuda} MiB of GPU memory at most, {weights} MiB of weights"
+"""
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not Path("/proc/self/smaps_rollup").exists(),
+    reason="needs a CUDA GPU and Linux's memory counters",
+)
+def test_an_export_loads_the_policy_straight_onto_its_device(tmp_path):
+    # ACT's default size, about 200 MiB of weights.
+    config = ACTConfig(
+        input_features=act_config().input_features,
+        output_features=act_config().output_features,
+        pretrained_backbone_weights=None,
+        device="cpu",
+    )
+    policy = ACTPolicy(config)
+    weights = sum(p.numel() * p.element_size() for p in policy.parameters()) >> 20
+    policy.save_pretrained(tmp_path)
+    for processor in make_pre_post_processors(config, dataset_stats=STATS):
+        processor.save_pretrained(tmp_path)
+    subprocess.run(
+        [sys.executable, "-c", LOAD_ON_THE_GPU, str(tmp_path), str(weights)], check=True, timeout=600
+    )
+
+
+def test_a_policy_that_reads_its_checkpoint_itself_gets_its_device(tmp_path, monkeypatch):
+    # G0.5 and VLA-JEPA map the file themselves, straight onto the device of their weights or rank.
+    config = act_config()
+    ACTPolicy(config).save_pretrained(tmp_path)
+    config.device = "meta"
+    mapped = {}
+
+    def load_model_as_safetensor(model, model_file, strict, device):
+        mapped["file"] = device
+        return [], []
+
+    def reads_its_checkpoint(cls, model, model_file, map_location, strict):
+        mapped["policy"] = map_location
+        return PreTrainedPolicy._load_as_safetensor.__func__(cls, model, model_file, map_location, strict)
+
+    monkeypatch.setattr(pretrained, "load_model_as_safetensor", load_model_as_safetensor)
+    monkeypatch.setattr(ACTPolicy, "_load_as_safetensor", classmethod(reads_its_checkpoint))
+    ACTPolicy.from_pretrained(tmp_path, config=config)
+    assert mapped == {"policy": "meta", "file": "cpu"}

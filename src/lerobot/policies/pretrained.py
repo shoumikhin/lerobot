@@ -32,7 +32,6 @@ from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.lerobot_types import PolicyOutput
 from lerobot.optim.optimizers import OptimizerParams
 from lerobot.utils.constants import ACTION
-from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.feature_spec import FeatureSpec
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.import_utils import _peft_available, require_package
@@ -221,8 +220,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     @classmethod
     def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+        # Mapped on the CPU, the file is copied into the parameters one tensor at a time, wherever they were
+        # built. Mapped on a GPU, all of it would first be copied there, beside the parameters. A policy that
+        # reads the file itself gets `map_location`, the device its weights go to.
         missing_keys, unexpected_keys = load_model_as_safetensor(
-            model, model_file, strict=strict, device=resolve_safetensors_device(map_location)
+            model, model_file, strict=strict, device="cpu"
         )
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model
