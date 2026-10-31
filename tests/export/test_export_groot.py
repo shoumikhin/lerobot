@@ -132,7 +132,7 @@ def write_backbone(path):
     ).save_pretrained(path)
 
 
-def save_checkpoint(path, mode: str):
+def save_checkpoint(path, mode: str, dataset_meta=None, **overrides):
     """A fine-tuned GR00T: 7 Qwen3 layers (two language parts), 9 diffusion blocks (two step parts)."""
     geometry, cameras = MODES[mode]
     backbone = path / "backbone"
@@ -178,6 +178,7 @@ def save_checkpoint(path, mode: str):
         max_state_dim=8,
         max_action_dim=6,
         use_bf16=False,
+        **overrides,
     )
     torch.manual_seed(0)
     policy = GrootPolicy(config)
@@ -189,7 +190,12 @@ def save_checkpoint(path, mode: str):
         OBS_STATE: {"min": torch.full((5,), -1.0), "max": torch.full((5,), 2.0)},
         ACTION: {"min": torch.full((5,), -10.0), "max": torch.full((5,), 30.0)},
     }
-    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=stats)
+    if config.use_relative_actions:
+        # Relative actions are normalized with statistics per chunk step.
+        stats[ACTION] = {name: value.expand(4, 5) for name, value in stats[ACTION].items()}
+    preprocessor, postprocessor = make_pre_post_processors(
+        config, dataset_stats=stats, dataset_meta=dataset_meta
+    )
     encode = next(s for s in preprocessor.steps if isinstance(s, GrootN17VLMEncodeStep))
     encode.model_name = str(backbone)
     encode.use_albumentations = mode == "albumentations"
@@ -274,6 +280,49 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(exported):
             expected = postprocessor(chunk)[0].numpy()
         actual = engine._run_chunk(frame, engine._task_values, noise)
         np.testing.assert_allclose(actual / engine._scale, expected / engine._scale, atol=1e-3)
+
+
+@pytest.mark.dataset
+def test_export_takes_the_state_under_the_name_the_saved_preprocessor_renames(tmp_path):
+    """The dataset names the state `observation.joints`, which the checkpoint's preprocessor renames."""
+    from lerobot.datasets import LeRobotDatasetMetadata
+    from lerobot.datasets.io_utils import write_info
+    from lerobot.processor import RenameObservationsProcessorStep
+
+    joints = "observation.joints"
+    image = {"dtype": "image", "names": ["height", "width", "channels"]}
+    features = {
+        **{name: {**image, "shape": (h, w, c)} for name, (c, h, w) in MODES["torchvision"][1].items()},
+        joints: {"dtype": "float32", "shape": (5,), "names": None},
+        ACTION: {"dtype": "float32", "shape": (5,), "names": [f"joint_{i}" for i in range(5)]},
+    }
+    root = tmp_path / "dataset"
+    metadata = LeRobotDatasetMetadata.create(
+        "user/tiny", fps=10, features=features, root=root, use_videos=False
+    )
+    metadata.save_episode_tasks([TASK])
+    metadata.info.total_tasks = 1
+    write_info(metadata.info, root)
+    # With relative actions, the actions part reads the state too.
+    checkpoint = save_checkpoint(tmp_path, "torchvision", dataset_meta=metadata, use_relative_actions=True)
+    config = GrootConfig.from_pretrained(checkpoint)
+    preprocessor, _ = make_pre_post_processors(config, checkpoint)
+    preprocessor.steps.insert(0, RenameObservationsProcessorStep(rename_map={joints: OBS_STATE}))
+    preprocessor.save_pretrained(checkpoint)
+    bundle = tmp_path / "bundle"
+    export(
+        [
+            "--backend.type=torch_test",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={bundle}",
+            "--dataset.repo_id=user/tiny",
+            f"--dataset.root={root}",
+            "--tolerance=1e-4",
+        ]
+    )
+    runs = Bundle.read(bundle).manifest.runs
+    assert [run.name for run in runs if joints in run.inputs] == ["vision", "actions"]
+    assert not any(OBS_STATE in run.inputs for run in runs)
 
 
 @pytest.mark.gpu
