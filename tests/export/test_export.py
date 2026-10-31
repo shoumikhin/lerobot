@@ -248,7 +248,10 @@ def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     request = tmp_path / "trace.json"
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
-    request.write_text(json.dumps({"step": "trace", "args": args, "result": str(tmp_path / "result.json")}))
+    folders = str(tmp_path / "folders.json")
+    request.write_text(
+        json.dumps({"step": "trace", "args": args, "folders": folders, "result": str(tmp_path / "result.json")})
+    )
     monkeypatch.setattr(sys, "argv", ["worker", str(request)])
     flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
