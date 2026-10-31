@@ -635,7 +635,7 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         # every sequence has emitted it. Keep stochastic decoding unchanged because
         # skipping multinomial calls would shift the RNG state for subsequent calls.
         end_of_action_token_id = tokenizer.convert_tokens_to_ids("|")
-        # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
+        # torch.compile also reports is_exporting() on PyTorch 2.11, not 2.15; non-strict export skips Dynamo.
         exporting = torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
         early_stop = temperature == 0 and not exporting
         finished = torch.zeros(bsize, dtype=torch.bool, device=device) if early_stop else None
