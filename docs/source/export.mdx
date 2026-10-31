@@ -188,6 +188,9 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot
   "backend": "executorch_tensorrt",
   "runtime": "executorch",
   "runtime_imports": ["torch_tensorrt_executorch_runtime"],
+  "runtime_options": {
+    "TensorRTBackend": { "use_shared_activation_scratch": true }
+  },
   "programs": {
     "model": { "file": "model.pte", "data": null }
   },
@@ -225,6 +228,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
 - On a GPU backend, the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
+- `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
 - `target` is the GPU the programs were built on, when they run only on that kind of GPU, as a TensorRT engine does. `runtime_versions` are the versions of the Python modules the programs need to load.
 

@@ -141,7 +141,7 @@ class BundleEngine:
         )
         check_target(manifest.target)
         check_runtime_versions(manifest.runtime_versions)
-        runtime = prepare_runtime(manifest.runtime, manifest.runtime_imports)
+        runtime = prepare_runtime(manifest.runtime, manifest.runtime_imports, manifest.runtime_options)
         programs = {
             name: runtime.load(
                 bundle.path / files.file, None if files.data is None else bundle.path / files.data
