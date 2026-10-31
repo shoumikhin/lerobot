@@ -112,7 +112,12 @@ class SparseMoeBlock(nn.Module):
 
         self.dim_inputs = config.dim_inputs
 
-    def forward(self, hidden_states: torch.Tensor, experts_indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        experts_indices: torch.Tensor,
+        experts_rows: tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.Tensor:
         """
         Route different hidden_states to corresponding experts for processing.
 
@@ -120,6 +125,10 @@ class SparseMoeBlock(nn.Module):
             hidden_states (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_dim).
             experts_indices (torch.Tensor): Tensor of shape (batch_size, seq_length),
                 indicating the expert index assigned to each token.
+            experts_rows (tuple[torch.Tensor, ...], optional): Routing that replaces `experts_indices`:
+                for each expert, the positions of its tokens in every sample, in order, shape
+                (batch_size, tokens). Experts past the end of the tuple get no tokens. Routing then uses
+                fixed shapes and no host reads.
 
         Returns:
             output (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_dim).
@@ -128,6 +137,17 @@ class SparseMoeBlock(nn.Module):
         output = torch.zeros_like(hidden_states)
 
         for expert_idx, expert in enumerate(self.experts):
+            if experts_rows is not None:
+                if expert_idx >= len(experts_rows):
+                    continue
+                dim_input = self.dim_inputs[expert_idx]
+                index = experts_rows[expert_idx].unsqueeze(-1).expand(-1, -1, hidden_dim)
+                selected_hidden = hidden_states.gather(1, index).flatten(0, 1)
+                processed_hidden = expert(selected_hidden[:, :dim_input]).view(batch_size, -1, dim_input)
+                output = output.scatter(
+                    1, index, torch.nn.functional.pad(processed_hidden, (0, hidden_dim - dim_input))
+                )
+                continue
             mask = experts_indices == expert_idx
             if mask.sum() == 0:
                 continue
@@ -168,6 +188,7 @@ class Qwen2_5_VLDecoderLayer_with_MoE(Qwen2_5_VLDecoderLayer):  # noqa: N801
         token_types: torch.LongTensor | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_rows: tuple[torch.Tensor, ...] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -193,7 +214,7 @@ class Qwen2_5_VLDecoderLayer_with_MoE(Qwen2_5_VLDecoderLayer):  # noqa: N801
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.mlp is None:  # using moe mlp
             hidden_states = hidden_states.to(self.moe.experts[0].down_proj.weight.dtype)
-            hidden_states = self.moe(hidden_states, token_types)
+            hidden_states = self.moe(hidden_states, token_types, token_rows)
         else:
             hidden_states = hidden_states.to(self.mlp.down_proj.weight.dtype)
             hidden_states = self.mlp(hidden_states)
@@ -261,6 +282,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
         moe_token_types: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
+        moe_token_rows: tuple[torch.Tensor, ...] | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         self._require_eager_attention(self.config._attn_implementation)
@@ -333,6 +355,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
                 token_types=routing_token_types,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                token_rows=moe_token_rows,
                 **kwargs,
             )
 

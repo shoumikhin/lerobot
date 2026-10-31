@@ -144,6 +144,34 @@ Language training uses `policy.text_loss_weight` (default `0.01`),
 `policy.flow_loss_weight` (default `1.0`), and `policy.tokenizer_max_length`
 (default `768`). `policy.recipe_path` optionally replaces the built-in recipe.
 
+## Export with torch.export
+
+`torch.export` cannot trace the stock vision tower, because it reads the image grid (`image_grid_thw`) into
+Python numbers. Build the grid data once from a preprocessed batch with the camera layout you deploy, and
+pass it to `predict_action_chunk`:
+
+```python
+import torch
+
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
+
+grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+tensors = {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
+
+
+class Predict(torch.nn.Module):
+    def forward(self, tensors):
+        return policy.predict_action_chunk({**batch, **tensors}, vision_grid=grid)
+
+
+with torch.no_grad():
+    program = torch.export.export(Predict(), (tensors,), strict=False)
+```
+
+The program refuses inputs whose image grid differs from the one `grid` was built for, and attention masks
+that hide more than padding. An eager call with `vision_grid=grid` runs the same code as the program, so
+comparing it with a call without `vision_grid` checks the export path. Only the diffusion prediction mode exports, on PyTorch 2.9 or later; save the program after `program.run_decompositions()`.
+
 ## License
 
 This model follows the **Apache 2.0 License**, consistent with the original [WallX repository](https://github.com/X-Square-Robot/wall-x).
