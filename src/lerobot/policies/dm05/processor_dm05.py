@@ -174,16 +174,8 @@ class DM05TokenizerProcessorStep(ObservationProcessorStep):
             )
         return self._tokenization
 
-    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
-        """Tokenize prompt, images, and optional normalized state bins."""
-        if OBS_STATE not in observation:
-            raise ValueError(f"DM05 requires `{OBS_STATE}` after preprocessing.")
-        state = torch.as_tensor(observation[OBS_STATE])
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
-        if state.ndim != 2:
-            raise ValueError(f"DM05 expects batched state [B,D], got {tuple(state.shape)}.")
-
+    def camera_images(self, observation: dict[str, Any], batch_size: int) -> list[torch.Tensor]:
+        """Each configured camera's images `[B, C, side, side]` in [0, 1], letterboxed to a centred square."""
         # The configured keys are the whole camera set: an observation carrying an extra camera must
         # not silently change the image count or the rendered prompt.
         if not self.image_keys:
@@ -201,9 +193,9 @@ class DM05TokenizerProcessorStep(ObservationProcessorStep):
                 raise TypeError(f"DM05 expects tensor images at {key!r}, got {type(images).__name__}.")
             if images.ndim == 3:
                 images = images.unsqueeze(0)
-            if images.ndim != 4 or images.shape[0] != state.shape[0]:
+            if images.ndim != 4 or images.shape[0] != batch_size:
                 raise ValueError(
-                    f"DM05 expects images [B,C,H,W] with B={state.shape[0]} at {key!r}, "
+                    f"DM05 expects images [B,C,H,W] with B={batch_size} at {key!r}, "
                     f"got {tuple(images.shape)}."
                 )
             images = images.float().div(255) if not images.is_floating_point() else images
@@ -214,14 +206,26 @@ class DM05TokenizerProcessorStep(ObservationProcessorStep):
             top, left = (side - height) // 2, (side - width) // 2
             pad = (left, side - width - left, top, side - height - top)
             image_batches.append(torch.nn.functional.pad(images, pad))
+        return image_batches
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        """Tokenize prompt, images, and optional normalized state bins."""
+        if OBS_STATE not in observation:
+            raise ValueError(f"DM05 requires `{OBS_STATE}` after preprocessing.")
+        state = torch.as_tensor(observation[OBS_STATE])
+        if state.ndim == 1:
+            state = state.unsqueeze(0)
+        if state.ndim != 2:
+            raise ValueError(f"DM05 expects batched state [B,D], got {tuple(state.shape)}.")
 
         batch_size = int(state.shape[0])
+        image_batches = self.camera_images(observation, batch_size)
         complementary_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
         state_bins = complementary_data.get(STATE_BINS)
         if self.add_state and (not isinstance(state_bins, list) or len(state_bins) != batch_size):
             raise ValueError("DM05 state bins are missing or do not match the batch size.")
         tasks = normalize_task_batch(complementary_data.get("task"), batch_size, self.default_task)
-        meta = build_meta(image_keys)
+        meta = build_meta(list(self.image_keys or []))
         samples = [
             {
                 "prompt": tasks[index],
