@@ -272,6 +272,17 @@ def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
     assert seen == [(False, False)]
 
 
+def test_a_backend_from_discover_packages_path_reaches_the_compile_step(checkpoint, tmp_path):
+    # No installed package adds this backend, so each step must load it from the command line.
+    run_export(
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--backend.discover_packages_path=tests.export.discovered_backend",
+        backend="torch_test_discovered",
+    )
+    assert Bundle.read(tmp_path / "b").manifest.backend == "torch_test_discovered"
+
+
 def test_the_compile_step_runs_without_autograd(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(
@@ -281,7 +292,7 @@ def test_the_compile_step_runs_without_autograd(tmp_path, monkeypatch):
     with torch.no_grad():
         program = torch.export.export(torch.nn.Linear(2, 2), (torch.zeros(1, 2),))
     torch.export.save(program, tmp_path / "part.pt2")
-    request = {"backend": {"type": "torch_test"}, "program": str(tmp_path / "part.pt2")}
+    request = {"backend": {"type": "torch_test"}, "program": str(tmp_path / "part.pt2"), "plugins": []}
     worker.compile_step({**request, "path": str(tmp_path / "out.pt2")})
     assert seen == [False]
 

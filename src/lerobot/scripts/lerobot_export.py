@@ -50,6 +50,7 @@ from typing import Any, cast
 
 from lerobot.bundle.manifest import Bundle, BundleManifest
 from lerobot.utils import init_logging
+from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, parse_plugin_args
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,8 @@ def export(args: Sequence[str]) -> Path:
             # The command line asked for help, which the trace step printed.
             raise SystemExit(0)
         folder, output_dir = Path(traced["folder"]), Path(traced["output_dir"])
+        # The trace step loaded these from the command line; a compile step needs the backend's.
+        plugins = [path for key, path in parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, args).items() if key.startswith("backend.")]
         try:
             manifest = BundleManifest.from_dict(traced["manifest"])
             for name, files in manifest.programs.items():
@@ -81,6 +84,7 @@ def export(args: Sequence[str]) -> Path:
                     "backend": traced["backend"],
                     "program": str(Path(traced["traced"]) / f"{name}.pt2"),
                     "path": str(folder / files.file),
+                    "plugins": plugins,
                 }
                 files.data = cast(dict[str, Any], _run_step(work, f"compile-{name}", request))["data"]
             shutil.rmtree(traced["traced"])

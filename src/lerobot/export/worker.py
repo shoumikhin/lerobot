@@ -49,7 +49,7 @@ from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
 from lerobot.utils import init_logging, register_third_party_plugins
-from lerobot.utils.import_utils import PLUGIN_KINDS
+from lerobot.utils.import_utils import PLUGIN_KINDS, load_plugin
 
 from . import backends  # noqa: F401
 from .bundle import write_bundle
@@ -160,6 +160,8 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
 
     Returns the name of the data file the backend wrote beside it, if any.
     """
+    for plugin in request["plugins"]:
+        load_plugin(plugin)
     backend = draccus.decode(ExportBackendConfig, request["backend"])
     path = Path(request["path"])
     logger.info("Compiling %s with %s", path.stem, backend.type)
