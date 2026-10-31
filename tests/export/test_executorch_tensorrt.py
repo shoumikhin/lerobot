@@ -141,7 +141,7 @@ def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-def test_operators_whose_plugins_need_pytorch_stay_out_of_tensorrt(monkeypatch, tmp_path):
+def test_compile_gets_the_plugin_and_weight_sharing_settings(monkeypatch, tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     seen = {}
@@ -153,4 +153,6 @@ def test_operators_whose_plugins_need_pytorch_stay_out_of_tensorrt(monkeypatch, 
     use_fake_tensorrt(monkeypatch, compile)
     with pytest.raises(ReachedCompileError):
         ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
+    # Operators whose TensorRT plugins need PyTorch stay out of TensorRT, and weights are shared.
     assert seen["fallback_pytorch_plugin_ops"] is True
+    assert seen["deduplicate_weights"] is True
