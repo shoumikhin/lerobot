@@ -94,6 +94,9 @@ RECIPES = {
         reads_task=True,
     ),
     "flux3": Recipe("tests.policies.flux3.export_stand_in", ("monkeypatch",), seeded=True, reads_task=True),
+    "evo1": Recipe(
+        "tests.policies.evo1.test_export_evo1", ("monkeypatch",), reads_task=True, marks=(OLD_TORCH,)
+    ),
 }
 
 

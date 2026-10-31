@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -203,6 +203,10 @@ class Evo1ActionProcessorStep(PolicyActionProcessorStep):
             below,
         )
         return action
+
+    def without_threshold(self) -> Evo1ActionProcessorStep:
+        """The step with the gripper not binarized, for `lerobot-export`'s check (see `action_pipelines`)."""
+        return replace(self, binarize_gripper=False) if self.binarize_gripper else self
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
