@@ -23,42 +23,11 @@ import pytest
 pytest.importorskip("transformers")
 
 import transformers.utils  # noqa: E402
-from transformers import PaliGemmaConfig  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
 from lerobot.policies.pi0 import PI0Config, PI0Policy, modeling_pi0  # noqa: E402
 from lerobot.policies.pi05 import PI05Config, PI05Policy, modeling_pi05  # noqa: E402
-
-# Every download option of `from_pretrained`, none at its default value.
-DOWNLOAD_ARGUMENTS = {
-    "force_download": True,
-    "resume_download": True,
-    "proxies": {"https": "http://proxy:8080"},
-    "token": "secret",
-    "cache_dir": "/cache",
-    "local_files_only": True,
-    "revision": "v1",
-}
-
-
-def use_tiny_backbone(monkeypatch, modeling_module):
-    """Make the policy in `modeling_module` have a few million parameters instead of billions."""
-    tiny = modeling_module.GemmaConfig(
-        width=16, depth=1, mlp_dim=32, num_heads=1, num_kv_heads=1, head_dim=16
-    )
-    monkeypatch.setattr(modeling_module, "get_gemma_config", lambda variant: tiny)
-    vision = {
-        "model_type": "siglip_vision_model",
-        "hidden_size": 16,
-        "num_hidden_layers": 1,
-        "num_attention_heads": 1,
-        "vision_use_head": False,
-    }
-    configs = {
-        "paligemma": lambda: PaliGemmaConfig(vision_config=vision),
-        "gemma": modeling_module.CONFIG_MAPPING["gemma"],
-    }
-    monkeypatch.setattr(modeling_module, "CONFIG_MAPPING", configs)
+from tests.policies.pi0_pi05.utils.meta_load import DOWNLOAD_ARGUMENTS, use_tiny_backbone  # noqa: E402
 
 
 class Tokenizer:
