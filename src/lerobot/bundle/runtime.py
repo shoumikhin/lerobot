@@ -52,7 +52,8 @@ class Runtime:
         load (`Callable[[Path, Path | None], Program]`):
             Loads a program file, with its data file if the manifest names one.
         prepare (`Callable[[], None]`, *optional*):
-            Runs once before the manifest's `runtime_imports` are imported.
+            Runs before the programs load, and before the manifest's `runtime_imports` import when the
+            runtime is registered before them.
     """
 
     load: Callable[[Path, Path | None], Program]
@@ -64,8 +65,13 @@ RUNTIMES: dict[str, Runtime] = {"executorch": Runtime(executorch.ExecuTorchProgr
 
 
 def prepare_runtime(runtime: str, modules: Sequence[str]) -> Runtime:
-    """Get the runtime named `runtime` ready, import the modules a bundle needs, and return the runtime."""
-    if runtime in RUNTIMES:
+    """Get the runtime named `runtime` ready, import the modules a bundle needs, and return the runtime.
+
+    The runtime prepares before the modules import, since a module may load native code that reads what
+    `prepare` set. One that a module registers prepares once the modules are imported.
+    """
+    prepared = runtime in RUNTIMES
+    if prepared:
         RUNTIMES[runtime].prepare()
     for module in modules:
         try:
@@ -78,4 +84,6 @@ def prepare_runtime(runtime: str, modules: Sequence[str]) -> Runtime:
             ) from error
     if runtime not in RUNTIMES:
         raise ValueError(f"Unknown runtime {runtime!r}; this version of LeRobot runs {sorted(RUNTIMES)}.")
+    if not prepared:
+        RUNTIMES[runtime].prepare()
     return RUNTIMES[runtime]
