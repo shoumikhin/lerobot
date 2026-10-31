@@ -137,6 +137,22 @@ def test_a_new_task_without_the_tokenizers_package_names_the_install(tmp_path, m
         tokens.ids("place the box")
 
 
+def test_a_new_task_is_tokenized_with_the_tokenizers_package_this_process_sees(tmp_path, monkeypatch):
+    # Found only through PYTHONPATH, as a package in the user site or installed with `pip install --target`.
+    package = tmp_path / "site" / "tokenizers"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "from types import SimpleNamespace\n"
+        "class Tokenizer:\n"
+        "    from_file = staticmethod(lambda path: Tokenizer())\n"
+        "    no_padding = no_truncation = lambda self: None\n"
+        "    encode = lambda self, text: SimpleNamespace(ids=[7] * len(text.split()))\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(package.parent))
+    monkeypatch.syspath_prepend(str(package.parent))
+    assert task_tokens_module.tokenize(tmp_path / TOKENIZER, ["place the box"]) == [[7, 7, 7]]
+
+
 def test_a_tokenizer_that_splits_differently_is_refused(tmp_path):
     tokens = TaskEncoder(
         tmp_path, write_task_files(tmp_path, torch.randn(len(WORDS), 4), {"pick the cube": [0, 2]})
