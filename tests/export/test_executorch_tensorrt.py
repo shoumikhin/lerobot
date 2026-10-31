@@ -159,6 +159,7 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
         "truncate_double": True,
         "offload_module_to_cpu": True,
         "disable_tf32": True,
+        "deduplicate_weights": True,
     }
     assert seen["save"] == (
         "engine",
