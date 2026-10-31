@@ -327,8 +327,9 @@ def test_the_parts_are_held_to_the_export_tolerance(tmp_path, monkeypatch, offse
         f"--policy.path={tmp_path / 'ckpt'}",
         f"--output_dir={tmp_path / 'b'}",
     ]
+    request = {"step": "trace", "args": args, "folders": str(tmp_path / "folders.json")}
     if passes:
-        worker.trace_step({"step": "trace", "args": args})
+        worker.trace_step(request)
     else:
         with pytest.raises(ValueError, match="compute another chunk"):
-            worker.trace_step({"step": "trace", "args": args})
+            worker.trace_step(request)
