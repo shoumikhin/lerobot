@@ -64,6 +64,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
 
         Returns the weights file of the CUDA backend's part, if it has one.
         """
+        import inspect
+
         import torch_tensorrt
 
         if not tensorrt_takes_the_plugin_setting():
@@ -84,6 +86,10 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
         }
+        # One host copy of each weight, and of its transpose, instead of one per layer that reads it
+        # (pytorch/TensorRT#4965). An older Torch-TensorRT would ignore the setting without a word.
+        if "deduplicate_weights" in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+            options["deduplicate_weights"] = True
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
         args, _ = program.example_inputs
