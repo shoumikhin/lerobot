@@ -525,6 +525,85 @@ def test_config_creation():
         raise
 
 
+def test_text_attention_keeps_bfloat16_scores_in_float32():
+    from copy import deepcopy
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import eager_attention_forward
+
+    from lerobot.policies.wall_x.qwen_model import Qwen2_5_VLConfig
+
+    hidden_size = 64
+    expert_config = {"hidden_size": hidden_size, "intermediate_size": 64, "hidden_act": "silu"}
+    text_config = {
+        "vocab_size": 32,
+        "hidden_size": hidden_size,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "layer_types": ["full_attention", "full_attention"],
+        "rope_parameters": {"rope_type": "default", "rope_theta": 1_000_000.0, "mrope_section": [8, 4, 4]},
+        "num_experts": 2,
+        "experts": [expert_config, expert_config],
+        "dim_inputs": (hidden_size, hidden_size),
+        "mlp_moe": True,
+        "dof_config": {"joint": 2},
+    }
+    vision_config = {
+        "depth": 1,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_heads": 2,
+        "out_hidden_size": hidden_size,
+        "patch_size": 14,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "window_size": 56,
+        "fullatt_block_indexes": [0],
+    }
+    config = Qwen2_5_VLConfig(
+        text_config=text_config, vision_config=vision_config, agent_pos_config={"state": 2}
+    )
+    tokenizer = SimpleNamespace(init_kwargs={}, convert_tokens_to_ids=lambda token: 1)
+    torch.manual_seed(0)
+    # The text model as the policy builds it.
+    model = Qwen2_5_VLMoEForAction(config, processor=SimpleNamespace(tokenizer=tokenizer)).model
+    stock = deepcopy(model)
+    stock.config._attn_implementation = "eager"
+    # In float32 it is stock eager attention, with the causal mask and an action-token island (tokens 2 to 4).
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    moe_token_types = torch.tensor([[0, 0, 1, 1, 1, 0]])
+    with torch.no_grad():
+        output, stock_output = (
+            text_model(input_ids=input_ids, moe_token_types=moe_token_types, output_attentions=True)
+            for text_model in (model, stock)
+        )
+    assert torch.equal(output.last_hidden_state, stock_output.last_hidden_state)
+    assert all(torch.equal(a, b) for a, b in zip(output.attentions, stock_output.attentions, strict=True))
+
+    # In bfloat16 it rounds no score before the softmax, also under the bfloat16 autocast of mixed precision.
+    module = model.layers[0].self_attn
+    # How the attention modules pick their attention function.
+    attention = ALL_ATTENTION_FUNCTIONS.get_interface(
+        module.config._attn_implementation, eager_attention_forward
+    )
+    num_heads, head_dim = 2, 64
+    torch.manual_seed(0)
+    # Large scores: rounding them to bfloat16 before the softmax moves the output by about 0.12 here.
+    query, key = (4 * torch.randn(1, num_heads, 32, head_dim).bfloat16() for _ in range(2))
+    value = torch.randn(1, num_heads, 32, head_dim).bfloat16()
+    expected, _ = eager_attention_forward(
+        module, query.float(), key.float(), value.float(), None, head_dim**-0.5
+    )
+    for autocast in (False, True):
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            actual, _ = attention(module, query, key, value, None, head_dim**-0.5)
+        assert actual.dtype == torch.bfloat16
+        assert (actual.float() - expected).abs().max() < 0.03
+
+
 def test_subtask_prompt_is_token_exact_with_the_trained_template():
     """WALL-OSS declares its mode in the user turn, so the template must match upstream."""
     img_keys = ["observation.images.face_view"]
