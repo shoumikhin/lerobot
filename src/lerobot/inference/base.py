@@ -29,9 +29,9 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from lerobot.lerobot_types import EnvTransition
 from lerobot.utils import QUERY_KIND, QUERY_TEXT
+from lerobot.utils.latency import LatencyWindow
 
 from .contracts import DEFAULT_MAX_TEXT_INPUT_CHARS, QueryKind
-from .latency import LatencyWindow
 
 if TYPE_CHECKING:
     import numpy as np
