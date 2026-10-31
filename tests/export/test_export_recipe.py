@@ -343,6 +343,27 @@ class EditedStepsRecipe(ActionChunkRecipe):
         return replace(self.preprocessor, steps=self.edit(self.preprocessor.steps))
 
 
+class InexactStepsRecipe(EditedStepsRecipe):
+    """Held to the export's tolerance rather than to rollout's actions bit for bit."""
+
+    exact = False
+
+
+class ScaleState(ProcessorStep):
+    """Scales the state, as a program that computes the same thing in another order rounds it."""
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        state = observation[OBS_STATE] * self.scale
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: state}}
+
+    def transform_features(self, features):
+        return features
+
+
 @pytest.mark.parametrize(
     ("recipe_class", "edit", "error"),
     [
@@ -353,6 +374,9 @@ class EditedStepsRecipe(ActionChunkRecipe):
             lambda steps: [step for step in steps if not isinstance(step, NormalizerProcessorStep)],
             "computes something else",
         ),
+        # Float32 rounding: the actions are not rollout's bit for bit, but within the tolerance.
+        (InexactStepsRecipe, lambda steps: [ScaleState(1 + 1e-6), *steps], None),
+        (InexactStepsRecipe, lambda steps: [ScaleState(2.0), *steps], "more than the tolerance"),
     ],
 )
 def test_a_recipe_gives_the_program_a_preprocessor_that_computes_the_same(recipe_class, edit, error):
