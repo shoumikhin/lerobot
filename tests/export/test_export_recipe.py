@@ -262,3 +262,39 @@ def test_a_program_preprocessor_that_computes_something_else_is_refused():
 
     with pytest.raises(ValueError, match="computes something else"):
         list(recipe.parts())
+
+
+class NudgeState(ProcessorStep):
+    """Moves the state by float32 rounding, as a program that adds in another order than the policy would."""
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        state = observation[OBS_STATE] * (1 + 1e-6)
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: state}}
+
+    def transform_features(self, features):
+        return features
+
+
+class TolerantRecipe(ActionChunkRecipe):
+    """A recipe whose program nudges the state and is held to the export's tolerance."""
+
+    def program_preprocessor(self):
+        return replace(self.preprocessor, steps=[NudgeState(), *self.preprocessor.steps])
+
+    def check_program(self, actions, expected):
+        difference = (np.abs(actions - expected) / self.test_case().action_scale).max()
+        if difference > self.tolerance:
+            raise ValueError(f"{difference} is more than the tolerance")
+
+
+def test_a_recipe_can_hold_its_program_to_the_tolerance():
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    recipe = TolerantRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config())
+
+    # The default check refuses this program, whose actions are not rollout's bit for bit.
+    [part] = recipe.parts()
+
+    assert isinstance(part.module.preprocessor.steps[0], NudgeState)

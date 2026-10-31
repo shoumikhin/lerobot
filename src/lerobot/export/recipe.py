@@ -285,12 +285,7 @@ class ActionChunkRecipe(ExportRecipe):
         ):
             with torch.no_grad():
                 actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
-            if not np.array_equal(actions, expected):
-                raise ValueError(
-                    f"The {self.policy.config.type} policy computes something else as one module than it "
-                    "does in lerobot-rollout, for example because a preprocessor step reads the frame in "
-                    "Python. It needs its own export recipe."
-                )
+            self.check_program(actions, expected)
         inputs = [*self._features, *([NOISE] if self._noise_shape else [])]
         yield Part("model", module, self._inputs(self._case.frame, self._case.noise), inputs, [ACTION])
 
@@ -306,6 +301,20 @@ class ActionChunkRecipe(ExportRecipe):
         still checked against the saved preprocessor.
         """
         return self.preprocessor
+
+    def check_program(self, actions: np.ndarray, expected: np.ndarray) -> None:
+        """Refuse a program whose actions for a frame, in PyTorch, are not the ones lerobot-rollout plays.
+
+        By default they must be the same bit for bit. A recipe whose program computes the same thing in another
+        order than the policy, for example over a prompt padded to a fixed length, holds them to the export's
+        tolerance instead.
+        """
+        if not np.array_equal(actions, expected):
+            raise ValueError(
+                f"The {self.policy.config.type} policy computes something else as one module than it "
+                "does in lerobot-rollout, for example because a preprocessor step reads the frame in "
+                "Python. It needs its own export recipe."
+            )
 
     @staticmethod
     def predict_chunk(policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
