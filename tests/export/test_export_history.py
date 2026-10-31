@@ -38,6 +38,7 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
+from tests.export import torch_backend  # noqa: F401  # registers torch_test for the in-process trace step
 from tests.export.plugins import use_plugins
 
 IMAGE = "observation.images.front"
