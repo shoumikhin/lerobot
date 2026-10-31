@@ -246,6 +246,30 @@ def test_gripper_steps_survive_a_save_load_round_trip(tmp_path):
         assert (step.gripper_dim, step.threshold) == (5, 0.25), class_name
 
 
+def test_the_export_checks_the_gripper_without_the_pre_snap_and_binarize_steps():
+    """`lerobot-export` checks a compiled program on the actions without its threshold steps, where rounding alone
+    cannot pick either side of a threshold; the program still plays the snapped and binarized gripper."""
+    from lerobot.export.recipe import PostprocessedActions
+
+    cfg = make_config(action_dim=7)
+    cfg.gripper_dim = 6
+    cfg.pre_snap_gripper_action = True
+    cfg.binarize_gripper_action = True
+    stats = _stats_for(cfg)
+    _, post = make_vla_jepa_pre_post_processors(cfg, stats)
+    plain = deepcopy(cfg)
+    plain.pre_snap_gripper_action = False
+    plain.binarize_gripper_action = False
+    _, unthresholded = make_vla_jepa_pre_post_processors(plain, stats)
+    chunk = torch.zeros(1, 2, 7)
+    chunk[0, :, 6] = torch.tensor([0.45, 0.55])
+
+    actions, continuous = PostprocessedActions(post)(chunk)
+
+    assert actions[:, 6].tolist() == [1.0, -1.0]
+    torch.testing.assert_close(continuous, unthresholded(chunk)[0].float())
+
+
 def test_gripper_steps_default_off():
     """The LIBERO-specific gripper steps are opt-in, since they assume LIBERO's units."""
     cfg = make_config(action_dim=7)

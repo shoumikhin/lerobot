@@ -147,6 +147,10 @@ class PreSnapGripperProcessorStep(ProcessorStep):
             transition[TransitionKey.ACTION] = a
         return transition
 
+    def without_threshold(self) -> None:
+        """Nothing: the snap is the threshold, which `lerobot-export`'s check leaves out (see `action_pipelines`)."""
+        return None
+
     def get_config(self) -> dict[str, Any]:
         # Without this the base class serializes `{}` and a reloaded pipeline silently reverts
         # to the class defaults, discarding whatever the training config set.
@@ -181,6 +185,10 @@ class BinarizeGripperProcessorStep(ProcessorStep):
             a[..., self.gripper_dim] = 1.0 - 2.0 * (a[..., self.gripper_dim] > self.threshold).float()
             transition[TransitionKey.ACTION] = a
         return transition
+
+    def without_threshold(self) -> None:
+        """Nothing: the step is the threshold, which `lerobot-export`'s check leaves out (see `action_pipelines`)."""
+        return None
 
     def get_config(self) -> dict[str, Any]:
         # See PreSnapGripperProcessorStep.get_config: `{}` would reload as the class defaults.
