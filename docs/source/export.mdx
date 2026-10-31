@@ -234,7 +234,7 @@ The export makes a random test frame and records the actions PyTorch computes fo
 - **At export**, the finished bundle replays the test frame in a fresh process, the same way `lerobot-rollout` will. If the actions differ too much from PyTorch's, nothing is written.
 - **At load**, `lerobot-rollout` replays the test frame again, before the robot connects. It also checks the robot's cameras and state (after `--rename_map`), the number of joints, and the joint names when the policy recorded them. Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module only gets a warning), or if its programs read a value that nothing gives. While the robot runs, every chunk must have the right shape and be finite before it is used.
 
-The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. In bfloat16 the pi0.5 recipe uses 0.2, measured on its test frame. Change it with `--tolerance`.
+The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. In bfloat16 the pi0.5 recipe uses 0.2, measured on its test frame. That catches only large errors: a recipe that swapped two cameras would move pi0.5's actions by about 0.03 there, so check a change to a recipe in float32, where the tolerance is 2e-05. Change the tolerance with `--tolerance`.
 
 <Tip>
 
@@ -259,6 +259,8 @@ Two things let a board with 8 GB build such a policy:
 
 - The recipe loads only the weights of the part it is tracing, then frees them.
 - Each part is compiled in a process of its own, and the memory goes back to the system when that process ends.
+
+The export also compares the chain's actions with the whole policy's own, which needs twice the policy's weights in memory. A board that does not have that memory, such as an 8 GB board for pi0.5, refuses the export unless you pass `--skip_policy_check=true`. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
 
 ### Past frames
 
@@ -302,6 +304,7 @@ lerobot-export \
     --policy.path=<user>/<pi05_checkpoint> \
     --policy.dtype=bfloat16 \
     --backend.type=executorch_tensorrt \
+    --skip_policy_check=true \
     --dataset.repo_id=<user>/<dataset> \
     --task="pick up the cube"
 ```
