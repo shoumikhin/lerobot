@@ -3157,3 +3157,63 @@ def test_action_encoder_takes_one_time_encoding_for_the_chunk():
     torch.testing.assert_close(
         encoder.encode(actions, time_encoding, cat_ids), encoder(actions, timestep, cat_ids), atol=0, rtol=0
     )
+
+
+def _alternate_vl_dit_before_the_split(model, hidden_states, encoder_hidden_states, timestep, image_mask, mask):
+    """`AlternateVLDiT.forward` as it was written before its blocks and output became methods."""
+    temb = model.timestep_encoder(timestep)
+    image_attention_mask = image_mask & mask
+    non_image_attention_mask = (~image_mask) & mask
+    for idx, block in enumerate(model.transformer_blocks):
+        if idx % 2 == 1:
+            hidden_states = block(hidden_states, temb=temb)
+        else:
+            encoder_mask = (
+                non_image_attention_mask
+                if idx % (2 * model.attend_text_every_n_blocks) == 0
+                else image_attention_mask
+            )
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_mask,
+                temb=temb,
+            )
+    shift, scale = model.proj_out_1(torch.nn.functional.silu(temb)).chunk(2, dim=1)
+    return model.proj_out_2(model.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None])
+
+
+def test_alternate_vl_dit_computes_what_it_did_before_the_split():
+    pytest.importorskip("diffusers")
+    from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
+
+    torch.manual_seed(0)
+    model = AlternateVLDiT(
+        output_dim=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        num_layers=4,
+        dropout=0.0,
+        final_dropout=False,
+        max_num_positional_embeddings=16,
+        interleave_self_attention=True,
+        cross_attention_dim=6,
+    ).eval()
+    hidden_states, encoder_hidden_states = torch.randn(2, 5, 8), torch.randn(2, 7, 6)
+    timestep = torch.tensor([3, 600])
+    image_mask = torch.tensor([[True, True, True, False, False, False, False]] * 2)
+    mask = torch.tensor([[True] * 7, [True] * 5 + [False] * 2])
+
+    with torch.no_grad():
+        actual = model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            image_mask=image_mask,
+            backbone_attention_mask=mask,
+        )
+        expected = _alternate_vl_dit_before_the_split(
+            model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
