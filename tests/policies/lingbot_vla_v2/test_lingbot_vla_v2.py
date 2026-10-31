@@ -27,10 +27,11 @@ import torch
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.lingbot_vla_v2.configuration_lingbot_vla_v2 import LingbotVLAV2Config, SlotMapping
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from tests.utils import skip_if_package_missing
 
 CAMERA = "observation.images.camera_top"
+WRIST = "observation.images.camera_wrist"
 CHUNK = 4
 
 
@@ -45,15 +46,12 @@ def _slot_kwargs(arm: list, effector: list) -> dict:
     return {"state_slots": _slots(OBS_STATE, arm, effector), "action_slots": _slots(ACTION, arm, effector)}
 
 
-def _ds_meta(dim: int) -> SimpleNamespace:
+def _ds_meta(dim: int, cameras: tuple[str, ...] = (CAMERA,)) -> SimpleNamespace:
     """The dataset metadata make_policy reads: features and stats of a ``dim``-D robot."""
     names = [f"joint_{i}" for i in range(dim - 1)] + ["gripper"]
     vector = {"dtype": "float32", "shape": (dim,), "names": names}
-    features = {
-        OBS_STATE: vector,
-        ACTION: vector,
-        CAMERA: {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]},
-    }
+    image = {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]}
+    features = {OBS_STATE: vector, ACTION: vector, **dict.fromkeys(cameras, image)}
     g = torch.Generator().manual_seed(dim)
     stats = {}
     for key in (OBS_STATE, ACTION):
@@ -62,11 +60,13 @@ def _ds_meta(dim: int) -> SimpleNamespace:
     return SimpleNamespace(features=features, stats=stats)
 
 
-def _raw_batch(dim: int, device: str = "cpu", batch_size: int = 2) -> dict:
+def _raw_batch(
+    dim: int, device: str = "cpu", batch_size: int = 2, cameras: tuple[str, ...] = (CAMERA,)
+) -> dict:
     g = torch.Generator().manual_seed(0)
     batch = {
         OBS_STATE: torch.randn(batch_size, dim, generator=g),
-        CAMERA: torch.rand(batch_size, 3, 32, 32, generator=g),
+        **{camera: torch.rand(batch_size, 3, 32, 32, generator=g) for camera in cameras},
         ACTION: torch.randn(batch_size, CHUNK, dim, generator=g),
     }
     return {**{k: v.to(device) for k, v in batch.items()}, "task": ["pick up the cube"] * batch_size}
@@ -158,6 +158,219 @@ def test_train_and_select_action(tiny_backbone):
     action = _select_action(policy, preprocessor, postprocessor, 7, "cpu")
     assert action.shape == (2, 7)
     assert torch.isfinite(action).all()
+
+
+def _policies(tiny_backbone, cameras, vision_boundaries=True):
+    """A policy, the same weights with `precompute_grid_thw=True`, a preprocessed batch without actions, noise."""
+    slots = _slot_kwargs(arm=[[0, 6]], effector=[[6, 7]])
+    meta = _ds_meta(7, cameras)
+    settings = {"qwen3vl_use_vision_boundaries": vision_boundaries, **slots}
+    cfg = _tiny_config(tiny_backbone, **settings)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    precompute = make_policy(
+        _tiny_config(tiny_backbone, precompute_grid_thw=True, **settings), ds_meta=meta
+    ).eval()
+    precompute.load_state_dict(policy.state_dict())
+    preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    raw = _raw_batch(7, cameras=cameras)
+    raw.pop(ACTION)
+    return policy, precompute, preprocessor(raw), torch.randn(2, CHUNK, cfg.max_action_dim)
+
+
+class _PredictActionChunk(torch.nn.Module):
+    """`predict_action_chunk` with the batch tensors as positional inputs, so torch.export can trace it."""
+
+    def __init__(self, policy, batch, grid=None):
+        super().__init__()
+        self.policy, self.batch, self.grid = policy, batch, grid
+        self.keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
+
+    def forward(self, noise, *tensors):
+        return self.policy.predict_action_chunk(
+            {**self.batch, **dict(zip(self.keys, tensors, strict=True))}, noise=noise, vision_grid=self.grid
+        )
+
+    def inputs(self, noise, batch):
+        # The sampler updates its noise in place, so every call gets its own copy.
+        return (noise.clone(), *(batch[key] for key in self.keys))
+
+
+def _grid(policy, batch):
+    from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid
+
+    visual = policy.model.qwenvl_with_expert.qwenvl.model.visual
+    return Qwen3VisionGrid.build(visual, batch["image_grid_thw"].flatten(0, -2))
+
+
+@pytest.mark.parametrize("cameras", [(CAMERA,), (CAMERA, WRIST)], ids=["one-camera", "two-cameras"])
+def test_prediction_on_a_vision_grid_exports_and_matches_eager(tiny_backbone, monkeypatch, cameras):
+    """Eager prediction keeps transformers' prefix positions; on a vision grid, prediction exports."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load
+
+    stock_rope_index, eager_rope_calls = Qwen3VLModel.get_rope_index, []
+
+    def counted_rope_index(self, *args, **kwargs):
+        assert not torch.compiler.is_exporting(), "exported prefix positions must not use get_rope_index"
+        eager_rope_calls.append(1)
+        return stock_rope_index(self, *args, **kwargs)
+
+    monkeypatch.setattr(Qwen3VLModel, "get_rope_index", counted_rope_index)
+    # The runtime asserts must not depend on transformers' own checks, which this switch turns off.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    policy, _, batch, noise = _policies(tiny_backbone, cameras)
+    core = policy.model.qwenvl_with_expert
+    build_prefix_position_ids, prefixes = core.build_prefix_position_ids, []
+
+    def recorded(input_ids, attention_mask, **kwargs):
+        positions = build_prefix_position_ids(input_ids, attention_mask, **kwargs)
+        prefixes.append((input_ids, attention_mask, positions))
+        return positions
+
+    monkeypatch.setattr(core, "build_prefix_position_ids", recorded)
+    stock = _PredictActionChunk(policy, batch)
+    module = _PredictActionChunk(policy, batch, _grid(policy, batch))
+    with torch.no_grad():
+        expected = stock(*stock.inputs(noise, batch)).clone()
+        calls_per_prediction = len(eager_rope_calls)
+        assert calls_per_prediction > 0
+        # On the grid, eager prediction runs the export path: no transformers positions, the same actions.
+        assert torch.equal(module(*module.inputs(noise, batch)), expected)
+        assert len(eager_rope_calls) == calls_per_prediction
+        program = torch.export.export(module, module.inputs(noise, batch), strict=False)
+    assert data_dependent_nodes(program) == []
+    # A grid other than the one the program holds, and a sample with no visible prefix token, on which eager rope
+    # positions fail, are refused.
+    changed = {**batch, "image_grid_thw": batch["image_grid_thw"].clone()}
+    changed["image_grid_thw"][..., 1:] = torch.tensor([2, 8])
+    empty = {key: batch[key].clone() for key in ("img_masks", OBS_LANGUAGE_ATTENTION_MASK)}
+    for mask in empty.values():
+        mask[1] = False
+    with torch.no_grad():
+        torch.testing.assert_close(program.module()(*module.inputs(noise, batch)), expected, rtol=0, atol=0)
+        for lowered in (program, save_and_load(program), program.run_decompositions()):
+            # The decompositions round differently.
+            torch.testing.assert_close(lowered.module()(*module.inputs(noise, batch)), expected)
+            for wrong in (changed, {**batch, **empty}):
+                with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                    lowered.module()(*module.inputs(noise, wrong))
+
+    # The positions the grid gives, computed from the grid ints of every camera, match transformers'.
+    input_ids, attention_mask, positions = prefixes[0]
+    every_grid = batch["image_grid_thw"].reshape(-1, 3).tolist()
+    assert torch.equal(core.build_fixed_grid_position_ids(input_ids, attention_mask, every_grid), positions)
+    if len(cameras) > 1:
+        # A hidden camera keeps its image tokens in the prefix, masked out: the export positions take every
+        # camera's grid, transformers takes the visible ones, and both must agree.
+        config = core.qwenvl.config
+        start = (input_ids[0] == config.vision_start_token_id).nonzero()[0, 0]
+        end = (input_ids[0] == config.vision_end_token_id).nonzero()[0, 0]
+        hidden = attention_mask.clone()
+        hidden[0, start : end + 1] = 0
+        stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
+        assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
+        # With cameras of two shapes and one token count, the hidden camera must not hand its grid to another.
+        camera = [config.vision_start_token_id, *[config.image_token_id] * 6, config.vision_end_token_id]
+        input_ids = torch.tensor([[1, *camera, *camera, 2]] * 2)
+        hidden = torch.ones_like(input_ids)
+        hidden[0, 1:9] = 0
+        every_grid = [[1, 4, 6], [1, 6, 4]] * 2
+        stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
+        assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
+
+
+def test_export_follows_the_vision_grid_not_the_precompute_cache(tiny_backbone):
+    """`precompute_grid_thw` caches the grid of its first call; export uses `vision_grid`."""
+    policy, precompute, batch, noise = _policies(tiny_backbone, (CAMERA,))
+    module = _PredictActionChunk(precompute, batch, _grid(precompute, batch))
+    # Another grid with the same token count, so the option keeps the cache it builds here.
+    other = {**batch, "image_grid_thw": batch["image_grid_thw"].clone()}
+    other["image_grid_thw"][..., 1:] = torch.tensor([2, 8])
+    with torch.no_grad():
+        expected = policy.predict_action_chunk(batch, noise=noise.clone())
+        precompute.predict_action_chunk(other, noise=noise.clone())
+        stock = _PredictActionChunk(precompute, batch)
+        with pytest.raises(ValueError, match="needs a vision_grid"):
+            torch.export.export(stock, stock.inputs(noise, batch), strict=False)
+        program = torch.export.export(module, module.inputs(noise, batch), strict=False).module()
+        torch.testing.assert_close(program(*module.inputs(noise, batch)), expected)
+
+
+@pytest.mark.parametrize("precompute_grid_thw", [False, True], ids=["option-off", "option-on"])
+def test_adjacent_cameras_without_vision_boundaries_are_refused(tiny_backbone, precompute_grid_thw):
+    """Without boundary tokens two visible cameras form one image block, which has no rope positions."""
+    policy, precompute, batch, noise = _policies(tiny_backbone, (CAMERA, WRIST), vision_boundaries=False)
+    with torch.no_grad(), pytest.raises(ValueError, match="at most one visible camera per sample"):
+        (precompute if precompute_grid_thw else policy).predict_action_chunk(batch, noise=noise)
+
+
+def test_exported_prediction_refuses_adjacent_cameras_without_vision_boundaries(tiny_backbone):
+    policy, _, batch, noise = _policies(tiny_backbone, (CAMERA, WRIST), vision_boundaries=False)
+    wrist_hidden = {**batch, "img_masks": batch["img_masks"].clone()}
+    wrist_hidden["img_masks"][:, 1] = False
+    module = _PredictActionChunk(policy, wrist_hidden, _grid(policy, wrist_hidden))
+    with torch.no_grad():
+        expected = policy.predict_action_chunk(wrist_hidden, noise=noise.clone())
+        with pytest.raises(ValueError, match="at most one visible camera per sample"):
+            module(*module.inputs(noise, batch))
+        program = torch.export.export(module, module.inputs(noise, wrist_hidden), strict=False).module()
+        torch.testing.assert_close(program(*module.inputs(noise, wrist_hidden)), expected)
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+            program(*module.inputs(noise, batch))
+
+
+def test_exported_prediction_with_hidden_cameras_matches_eager(tiny_backbone):
+    """With vision boundaries (the default), a hidden camera keeps its masked tokens in the prefix: the grid
+    positions take its grid, eager positions do not, and the actions must agree."""
+    policy, _, batch, noise = _policies(tiny_backbone, (CAMERA, WRIST))
+    hidden = {**batch, "img_masks": batch["img_masks"].clone()}
+    hidden["img_masks"][0, 1] = False
+    hidden["img_masks"][1, 0] = False
+    module = _PredictActionChunk(policy, hidden, _grid(policy, hidden))
+    with torch.no_grad():
+        expected = policy.predict_action_chunk(hidden, noise=noise.clone())
+        assert not torch.equal(expected, policy.predict_action_chunk(batch, noise=noise.clone()))
+        assert torch.equal(module(*module.inputs(noise, hidden)), expected)
+        program = torch.export.export(module, module.inputs(noise, hidden), strict=False).module()
+        torch.testing.assert_close(program(*module.inputs(noise, hidden)), expected, rtol=0, atol=0)
+
+
+def test_vision_grid_refuses_cameras_with_different_token_counts(tiny_backbone):
+    """The grid path splits the tower output evenly per camera, as eager stacks it: one token count only."""
+    policy, _, batch, noise = _policies(tiny_backbone, (CAMERA, WRIST))
+    # Each sample keeps its 32 patches, split 8 and 24: the tower runs, an even split would mix the cameras.
+    uneven = {**batch, "image_grid_thw": batch["image_grid_thw"].clone()}
+    uneven["image_grid_thw"][:, 0, 1:] = torch.tensor([2, 4])
+    uneven["image_grid_thw"][:, 1, 1:] = torch.tensor([4, 6])
+    with torch.no_grad(), pytest.raises(ValueError, match="same number of image tokens"):
+        policy.predict_action_chunk(uneven, noise=noise, vision_grid=_grid(policy, uneven))
+
+
+def test_full_cuda_graph_prefix_refuses_a_vision_grid(tiny_backbone):
+    """`use_cudagraph_prefix_full` hands the stock tower's outputs to `embed_prefix`, which the grid would not
+    describe; the inputs of that call are built here on the CPU."""
+    policy, _, batch, _ = _policies(tiny_backbone, (CAMERA,))
+    images, img_masks, lang_tokens, lang_masks, _, image_grid_thw = policy._extract_model_inputs(batch)
+    flow, grid = policy.model, _grid(policy, batch)
+    with torch.no_grad():
+        flat = (images.flatten(0, 1), image_grid_thw.flatten(0, -2))
+        vision_outputs = flow.qwenvl_with_expert.embed_image(*flat)
+        args = (images, img_masks, lang_tokens, lang_masks, image_grid_thw)
+        flow.embed_prefix(*args, vision_outputs=vision_outputs)
+        with pytest.raises(ValueError, match="cannot take a vision_grid"):
+            flow.embed_prefix(*args, vision_outputs=vision_outputs, vision_grid=grid)
+
+
+def test_export_refuses_float32_flash_attention_in_the_vision_tower(tiny_backbone):
+    """Eager runs float32 flash attention in bfloat16, which the exported tower does not reproduce."""
+    policy, _, batch, noise = _policies(tiny_backbone, (CAMERA,))
+    module = _PredictActionChunk(policy, batch, _grid(policy, batch))
+    with torch.no_grad():
+        # Set after building, which would need flash_attn; export refuses before attention runs.
+        policy.model.qwenvl_with_expert.qwenvl.model.visual.config._attn_implementation = "flash_attention_2"
+        with pytest.raises(ValueError, match="flash_attention_2 needs bfloat16 weights"):
+            torch.export.export(module, module.inputs(noise, batch), strict=False)
 
 
 def test_align_query_tokens(tiny_backbone, monkeypatch):
