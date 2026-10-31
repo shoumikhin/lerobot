@@ -69,6 +69,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # Float32 math stays float32, as in PyTorch. TensorRT's default TF32 moved ACT's actions by up to
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
+            # One host copy of each weight, and of its transpose, instead of one per layer that reads it
+            # (pytorch/TensorRT#4965).
+            "deduplicate_weights": True,
         }
         args, _ = program.example_inputs
         engine = torch_tensorrt.dynamo.compile(program, arg_inputs=args, **options)
