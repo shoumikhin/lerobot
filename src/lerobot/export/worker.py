@@ -76,9 +76,13 @@ def trace_step(request: dict[str, Any]) -> dict[str, Any]:
     The bundle goes into a new folder beside the output folder. Returns that folder, its manifest, and what is
     left to compile.
     """
+    argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
     sys.argv = ["lerobot-export", *request["args"]]
-    return cast(Callable[[], dict[str, Any]], _trace)()
+    try:
+        return cast(Callable[[], dict[str, Any]], _trace)()
+    finally:
+        sys.argv = argv
 
 
 @parser.wrap()
