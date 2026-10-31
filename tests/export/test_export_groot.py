@@ -463,3 +463,40 @@ def test_n17_action_decode_matches_the_processor_step():
     expected = pipeline(actions.clone())
     actual = N17ActionDecode(decode, pack, 4)(actions, torch.from_numpy(state)[None])
     torch.testing.assert_close(actual, expected.float(), rtol=0, atol=1e-5)
+
+
+def test_action_scale_of_a_relative_rotation_is_one():
+    """Constant actions are no rotation, so the scale of a relative end-effector rotation is not measured."""
+    from types import SimpleNamespace
+
+    from lerobot.policies.groot.export_groot import GrootExportRecipe, N17ActionDecode, _N17ChunkActions
+    from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep, GrootN17PackInputsStep
+
+    stats = {"min": [-1.0] * 9, "max": [1.0] * 9, "mean": [0.0] * 9}
+    raw_stats = {"action": {"eef": stats}, "relative_action": {"eef": stats}, "state": {"eef": stats}}
+    modality_config = {
+        "action": {
+            "modality_keys": ["eef"],
+            "delta_indices": list(range(4)),
+            "action_configs": [{"rep": "relative", "type": "eef", "format": "xyz+rot6d"}],
+        },
+        "state": {"modality_keys": ["eef"]},
+    }
+    pack = GrootN17PackInputsStep(raw_stats=raw_stats, modality_config=modality_config)
+    decode = GrootN17ActionDecodeStep(
+        env_action_dim=9,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+        use_percentiles=False,
+        use_relative_action=True,
+        pack_step=pack,
+    )
+    recipe = object.__new__(GrootExportRecipe)
+    recipe._model_config = SimpleNamespace(max_action_dim=9)
+    recipe._frame = {OBS_STATE: np.array([0.1, 0.2, 0.3, 1, 0, 0, 0, 1, 0], np.float32)}
+    recipe._images = SimpleNamespace(state_name=OBS_STATE)
+    recipe._device = torch.device("cpu")
+    recipe._steps = 4
+    recipe._chunk_actions = _N17ChunkActions(4, 9, N17ActionDecode(decode, pack, 4))
+    # The state's rotation is the identity, so the xyz moves by one per normalized unit, as its statistics say.
+    np.testing.assert_array_equal(recipe._action_scale(), np.ones(9, np.float32))
