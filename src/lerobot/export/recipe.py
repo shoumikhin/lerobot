@@ -637,21 +637,21 @@ def whole_policy_fits(model_file: Path, device: torch.device) -> bool:
 def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
-    """The whole trained policy, in eval mode on the CPU, and its processors set to the backend's device."""
+    """The whole trained policy, in eval mode on the backend's device, and its processors set to that device."""
     from lerobot.policies.factory import load_pretrained_policy
 
     config = cast(PreTrainedConfig, cfg.policy)
-    # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
-    config.device = "cpu"
+    config.device = cfg.backend.device
     # How the policy runs, not how it trained, decides what compiles it.
     if hasattr(config, "compile_model"):
         config.compile_model = False
-    policy = load_pretrained_policy(config)
+    # Built on the device, so the checkpoint is copied there once and its weights are never on the CPU as well.
+    with torch.device(cfg.backend.device):
+        policy = load_pretrained_policy(config)
     if hasattr(policy, "merge_and_unload"):
         # A PEFT adapter: compile the base weights with the adapter folded in.
         policy = policy.merge_and_unload()
     policy.eval()
-    config.device = cfg.backend.device
     return policy, *load_processors(config)
 
 
