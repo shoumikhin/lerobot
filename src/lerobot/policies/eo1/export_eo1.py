@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from lerobot.export.recipe import ActionChunkRecipe, Part
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe, Part
 from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.import_utils import _transformers_available
 
@@ -46,6 +46,9 @@ if TYPE_CHECKING or _transformers_available:
 
 class EO1ExportRecipe(ActionChunkRecipe):
     """[`ActionChunkRecipe`] with EO-1's processor step made traceable, the vision tower on a fixed grid."""
+
+    # EO-1 runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
 
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its processor step wrapped in [`FixedPromptStep`]."""
