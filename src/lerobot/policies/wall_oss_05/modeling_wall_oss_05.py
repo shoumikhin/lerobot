@@ -988,9 +988,7 @@ class WallOSS05Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """`noise` is the optional starting sample, shape `(batch_size, chunk_size, max_action_dim)`."""
         inputs = self._pretokenized_inputs(batch)
-        vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
-            self._vision_grid, self.model.visual, inputs["image_grid_thw"]
-        )
+        vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, self.model.visual, inputs["image_grid_thw"])
         if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
             check_visible_images(inputs["input_ids"], inputs["attention_mask"], self.model.config)
         if is_exporting():
@@ -1002,6 +1000,9 @@ class WallOSS05Policy(PreTrainedPolicy):
             noise=noise,
             **inputs,
         )
+        if vision_grid is not None:
+            # Kept only now, so a call that fails while preparing leaves the prepared grid in place.
+            self._vision_grid = vision_grid
         return output["predict_action"]
 
     def supports_text_generation(self) -> bool:

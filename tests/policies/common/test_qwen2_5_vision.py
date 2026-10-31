@@ -40,7 +40,7 @@ from lerobot.policies.common.qwen_vision import (  # noqa: E402
     prepare_image_grid,
     qwen_image_rope_index,
 )
-from tests.policies.common.fixed_grid_checks import data_dependent_nodes  # noqa: E402
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load  # noqa: E402
 
 IMAGE_TOKEN_ID = 99
 VISION_START_ID, VISION_END_ID = 97, 98
@@ -87,7 +87,7 @@ class FixedGridVision(torch.nn.Module):
         return qwen2_5_vision_forward(self.visual, pixel_values, grid)
 
 
-# Two images of 18x18 patches (as 224 px cameras give) have uneven attention windows; the
+# Two images of 18x18 patches (as WALL-X gives for 224 px cameras) have uneven attention windows; the
 # two-frame grid checks the temporal axis.
 @pytest.mark.parametrize("grids", [[[1, 18, 18], [1, 18, 18]], [[2, 8, 12], [1, 16, 22]]])
 def test_vision_forward_matches_stock_and_exports(grids):
@@ -124,13 +124,10 @@ def test_export_without_a_fitting_prepared_grid_names_the_mismatch():
             torch.export.export(FixedGridVision(tower, cache), (pixel_values, grid_thw), strict=False)
 
 
-@pytest.mark.parametrize("disable_checks", [False, True], ids=["checks-on", "checks-off"])
 @pytest.mark.parametrize(
     "changed", [[[1, 12, 8]], [[1, 8, 12], [1, 4, 4]]], ids=["same-count", "more-images"]
 )
-def test_preparation_rebuilds_a_changed_grid(monkeypatch, changed, disable_checks):
-    if disable_checks:
-        monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+def test_preparation_rebuilds_a_changed_grid(changed):
     visual = _tiny_visual()
     with prepare_image_grid():
         cache = Qwen2_5VisionGrid.track(None, visual, torch.tensor(GRID))
@@ -163,21 +160,31 @@ def test_a_call_without_images_has_no_grid():
 def test_compiled_code_does_not_take_the_export_path():
     @torch.compile(backend="eager", fullgraph=True)
     def exporting(x):
-        return x + 1 if is_exporting() else x
+        return x + 1 if is_exporting() else x, x + 1 if torch.compiler.is_exporting() else x
 
-    # torch.compile on PyTorch 2.11 also reports torch.compiler.is_exporting().
-    assert torch.equal(exporting(torch.zeros(2)), torch.zeros(2))
+    ours, torchs = exporting(torch.zeros(2))
+    # torch.compile on PyTorch 2.11 also reports torch.compiler.is_exporting(); later versions do not.
+    if torch.equal(torchs, torch.zeros(2)):
+        pytest.skip("torch.compile on this PyTorch does not report torch.compiler.is_exporting()")
+    assert torch.equal(ours, torch.zeros(2))
 
 
-def test_exported_program_rejects_a_changed_grid():
+# The grid check is the only guard of the cached grid, so transformers' TRANSFORMERS_DISABLE_TORCH_CHECK=1
+# must not remove it, and saving or decomposing the program must keep it.
+@pytest.mark.parametrize("transformers_checks_off", [False, True], ids=["switch-unset", "switch-set"])
+def test_exported_program_rejects_a_changed_grid(monkeypatch, transformers_checks_off):
+    if transformers_checks_off:
+        monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
     model = FixedGridVision(visual, Qwen2_5VisionGrid.build(visual, grid_thw))
     with torch.no_grad():
-        program = torch.export.export(model, (_pixels(grid_thw), grid_thw), strict=False).module()
-    program(_pixels(grid_thw), grid_thw)
-    with pytest.raises(RuntimeError):
-        program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
+        program = torch.export.export(model, (_pixels(grid_thw), grid_thw), strict=False)
+        for lowered in (program, save_and_load(program), program.run_decompositions()):
+            lowered.module()(_pixels(grid_thw), grid_thw)
+            # 12x8 has the image and patch counts of the prepared 8x12 grid.
+            with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                lowered.module()(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
 
 
 def test_masks_hiding_more_than_padding_are_refused_also_after_export():

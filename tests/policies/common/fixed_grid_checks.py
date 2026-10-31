@@ -18,6 +18,8 @@
 Their exported programs must not depend on tensor values for any shape.
 """
 
+import io
+
 import pytest
 import torch
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
@@ -38,10 +40,19 @@ def count_grid_builds(monkeypatch: pytest.MonkeyPatch) -> list[type]:
     return builds
 
 
-def data_dependent_nodes(program: torch.export.ExportedProgram) -> list[str]:
-    """Nodes whose output shape depends on tensor values: `nonzero`, boolean-mask indexing, unbacked sizes.
+def save_and_load(program: torch.export.ExportedProgram) -> torch.export.ExportedProgram:
+    """`program` after a round trip through `torch.export.save` and `torch.export.load`."""
+    buffer = io.BytesIO()
+    torch.export.save(program, buffer)
+    buffer.seek(0)
+    return torch.export.load(buffer)
 
-    Runtime asserts (`torch_compilable_check`) read values too, but only to raise, so they are not listed.
+
+def data_dependent_nodes(program: torch.export.ExportedProgram) -> list[str]:
+    """Nodes whose output shape depends on tensor values: `nonzero`, `masked_select`, boolean-mask indexing and
+    other unbacked sizes.
+
+    Runtime asserts (`check_input`) read values too, but only to raise, so they are not listed.
     """
     found = []
     # Code under `torch.no_grad()` inside the exported function becomes submodules with their own graphs.
@@ -56,7 +67,7 @@ def data_dependent_nodes(program: torch.export.ExportedProgram) -> list[str]:
             continue
         name = str(node.target)
         indices = node.args[1] if name.startswith(("aten.index.", "aten.index_put")) else []
-        values = [getattr(index, "meta", {}).get("val") for index in indices or []]
+        values = [getattr(index, "meta", {}).get("val") for index in indices]
         if any(isinstance(v, torch.Tensor) and v.dtype == torch.bool for v in values):
             found.append(f"{name} with a boolean mask")
         elif "nonzero" in name or "masked_select" in name:

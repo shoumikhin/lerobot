@@ -35,7 +35,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from lerobot.processor.converters import create_transition
 from lerobot.utils.constants import ACTION, OBS_STATE, QUERY_KIND, QUERY_TEXT
-from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes, save_and_load
 
 HIDDEN_SIZE = 8
 STATE_DIM = 4
@@ -694,7 +694,11 @@ def _export_sampling(policy, batch, noise):
         program = torch.export.export(
             SampleActions(), (noise.clone(), *(batch[key] for key in keys)), strict=False
         )
-    return program, lambda inputs: program.module()(noise.clone(), *(inputs[key] for key in keys))
+
+    def run(inputs, lowered=program):
+        return lowered.module()(noise.clone(), *(inputs[key] for key in keys))
+
+    return program, run
 
 
 def _noise(policy):
@@ -717,29 +721,38 @@ def test_prepared_sampling_exports_and_matches_eager(monkeypatch):
         for _ in range(2):  # The second call reuses the prepared grid.
             assert torch.equal(policy.predict_action_chunk(batch, noise=noise.clone()), expected)
     assert len(builds) == 1
+    # The switch that turns off the transformers checks must leave the exported checks in place.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     # The exported positions follow the installed transformers' still-image convention, probed once.
     program, run = _export_sampling(policy, batch, noise)
     torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
     assert len(builds) == 1 and len(probes) == 1
     assert data_dependent_nodes(program) == []
-    # The prompt checks: one action token fewer is rejected by the exported program, and in eager mode
-    # even with the switch that turns off the transformers checks.
+    # Each malformed prompt trips one check, since the exported program raises without the check's message:
+    # one action token too many, right before the chunk; the action tokens out of one chunk at
+    # `action_token_start`; an image token fewer; and a second state token.
     malformed = {**batch, "input_ids": batch["input_ids"].clone()}
-    malformed["input_ids"][0, -2] = 2
-    # Also the action tokens out of one chunk at `action_token_start`, and an image token fewer.
+    malformed["input_ids"][0, 9] = ACTION_TOKEN_ID
     split = {**batch, "input_ids": batch["input_ids"].clone()}
     split["input_ids"][0, -2:] = torch.tensor([2, ACTION_TOKEN_ID])
     fewer_images = {**batch, "input_ids": batch["input_ids"].clone()}
     fewer_images["input_ids"][0, 4] = 1
-    for wrong in (malformed, split, fewer_images):
-        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-        with torch.no_grad(), pytest.raises(RuntimeError):
-            run(wrong)
-    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    two_states = {**batch, "input_ids": batch["input_ids"].clone()}
+    two_states["input_ids"][0, 9] = STATE_TOKEN_ID
+    lowered_programs = (program, save_and_load(program), program.run_decompositions())
+    for lowered in lowered_programs[1:]:
+        torch.testing.assert_close(run(batch, lowered), expected)
+    for lowered in lowered_programs:
+        for wrong in (malformed, split, fewer_images, two_states):
+            with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                run(wrong, lowered)
+    # The eager checks raise with the switch set, too.
     with pytest.raises(ValueError, match="exactly 3 action tokens"):
         policy.predict_action_chunk(malformed)
     with pytest.raises(ValueError, match="contiguous chunk"):
         policy.predict_action_chunk(split)
+    with pytest.raises(ValueError, match="State features and state tokens do not match"):
+        policy.predict_action_chunk(two_states)
     # Samples whose action tokens sit at different places.
     rows = torch.cat([batch["input_ids"], batch["input_ids"].roll(-1, dims=1)])
     shifted = {
@@ -816,8 +829,82 @@ def test_preparation_and_export_refuse_hidden_vision_tokens(monkeypatch):
                 policy.predict_action_chunk(inputs, noise=noise.clone())
     _, run = _export_sampling(policy, batch, noise)
     for inputs in refused:
-        with torch.no_grad(), pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
             run(inputs)
     more_padding = hide(1)
     expected = policy.predict_action_chunk(more_padding, noise=noise.clone())
     torch.testing.assert_close(run(more_padding), expected, rtol=0, atol=0)
+
+
+def test_export_follows_a_get_rope_index_that_scales_image_starts(monkeypatch):
+    # transformers 5.4.0 to 5.5.3 multiply the temporal start of an image by `tokens_per_second`.
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    vlm = policy.model.vlm_backbone.model
+    stock = type(vlm).get_rope_index
+
+    def scaled(self, input_ids, *args, **kwargs):
+        positions, deltas = stock(self, input_ids, *args, **kwargs)
+        positions[0][input_ids == self.config.image_token_id] *= 4
+        return positions, deltas
+
+    monkeypatch.setattr(type(vlm), "get_rope_index", scaled)
+    noise = _noise(policy)
+    batch["action_token_start"] = 10
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+    _, run = _export_sampling(policy, batch, noise)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+
+
+def test_sampling_export_needs_the_action_start_and_the_images(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+    with pytest.raises(ValueError, match="needs action_token_start"):
+        _export_sampling(policy, batch, noise)
+
+    batch["action_token_start"] = 10
+    text_ids = batch["input_ids"].masked_fill(torch.isin(batch["input_ids"], torch.tensor([40, 41, 42])), 1)
+    text_only = {
+        **batch,
+        "input_ids": text_ids,
+        "mm_token_type_ids": torch.zeros_like(text_ids, dtype=torch.int),
+        "pixel_values": None,
+        "image_grid_thw": None,
+    }
+    for inputs in ({**batch, "pixel_values": None}, text_only):
+        with pytest.raises(ValueError, match="exports prompts with images only"):
+            _export_sampling(policy, inputs, noise)
+
+
+def test_preparation_keeps_its_grid_through_calls_without_images_or_that_fail(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    batch["action_token_start"] = 10
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    text_ids = batch["input_ids"].masked_fill(torch.isin(batch["input_ids"], torch.tensor([40, 41, 42])), 1)
+    text_only = {
+        **batch,
+        "input_ids": text_ids,
+        "mm_token_type_ids": torch.zeros_like(text_ids, dtype=torch.int),
+        "pixel_values": None,
+        "image_grid_thw": None,
+    }
+    # Another grid with the same image and token counts, in calls that fail after the grid is built: one hides
+    # the vision start token, one has an image token fewer than its grid.
+    changed = {**batch, "image_grid_thw": torch.tensor([[1, 2, 8]])}
+    hidden_start = {**changed, "attention_mask": changed["attention_mask"].index_fill(1, torch.tensor([2]), 0)}
+    fewer_tokens = {**changed, "input_ids": changed["input_ids"].index_fill(1, torch.tensor([6]), 1)}
+    fewer_tokens["mm_token_type_ids"] = fewer_tokens["input_ids"].eq(40).int()
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        policy.predict_action_chunk(text_only, noise=noise.clone())
+        with pytest.raises(ValueError, match="must hide only padding"):
+            policy.predict_action_chunk(hidden_start, noise=noise.clone())
+        with pytest.raises(RuntimeError, match="shape mismatch"):
+            policy.predict_action_chunk(fewer_tokens, noise=noise.clone())
+    policy.predict_action_chunk(text_only, noise=noise.clone())
+    _, run = _export_sampling(policy, batch, noise)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)

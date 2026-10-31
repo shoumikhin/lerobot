@@ -17,17 +17,9 @@
 """Input checks that a policy keeps when `torch.export` or `torch.compile` traces it."""
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
-
-from lerobot.utils.import_utils import _transformers_available
-
-if TYPE_CHECKING or _transformers_available:
-    from transformers.utils import torch_compilable_check
-else:
-    torch_compilable_check = None
 
 
 def check_input(
@@ -35,11 +27,15 @@ def check_input(
 ) -> None:
     """Raise `error_type` with `message` unless `condition` holds (for every element of a tensor).
 
-    In eager mode this is a plain check that always raises, as these input checks were before. While
-    `torch.export` or `torch.compile` traces, it is transformers' `torch_compilable_check`, a runtime assert in
-    the program (which `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off; a failed assert loses its message).
+    In eager mode this is a plain check. While `torch.export` traces, it becomes a runtime assert in the
+    program, which raises a `RuntimeError` without `message` when it fails. Under `torch.compile` the eager
+    check runs at a graph break.
     """
     if torch.compiler.is_compiling() or torch.compiler.is_exporting():
-        torch_compilable_check(condition, message, error_type=error_type)
+        if isinstance(condition, Tensor):
+            # Read the failure count, not a bool: PyTorch 2.11 cannot save or decompose an assert on a bool
+            # read from a tensor.
+            condition = torch.logical_not(condition).sum().item() == 0
+        torch._check_with(error_type, condition, message if callable(message) else lambda: message)
     elif not bool(torch.as_tensor(condition).all()):
         raise error_type(message() if callable(message) else message)

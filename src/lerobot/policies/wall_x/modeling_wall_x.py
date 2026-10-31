@@ -41,6 +41,7 @@ from os import PathLike
 from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
+import packaging.version
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
@@ -1224,7 +1225,12 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     agent_pos_mask,
                 )
                 proprioception_mask = input_ids == self.action_token_id_set["propri_token_id"]
-                # masked_scatter would silently drop extra state rows, so check every sample's state tokens.
+                # masked_scatter would silently drop extra state rows, so check the rows and every sample's state
+                # tokens.
+                if proprio_embed.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Proprioception has {proprio_embed.shape[0]} samples but input_ids has {batch_size}."
+                    )
                 tokens_per_sample = proprio_embed.shape[1:-1].numel()
                 check_input(
                     proprioception_mask.sum(dim=1) == tokens_per_sample,
@@ -1403,6 +1409,11 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             # Initialize with random noise
             if noise is None:
                 noise = sample_noise((batch_size, pred_horizon, action_dim), inputs_embeds.device)
+            elif noise.shape != (batch_size, pred_horizon, action_dim):
+                # masked_scatter would put one sample's extra noise rows into the next sample.
+                raise ValueError(
+                    f"noise must have shape {(batch_size, pred_horizon, action_dim)}, got {tuple(noise.shape)}."
+                )
             noisy_action = noise.to(device=inputs_embeds.device, dtype=torch.float32)
             dof_mask = dof_mask.to(inputs_embeds.device).to(torch.float32)
 
@@ -1416,6 +1427,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 action_mask.sum(dim=1) == pred_horizon,
                 lambda: f"Expected {pred_horizon} action tokens per sample.",
             )
+            if moe_token_types is None:
+                raise ValueError("moe_token_types must be provided for MoE routing")
             check_input(
                 (moe_token_types == action_mask).all(),
                 "moe_token_types must mark exactly the action tokens.",
@@ -2033,9 +2046,10 @@ class WallXPolicy(PreTrainedPolicy):
         `noise` is the optional starting sample of the diffusion mode, shape
         `(batch_size, chunk_size, max_action_dim)`. It is not used by the fast mode.
 
-        The diffusion mode can be exported with `torch.export` under `torch.no_grad()` after an eager call inside
-        `prepare_image_grid()`. With grad enabled, export fails with a `SpecViolationError`: it wraps this method's
-        `no_grad` region, and transformers' vmap-based mask functions inside it do not survive that.
+        The diffusion mode can be exported with `torch.export` on PyTorch 2.9 or later, under `torch.no_grad()`,
+        after an eager call inside `prepare_image_grid()`. With grad enabled, export fails with a
+        `SpecViolationError`: it wraps this method's `no_grad` region, and transformers' vmap-based mask functions
+        inside it do not survive that.
         """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
@@ -2048,9 +2062,12 @@ class WallXPolicy(PreTrainedPolicy):
         action_dim = self.config.output_features[ACTION].shape[0]
 
         if self.config.prediction_mode == "diffusion":
-            vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
-                self._vision_grid, self.model.visual, batch["image_grid_thw"]
-            )
+            if is_exporting() and packaging.version.parse(torch.__version__) < packaging.version.parse("2.9.0"):
+                raise RuntimeError(
+                    "Exporting WALL-X needs PyTorch 2.9 or later: torch.export cannot trace transformers' causal "
+                    "mask with WALL-X's action mask function before that."
+                )
+            vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, self.model.visual, batch["image_grid_thw"])
             if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
                 check_visible_images(batch["input_ids"], batch["attention_mask"], self.model.config)
             if vision_grid is not None and is_exporting():
@@ -2063,6 +2080,9 @@ class WallXPolicy(PreTrainedPolicy):
                 predict_mode="diffusion",
                 noise=noise,
             )
+            if vision_grid is not None:
+                # Kept only now, so a call that fails while preparing leaves the prepared grid in place.
+                self._vision_grid = vision_grid
         elif self.config.prediction_mode == "fast":
             if not isinstance(generation_prompt_ids, Tensor):
                 raise ValueError(

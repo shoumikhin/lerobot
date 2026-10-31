@@ -52,7 +52,7 @@ from lerobot.processor import (
     transition_to_batch,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
-from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes, save_and_load
 
 
 @pytest.fixture
@@ -896,6 +896,26 @@ def _tiny_policy():
     return policy
 
 
+def _export_prediction(policy, batch, noise):
+    keys = sorted(batch)
+
+    class PredictActionChunk(nn.Module):
+        def forward(self, noise, *tensors):
+            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
+
+    # Exported with grad enabled, the program would turn grad off for prediction and leave it off when one of
+    # its checks fails, and it could not be saved.
+    with torch.no_grad():
+        program = torch.export.export(
+            PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+        )
+
+    def run(inputs, lowered=program):
+        return lowered.module()(noise.clone(), *(inputs[key] for key in keys))
+
+    return program, run
+
+
 def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
     policy = _tiny_policy()
     ids = torch.tensor(
@@ -932,39 +952,33 @@ def test_prepared_prediction_exports_and_matches_eager(monkeypatch):
     assert len(builds) == 1
     assert contiguous and all(contiguous)
 
-    keys = sorted(batch)
-
-    class PredictActionChunk(nn.Module):
-        def forward(self, noise, *tensors):
-            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
-
-    def run(module, inputs):
-        return module(noise.clone(), *(inputs[key] for key in keys))
-
-    program = torch.export.export(
-        PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
-    )
-    torch.testing.assert_close(run(program.module(), batch), expected)
+    # The switch that turns off the transformers checks must leave the exported checks in place.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    program, run = _export_prediction(policy, batch, noise)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
     assert len(builds) == 1
     assert data_dependent_nodes(program) == []
-    # The input checks: a prompt whose last action token is replaced is rejected by the exported program,
-    # and in eager mode even with the switch that turns off the transformers checks.
+    # The input checks: a prompt whose last action token is replaced, an action token inside the prefix
+    # (marked as such), and an image token fewer are rejected by the exported program, and in eager mode.
     malformed = {**batch, "input_ids": ids.clone()}
     malformed["input_ids"][0, -1] = 6
-    # Also an action token inside the prefix (marked as such), and an image token fewer.
     inside = ids.clone()
     inside[0, 2] = 31
     inside = {**batch, "input_ids": inside, "moe_token_types": inside == 31}
     fewer_images = {**batch, "input_ids": ids.clone()}
     fewer_images["input_ids"][0, 4] = 4
-    for wrong in (malformed, inside, fewer_images):
-        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-        with torch.no_grad(), pytest.raises(RuntimeError):
-            run(program.module(), wrong)
-    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
-    for wrong in (malformed, inside):
-        with pytest.raises(ValueError, match="Flow inputs must end"):
+    lowered_programs = (program, save_and_load(program), program.run_decompositions())
+    for lowered in lowered_programs[1:]:
+        torch.testing.assert_close(run(batch, lowered), expected)
+    for lowered in lowered_programs:
+        for wrong in (malformed, inside, fewer_images):
+            with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                run(wrong, lowered)
+    for wrong, message in ((malformed, "Flow inputs must end"), (inside, "Flow inputs must end")):
+        with pytest.raises(ValueError, match=message):
             policy.predict_action_chunk(wrong, noise=noise.clone())
+    with pytest.raises(ValueError, match="Image token/features mismatch"):
+        policy.predict_action_chunk(fewer_images, noise=noise.clone())
 
 
 def test_preparation_and_export_refuse_hidden_vision_tokens():
@@ -980,7 +994,6 @@ def test_preparation_and_export_refuse_hidden_vision_tokens():
         "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
     }
     noise = torch.randn(2, 2, policy.config.max_action_dim)
-    keys = sorted(batch)
 
     def hide(tokens):
         attention_mask = batch["attention_mask"].clone()
@@ -995,17 +1008,43 @@ def test_preparation_and_export_refuse_hidden_vision_tokens():
             with pytest.raises(ValueError, match="must hide only padding"):
                 policy.predict_action_chunk(inputs, noise=noise.clone())
 
-    class PredictActionChunk(nn.Module):
-        def forward(self, noise, *tensors):
-            return policy.predict_action_chunk(dict(zip(keys, tensors, strict=True)), noise=noise)
-
-    program = torch.export.export(
-        PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
-    ).module()
+    _, run = _export_prediction(policy, batch, noise)
     for inputs in refused:
-        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-        with torch.no_grad(), pytest.raises(RuntimeError):
-            program(noise.clone(), *(inputs[key] for key in keys))
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+            run(inputs)
+
+
+def test_preparation_keeps_its_grid_through_calls_without_images_or_that_fail():
+    policy = _tiny_policy()
+    image = [29, 28, 28, 30]
+    ids = torch.tensor([[0, 0, 4, *image, *image, 6, 31, 31], [4, 5, 4, *image, *image, 6, 31, 31]])
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(32, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]] * 2),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    noise = torch.randn(2, 2, policy.config.max_action_dim)
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    text_ids = ids.masked_fill(torch.isin(ids, torch.tensor([28, 29, 30])), 5)
+    text_only = {**batch, "input_ids": text_ids, "pixel_values": None, "image_grid_thw": None}
+    # Another grid with the same image and token counts, in calls that fail after the grid is built: one hides
+    # the first vision start token, one has no last action token.
+    changed = {**batch, "image_grid_thw": torch.tensor([[1, 4, 2], [1, 2, 4]] * 2)}
+    hidden_start = {**changed, "attention_mask": changed["attention_mask"].index_fill(1, torch.tensor([3]), False)}
+    no_last_action = {**changed, "input_ids": ids.index_fill(1, torch.tensor([13]), 6)}
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        policy.predict_action_chunk(text_only, noise=noise.clone())
+        with pytest.raises(ValueError, match="must hide only padding"):
+            policy.predict_action_chunk(hidden_start, noise=noise.clone())
+        with pytest.raises(ValueError, match="Flow inputs must end"):
+            policy.predict_action_chunk(no_last_action, noise=noise.clone())
+    policy.predict_action_chunk(text_only, noise=noise.clone())
+    _, run = _export_prediction(policy, batch, noise)
+    torch.testing.assert_close(run(batch), expected)
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

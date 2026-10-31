@@ -127,7 +127,8 @@ class SparseMoeBlock(nn.Module):
                 indicating the expert index assigned to each token.
             experts_counts (tuple[int, ...], optional): Number of tokens every sample routes to each
                 expert, when the caller knows it, with experts past the end of the tuple getting none.
-                Routing then uses fixed shapes and no host reads.
+                Routing then uses fixed shapes and no host reads. The counts must match
+                `experts_indices`; they are not checked here.
 
         Returns:
             output (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_dim).
@@ -137,11 +138,11 @@ class SparseMoeBlock(nn.Module):
 
         for expert_idx, expert in enumerate(self.experts):
             mask = experts_indices == expert_idx
-            dim_input = self.dim_inputs[expert_idx]
             if experts_counts is not None:
                 count = experts_counts[expert_idx] if expert_idx < len(experts_counts) else 0
                 if count == 0:
                     continue
+                dim_input = self.dim_inputs[expert_idx]
                 # The expert's tokens of each sample, in order: the same rows as hidden_states[mask].
                 positions = torch.arange(seq_length, device=hidden_states.device)
                 index = torch.where(mask, positions, seq_length).topk(count, dim=1, largest=False)
@@ -154,6 +155,7 @@ class SparseMoeBlock(nn.Module):
                 continue
             if mask.sum() == 0:
                 continue
+            dim_input = self.dim_inputs[expert_idx]
 
             selected_hidden = hidden_states[mask]
             processed_hidden = expert(selected_hidden[:, :dim_input])

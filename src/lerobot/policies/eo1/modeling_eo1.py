@@ -55,12 +55,10 @@ from .processor_eo1 import EO1_SPECIAL_TOKENS
 if TYPE_CHECKING or _transformers_available:
     from transformers.activations import ACT2FN
     from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
-    from transformers.utils import torch_compilable_check
 else:
     ACT2FN = None
     Qwen2_5_VLForConditionalGeneration = None
     Qwen2_5_VLProcessor = None
-    torch_compilable_check = None
 
 logger = logging.getLogger(__name__)
 
@@ -371,9 +369,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
             special_state_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         )
         if state_features is not None:
-            torch_compilable_check(
+            check_input(
                 special_state_mask.sum() == state_features.numel(),
-                f"State features and state tokens do not match, tokens: {n_state_tokens}, features: {state_features.shape[0]}",
+                lambda: f"State features and state tokens do not match, tokens: {n_state_tokens}, features: {state_features.shape[0]}",
             )
 
         n_action_tokens = special_action_mask.sum()
@@ -381,9 +379,9 @@ class EO1VisionFlowMatchingModel(nn.Module):
             special_action_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         )
         if action_features is not None:
-            torch_compilable_check(
+            check_input(
                 special_action_mask.sum() == action_features.numel(),
-                f"Action features and action tokens do not match, tokens: {n_action_tokens}, features: {action_features.shape[0]}",
+                lambda: f"Action features and action tokens do not match, tokens: {n_action_tokens}, features: {action_features.shape[0]}",
             )
 
         return special_state_mask, special_action_mask
@@ -614,7 +612,8 @@ class EO1VisionFlowMatchingModel(nn.Module):
         """Sample actions from the model.
 
         `action_token_start` is where the action tokens start in the left-padded rollout prompt, as
-        `EO1QwenProcessorStep` reports it. When it is None, it is read from `input_ids`.
+        `EO1QwenProcessorStep` reports it. When it is None, it is read from `input_ids`, which `torch.export`
+        cannot trace, so an export needs it.
         """
         if input_ids is None:
             raise ValueError("input_ids are required for EO1 action sampling.")
@@ -652,6 +651,11 @@ class EO1VisionFlowMatchingModel(nn.Module):
         )
         act_start = action_token_start
         if act_start is None:
+            if is_exporting():
+                raise ValueError(
+                    "Exporting EO-1 sampling needs action_token_start, which EO1QwenProcessorStep reports for "
+                    "left-padded prompts."
+                )
             act_start = int(action_mask[0].to(torch.int64).argmax().item())
         act_end = act_start + self.config.chunk_size
         if act_start < 0 or act_end > input_ids.shape[1]:
@@ -671,12 +675,14 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
-        grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
+        grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
         if grid is not None and (is_preparing_image_grid() or is_exporting()):
             check_visible_images(input_ids, attention_mask, vlm.config)
             # Probed while preparing, because the export cannot run `get_rope_index`.
             image_temporal_scale = self._rope_temporal_scale()
-        if grid is not None and pixel_values is not None and is_exporting():
+        if is_exporting():
+            if grid is None or pixel_values is None:
+                raise ValueError("EO-1 exports prompts with images only: pass pixel_values and image_grid_thw.")
             position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,
@@ -745,4 +751,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
             return v_t.reshape(input_x_t.shape).to(input_x_t.dtype)
 
         x_t = euler_integrate(denoise_fn, x_t, self.config.num_denoise_steps)
+        if grid is not None:
+            # Kept only now, so a call that fails while preparing leaves the prepared grid in place.
+            self._vision_grid = grid
         return x_t

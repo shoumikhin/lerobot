@@ -23,17 +23,16 @@ cache, with one subclass per tower.
 
 The cache is prepared explicitly, by one eager call on the export inputs inside `prepare_image_grid()`:
 
-    with prepare_image_grid():
-        policy.predict_action_chunk(batch)
-    program = torch.export.export(module, args, strict=False)
+    with torch.no_grad():
+        with prepare_image_grid():
+            policy.predict_action_chunk(batch)
+        program = torch.export.export(module, args, strict=False)
 
-Outside that block the policies run their stock code and neither read nor cache the grid. Under export,
-`replay_vision_block` runs each vision block from its submodules with the attention chunk lengths as
-Python ints, because the stock attention reads them back from a tensor.
+Outside that block the policies run their stock code, and the cache helper neither reads the grid nor
+caches it. Under export, `replay_vision_block` runs each vision block from its submodules with the
+attention chunk lengths as Python ints, because the stock attention reads them back from a tensor.
 
-Under export the cached grid is checked with transformers' `torch_compilable_check`, a runtime assert in
-the program that `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off like every other check of that kind; a
-failed assert loses its message.
+Under export the cached grid is checked by a runtime assert in the program (see `check_input`).
 """
 
 from collections.abc import Callable, Iterator
@@ -52,11 +51,9 @@ from .input_checks import check_input
 if TYPE_CHECKING or _transformers_available:
     from transformers import PretrainedConfig
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    from transformers.utils import torch_compilable_check
 else:
     PretrainedConfig = None
     ALL_ATTENTION_FUNCTIONS = None
-    torch_compilable_check = None
 
 _preparing_image_grid: ContextVar[bool] = ContextVar("preparing_image_grid", default=False)
 
@@ -117,8 +114,9 @@ class FixedImageGrid:
         Inside `prepare_image_grid()` an eager call builds it, and rebuilds it whenever the grid, the device or
         the dtype changed. Under `torch.export` the grid cannot be read, so the prepared cache must fit: the
         image count, device and dtype are checked while tracing, and the grid values by a runtime assert in
-        the program. Otherwise the cache is returned as it is and the grid is not read. A call without
-        images (`grid_thw` None) has no grid: None.
+        the program. Outside preparation and export the cache is returned as it is and the grid is not read.
+        A call without images (`grid_thw` None) has no grid: None. A policy stores the returned cache only when
+        its call succeeds, so a call without images, or one that fails, keeps the prepared cache.
         """
         if grid_thw is None:
             return None
@@ -136,7 +134,10 @@ class FixedImageGrid:
                     f"{visual.device} {visual.dtype}"
                 )
             else:
-                cache.check(grid_thw)
+                check_input(
+                    grid_thw == grid_thw.new_tensor(cache.grid_thw),
+                    "The image grid differs from the one prepared for torch.export.",
+                )
                 return cache
             raise RuntimeError(
                 f"Cannot export on a fixed image grid: {problem}. Run the policy once on the export inputs "
@@ -150,16 +151,9 @@ class FixedImageGrid:
             return cls.build(visual, grid_thw)
         return cache
 
-    def check(self, grid_thw: Tensor) -> None:
-        """Assert in an exported program that `grid_thw` equals the cached grid."""
-        torch_compilable_check(
-            grid_thw == grid_thw.new_tensor(self.grid_thw),
-            "The image grid differs from the one prepared for torch.export.",
-        )
-
 
 def check_visible_images(input_ids: Tensor, attention_mask: Tensor, config: PretrainedConfig) -> None:
-    """Refuse an attention mask that hides more than padding at the ends of a row, or hides an image token.
+    """Refuse an attention mask that hides more than padding at the ends of a row, or hides a vision token.
 
     `qwen_image_rope_index` keeps every image on its own grid, while eager rope positions give the grids to the
     visible images only, join image runs that a hidden token separated, and fail on a row with no visible token.
@@ -171,9 +165,9 @@ def check_visible_images(input_ids: Tensor, attention_mask: Tensor, config: Pret
     valid = attention_mask.bool()
     run_starts = valid & ~torch.cat([torch.zeros_like(valid[:, :1]), valid[:, :-1]], dim=1)
     vision_token_ids = [config.image_token_id, config.vision_start_token_id, config.vision_end_token_id]
-    hidden = ~valid & torch.isin(input_ids, input_ids.new_tensor(vision_token_ids))
+    hidden_vision = ~valid & torch.isin(input_ids, input_ids.new_tensor(vision_token_ids))
     check_input(
-        (run_starts.sum(dim=1) == 1) & ~hidden.any(dim=1),
+        (run_starts.sum(dim=1) == 1) & ~hidden_vision.any(dim=1),
         "To run on a fixed image grid, the attention mask must hide only padding at the ends of each row, and no "
         "image, vision start or vision end token: eager rope positions differ or fail otherwise.",
     )
@@ -187,10 +181,11 @@ def chunked_vision_attention(
     apply_rotary_pos_emb_vision: Callable,
     eager_attention_forward: Callable,
 ) -> Tensor:
-    """The non-flash path of a stock Qwen-VL vision attention, split per chunk of `lengths` (Python ints).
+    """A stock Qwen-VL vision attention, run chunk by chunk over `lengths` (Python ints).
 
-    The stock attention splits by `cu_seqlens`, which it reads back from a tensor. The last two arguments come
-    from the tower's transformers modeling module.
+    The stock attention splits by `cu_seqlens`, which it reads back from a tensor; this calls the configured
+    attention function once per chunk instead. The last two arguments come from the tower's transformers
+    modeling module.
     """
     seq_length = hidden_states.shape[0]
     query, key, value = (
