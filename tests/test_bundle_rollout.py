@@ -14,6 +14,7 @@
 
 """`lerobot-rollout --bundle.path`: a bundle on a robot, without PyTorch."""
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -86,6 +87,7 @@ def test_the_command_runs_a_bundle_without_torch(tmp_path, monkeypatch, plugins,
         "--robot.static_values=[1.0, 2.0, 3.0]",
         "--fps=100",
         "--duration=0.1",
+        "--status_interval_s=0.02",
         f"--robot.log={log}",
         cwd=REPO,
     )
@@ -145,6 +147,21 @@ def test_actions_follow_the_joint_names_the_bundle_records(tmp_path):
     # The state is read in the bundle's joint order (3, 2, 1), and each action is named the same way.
     assert _actions(tmp_path)[0] == {"motor_3.pos": 3.0, "motor_2.pos": 2.0, "motor_1.pos": 1.0}
     assert _actions(tmp_path)[1] == {"motor_3.pos": 6.0, "motor_2.pos": 4.0, "motor_1.pos": 2.0}
+
+
+@pytest.mark.parametrize("interval", [0.05, 0])
+def test_bundle_mode_logs_its_status_every_interval(tmp_path, caplog, interval):
+    bundle = make_numpy_bundle(tmp_path / "bundle")
+    with caplog.at_level(logging.INFO, logger="lerobot.utils.rollout_status"):
+        rollout(_config(tmp_path, bundle, duration=0.3, status_interval_s=interval))
+    lines = [r.getMessage() for r in caplog.records if r.name == "lerobot.utils.rollout_status"]
+    if interval:
+        # At most one line per interval of the 0.3 s run.
+        assert 0 < len(lines) <= round(0.3 / interval), lines
+        assert all(line.startswith("Rollout: loop ") for line in lines), lines
+        assert any(" infer " in line for line in lines), lines
+    else:
+        assert lines == []
 
 
 def test_interpolation_sends_commands_between_actions(tmp_path):
