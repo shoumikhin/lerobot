@@ -5,7 +5,7 @@ A trained policy normally runs in PyTorch. PyTorch is flexible, but on a small r
 A bundle is useful because:
 
 - **It is fast.** A compiler such as NVIDIA TensorRT tunes the policy's math for one chip.
-- **It runs no policy code.** The robot process runs the compiled programs instead of the PyTorch policy.
+- **It needs no PyTorch.** The robot process runs the compiled programs instead of the policy's Python code, and never imports PyTorch.
 - **It is built for small boards.** Large policies such as π₀.₅ (pi0.5) and GR00T N1.7 are split into small programs, so they can be built and run on an NVIDIA Jetson Orin Nano with 8 GB of memory.
 - **It checks itself.** The bundle carries a test frame. It is replayed at export and again before the robot moves.
 
@@ -180,7 +180,7 @@ For any other policy, it stops with the reason. For example, ACT with temporal e
 
 ### The bundle is the contract
 
-The bundle holds everything `lerobot-rollout` needs, and nothing else. No policy code runs on the robot. Here is the manifest of the ACT bundle above. Your values, such as `action_scale`, will differ:
+The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot runs the compiled programs, not the policy's Python code. Here is the manifest of the ACT bundle above. Your values, such as `action_scale`, will differ:
 
 ```json
 {
