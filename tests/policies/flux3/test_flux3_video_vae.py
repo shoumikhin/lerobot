@@ -20,6 +20,7 @@ import torch
 
 from lerobot.policies.flux3.f3 import video_vae
 from lerobot.policies.flux3.f3.video_vae import Natten3D, neighborhood_attention
+from tests.utils import require_cuda
 
 # The keys each query of one axis attends to, measured on NATTEN 0.21.7: (axis size, window, causal) -> keys.
 NATTEN_WINDOWS = {
@@ -117,3 +118,21 @@ def test_natten_backend_reaches_its_kernel(monkeypatch):
     monkeypatch.setenv("F3_NATTEN_BACKEND", "flex-fna")
     Natten3D(16, [3, 3, 3], 2)(torch.randn(1, 3, 4, 4, 16))
     assert calls[0]["backend"] == "flex-fna"
+
+
+@require_cuda
+def test_natten_gets_one_dtype_under_cuda_autocast(monkeypatch):
+    dtypes = []
+
+    def na3d(q, k, v, **kwargs):  # stands in for NATTEN's kernel, which refuses mixed dtypes
+        dtypes.append({q.dtype, k.dtype, v.dtype})
+        return v
+
+    monkeypatch.setattr(video_vae, "_natten_available", True)
+    monkeypatch.setattr(video_vae, "na3d", na3d, raising=False)
+    monkeypatch.setattr(video_vae, "_natten_backends", {})
+    monkeypatch.setenv("F3_NATTEN_BACKEND", "cutlass-fna")
+    block = Natten3D(16, [3, 3, 3], 2, qk_norm=True).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        block(torch.randn(1, 3, 4, 4, 16, device="cuda"))
+    assert dtypes == [{torch.bfloat16}]
