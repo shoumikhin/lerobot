@@ -250,13 +250,14 @@ def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
 
 def anonymous_mib() -> int:
     """The memory of this process that no file backs, so not the pages of a memory-mapped checkpoint."""
-    with open("/proc/self/status") as status:
-        return next(int(line.split()[1]) // 1024 for line in status if line.startswith("RssAnon:"))
+    # Not RssAnon, which on a Jetson also counts the GPU's allocations.
+    with open("/proc/self/smaps_rollup") as smaps:
+        return next(int(line.split()[1]) // 1024 for line in smaps if line.startswith("Anonymous:"))
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not Path("/proc/self/status").exists(),
+    not torch.cuda.is_available() or not Path("/proc/self/smaps_rollup").exists(),
     reason="needs a CUDA GPU and Linux's memory counters",
 )
 def test_an_export_loads_the_policy_straight_onto_its_device(tmp_path):
