@@ -2084,7 +2084,7 @@ class FastWAM(torch.nn.Module):
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError("`infer_action` requires `video_attention_mask_mode='first_frame_causal'`.")
 
-        # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
+        # torch.compile also reports is_exporting() on PyTorch 2.11, not 2.15; non-strict export skips Dynamo.
         if noise is None and torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling():
             # An exported program keeps one generator whose state carries over between calls.
             raise ValueError("Pass noise to export FastWAM; its sampling noise must be an input.")
