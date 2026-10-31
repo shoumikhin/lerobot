@@ -116,6 +116,13 @@ def test_missing_weights_raise(config, tmp_path, monkeypatch):
         load(PI05Policy, tmp_path, config, monkeypatch)
 
 
+def test_loading_inside_torch_device_meta_raises(config, tmp_path):
+    # Nothing would place the weights, so it must fail instead of returning a policy without them.
+    path = save_checkpoint(PI05Policy, config, tmp_path / "ckpt", RENAMES)
+    with pytest.raises(NotImplementedError, match="meta tensor"), torch.device("meta"):
+        PI05Policy.from_pretrained(path, config=config)
+
+
 def test_missing_transformers_names_the_extra(config, tmp_path, monkeypatch):
     monkeypatch.setitem(import_utils._require_package_cache, "transformers", False)
     monkeypatch.setitem(sys.modules, "transformers.utils", None)

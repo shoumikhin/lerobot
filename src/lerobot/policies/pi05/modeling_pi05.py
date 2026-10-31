@@ -64,7 +64,7 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
-from ..common.openpi_checkpoint import load_complete_checkpoint
+from ..common.openpi_checkpoint import building_on_meta, load_complete_checkpoint
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -1098,8 +1098,8 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # On the meta device, load_complete_checkpoint places the parameters and then moves the buffers.
-        if not next(self.model.parameters()).is_meta:
+        # When load_complete_checkpoint builds the policy, it places the parameters and moves the buffers.
+        if not building_on_meta():
             self.model.to(config.device)
 
         self.reset()

@@ -74,6 +74,11 @@ def _parameters_on_meta() -> Iterator[None]:
         _meta_init.replacements = previous
 
 
+def building_on_meta() -> bool:
+    """Whether this thread is building a model inside `_parameters_on_meta`."""
+    return getattr(_meta_init, "replacements", None) is not None
+
+
 def _shares_parameters(model: nn.Module) -> bool:
     return len(list(model.parameters())) != len(list(model.named_parameters(remove_duplicate=False)))
 
@@ -106,7 +111,7 @@ def load_complete_checkpoint(
 
     This skips randomly initializing weights that the checkpoint replaces, and never holds a second full copy
     of them. Returns None, before reading any weight, when the file cannot be read, it misses a key the policy
-    has or holds one with another shape, or the policy shares a parameter or computed a buffer from one.
+    has or holds one with another shape, or the policy shares a parameter or has a buffer on the meta device.
     `from_pretrained` then builds the policy and calls `load_state_dict`. Errors while reading the weights
     raise. Weights the policy does not have are skipped. The regular path gives the same weights: it copies
     every other weight, then catches the error about the extra ones.
@@ -153,7 +158,7 @@ def load_complete_checkpoint(
         if _shares_parameters(policy) or any(buffer.is_meta for buffer in policy.buffers()):
             print(
                 "Not loading weights straight into the policy: "
-                "it shares a parameter or computes a buffer from one."
+                "it shares a parameter or has a buffer on the meta device."
             )
             return None
         tensors = ((name, checkpoint.get_tensor(key)) for key, fixed in names.items() for name in fixed)

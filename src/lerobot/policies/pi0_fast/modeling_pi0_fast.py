@@ -56,7 +56,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
 )
 
-from ..common.openpi_checkpoint import load_complete_checkpoint
+from ..common.openpi_checkpoint import building_on_meta, load_complete_checkpoint
 from ..common.vla_utils import pad_vector, prepare_attention_masks_4d, resize_with_pad_torch
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
@@ -796,8 +796,8 @@ class PI0FastPolicy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # On the meta device, load_complete_checkpoint places the parameters and then moves the buffers.
-        if not next(self.model.parameters()).is_meta:
+        # When load_complete_checkpoint builds the policy, it places the parameters and moves the buffers.
+        if not building_on_meta():
             self.model.to(config.device)
 
         self.reset()

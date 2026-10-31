@@ -150,7 +150,7 @@ def test_model_the_loader_cannot_fill_loads_the_regular_way(config, tmp_path, mo
 
     path = save(config, tmp_path / "ckpt")
     model, used_meta = load(Subclass, path, config, monkeypatch)
-    assert "it shares a parameter or computes a buffer from one" in capsys.readouterr().out
+    assert "it shares a parameter or has a buffer on the meta device" in capsys.readouterr().out
     expected, _ = load(Subclass, path, config, monkeypatch, regular=True)
     assert not used_meta
     assert_same(model, expected)
@@ -229,6 +229,13 @@ def test_download_arguments_reach_the_weights(config, tmp_path, monkeypatch, com
 def test_missing_weights_raise(config, tmp_path, monkeypatch):
     with pytest.raises(OSError, match="model.safetensors"):
         load(PI0Policy, tmp_path, config, monkeypatch)
+
+
+def test_loading_inside_torch_device_meta_raises(config, tmp_path):
+    # Nothing would place the weights, so it must fail instead of returning a policy without them.
+    path = save(config, tmp_path / "ckpt")
+    with pytest.raises(NotImplementedError, match="meta tensor"), torch.device("meta"):
+        PI0Policy.from_pretrained(path, config=config)
 
 
 def test_missing_transformers_names_the_extra(config, tmp_path, monkeypatch):
