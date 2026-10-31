@@ -276,6 +276,47 @@ def test_bundle_plays_the_actions_of_the_pytorch_policy(exported):
         np.testing.assert_allclose(actual / engine._scale, expected / engine._scale, atol=1e-3)
 
 
+
+@pytest.mark.dataset
+def test_export_takes_the_state_under_the_name_the_saved_preprocessor_renames(tmp_path):
+    """The dataset names the state `observation.joints`, which the checkpoint's preprocessor renames."""
+    from lerobot.datasets import LeRobotDatasetMetadata
+    from lerobot.datasets.io_utils import write_info
+    from lerobot.processor import RenameObservationsProcessorStep
+
+    joints = "observation.joints"
+    checkpoint = save_checkpoint(tmp_path, "torchvision")
+    config = GrootConfig.from_pretrained(checkpoint)
+    preprocessor, _ = make_pre_post_processors(config, checkpoint)
+    preprocessor.steps.insert(0, RenameObservationsProcessorStep(rename_map={joints: OBS_STATE}))
+    preprocessor.save_pretrained(checkpoint)
+    image = {"dtype": "image", "names": ["height", "width", "channels"]}
+    features = {
+        **{name: {**image, "shape": (h, w, c)} for name, (c, h, w) in MODES["torchvision"][1].items()},
+        joints: {"dtype": "float32", "shape": (5,), "names": None},
+        ACTION: {"dtype": "float32", "shape": (5,), "names": None},
+    }
+    root = tmp_path / "dataset"
+    metadata = LeRobotDatasetMetadata.create(
+        "user/tiny", fps=10, features=features, root=root, use_videos=False
+    )
+    metadata.save_episode_tasks([TASK])
+    metadata.info.total_tasks = 1
+    write_info(metadata.info, root)
+    bundle = tmp_path / "bundle"
+    export(
+        [
+            "--backend.type=torch_test",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={bundle}",
+            "--dataset.repo_id=user/tiny",
+            f"--dataset.root={root}",
+            "--tolerance=1e-4",
+        ]
+    )
+    vision = Bundle.read(bundle).manifest.runs[0]
+    assert joints in vision.inputs and OBS_STATE not in vision.inputs
+
 @pytest.mark.gpu
 @pytest.mark.parametrize(
     "mode,height,width,geometry",
