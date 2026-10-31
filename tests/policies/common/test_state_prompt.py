@@ -44,16 +44,24 @@ class StatePrompt(torch.nn.Module):
         return self.tokens(bins)
 
 
-def test_a_program_writes_the_processors_prompt_for_any_state_then_padding():
-    tokens = StatePromptTokens.around(processor_prompt([42, 42, 42]), [42, 42, 42], PIECES, PAD, length=20)
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+def test_a_program_writes_the_processors_prompt_for_any_state_padded_on_its_side(padding_side):
+    tokens = StatePromptTokens.around(
+        processor_prompt([42, 42, 42]), [42, 42, 42], PIECES, PAD, length=20, padding_side=padding_side
+    )
     program = torch.export.export(StatePrompt(tokens), (torch.tensor([100, 110, 120]),), strict=False)
 
     for bins in ([7, 120, 0], [120, 120, 120], [3, 4, 5], [9, 0, 57]):
         ids, mask = program.module()(torch.tensor(bins))
 
         expected = processor_prompt(bins)
-        assert ids.tolist() == expected + [PAD] * (20 - len(expected)), bins
-        assert mask.tolist() == [True] * len(expected) + [False] * (20 - len(expected)), bins
+        padding = 20 - len(expected)
+        if padding_side == "right":
+            assert ids.tolist() == expected + [PAD] * padding, bins
+            assert mask.tolist() == [True] * len(expected) + [False] * padding, bins
+        else:
+            assert ids.tolist() == [PAD] * padding + expected, bins
+            assert mask.tolist() == [False] * padding + [True] * len(expected), bins
 
 
 def test_by_default_the_prompt_is_as_long_as_the_widest_state_makes_it():
