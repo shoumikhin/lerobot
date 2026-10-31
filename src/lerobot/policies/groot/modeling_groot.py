@@ -155,9 +155,7 @@ class GrootPolicy(PreTrainedPolicy):
                 parameter.data = parameter.data.to(torch.float32)
 
     @classmethod
-    def _build_groot_model_from_checkpoint(
-        cls, config: GrootConfig, model_file: str, base_config_path: str | None
-    ) -> GR00TN17 | None:
+    def _build_groot_model_from_checkpoint(cls, config: GrootConfig, model_file: str) -> GR00TN17 | None:
         """Build GR00T from a fine-tuned checkpoint without downloading or loading NVIDIA's base weights.
 
         Reads only NVIDIA's config files. Returns None when the checkpoint does not match what the regular path
@@ -189,7 +187,7 @@ class GrootPolicy(PreTrainedPolicy):
                 state_dict[lm_head] = state_dict[embedding]
 
             groot_config = GR00TN17Config.from_pretrained(
-                base_config_path, **cls._groot_config_overrides(config)
+                config.base_config_path, **cls._groot_config_overrides(config)
             )
             if config.dtype != torch.float32 and groot_config.dtype is None:
                 # "auto" then falls back to the dtype of the base weights, which only the regular path reads.
@@ -325,7 +323,8 @@ class GrootPolicy(PreTrainedPolicy):
         Args:
             pretrained_name_or_path: Path to the GR00T model or fine-tuned checkpoint
             config: Optional GrootConfig. If None, loads from checkpoint or creates default. For a fine-tuned
-                checkpoint, it records the folder the base config files are read from (see base_config_path).
+                checkpoint, it records the folder the base config files are read from
+                (see GrootConfig.base_config_path).
             force_download: Force download even if cached
             resume_download: Resume interrupted download
             proxies: Proxy settings
@@ -411,9 +410,7 @@ class GrootPolicy(PreTrainedPolicy):
                 # force_download. A local folder has nothing to download.
                 logger.info("force_download is set, so the checkpoint loads the regular way.")
             elif cls is GrootPolicy:
-                groot_model = cls._build_groot_model_from_checkpoint(
-                    config, model_file, config._loaded_base_config_path
-                )
+                groot_model = cls._build_groot_model_from_checkpoint(config, model_file)
                 if groot_model is not None:
                     policy = cls(config, _groot_model=groot_model, **kwargs)
                     policy.to(config.device)
