@@ -52,6 +52,13 @@ class Recipe:
 RECIPES = {
     "wall_x": Recipe("tests.policies.wall_x.export_stand_in"),
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
+    # Bins 0, 5 and 192: numbers of one, one and three digits, where the checked frames' take three each.
+    "fineart_vla": Recipe(
+        "tests.policies.fineart_vla.export_stand_in",
+        ("monkeypatch",),
+        state=[-1.0, -0.96, 0.5],
+        marks=(pytest.mark.dataset,),
+    ),
     # Its language recipe comes with the dataset extra.
     "eo1": Recipe(
         "tests.policies.eo1.export_stand_in", ("monkeypatch",), cuda=True, marks=(pytest.mark.dataset,)
@@ -112,6 +119,7 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
             marks=pytest.mark.dataset,
         ),
         pytest.param("dm05", {"add_state": False}, "add_state=false", id="dm05-no-state"),
+        pytest.param("fineart_vla", {"text_recipe": False}, "has no text recipe", id="fineart-no-recipe"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
@@ -124,6 +132,13 @@ def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, chang
     [
         pytest.param("dm05", "prompt", "writes another prompt", id="dm05-prompt"),
         pytest.param("dm05", "pixels", "pixel values differ", id="dm05-pixels"),
+        pytest.param(
+            "fineart_vla",
+            "prompt",
+            "writes another prompt",
+            id="fineart_vla-prompt",
+            marks=pytest.mark.dataset,
+        ),
     ],
 )
 def test_the_checks_refuse_another_prompt_or_other_pixels(request, monkeypatch, name, broken, error):
