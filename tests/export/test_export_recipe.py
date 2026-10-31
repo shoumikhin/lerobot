@@ -336,3 +336,53 @@ def test_a_program_preprocessor_that_computes_something_else_is_refused():
 
     with pytest.raises(ValueError, match="computes something else"):
         list(recipe.parts())
+
+
+class ScaleState(ProcessorStep):
+    """Scales the state, as a program that computes the same thing in another order rounds it."""
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        state = observation[OBS_STATE] * self.scale
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: state}}
+
+    def transform_features(self, features):
+        return features
+
+
+class ScaledStateRecipe(ActionChunkRecipe):
+    """A recipe whose program scales the state and is held to the export's tolerance."""
+
+    exact = False
+    scale = 1.0
+
+    def program_preprocessor(self):
+        return replace(self.preprocessor, steps=[ScaleState(self.scale), *self.preprocessor.steps])
+
+
+def scaled_state_recipe(scale: float) -> ScaledStateRecipe:
+    torch.manual_seed(0)
+    config = act_config()
+    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
+    recipe = ScaledStateRecipe(ACTPolicy(config).eval(), preprocessor, postprocessor, export_config())
+    recipe.scale = scale
+    return recipe
+
+
+def test_a_recipe_can_hold_its_program_to_the_tolerance():
+    # Float32 rounding: the default check would refuse this program, whose actions are not rollout's bit for bit.
+    recipe = scaled_state_recipe(1 + 1e-6)
+
+    [part] = recipe.parts()
+
+    assert isinstance(part.module.preprocessor.steps[0], ScaleState)
+
+
+def test_a_program_beyond_the_tolerance_is_refused():
+    recipe = scaled_state_recipe(2.0)
+
+    with pytest.raises(ValueError, match="more than the tolerance"):
+        list(recipe.parts())
