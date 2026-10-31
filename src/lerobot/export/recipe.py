@@ -61,7 +61,8 @@ FLOAT32_TOLERANCE = 2e-5
 BFLOAT16_TOLERANCE = 0.075
 # Ten bfloat16 denoising steps amplify rounding: pi0.5's LIBERO checkpoint's TensorRT bundle differed from its test
 # case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03. EO-1's
-# TensorRT bundle differed from its test case by 0.079 on an H100, where another kernel moved it by 0.076.
+# TensorRT bundle differed from its test case by 0.079 on an H100, where another kernel moved it by 0.076. Another
+# attention kernel moves Wall-OSS 0.5's actions by up to 0.16.
 BFLOAT16_STEPS_TOLERANCE = 0.2
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
