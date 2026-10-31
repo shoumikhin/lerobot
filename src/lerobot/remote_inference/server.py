@@ -53,6 +53,7 @@ from lerobot.transport import (
     ZenohTransport,
 )
 
+from .bundle import BundleRunner
 from .chunk_contract import (
     CHUNK_ALIGNMENT,
     RTC_MODEL_SPACE,
@@ -129,7 +130,7 @@ class SessionWorker:
 
     def __init__(
         self,
-        runner: PolicyRunner,
+        runner: PolicyRunner | BundleRunner,
         *,
         deployment: str,
         artifact_identity: str,
