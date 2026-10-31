@@ -25,6 +25,7 @@ from packaging.version import Version
 
 from lerobot.bundle.manifest import NOISE
 from lerobot.export.recipe import ActionChunkRecipe, random_frame
+from lerobot.utils.constants import OBS_STATE
 
 # torch.export in PyTorch 2.10 cannot trace these policies' draws with the noise input in their place, and an
 # export needs PyTorch 2.15 anyway.
@@ -36,11 +37,14 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not availa
 class Recipe:
     """A policy's recipe, which `make_recipe` in `module` builds from the fixtures that `uses` names.
 
-    `cuda` also runs the recipe on a GPU, where its pixels must still be the processor's bit for bit.
+    `state` is the state of the frame the program is compared on, for a policy that writes the state into its
+    prompt: its numbers take other widths there than in the frames the recipe checked. `cuda` also runs the
+    recipe on a GPU, where its pixels must still be the processor's bit for bit.
     """
 
     module: str
     uses: tuple[str, ...] = ()
+    state: list[float] | None = None
     cuda: bool = False
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
@@ -48,6 +52,13 @@ class Recipe:
 RECIPES = {
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
     "eo1": Recipe("tests.policies.eo1.export_stand_in", ("monkeypatch",), cuda=True),
+    # Bins 0, 5 and 191: numbers of one, one and three digits, where the checked frames' take three each.
+    "dm05": Recipe(
+        "tests.policies.dm05.export_stand_in",
+        ("tmp_path",),
+        state=[-1.0, -0.96, 0.5],
+        cuda=True,
+    ),
 }
 
 
@@ -66,6 +77,7 @@ def make_recipe(request: pytest.FixtureRequest, name: str, **kwargs) -> ActionCh
     ],
 )
 def test_the_exported_program_computes_what_the_policy_does(request, name, device):
+    recipe = RECIPES[name]
     built = make_recipe(request, name, **({} if device == "cpu" else {"device": device}))
 
     # Checks the eager module against the policy as lerobot-rollout runs it, on two frames.
@@ -75,6 +87,8 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
     assert NOISE in part.inputs
     # A third frame and another noise, which the program must read rather than hold.
     frame = random_frame(built.config.input_features, torch.Generator().manual_seed(1))
+    if recipe.state is not None:
+        frame[OBS_STATE] = np.array(recipe.state, dtype=np.float32)
     noise = np.random.default_rng(2).standard_normal(built.test_case().noise.shape, np.float32)
     inputs = tuple(torch.from_numpy(x).to(device) for x in (*frame.values(), noise))
     with torch.no_grad():
