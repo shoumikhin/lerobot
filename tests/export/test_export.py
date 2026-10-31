@@ -30,6 +30,7 @@ from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import POLICY_CONFIG, Bundle
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -37,6 +38,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import assert_runs_without_torch
@@ -293,6 +295,23 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     assert sorted(manifest.programs) == ["model", "prepare", "scale"]
     constants = load_file(bundle.path / bundle.manifest.constants)
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        and is_package_available("executorch")
+        and is_package_available("torch_tensorrt")
+    )
+    or not tensorrt_takes_the_plugin_setting(),
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
+)
+def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tmp_path):
+    """The export writes the option, and the bundle passes the export's own check in a fresh process."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_tensorrt")
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
 
 
 EXPORT_WITHOUT_TORCH = """
