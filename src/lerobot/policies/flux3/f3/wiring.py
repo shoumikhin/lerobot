@@ -171,10 +171,12 @@ def fresh_head_state_dict(
     generator = torch.Generator().manual_seed(seed)
     out: dict[str, torch.Tensor] = {}
     for m, width in ((modality, channels), (f"{modality}_cond", cond_channels or channels)):
-        weight = torch.empty(hidden_size, width)
+        # On the CPU, where `generator` draws, whatever device the caller builds under: `load_state_dict` copies
+        # them to the DiT's device.
+        weight = torch.empty(hidden_size, width, device="cpu")
         nn.init.xavier_uniform_(weight, generator=generator)
         out[f"emb_in.{m}.weight"] = weight
-        with torch.random.fork_rng(devices=[]):
+        with torch.random.fork_rng(devices=[]), torch.device("cpu"):
             layer_state = LastLayer(hidden_size, width).state_dict()
         for k, v in layer_state.items():
             out[f"final_layer.{m}.{k}"] = torch.zeros_like(v)

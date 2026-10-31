@@ -237,7 +237,7 @@ def test_the_default_loader_maps_every_shard_on_the_cpu(tmp_path, monkeypatch):
 
 
 def test_a_policy_that_reads_its_checkpoint_itself_gets_its_device(tmp_path, monkeypatch):
-    # G0.5 maps the file itself, straight onto the device its weights go to.
+    # A loader of its own, as G0.5 has, still gets the policy's device; the default one maps the file on the CPU.
     config = tiny_act_config()
     ACTPolicy(config).save_pretrained(tmp_path)
     config.device = "meta"

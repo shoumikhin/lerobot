@@ -157,8 +157,7 @@ class ExportRecipe(abc.ABC):
 
     Args:
         policy (`PreTrainedPolicy`):
-            The trained policy, in eval mode on the CPU. The recipe moves what it compiles to the backend's
-            device.
+            The trained policy, in eval mode on the backend's device.
         preprocessor (`PolicyProcessorPipeline`):
             Its saved preprocessor, set to run on the backend's device.
         postprocessor (`PolicyProcessorPipeline`):
@@ -567,23 +566,24 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
 def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
-    """The whole trained policy, in eval mode on the CPU, and its processors set to the backend's device."""
+    """The whole trained policy, in eval mode on the backend's device, and its processors set to that device."""
     from lerobot.policies.factory import load_pretrained_policy
 
     config = cast(PreTrainedConfig, cfg.policy)
-    # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
-    config.device = "cpu"
+    config.device = cfg.backend.device
     # A checkpoint can save torch.compile on; the export traces the policy's own code and compiles it with
     # its backend.
     if hasattr(config, "compile_model"):
         config.compile_model = False
-    # Strict: a weight the checkpoint does not fill would stay random, and no later check could tell.
-    policy = load_pretrained_policy(config, strict=True)
+    # Built on the device, so the weights are copied there once from the checkpoint, with no second copy of
+    # the model on the CPU.
+    with torch.device(cfg.backend.device):
+        # Strict: a weight the checkpoint does not fill would stay random, and no later check could tell.
+        policy = load_pretrained_policy(config, strict=True)
     if hasattr(policy, "merge_and_unload"):
         # A PEFT adapter: compile the base weights with the adapter folded in.
         policy = policy.merge_and_unload()
     policy.eval()
-    config.device = cfg.backend.device
     return policy, *load_processors(config)
 
 
