@@ -70,6 +70,26 @@ def test_the_command_runs_a_bundle_without_torch(tmp_path):
     )
 
 
+def test_discovering_a_robot_package_of_lerobot_imports_no_torch(tmp_path):
+    """The package registers the robot; its kinematics processor, which imports PyTorch, is not loaded."""
+    assert_runs_without_torch(
+        """
+        import sys
+        from lerobot.scripts.lerobot_rollout_entry import main
+
+        sys.argv = ["lerobot-rollout", *sys.argv[1:]]
+        try:
+            main()
+        except SystemExit as error:
+            assert error.code == 0, error.code
+        """,
+        f"--bundle.path={make_numpy_bundle(tmp_path / 'bundle')}",
+        "--robot.discover_packages_path=lerobot.robots.so_follower",
+        "--help",
+        cwd=REPO,
+    )
+
+
 def test_bundle_mode_loads_no_plugin_but_robots_and_cameras(tmp_path):
     with pytest.raises(ValueError, match="robot and camera plugins only"):
         bundle_rollout.main(
