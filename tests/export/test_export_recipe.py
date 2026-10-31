@@ -807,6 +807,43 @@ class EditedStepsRecipe(ActionChunkRecipe):
         return replace(self.preprocessor, steps=self.edit(self.preprocessor.steps))
 
 
+class InexactStepsRecipe(EditedStepsRecipe):
+    """Held to the export's tolerance rather than to rollout's actions bit for bit."""
+
+    exact = False
+
+
+class ScaleState(ProcessorStep):
+    """Scales the state, as a program that computes the same thing in another order rounds it."""
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        state = observation[OBS_STATE] * self.scale
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: state}}
+
+    def transform_features(self, features):
+        return features
+
+
+class FrozenState(ProcessorStep):
+    """Keeps the first state it sees, as a program that held the test case's state as a constant would."""
+
+    def __init__(self):
+        self.state = None
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        if self.state is None:
+            self.state = observation[OBS_STATE]
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: self.state}}
+
+    def transform_features(self, features):
+        return features
+
+
 @pytest.mark.parametrize(
     ("recipe_class", "edit", "error"),
     [
@@ -817,6 +854,13 @@ class EditedStepsRecipe(ActionChunkRecipe):
             lambda steps: [step for step in steps if not isinstance(step, NormalizerProcessorStep)],
             "computes something else",
         ),
+        # Float32 rounding: the actions are not rollout's bit for bit, but within the tolerance.
+        (InexactStepsRecipe, lambda steps: [ScaleState(1 + 1e-6), *steps], None),
+        (InexactStepsRecipe, lambda steps: [ScaleState(2.0), *steps], "more than the tolerance"),
+        # A NaN difference is more than any tolerance too.
+        (InexactStepsRecipe, lambda steps: [ScaleState(float("nan")), *steps], "more than the tolerance"),
+        # Right for the test case's frame, which it sees first, and wrong for any other.
+        (EditedStepsRecipe, lambda steps: [FrozenState(), *steps], "computes something else"),
     ],
 )
 def test_a_recipe_gives_the_program_a_preprocessor_that_computes_the_same(recipe_class, edit, error):

@@ -377,7 +377,16 @@ class ActionChunkRecipe(ExportRecipe):
     `PreTrainedPolicy.chunk_inference_spec`, draw a starting noise they take in exactly one random normal
     draw and compute the same chunk when given the standard normal draw behind it, and compute the same chunk
     twice from the same frame and noise.
+
+    **Attributes**:
+        - **exact** (`bool`) -- Whether the program must compute, in PyTorch, the actions lerobot-rollout plays
+          bit for bit, both with TF32 off as the export runs (rollout turns TF32 on by default, which moves a
+          float32 policy's actions on a GPU a little). A recipe whose program computes them in another
+          order, for example over a prompt padded to a fixed length, sets it to False, and the program is held
+          to the export's tolerance instead.
     """
+
+    exact: bool = True
 
     def __init__(
         self,
@@ -420,12 +429,7 @@ class ActionChunkRecipe(ExportRecipe):
         ):
             with torch.no_grad():
                 actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
-            if not np.array_equal(actions, expected):
-                raise ValueError(
-                    f"The {self.policy.config.type} policy computes something else as one module than it "
-                    "does in lerobot-rollout, for example because a preprocessor step reads the frame in "
-                    "Python. It needs its own export recipe."
-                )
+            self._check_program(actions, expected)
         inputs = [*self._features, *([NOISE] if self._noise_shape else [])]
         yield Part("model", module, self._inputs(self._case.frame, self._case.noise), inputs, [ACTION])
 
@@ -441,6 +445,23 @@ class ActionChunkRecipe(ExportRecipe):
         still checked against the saved preprocessor.
         """
         return self.preprocessor
+
+    def _check_program(self, actions: np.ndarray, expected: np.ndarray) -> None:
+        if self.exact:
+            if not np.array_equal(actions, expected):
+                raise ValueError(
+                    f"The {self.policy.config.type} policy computes something else as one module than it "
+                    "does in lerobot-rollout, for example because a preprocessor step reads the frame in "
+                    "Python. It needs its own export recipe."
+                )
+            return
+        difference = float((np.abs(actions - expected) / self._case.action_scale).max())
+        # Not `>`: a NaN difference must fail too.
+        if not difference <= self.tolerance:
+            raise ValueError(
+                f"The {self.policy.config.type} policy's program computes actions {difference:.3g} normalized "
+                f"units from the ones lerobot-rollout plays, more than the tolerance {self.tolerance}."
+            )
 
     def predict_chunk(self, policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
         """The `[1, chunk, action]` chunk the policy predicts for a preprocessed batch, as rollout gets it.
