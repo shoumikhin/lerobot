@@ -15,8 +15,8 @@
 """Each policy's export recipe on a stand-in policy, in memory: its program computes what the eager module the
 recipe checked does, and the recipe refuses what its program cannot compute."""
 
-from dataclasses import dataclass
-from importlib import import_module
+import importlib
+from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
@@ -40,6 +40,7 @@ class Recipe:
     `state` is the state of the frame the program is compared on, for a policy that writes the state into its
     prompt: its numbers take other widths there than in the frames the recipe checked. `cuda` also runs the
     recipe on a GPU, where its pixels must still be the processor's bit for bit.
+    `options` are more arguments of `make_recipe`.
     """
 
     module: str
@@ -47,6 +48,7 @@ class Recipe:
     state: list[float] | None = None
     cuda: bool = False
     marks: tuple[pytest.MarkDecorator, ...] = ()
+    options: dict = field(default_factory=dict)
 
 
 RECIPES = {
@@ -59,6 +61,10 @@ RECIPES = {
         state=[-1.0, -0.96, 0.5],
         marks=(pytest.mark.dataset,),
     ),
+    # Bins 0, 10 and 384: numbers of one, two and three digits, where the checked frames' take three each.
+    "wall_oss_05": Recipe("tests.policies.wall_oss_05.export_stand_in", state=[-1.0, -0.96, 0.5]),
+    # A camera the image processor resizes, which it does otherwise on float pixels than on the step's uint8.
+    "wall_oss_05_250x448": Recipe("tests.policies.wall_oss_05.export_stand_in", options={"short_side": 250}),
     # Its language recipe comes with the dataset extra.
     "eo1": Recipe(
         "tests.policies.eo1.export_stand_in", ("monkeypatch",), cuda=True, marks=(pytest.mark.dataset,)
@@ -76,7 +82,7 @@ RECIPES = {
 def make_recipe(request: pytest.FixtureRequest, name: str, **kwargs) -> ActionChunkRecipe:
     recipe = RECIPES[name]
     fixtures = [request.getfixturevalue(fixture) for fixture in recipe.uses]
-    return import_module(recipe.module).make_recipe(*fixtures, **kwargs)
+    return importlib.import_module(recipe.module).make_recipe(*fixtures, **recipe.options, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -120,6 +126,7 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
         ),
         pytest.param("dm05", {"add_state": False}, "add_state=false", id="dm05-no-state"),
         pytest.param("fineart_vla", {"text_recipe": False}, "has no text recipe", id="fineart-no-recipe"),
+        pytest.param("wall_oss_05", {"long_side": 224}, "long side is 448 pixels", id="wall_oss_05-camera"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
@@ -139,12 +146,14 @@ def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, chang
             id="fineart_vla-prompt",
             marks=pytest.mark.dataset,
         ),
+        pytest.param("wall_oss_05", "prompt", "writes another prompt", id="wall_oss_05-prompt"),
+        pytest.param("wall_oss_05", "pixels", "pixel_values differ", id="wall_oss_05-pixels"),
     ],
 )
 def test_the_checks_refuse_another_prompt_or_other_pixels(request, monkeypatch, name, broken, error):
     """A program whose prompt or pixels are not the saved steps' is refused. Here the first bin's number gets
     another number's tokens, as from a tokenizer that splits it otherwise alone, or the pixels move."""
-    step_type = import_module(f"lerobot.policies.{name}.export_{name}")._StatePromptStep
+    step_type = importlib.import_module(f"lerobot.policies.{name}.export_{name}")._StatePromptStep
     init = step_type.__init__
 
     def broken_init(self, *args):
