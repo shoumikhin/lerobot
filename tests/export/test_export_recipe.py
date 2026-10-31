@@ -30,7 +30,11 @@ import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
+    BFLOAT16_TOLERANCE,
+    FLOAT32_TOLERANCE,
     ActionChunkRecipe,
+    ExportRecipe,
     ReplayDraws,
     export_task,
     frame_shapes,
@@ -873,3 +877,31 @@ def test_a_recipe_gives_the_program_a_preprocessor_that_computes_the_same(recipe
         [part] = recipe.parts()
         steps = [type(step) for step in part.module.preprocessor.steps]
         assert steps == [type(step) for step in edit(recipe.preprocessor.steps)]
+
+
+class BareRecipe(ExportRecipe):
+    """A recipe without parts, to read the tolerance it picks."""
+
+    def parts(self):
+        yield from ()
+
+    def test_case(self):
+        raise NotImplementedError
+
+
+class DenoisingRecipe(BareRecipe):
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
+
+@pytest.mark.parametrize(
+    ("dtype", "default", "raised"),
+    [
+        (torch.float32, FLOAT32_TOLERANCE, FLOAT32_TOLERANCE),
+        (torch.bfloat16, BFLOAT16_TOLERANCE, BFLOAT16_STEPS_TOLERANCE),
+    ],
+)
+def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
+    policy = ACTPolicy(act_config()).to(dtype)
+
+    assert BareRecipe(policy, None, None, export_config()).tolerance == default
+    assert DenoisingRecipe(policy, None, None, export_config()).tolerance == raised

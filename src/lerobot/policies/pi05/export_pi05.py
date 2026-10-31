@@ -48,6 +48,7 @@ from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
     BFLOAT16_TOLERANCE,
+    BFLOAT16_STEPS_TOLERANCE,
     FLOAT32_TOLERANCE,
     ExportRecipe,
     Part,
@@ -133,9 +134,6 @@ EDGE_CASE_TASKS = ("", "!!!", "pick_up_the_cube", "pick up\nthe cube", "  Pick u
 EXTREME_STATE = 1e6
 # Random frames whose prompt is compared with the policy's processor at export, beside the test frame.
 PROMPT_CHECK_FRAMES = 3
-# Ten bfloat16 denoising steps amplify rounding: the LIBERO checkpoint's TensorRT bundle differed from its test
-# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03.
-BFLOAT16_STEPS_TOLERANCE = 0.2
 # Loading the whole policy peaks at 2.45 times its checkpoint's size, since pi0.5 builds its policy in float32 and
 # then loads a bfloat16 checkpoint into it (measured); the rest is room for the activations.
 WHOLE_POLICY_PEAK = 3
@@ -426,6 +424,9 @@ class PI05ExportRecipe(ExportRecipe):
             The `lerobot-export` configuration.
     """
 
+    # pi0.5 runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
     @classmethod
     def load(cls, cfg: ExportConfig) -> PI05ExportRecipe:
         """The recipe, with no weight loaded yet."""
@@ -457,7 +458,7 @@ class PI05ExportRecipe(ExportRecipe):
         self.tolerance = (
             cfg.tolerance
             if cfg.tolerance is not None
-            else BFLOAT16_STEPS_TOLERANCE
+            else self.bfloat16_tolerance
             if policy_config.dtype == torch.bfloat16
             else FLOAT32_TOLERANCE
         )

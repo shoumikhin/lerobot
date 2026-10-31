@@ -323,6 +323,15 @@ def test_export_refuses_images_or_a_state_the_saved_processor_does_not_make(
         GrootExportRecipe(_export_config(GrootConfig.from_pretrained(checkpoint), tmp_path))
 
 
+def test_a_subclass_sets_the_bfloat16_tolerance(checkpoint, tmp_path):
+    class LooserRecipe(GrootExportRecipe):
+        bfloat16_tolerance = 0.2
+
+    config = GrootConfig.from_pretrained(checkpoint)
+    config.use_bf16 = True
+    assert LooserRecipe(_export_config(config, tmp_path)).tolerance == 0.2
+
+
 JOINTS = "observation.joints"
 
 

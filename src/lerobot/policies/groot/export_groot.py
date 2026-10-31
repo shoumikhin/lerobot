@@ -51,7 +51,6 @@ from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Program
 from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
-    BFLOAT16_TOLERANCE,
     FLOAT32_TOLERANCE,
     ChainRecipe,
     Part,
@@ -172,7 +171,7 @@ class GrootExportRecipe(ChainRecipe):
         self._metadata = dataset_metadata(cfg)
         self._generator = torch.Generator().manual_seed(cfg.seed)
         bfloat16 = config.use_bf16 or config.dtype == torch.bfloat16
-        default_tolerance = BFLOAT16_TOLERANCE if bfloat16 else FLOAT32_TOLERANCE
+        default_tolerance = self.bfloat16_tolerance if bfloat16 else FLOAT32_TOLERANCE
         self.tolerance = cfg.tolerance if cfg.tolerance is not None else default_tolerance
         self.task = export_task(cfg, self._metadata, "GR00T")
         features = self._robot_features(config)

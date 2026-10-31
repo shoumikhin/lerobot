@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 # up to 0.036, and eager PyTorch with another attention kernel moves their actions by up to 0.05.
 FLOAT32_TOLERANCE = 2e-5
 BFLOAT16_TOLERANCE = 0.075
+# Ten bfloat16 denoising steps amplify rounding: pi0.5's LIBERO checkpoint's TensorRT bundle differed from its test
+# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03.
+BFLOAT16_STEPS_TOLERANCE = 0.2
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
@@ -261,6 +264,10 @@ class ExportRecipe(abc.ABC):
             The largest allowed action difference on the test case, in normalized action units.
     """
 
+    #: The default tolerance of a bfloat16 checkpoint. A recipe whose policy runs ten bfloat16 denoising steps,
+    #: which amplify rounding, raises it to `BFLOAT16_STEPS_TOLERANCE`.
+    bfloat16_tolerance: float = BFLOAT16_TOLERANCE
+
     @classmethod
     def load(cls, cfg: ExportConfig) -> ExportRecipe:
         """The recipe for the checkpoint `cfg.policy` names.
@@ -284,7 +291,11 @@ class ExportRecipe(abc.ABC):
         self.cfg = cfg
         self.config: PreTrainedConfig = policy.config
         self.task: str | None = None
-        self.tolerance = cfg.tolerance if cfg.tolerance is not None else _default_tolerance(policy)
+        self.tolerance = (
+            cfg.tolerance
+            if cfg.tolerance is not None
+            else _default_tolerance(policy, self.bfloat16_tolerance)
+        )
 
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:
@@ -760,9 +771,9 @@ def _integer_range(args: tuple, kwargs: dict[str, Any]) -> tuple[int, int, tuple
     return values["low"], values["high"], tuple(values["size"])
 
 
-def _default_tolerance(policy: PreTrainedPolicy) -> float:
+def _default_tolerance(policy: PreTrainedPolicy, bfloat16_tolerance: float) -> float:
     if any(p.dtype == torch.bfloat16 for p in policy.parameters()):
-        return BFLOAT16_TOLERANCE
+        return bfloat16_tolerance
     return FLOAT32_TOLERANCE
 
 
