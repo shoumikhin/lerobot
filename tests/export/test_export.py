@@ -246,9 +246,9 @@ def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
     seen = []
     load = factory.load_pretrained_policy
 
-    def load_pretrained_policy(config):
+    def load_pretrained_policy(config, **kwargs):
         seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
-        return load(config)
+        return load(config, **kwargs)
 
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     request = tmp_path / "trace.json"
