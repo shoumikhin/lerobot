@@ -193,6 +193,28 @@ def test_operators_whose_plugins_need_pytorch_stay_out_of_tensorrt(monkeypatch, 
     assert seen == {"fallback_pytorch_plugin_ops": True}
 
 
+@pytest.mark.parametrize("supported", [True, False])
+def test_weights_are_shared_across_layers_when_torch_tensorrt_can(monkeypatch, tmp_path, supported):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    seen = {}
+
+    def compile_with_the_setting(
+        program, arg_inputs, *, fallback_pytorch_plugin_ops, deduplicate_weights=False, **options
+    ):
+        seen.update(options, deduplicate_weights=deduplicate_weights)
+        raise ReachedCompileError
+
+    def compile_without_it(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
+        seen.update(options)
+        raise ReachedCompileError
+
+    use_fake_tensorrt(monkeypatch, compile_with_the_setting if supported else compile_without_it)
+    with pytest.raises(ReachedCompileError):
+        ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
+    assert seen.get("deduplicate_weights") is (True if supported else None)
+
+
 def test_a_torch_tensorrt_without_the_plugin_setting_is_refused(monkeypatch, tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
