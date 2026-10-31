@@ -15,7 +15,6 @@
 """A stand-in DM05 for its export recipe, on DM05's preprocessor with a tiny Gemma3 processor."""
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +32,7 @@ from lerobot.policies.dm05.processor_dm05 import (  # noqa: E402
 )
 from lerobot.policies.pretrained import PreTrainedPolicy  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from tests.export.recipe_config import export_config  # noqa: E402
 
 CAMERA = "observation.images.front"
 CHUNK = 2
@@ -89,7 +89,7 @@ class PromptReader(DM05Policy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(tmp_path, device="cpu", add_state=True) -> DM05ExportRecipe:
+def make_recipe(tmp_path, device="cpu", add_state=True, task="pick up the cube") -> DM05ExportRecipe:
     save_processor(tmp_path / "processor")
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
@@ -107,7 +107,5 @@ def make_recipe(tmp_path, device="cpu", add_state=True) -> DM05ExportRecipe:
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
     )
     preprocessor, postprocessor = make_dm05_pre_post_processors(config)
-    cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
-    )
+    cfg = export_config(task, device)
     return DM05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

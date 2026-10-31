@@ -14,8 +14,6 @@
 
 """A stand-in FineART-VLA for its export recipe, on FineART-VLA's preprocessor with a tiny tokenizer."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -38,6 +36,7 @@ from lerobot.utils.constants import (  # noqa: E402
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
 )
+from tests.export.recipe_config import export_config  # noqa: E402
 
 CAMERA = "observation.images.front"
 CHUNK = 2
@@ -72,7 +71,9 @@ class PromptReader(FineARTVLAPolicy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(monkeypatch, device="cpu", text_recipe=True) -> FineARTVLAExportRecipe:
+def make_recipe(
+    monkeypatch, device="cpu", text_recipe=True, task="pick up the cube"
+) -> FineARTVLAExportRecipe:
     # Also the tokenizer of pi0.5's preprocessor, which a checkpoint without a text recipe has.
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer())
     if text_recipe:
@@ -94,7 +95,5 @@ def make_recipe(monkeypatch, device="cpu", text_recipe=True) -> FineARTVLAExport
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
     )
     preprocessor, postprocessor = make_fineart_vla_pre_post_processors(config)
-    cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
-    )
+    cfg = export_config(task, device)
     return FineARTVLAExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

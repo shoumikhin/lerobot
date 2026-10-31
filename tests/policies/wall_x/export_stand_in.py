@@ -37,6 +37,7 @@ from lerobot.policies.wall_x.processor_wall_x import (  # noqa: E402
     make_wall_x_pre_post_processors,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from tests.export.recipe_config import export_config  # noqa: E402
 from tests.policies.common.qwen2_5_vl_helpers import tiny_vision_tower  # noqa: E402
 
 CAMERA = "observation.images.front"
@@ -76,7 +77,7 @@ class PixelWallX(WallXPolicy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(device="cpu") -> WallXExportRecipe:
+def make_recipe(device="cpu", task="pick up the cube") -> WallXExportRecipe:
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
     config = WallXConfig(
@@ -94,7 +95,5 @@ def make_recipe(device="cpu") -> WallXExportRecipe:
     preprocessor, postprocessor = make_wall_x_pre_post_processors(config)
     (step,) = (step for step in preprocessor.steps if isinstance(step, WallXTokenizerStep))
     step._processor = processor()
-    cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
-    )
+    cfg = export_config(task, device)
     return WallXExportRecipe(PixelWallX(config).eval(), preprocessor, postprocessor, cfg)

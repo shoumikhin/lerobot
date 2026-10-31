@@ -15,7 +15,6 @@
 """A stand-in MolmoAct2 for its export recipe, on MolmoAct2's preprocessor with its own image processor."""
 
 import re
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +34,7 @@ from lerobot.policies.molmoact2.processor_molmoact2 import (  # noqa: E402
 )
 from lerobot.policies.pretrained import PreTrainedPolicy  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from tests.export.recipe_config import export_config  # noqa: E402
 
 CAMERA = "observation.images.front"
 CHUNK = 2
@@ -98,7 +98,7 @@ class PromptReader(MolmoAct2Policy):
 
 
 def make_recipe(
-    monkeypatch, device="cpu", width=SIDE, crop_mode="resize", state_mask=False
+    monkeypatch, device="cpu", width=SIDE, crop_mode="resize", state_mask=False, task="pick up the cube"
 ) -> MolmoAct2ExportRecipe:
     """The recipe on a stand-in policy. `state_mask` normalizes the state by quantiles with a gripper mask, as
     every published MolmoAct2 checkpoint's statistics do."""
@@ -126,7 +126,5 @@ def make_recipe(
         # The last value is the gripper's, which the policy reads as it is.
         stats = {OBS_STATE: {"q01": low, "q99": high, "min": low, "max": high, "mask": [True, True, False]}}
     preprocessor, postprocessor = make_molmoact2_pre_post_processors(config, stats)
-    cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
-    )
+    cfg = export_config(task, device)
     return MolmoAct2ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

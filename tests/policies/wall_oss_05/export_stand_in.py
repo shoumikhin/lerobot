@@ -38,6 +38,7 @@ from lerobot.policies.wall_oss_05.processor_wall_oss_05 import (  # noqa: E402
     make_wall_oss_05_pre_post_processors,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from tests.export.recipe_config import export_config  # noqa: E402
 from tests.policies.common.qwen2_5_vl_helpers import tiny_vision_tower  # noqa: E402
 
 CAMERA = "observation.images.front"
@@ -90,7 +91,9 @@ class PromptReader(WallOSS05Policy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(device="cpu", long_side=448, short_side=None) -> WallOSS05ExportRecipe:
+def make_recipe(
+    device="cpu", long_side=448, short_side=None, task="pick up the cube"
+) -> WallOSS05ExportRecipe:
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
     config = WallOSS05Config(
@@ -111,7 +114,5 @@ def make_recipe(device="cpu", long_side=448, short_side=None) -> WallOSS05Export
     preprocessor, postprocessor = make_wall_oss_05_pre_post_processors(config)
     (step,) = (step for step in preprocessor.steps if isinstance(step, WallOSS05TokenizerStep))
     step._processor = processor()
-    cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
-    )
+    cfg = export_config(task, device)
     return WallOSS05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)
