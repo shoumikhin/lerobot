@@ -88,7 +88,7 @@ class PixelWallX(WallXPolicy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(device="cpu") -> WallXExportRecipe:
+def make_recipe(device="cpu", task="pick up the cube") -> WallXExportRecipe:
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
     config = WallXConfig(
@@ -107,6 +107,6 @@ def make_recipe(device="cpu") -> WallXExportRecipe:
     (step,) = (step for step in preprocessor.steps if isinstance(step, WallXTokenizerStep))
     step._processor = processor()
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device=device), seed=0, dataset=None, task=task, tolerance=None
     )
     return WallXExportRecipe(PixelWallX(config).eval(), preprocessor, postprocessor, cfg)

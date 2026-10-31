@@ -89,7 +89,7 @@ class PromptReader(DM05Policy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(tmp_path, device="cpu", add_state=True) -> DM05ExportRecipe:
+def make_recipe(tmp_path, device="cpu", add_state=True, task="pick up the cube") -> DM05ExportRecipe:
     save_processor(tmp_path / "processor")
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
@@ -108,6 +108,6 @@ def make_recipe(tmp_path, device="cpu", add_state=True) -> DM05ExportRecipe:
     )
     preprocessor, postprocessor = make_dm05_pre_post_processors(config)
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device=device), seed=0, dataset=None, task=task, tolerance=None
     )
     return DM05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

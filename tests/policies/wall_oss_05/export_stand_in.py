@@ -102,7 +102,9 @@ class PromptReader(WallOSS05Policy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(device="cpu", long_side=448, short_side=None) -> WallOSS05ExportRecipe:
+def make_recipe(
+    device="cpu", long_side=448, short_side=None, task="pick up the cube"
+) -> WallOSS05ExportRecipe:
     torch.manual_seed(0)
     identity = NormalizationMode.IDENTITY
     config = WallOSS05Config(
@@ -124,6 +126,6 @@ def make_recipe(device="cpu", long_side=448, short_side=None) -> WallOSS05Export
     (step,) = (step for step in preprocessor.steps if isinstance(step, WallOSS05TokenizerStep))
     step._processor = processor()
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device=device), seed=0, dataset=None, task=task, tolerance=None
     )
     return WallOSS05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)

@@ -39,7 +39,9 @@ class Recipe:
 
     `state` is the state of the frame the program is compared on, for a policy that writes the state into its
     prompt: its numbers take other widths there than in the frames the recipe checked. `cuda` also runs the
-    recipe on a GPU, where its pixels must still be the processor's bit for bit.
+    recipe on a GPU, where its pixels must still be the processor's bit for bit. `seeded` is for a policy that
+    seeds its own noise, which the program holds, and `reads_task` for one whose bundle holds the task, as the
+    recipe's own probe finds.
     `options` are more arguments of `make_recipe`.
     """
 
@@ -47,27 +49,37 @@ class Recipe:
     uses: tuple[str, ...] = ()
     state: list[float] | None = None
     cuda: bool = False
+    seeded: bool = False
+    reads_task: bool = False
     marks: tuple[pytest.MarkDecorator, ...] = ()
     options: dict = field(default_factory=dict)
 
 
 RECIPES = {
-    "wall_x": Recipe("tests.policies.wall_x.export_stand_in"),
+    "wall_x": Recipe("tests.policies.wall_x.export_stand_in", reads_task=True),
     "gaussian_actor": Recipe("tests.export.test_export_gaussian_actor", marks=(OLD_TORCH,)),
     # Bins 0, 5 and 192: numbers of one, one and three digits, where the checked frames' take three each.
     "fineart_vla": Recipe(
         "tests.policies.fineart_vla.export_stand_in",
         ("monkeypatch",),
         state=[-1.0, -0.96, 0.5],
+        reads_task=True,
         marks=(pytest.mark.dataset,),
     ),
     # Bins 0, 10 and 384: numbers of one, two and three digits, where the checked frames' take three each.
-    "wall_oss_05": Recipe("tests.policies.wall_oss_05.export_stand_in", state=[-1.0, -0.96, 0.5]),
+    "wall_oss_05": Recipe(
+        "tests.policies.wall_oss_05.export_stand_in", state=[-1.0, -0.96, 0.5], reads_task=True
+    ),
     # A camera the image processor resizes, which it does otherwise on float pixels than on the step's uint8.
-    "wall_oss_05_250x448": Recipe("tests.policies.wall_oss_05.export_stand_in", options={"short_side": 250}),
-    "molmoact2": Recipe("tests.policies.molmoact2.export_stand_in", ("monkeypatch",)),
+    "wall_oss_05_250x448": Recipe(
+        "tests.policies.wall_oss_05.export_stand_in", options={"short_side": 250}, reads_task=True
+    ),
+    "molmoact2": Recipe("tests.policies.molmoact2.export_stand_in", ("monkeypatch",), reads_task=True),
     "molmoact2_state_mask": Recipe(
-        "tests.policies.molmoact2.export_stand_in", ("monkeypatch",), options={"state_mask": True}
+        "tests.policies.molmoact2.export_stand_in",
+        ("monkeypatch",),
+        options={"state_mask": True},
+        reads_task=True,
     ),
     # Its language recipe comes with the dataset extra.
     "eo1": Recipe(
@@ -79,7 +91,9 @@ RECIPES = {
         ("tmp_path",),
         state=[-1.0, -0.96, 0.5],
         cuda=True,
+        reads_task=True,
     ),
+    "flux3": Recipe("tests.policies.flux3.export_stand_in", ("monkeypatch",), seeded=True, reads_task=True),
 }
 
 
@@ -106,13 +120,16 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
     [part] = built.parts()
     program = torch.export.export(part.module, part.example_inputs).module()
 
-    assert NOISE in part.inputs
-    # A third frame and another noise, which the program must read rather than hold.
+    assert (NOISE not in part.inputs) == (built.test_case().noise is None) == recipe.seeded
+    # A third frame, and for a policy that does not seed its own noise another noise, which the program must
+    # read rather than hold.
     frame = random_frame(built.config.input_features, torch.Generator().manual_seed(1))
+    assert built._reads_task(frame) == recipe.reads_task
     if recipe.state is not None:
         frame[OBS_STATE] = np.array(recipe.state, dtype=np.float32)
-    noise = np.random.default_rng(2).standard_normal(built.test_case().noise.shape, np.float32)
-    inputs = tuple(torch.from_numpy(x).to(device) for x in (*frame.values(), noise))
+    shape = None if recipe.seeded else built.test_case().noise.shape
+    noise = [] if shape is None else [np.random.default_rng(2).standard_normal(shape, np.float32)]
+    inputs = tuple(torch.from_numpy(x).to(device) for x in (*frame.values(), *noise))
     with torch.no_grad():
         torch.testing.assert_close(program(*inputs), part.module(*inputs), rtol=0, atol=0)
 
@@ -175,3 +192,12 @@ def test_the_checks_refuse_another_prompt_or_other_pixels(request, monkeypatch, 
     monkeypatch.setattr(step_type, "__init__", broken_init)
     with pytest.raises(ValueError, match=error):
         list(make_recipe(request, name).parts())
+
+
+@pytest.mark.parametrize("name", [name for name, recipe in RECIPES.items() if recipe.reads_task])
+def test_the_bundle_holds_the_task_the_policy_reads(request, name):
+    with pytest.raises(ValueError, match="reads the task"):
+        make_recipe(request, name, task="")
+    cube, stop = (make_recipe(request, name, task=task) for task in ("pick up the cube", "stop"))
+    assert cube.task == "pick up the cube"
+    assert not np.array_equal(cube.test_case().actions, stop.test_case().actions)
