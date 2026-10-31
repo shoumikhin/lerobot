@@ -147,13 +147,6 @@ def test_export_keeps_a_task_given(checkpoint, tmp_path):
     assert Bundle.read(tmp_path / "bundle").manifest.task == "pick"
 
 
-def test_export_writes_nothing_over_tolerance(checkpoint, tmp_path):
-    output_dir = tmp_path / "bundle"
-    with pytest.raises(RuntimeError, match="failed its check"):
-        run_export(f"--policy.path={checkpoint}", f"--output_dir={output_dir}", "--backend.offset=10.0")
-    assert list(tmp_path.iterdir()) == []
-
-
 # Robot units of the test checkpoint's actions, whose spread is 30: float32's measured drift between eager
 # PyTorch and correct compilers (8.3e-6 normalized), and ten times that.
 @pytest.mark.parametrize(("offset", "passes"), [(2.5e-4, True), (2.5e-3, False)])
@@ -168,6 +161,8 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
     else:
         with pytest.raises(RuntimeError, match="failed its check"):
             run_export(*args)
+        # Nothing is written, not even the folders the export made beside the output folder.
+        assert list(tmp_path.iterdir()) == []
 
 
 def test_a_backend_takes_a_pytorch_as_new_as_it_needs(monkeypatch):
