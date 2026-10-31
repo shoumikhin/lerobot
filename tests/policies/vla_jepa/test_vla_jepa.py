@@ -48,9 +48,12 @@ from conftest import (  # noqa: E402
     make_train_batch,
     set_seed_all,
 )
+from lerobot.policies.common.qwen_vision import prepare_image_grid  # noqa: E402
 from lerobot.policies.vla_jepa.configuration_vla_jepa import VLAJEPAConfig  # noqa: E402
 from lerobot.policies.vla_jepa.modeling_vla_jepa import VLAJEPAModel, VLAJEPAPolicy  # noqa: E402
 from lerobot.utils.constants import ACTION  # noqa: E402
+from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes  # noqa: E402
+from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK  # noqa: E402
 
 PRETRAINED_REPO_ID = "ginwind/VLA-JEPA"
 PRETRAINED_SUBFOLDER = "LIBERO"
@@ -205,6 +208,44 @@ def test_predict_action_chunk_runs_on_the_qwen_inputs_of_its_batch(
     # Other pixel values in the batch move the actions: Qwen reads the batch's tensors.
     other = {**batch, **qwen_inputs, "pixel_values": qwen_inputs["pixel_values"].flip(0)}
     assert not torch.equal(policy.predict_action_chunk(other, noise=noise), expected)
+
+
+def test_predict_action_exports_on_a_prepared_image_grid(
+    tiny_qwen_config: VLAJEPAConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_seed_all(0)
+    policy = VLAJEPAPolicy(tiny_qwen_config).eval()
+    batch = make_inference_batch(batch_size=1, image_size=TINY_QWEN_IMAGE_SIZE)
+    qwen_inputs = policy.qwen_inputs(batch)
+    keys = sorted(qwen_inputs)
+    state = policy._prepare_model_inputs(batch, training=False)["state"]
+    noise = torch.randn(1, ACTION_HORIZON, ACTION_DIM)
+
+    class PredictAction(nn.Module):
+        def forward(self, state: Tensor, noise: Tensor, *tensors: Tensor) -> Tensor:
+            return policy.model.predict_action(dict(zip(keys, tensors, strict=True)), state, noise=noise)
+
+    inputs = (state, noise, *(qwen_inputs[key] for key in keys))
+    builds = count_grid_builds(monkeypatch)
+    with torch.no_grad():
+        expected = PredictAction()(*inputs)
+        with prepare_image_grid():
+            for _ in range(2):  # The second call reuses the prepared grid.
+                assert torch.equal(PredictAction()(*inputs), expected)
+        exported = torch.export.export(PredictAction(), inputs, strict=False)
+        torch.testing.assert_close(exported.module()(*inputs), expected)
+    assert len(builds) == 1
+    assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
+
+    # A prompt without its embodied action tokens is refused, in eager mode and by the program.
+    input_ids = qwen_inputs["input_ids"]
+    no_embodied = input_ids.masked_fill(input_ids == policy.model.embodied_action_token_id, 0)
+    broken = tuple(no_embodied if key == "input_ids" else qwen_inputs[key] for key in keys)
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="must hold 3 embodied action tokens"):
+            PredictAction()(state, noise, *broken)
+        with pytest.raises(RuntimeError):
+            exported.module()(state, noise, *broken)
 
 
 # ---------------------------------------------------------------------------
