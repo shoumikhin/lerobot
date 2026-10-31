@@ -25,6 +25,7 @@ from safetensors import safe_open
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
 from lerobot.policies.factory import (
     make_policy,
     make_pre_post_processors,
@@ -50,6 +51,7 @@ from lerobot.processor import (
     transition_to_batch,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load
 
 
 @pytest.fixture
@@ -883,6 +885,165 @@ def test_flow_sampling_caches_vision_and_prefix_with_action_parity(batch_size):
             **inputs, action_horizon=2, action_dim=26, num_inference_timesteps=10, noise=noise
         )["predict_action"]
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def _tiny_policy():
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(convert_tokens_to_ids=lambda _: 31))
+    torch.manual_seed(19)
+    policy = WallOSS05Policy(_config(chunk_size=2, n_action_steps=2), load_model=False)
+    policy.model = WallOSS05Model(_tiny_native_config(), processor).eval()
+    return policy
+
+
+def _export_prediction(policy, batch, noise, grid):
+    keys = sorted(batch)
+
+    class PredictActionChunk(nn.Module):
+        def forward(self, noise, *tensors):
+            inputs = dict(zip(keys, tensors, strict=True))
+            return policy.predict_action_chunk(inputs, noise=noise, vision_grid=grid)
+
+    # Exported with grad enabled, the program would turn grad off for prediction and leave it off when one of
+    # its checks fails, and it could not be saved.
+    with torch.no_grad():
+        program = torch.export.export(
+            PredictActionChunk(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+        )
+
+    def run(inputs, lowered=program):
+        return lowered.module()(noise.clone(), *(inputs[key] for key in keys))
+
+    return program, run
+
+
+def _two_image_batch(policy):
+    image = [29, 28, 28, 30]
+    ids = torch.tensor([[0, 0, 4, *image, *image, 6, 31, 31], [4, 5, 4, *image, *image, 6, 31, 31]])
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(32, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]] * 2),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    return batch, torch.randn(2, 2, policy.config.max_action_dim)
+
+
+def test_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatch):
+    policy = _tiny_policy()
+    ids = torch.tensor(
+        [[0, 0, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31], [4, 5, 4, 29, 28, 30, 29, 28, 30, 6, 31, 31]]
+    )
+    batch = {
+        "input_ids": ids,
+        "attention_mask": ids != 0,
+        "pixel_values": torch.randn(16, 24),
+        "image_grid_thw": torch.tensor([[1, 2, 2]] * 4),
+        "moe_token_types": ids == 31,
+        "dof_mask": (torch.arange(26) < 6).expand(2, 2, -1).clone(),
+    }
+    noise = torch.randn(2, 2, policy.config.max_action_dim)
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    # The exported positions equal the eager ones, padding included (Wall-OSS puts padding at 1).
+    grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+    eager_positions = policy.model._position_ids(ids, batch["attention_mask"], batch["image_grid_thw"])
+    fixed_positions = policy.model._position_ids(ids, batch["attention_mask"], batch["image_grid_thw"], grid)
+    assert torch.equal(fixed_positions, eager_positions)
+
+    # The routed projections must get contiguous inputs, as the boolean-mask gather gave them; a strided
+    # width slice changes the matrix multiply bits at real model sizes.
+    contiguous = []
+    attention = policy.model.model.layers[0].self_attn
+    for projection in attention.qkv_proj_experts:
+        projection.register_forward_pre_hook(lambda module, args: contiguous.append(args[0].is_contiguous()))
+    assert torch.equal(policy.predict_action_chunk(batch, noise=noise.clone(), vision_grid=grid), expected)
+    assert contiguous and all(contiguous)
+
+    # The switch that turns off the transformers checks must leave the exported checks in place.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    program, run = _export_prediction(policy, batch, noise, grid)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+    assert data_dependent_nodes(program) == []
+    # The input checks: a prompt whose last action token is replaced, an action token inside the prefix
+    # (marked as such), an image token fewer, and moe_token_types that mark a prompt token instead of the
+    # action tokens are rejected by the exported program, and in eager mode.
+    malformed = {**batch, "input_ids": ids.clone()}
+    malformed["input_ids"][0, -1] = 6
+    inside = ids.clone()
+    inside[0, 2] = 31
+    inside = {**batch, "input_ids": inside, "moe_token_types": inside == 31}
+    fewer_images = {**batch, "input_ids": ids.clone()}
+    fewer_images["input_ids"][0, 4] = 4
+    wrong_routing = {**batch, "moe_token_types": ids == 4}
+    lowered_programs = (program, save_and_load(program), program.run_decompositions())
+    for lowered in lowered_programs[1:]:
+        torch.testing.assert_close(run(batch, lowered), expected)
+    for lowered in lowered_programs:
+        for wrong in (malformed, inside, fewer_images, wrong_routing):
+            with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                run(wrong, lowered)
+    for wrong, message in (
+        (malformed, "Flow inputs must end"),
+        (inside, "Flow inputs must end"),
+        (wrong_routing, "moe_token_types must mark exactly the action tokens"),
+        ({**batch, "moe_token_types": None}, "moe_token_types must be provided"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            policy.predict_action_chunk(wrong, noise=noise.clone())
+    with pytest.raises(ValueError, match="Image token/features mismatch"):
+        policy.predict_action_chunk(fewer_images, noise=noise.clone())
+
+
+def test_vision_grid_refuses_hidden_vision_tokens_also_after_export():
+    policy = _tiny_policy()
+    batch, noise = _two_image_batch(policy)
+    grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+
+    def hide(tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[1, tokens] = False
+        return {**batch, "attention_mask": attention_mask}
+
+    # In the second prompt: the vision start token, an image token, the vision end token, every token, and the
+    # tokens up to and including the first vision start, which leaves one visible run.
+    refused = (hide(3), hide(4), hide(6), hide(slice(None)), hide(slice(0, 4)))
+    for inputs in refused:
+        with pytest.raises(ValueError, match="must hide only padding"):
+            policy.predict_action_chunk(inputs, noise=noise.clone(), vision_grid=grid)
+    _, run = _export_prediction(policy, batch, noise, grid)
+    for inputs in refused:
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+            run(inputs)
+
+
+def test_vision_grid_must_fit_the_call():
+    policy = _tiny_policy()
+    batch, noise = _two_image_batch(policy)
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
+    grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+    # The same image and token counts in another order, as a stale grid would have.
+    other = Qwen2_5VisionGrid.build(policy.model.visual, torch.tensor([[1, 4, 2], [1, 2, 4]] * 2))
+    with pytest.raises(ValueError, match="differs from the one the vision grid was built for"):
+        policy.predict_action_chunk(batch, noise=noise.clone(), vision_grid=other)
+    text_only = {**batch, "pixel_values": None, "image_grid_thw": None}
+    with pytest.raises(ValueError, match="vision_grid needs pixel_values and image_grid_thw"):
+        policy.predict_action_chunk(text_only, noise=noise.clone(), vision_grid=grid)
+    # One image token moved to the other sample keeps the total but splits an image between the samples.
+    moved = batch["input_ids"].clone()
+    moved[0, 2], moved[1, 4] = 28, 5
+    moved = {**batch, "input_ids": moved}
+    with pytest.raises(ValueError, match="must cover whole images"):
+        policy.predict_action_chunk(moved, noise=noise.clone(), vision_grid=grid)
+
+    with pytest.raises(ValueError, match="needs a vision_grid"):
+        _export_prediction(policy, batch, noise, None)
+    _, run = _export_prediction(policy, batch, noise, grid)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+    swapped = {**batch, "image_grid_thw": torch.tensor([[1, 4, 2], [1, 2, 4]] * 2)}
+    for wrong in (swapped, moved):
+        with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+            run(wrong)
 
 
 @pytest.mark.parametrize("joint", [False, True], ids=["text-only", "joint-text-action"])

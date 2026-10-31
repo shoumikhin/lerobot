@@ -280,6 +280,34 @@ Do not evaluate the base checkpoint as though it were a task-specific policy.
 The canonical representation, normalization statistics, and task distribution
 must match the fine-tuned checkpoint.
 
+## Export with torch.export
+
+`torch.export` cannot trace the stock vision tower, because it reads the image grid (`image_grid_thw`) into
+Python numbers. Build the grid data once from a preprocessed batch with the camera layout you deploy, and
+pass it to `predict_action_chunk`:
+
+```python
+import torch
+
+from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid
+
+grid = Qwen2_5VisionGrid.build(policy.model.visual, batch["image_grid_thw"])
+tensors = {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
+
+
+class Predict(torch.nn.Module):
+    def forward(self, tensors):
+        return policy.predict_action_chunk({**batch, **tensors}, vision_grid=grid)
+
+
+with torch.no_grad():
+    program = torch.export.export(Predict(), (tensors,), strict=False)
+```
+
+The program refuses inputs whose image grid differs from the one `grid` was built for, and attention masks
+that hide more than padding. An eager call with `vision_grid=grid` runs the same code as the program, so
+comparing it with a call without `vision_grid` checks the export path. Wall-OSS-0.5 needs `moe_token_types` that mark exactly the action tokens.
+
 ## References
 
 - [Wall-OSS-0.5 project page](https://x2robot.com/en/research/68bc2cde8497d7f238dde690)
