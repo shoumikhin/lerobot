@@ -25,7 +25,16 @@ from torch import Tensor
 
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export.recipe import ActionChunkRecipe, ReplayDraws, frame_shapes, robot_features
+from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
+    BFLOAT16_TOLERANCE,
+    FLOAT32_TOLERANCE,
+    ActionChunkRecipe,
+    ExportRecipe,
+    ReplayDraws,
+    frame_shapes,
+    robot_features,
+)
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -312,3 +321,31 @@ def test_a_program_beyond_the_tolerance_is_refused():
 
     with pytest.raises(ValueError, match="more than the tolerance"):
         list(recipe.parts())
+
+
+class BareRecipe(ExportRecipe):
+    """A recipe without parts, to read the tolerance it picks."""
+
+    def parts(self):
+        yield from ()
+
+    def test_case(self):
+        raise NotImplementedError
+
+
+class DenoisingRecipe(BareRecipe):
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
+
+@pytest.mark.parametrize(
+    ("dtype", "default", "raised"),
+    [
+        (torch.float32, FLOAT32_TOLERANCE, FLOAT32_TOLERANCE),
+        (torch.bfloat16, BFLOAT16_TOLERANCE, BFLOAT16_STEPS_TOLERANCE),
+    ],
+)
+def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
+    policy = ACTPolicy(act_config()).to(dtype)
+
+    assert BareRecipe(policy, None, None, export_config()).tolerance == default
+    assert DenoisingRecipe(policy, None, None, export_config()).tolerance == raised
