@@ -163,6 +163,7 @@ def test_bundle_mode_refuses_the_options_it_does_not_have(tmp_path, monkeypatch)
         bundle_rollout.main([f"--bundle.path={bundle}", "--robot.type=mock_robot", "--dataset.repo_id=a/b"])
 
 
+@pytest.mark.dataset
 @pytest.mark.parametrize(
     ("argv", "mode"),
     [
@@ -195,6 +196,7 @@ def test_help_with_a_bundle_path_is_the_bundle_mode_help(monkeypatch, capsys):
     assert "--bundle.path" in help_text and "--policy.path" not in help_text
 
 
+@pytest.mark.dataset
 def test_the_policy_mode_points_a_bundle_to_the_bundle_mode(tmp_path, monkeypatch):
     from lerobot.rollout import RolloutConfig
     from tests.mocks.mock_robot import MockRobotConfig
