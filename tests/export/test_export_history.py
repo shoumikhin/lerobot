@@ -42,6 +42,10 @@ from tests.export import torch_backend  # noqa: F401  # registers torch_test for
 from tests.export.plugins import use_plugins
 
 IMAGE = "observation.images.front"
+# Big enough for a 3x3 last ResNet feature map: on a 1x1 map SpatialSoftmax has one cell, so the camera
+# would not change the actions.
+FRAME = (96, 96)
+CROP = (84, 84)
 TICKS = 20
 BACKENDS = [
     "torch_test",
@@ -50,6 +54,17 @@ BACKENDS = [
         marks=pytest.mark.skipif(
             not (is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)),
             reason="needs ExecuTorch and PyTorch 2.15",
+        ),
+    ),
+    pytest.param(
+        "executorch_tensorrt",
+        marks=pytest.mark.skipif(
+            not (
+                torch.cuda.is_available()
+                and is_package_available("torch_tensorrt")
+                and is_package_available("executorch")
+            ),
+            reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
         ),
     ),
 ]
@@ -71,14 +86,14 @@ def vqbet_checkpoint(path) -> None:
 
     config = VQBeTConfig(
         input_features={
-            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, *FRAME)),
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
         },
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
         n_obs_steps=3,
         n_action_pred_token=2,
         action_chunk_size=4,
-        crop_shape=(28, 28),
+        crop_shape=CROP,
         pretrained_backbone_weights=None,
         use_group_norm=True,
         spatial_softmax_num_keypoints=8,
@@ -241,7 +256,7 @@ def play(checkpoint, bundle: Bundle, monkeypatch) -> list[float]:
     differences = []
     for _ in range(TICKS):
         frame = {
-            IMAGE: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+            IMAGE: rng.integers(0, 256, (*FRAME, 3), dtype=np.uint8),
             OBS_STATE: rng.random(2, dtype=np.float32),
         }
         drawn = len(draws)
