@@ -3159,7 +3159,9 @@ def test_action_encoder_takes_one_time_encoding_for_the_chunk():
     )
 
 
-def _alternate_vl_dit_before_the_split(model, hidden_states, encoder_hidden_states, timestep, image_mask, mask):
+def _alternate_vl_dit_before_the_split(
+    model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+):
     """`AlternateVLDiT.forward` as it was written before its blocks and output became methods."""
     temb = model.timestep_encoder(timestep)
     image_attention_mask = image_mask & mask
