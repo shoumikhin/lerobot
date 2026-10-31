@@ -65,6 +65,10 @@ RECIPES = {
     "wall_oss_05": Recipe("tests.policies.wall_oss_05.export_stand_in", state=[-1.0, -0.96, 0.5]),
     # A camera the image processor resizes, which it does otherwise on float pixels than on the step's uint8.
     "wall_oss_05_250x448": Recipe("tests.policies.wall_oss_05.export_stand_in", options={"short_side": 250}),
+    "molmoact2": Recipe("tests.policies.molmoact2.export_stand_in", ("monkeypatch",)),
+    "molmoact2_state_mask": Recipe(
+        "tests.policies.molmoact2.export_stand_in", ("monkeypatch",), options={"state_mask": True}
+    ),
     # Its language recipe comes with the dataset extra.
     "eo1": Recipe(
         "tests.policies.eo1.export_stand_in", ("monkeypatch",), cuda=True, marks=(pytest.mark.dataset,)
@@ -127,6 +131,10 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
         pytest.param("dm05", {"add_state": False}, "add_state=false", id="dm05-no-state"),
         pytest.param("fineart_vla", {"text_recipe": False}, "has no text recipe", id="fineart-no-recipe"),
         pytest.param("wall_oss_05", {"long_side": 224}, "long side is 448 pixels", id="wall_oss_05-camera"),
+        pytest.param(
+            "molmoact2", {"crop_mode": "overlap-and-resize"}, "uses 'overlap-and-resize'", id="molmoact2-crop"
+        ),
+        pytest.param("molmoact2", {"width": 42}, "28x42 becomes 28x28", id="molmoact2-camera"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
