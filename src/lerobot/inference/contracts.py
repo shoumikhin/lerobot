@@ -132,10 +132,13 @@ class ActionProvenance:
 
 @dataclass(frozen=True)
 class ActionChunk:
-    """A runner result in canonical coordinates plus optional RTC model values."""
+    """A runner result in canonical coordinates plus optional RTC model values.
+
+    The runner of a bundle from `lerobot-export` returns a NumPy array, as the bundle's programs do.
+    """
 
     model_actions: torch.Tensor | None
-    canonical_actions: torch.Tensor
+    canonical_actions: torch.Tensor | np.ndarray
     provenance: ActionProvenance
     execution_steps: int
     server_durations: dict[str, float] = field(default_factory=dict)

@@ -338,6 +338,24 @@ Measured on a Jetson Orin Nano 8 GB with SO-101 checkpoints, on the first export
 
 The error is measured against the PyTorch policy in float32, on 50 dataset frames. The bundles stay close to the error that PyTorch itself makes when it runs the policy in bfloat16. These runs used a rollout process that never imported PyTorch, as `lerobot-rollout --mode=bundle` does. Loading the PyTorch library alone would take about 0.3 GiB more on an Orin Nano.
 
+## Serve a bundle remotely
+
+A small robot computer can drive a policy that only a bigger computer can run. The bigger computer, such as a GPU workstation with a TensorRT bundle, runs the bundle and sends the actions over the network. This uses [remote inference](./remote_inference): set it up as that page explains, and point the server's `model.repo_or_path` at the bundle folder instead of a checkpoint.
+
+```bash
+lerobot-policy-server --config_path=server.yaml \
+    --model.repo_or_path=outputs/export/act_executorch_tensorrt
+```
+
+The robot computer runs `lerobot-rollout --inference.type=remote`, exactly as for a checkpoint.
+
+- The server loads the bundle with the same engine as `lerobot-rollout --bundle.path`, so the bundle replays its test frame before the server says it is ready.
+- The `features` and `action_feature` in `server.yaml` must match what the bundle takes and returns, with the bundle's names. Otherwise the server refuses to start and names what differs.
+- The chunk length comes from the bundle, and `model.device` is not used: the backend chose the device at export.
+- A bundle that takes its task at run time runs the task each observation carries. An empty task runs the bundle's own.
+
+A bundle runs as it was compiled, so the server refuses three settings with it: the [RTC](./rtc) modes (they need the PyTorch policy), `execution.n_action_steps`, and `language.enabled`. Serve the checkpoint if you need them. The server also refuses a bundle that reads past frames, because it sees one frame per chunk, not one per control tick. Run such a bundle with `lerobot-rollout`.
+
 ## Supported policies and backends
 
 This table lists what has been tested:
