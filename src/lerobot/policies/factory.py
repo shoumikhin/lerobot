@@ -259,7 +259,7 @@ def load_pretrained_policy(policy_config: PreTrainedConfig, strict: bool | None 
     The adapter and the base model keep their own revisions. `strict` is passed to the policy's
     `from_pretrained`; `None` keeps the policy's own default.
     """
-    load_options = {} if strict is None else {"strict": strict}
+    load_options: dict[str, Any] = {} if strict is None else {"strict": strict}
     pretrained_path = policy_config.pretrained_path
     if pretrained_path is None:
         raise ValueError("The policy config names no checkpoint to load (pretrained_path is not set).")
