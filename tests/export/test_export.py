@@ -501,6 +501,22 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
+@pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path):
+    """The bundle check loads an XNNPACK program and replays the test case with it, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_xnnpack")
+    assert_runs_without_torch(
+        """
+        import runpy
+        import sys
+
+        sys.argv = ["lerobot.bundle", sys.argv[1]]
+        runpy.run_module("lerobot.bundle", run_name="__main__")
+        """,
+        str(tmp_path / "b"),
+    )
+
+
 def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
     """Only the steps import PyTorch, so what one step used is freed before the next starts."""
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}"]
