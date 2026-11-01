@@ -164,6 +164,44 @@ def test_public_dtype_train_infer_and_checkpoint(offline_components, tmp_path, f
     assert loaded.config.dtype == dtype
 
 
+def test_bfloat16_policy_trains_and_predicts_on_the_cpu(offline_components):
+    from lerobot.policies.fastwam.wan.model import sinusoidal_embedding_1d
+
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.bfloat16))
+    # No autocast: CUDA autocast covers no CPU tensor.
+    loss, _ = policy(training_batch())
+    loss.backward()
+    grads = [param.grad for param in policy.parameters() if param.grad is not None]
+    assert grads and all(torch.isfinite(grad).all() for grad in grads)
+    policy.eval()
+    batch = training_batch()
+    del batch["action"]
+    with torch.no_grad():
+        action = policy.predict_action_chunk(batch, noise=torch.randn(1, 8, 3))
+    assert action.shape == (1, 8, 3)
+    assert torch.isfinite(action).all()
+    # The time embedding and the output head compute in float32, from the bfloat16 weights cast up, as under
+    # CUDA autocast, with and without an outer CPU autocast.
+    video = policy.model.video_expert
+    # The first latent frame's tokens get timestep 0, the second frame's the given one.
+    position = sinusoidal_embedding_1d(video.freq_dim, torch.tensor([0.0, 500.0])).float()
+    with torch.no_grad():
+        expected = deepcopy(video.time_embedding).float()(position)
+    for autocast in (False, True):
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            state = video.pre_dit(
+                x=torch.randn(1, 4, 2, 8, 16),
+                timestep=torch.tensor([500.0]),
+                context=torch.randn(1, 4, 8),
+                fuse_vae_embedding_in_latents=True,
+            )
+            t = state["t"]
+            head = video.head(torch.randn(t.shape, dtype=torch.bfloat16), t)
+        assert t.dtype == head.dtype == torch.float32
+        torch.testing.assert_close(t[0, [0, -1]], expected)
+
+
 def test_cli_backbone_conversion_loads_weights_and_trains(offline_components, tmp_path, monkeypatch):
     torch.manual_seed(7)
     original = FastWAMPolicy(tiny_config(dtype=torch.float32))
