@@ -165,12 +165,27 @@ class TDMPCPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def plan(self, z: Tensor) -> Tensor:
-        """Plan sequence of actions using TD-MPC inference.
+        """Plan sequence of actions using TD-MPC inference, warm started from the previous plan since `reset`.
 
         Args:
             z: (batch, latent_dim,) tensor for the initial state.
         Returns:
             (horizon, batch, action_dim,) tensor for the planned trajectory of actions.
+        """
+        actions, self._prev_mean = self.plan_with_warm_start(z, self._prev_mean)
+        return actions
+
+    @torch.no_grad()
+    def plan_with_warm_start(self, z: Tensor, prev_mean: Tensor | None) -> tuple[Tensor, Tensor]:
+        """Plan sequence of actions using TD-MPC inference, with the warm start passed in and returned.
+
+        Args:
+            z: (batch, latent_dim,) tensor for the initial state.
+            prev_mean: (horizon, batch, action_dim,) tensor for the mean the previous plan ended with, or None for
+                the first plan, which starts from zeros.
+        Returns:
+            (horizon, batch, action_dim,) tensor for the planned trajectory of actions, and the mean that warm
+            starts the next plan.
         """
         device = get_device_from_parameters(self)
 
@@ -205,8 +220,8 @@ class TDMPCPolicy(PreTrainedPolicy):
         # The initial mean and standard deviation for the cross-entropy method (CEM).
         mean = torch.zeros(self.config.horizon, batch_size, action_dim, device=device)
         # Maybe warm start CEM with the mean from the previous step.
-        if self._prev_mean is not None:
-            mean[:-1] = self._prev_mean[1:]
+        if prev_mean is not None:
+            mean[:-1] = prev_mean[1:]
         std = self.config.max_std * torch.ones_like(mean)
 
         for _ in range(self.config.cem_iterations):
@@ -250,14 +265,11 @@ class TDMPCPolicy(PreTrainedPolicy):
             )
             std = _std.clamp_(self.config.min_std, self.config.max_std)
 
-        # Keep track of the mean for warm-starting subsequent steps.
-        self._prev_mean = mean
-
         # Randomly select one of the elite actions from the last iteration of MPPI/CEM using the softmax
         # scores from the last iteration.
-        actions = elite_actions[:, torch.multinomial(score.T, 1).squeeze(), torch.arange(batch_size)]
+        actions = elite_actions[:, torch.multinomial(score.T, 1).squeeze(1), torch.arange(batch_size)]
 
-        return actions
+        return actions, mean
 
     @torch.no_grad()
     def estimate_value(self, z: Tensor, actions: Tensor):
