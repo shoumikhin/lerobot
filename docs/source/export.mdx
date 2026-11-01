@@ -203,6 +203,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
   "task_tokens": null,
   "noise_shape": null,
   "history": {},
+  "carry": {},
   "task": null,
   "action_names": null,
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
@@ -225,7 +226,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
 - `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
 - For a policy that starts from random noise, on a CUDA device (`executorch_cuda`, `executorch_tensorrt`) the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
-- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history` is for policies that read past frames (see [Past frames](#past-frames)). `task_tokens` names the files that turn a task into vectors (see [Tasks](#tasks)).
+- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history` and `carry` are for policies that read past frames or keep values between chunks (see [Past frames](#past-frames) and [Values kept between chunks](#values-kept-between-chunks)). `task_tokens` names the files that turn a task into vectors (see [Tasks](#tasks)).
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too. Engines that share the buffer take turns on the GPU, even when two bundles run on two threads, because the TensorRT delegate makes each wait for the one before ([pytorch/TensorRT#4739](https://github.com/pytorch/TensorRT/pull/4739), in Torch-TensorRT 2.15). Load such bundles one at a time, since loading one changes an environment variable and the module search path of the process while it runs.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
@@ -286,6 +287,12 @@ The export also compares the chain's actions with the whole policy's own, which 
 Diffusion Policy, Multi-Task DiT and VQ-BeT read past frames, not only the current one. In PyTorch the policy keeps them in queues that fill on every control tick. A compiled program keeps nothing between runs, so the bundle names those frames in its manifest under `history`, with how many to keep. The bundle then keeps them on every tick and passes them to the programs, oldest first. A policy that samples random numbers inside its steps reads them from the bundle's `noise`, so the compiled policy samples like the PyTorch one.
 
 Diffusion Policy and Multi-Task DiT run their encoder once per chunk, and one denoising step many times in a loop, the same way the pi0.5 chain runs its `step`.
+
+### Values kept between chunks
+
+Some policies keep a value from one chunk to the next, such as a planner that starts each plan from where its previous one ended. A compiled program keeps nothing between runs, so such a program takes the value as an input and returns the new one. The bundle names these values in its manifest under `carry`, with their shapes. The bundle passes each one from a chunk to the next, and starts it again from zeros after a reset. The test case of such a bundle holds a few chunks, and the check plays them in order, so it also checks what is passed on.
+
+TD-MPC is such a planner. It plans each chunk by refining a guess over a few rounds, and starts that guess from where its previous plan ended, or from zeros after a reset. Its random numbers come from the bundle's `noise`, like those of the policies above.
 
 ### Tasks
 
@@ -367,6 +374,7 @@ Two tables list what has been tested. In both:
 | Multi-Task DiT   | own (past frames)      | Yes         | Yes         | Yes             | Yes              |
 | VQ-BeT           | own (past frames)      | Yes         | Yes         | Yes             | Yes              |
 | Gaussian actor   | own (one action)       | Yes         | Yes         | Yes             | Yes              |
+| TD-MPC           | own (planner)          | Yes         | Yes         | Yes             | Yes              |
 | X-VLA            | default                | Yes         | Yes         | Yes             | Yes              |
 | EVO1             | own (uniform noise)    | Yes         | Yes         | No              | Too big          |
 | FastWAM          | own (seeded noise)     | Yes         | Yes         | Yes             | Too big          |
@@ -397,6 +405,7 @@ Two tables list what has been tested. In both:
 | ----------- | -------------------------------------- | --------------------- | ------------- | ----------------------- |
 | ACT         | Yes (data center GPU, Jetson AGX Thor) | Yes (x86 CPU)         | Yes (x86 CPU) | Yes (Apple Silicon Mac) |
 | SmolVLA     | No                                     | No (bfloat16 weights) | Program       | -                       |
+| TD-MPC      | Yes (data center GPU)                  | Yes (x86 CPU)         | -             | -                       |
 | EVO1        | Yes (data center GPU)                  | -                     | -             | -                       |
 | X-VLA       | -                                      | Yes (x86 CPU)         | Yes (x86 CPU) | -                       |
 | FineART VLA | Yes (data center GPU)                  | -                     | -             | -                       |
@@ -407,7 +416,7 @@ Two tables list what has been tested. In both:
 
 The policies missing from this table have not been tested on these backends.
 
-- The ACT XNNPACK and OpenVINO results, and the EVO1, FineART VLA, EO-1, VLA-JEPA, WALL-X and FLUX3 results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA and SmolVLA results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
+- The ACT XNNPACK and OpenVINO results, and the EVO1, TD-MPC, FineART VLA, EO-1, VLA-JEPA, WALL-X and FLUX3 results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA and SmolVLA results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
 - The ACT MLX result used an Apple Silicon Mac with PyTorch 2.15 and a development build of ExecuTorch 1.6.
 - The SmolVLA results here were measured when it was exported as one program, before its chain recipe. The chain needs about half the memory of one program, as checked on a Jetson AGX Thor.
 - SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its one-program `executorch_cuda` export failed because SmolVLA computes its time embedding in float64, which the development build of ExecuTorch's CUDA backend used then could not load. With ExecuTorch 1.6.0, the chain recipe exports and runs on `executorch_cuda` in LeRobot's tests, which use a tiny SmolVLA; the full policy is still to be measured there.
@@ -420,6 +429,7 @@ The policies missing from this table have not been tested on these backends.
 
 ### Notes for every backend
 
+- The TD-MPC results used a TD-MPC trained on PushT, which reads keypoints rather than a camera image. TD-MPC picks the best of many sampled plans. When two of them score almost the same, another backend's rounding can make the bundle pick the other one. Its actions then differ from PyTorch's by far more than the tolerance, for that chunk and sometimes the next few. Over 40 chunks this happened once or twice with each backend, and PyTorch itself picks differently on CPU and on GPU at the same chunks. If a TD-MPC export fails its check, export it again with another `--seed`.
 - EVO1 runs inside its own `torch.autocast`. A checkpoint trained with a frozen vision-language model (EVO1's stage 1, the default) also runs that model in `torch.no_grad()` there, and PyTorch 2.15 then saves the traced program but refuses to load it (`wrap_with_autocast is missing val field`). pytorch/pytorch#202925 fixes this. A stage 2 checkpoint, such as EVO1's LIBERO one, exports with PyTorch 2.15. EVO1 reads the task, so give it with `--task`, or give the dataset with `--dataset.repo_id`.
 
 Other policies have not been tested with `lerobot-export`.
@@ -480,9 +490,10 @@ Two optional methods cover bigger policies:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree. For a part that runs once per step, such as a denoising step, `repeated_runs` builds its runs and the constants each run reads;
   - `constants`: named arrays the runs read, such as time values;
   - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;
-  - `history`: how many past frames of each frame key the programs take.
+  - `history`: how many past frames of each frame key the programs take;
+  - `carry`: the values the runs pass from one chunk to the next, with their shapes.
 
-`policies/pi05/export_pi05.py`, `policies/groot/export_groot.py` and `policies/smolvla/export_smolvla.py` are full examples of a chain. `policies/diffusion/export_diffusion.py` shows a recipe that reads past frames, and `policies/gaussian_actor/export_gaussian_actor.py` a small change to the default recipe.
+`policies/pi05/export_pi05.py`, `policies/groot/export_groot.py` and `policies/smolvla/export_smolvla.py` are full examples of a chain. `policies/diffusion/export_diffusion.py` shows a recipe that reads past frames, `policies/tdmpc/export_tdmpc.py` one that carries a value between chunks, and `policies/gaussian_actor/export_gaussian_actor.py` a small change to the default recipe.
 
 ### A backend
 
