@@ -14,7 +14,10 @@ Copied files:
 
 - `model.py` (was `wan/modules/model.py`), trimmed: the flash-attention path
   (the vendored `attention.py` and the block/model `forward`s) was removed.
-  FastWAM's DiT uses SDPA instead (see `video_dit.py`).
+  FastWAM's DiT uses SDPA instead (see `video_dit.py`). Changed: the time
+  embedding, time projection and head use `Float32Linear` (defined there) with
+  autocast off, in place of upstream's CUDA float32 autocast regions, so they
+  compute in float32 on every device.
 - `get_sampling_sigmas` in `video_dit.py` (was `wan/utils/fm_solvers.py`), inlined
   next to its only caller.
 
