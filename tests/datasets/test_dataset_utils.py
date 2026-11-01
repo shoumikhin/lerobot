@@ -293,21 +293,23 @@ def test_older_major_dataset_still_raises_conversion_error():
         check_version_compatibility("user/dataset", "v2.1", "v3.0")
 
 
-def test_video_frame_column_loads_in_a_process_that_imports_only_io_utils(tmp_path):
+def test_importing_the_package_registers_the_video_frame_feature_type(tmp_path):
     # Importing lerobot.datasets registers the VideoFrame feature type, as it did before the package became lazy.
-    (tmp_path / "chunk-000").mkdir()
     data = {"observation.image": [{"path": "videos/episode_0.mp4", "timestamp": 0.1}], "episode_index": [0]}
     features = Features({"observation.image": VideoFrame(), "episode_index": Value("int64")})
-    Dataset.from_dict(data, features=features).to_parquet(tmp_path / "chunk-000" / "file-000.parquet")
+    Dataset.from_dict(data, features=features).to_parquet(tmp_path / "data.parquet")
     code = (
         "import sys\n"
-        "from pathlib import Path\n"
-        "from lerobot.datasets.io_utils import load_nested_dataset\n"
-        "assert 'lerobot.datasets.video_utils' not in sys.modules\n"
-        "print(type(load_nested_dataset(Path(sys.argv[1])).features['observation.image']).__name__)\n"
+        "import datasets\n"
+        "import lerobot.datasets\n"
+        "loaded = datasets.Dataset.from_parquet(sys.argv[1], cache_dir=sys.argv[2])\n"
+        "print(type(loaded.features['observation.image']).__name__, 'torch' in sys.modules)\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code, str(tmp_path / "data.parquet"), str(tmp_path / "cache")],
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split()[-1] == "VideoFrame"
+    assert result.stdout.split()[-2:] == ["VideoFrame", "False"]
