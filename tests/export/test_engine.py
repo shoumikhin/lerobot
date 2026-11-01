@@ -30,7 +30,15 @@ from safetensors.numpy import load_file, save_file
 from torch import Tensor, nn
 
 from lerobot.bundle.engine import BundleEngine
-from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle
+from lerobot.bundle.manifest import (
+    MANIFEST,
+    NOISE,
+    TEST_CASE,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+)
 from lerobot.bundle.runtime import RUNTIMES
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 from tests.export.torch_backend import make_bundle, record_places
@@ -369,6 +377,55 @@ def test_engine_keeps_a_copy_of_each_past_frame(tmp_path):
     np.testing.assert_array_equal(action, [11.0, 11.0, 11.0])
 
 
+class Accumulate(nn.Module):
+    """A chunk of one action: the state plus the states of the chunks before, whose sum the bundle carries."""
+
+    def forward(self, state: Tensor, total: Tensor) -> tuple[Tensor, Tensor]:
+        return (state + total)[None], total + state
+
+
+# Two chunks, so the check passes only if the second one reads what the first one carried.
+CHUNKS = {OBS_STATE: np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], np.float32)}
+
+
+def _carry_bundle(folder, expected: np.ndarray | None = None) -> Bundle:
+    """A bundle of `Accumulate` whose test case plays `CHUNKS` and expects `expected`, by default the right actions."""
+    folder.mkdir(parents=True)
+    module = Accumulate()
+    total = torch.zeros(3)
+    for state in torch.from_numpy(CHUNKS[OBS_STATE]):
+        actions, total = module(state, total)
+    torch.export.save(torch.export.export(module, (torch.ones(3), torch.zeros(3))), folder / "model.pt2")
+    save_file({**CHUNKS, ACTION: actions.numpy() if expected is None else expected}, folder / TEST_CASE)
+    manifest = BundleManifest(
+        backend="torch_test",
+        runtime="torch_test",
+        runtime_imports=["tests.export.torch_backend"],
+        programs={"model": ProgramFiles("model.pt2")},
+        runs=[ProgramRun("model", "model", [OBS_STATE, "total"], [ACTION, "total"])],
+        carry={"total": [3]},
+        action_scale=[1.0] * 3,
+        tolerance=1e-4,
+    )
+    Bundle(folder, manifest).write()
+    return Bundle.read(folder)
+
+
+def test_engine_carries_values_from_chunk_to_chunk_until_a_reset(tmp_path):
+    engine = BundleEngine(_carry_bundle(tmp_path / "bundle"))
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(10, 20, 30)]
+    # From zeros at the first chunk: the check of the test case leaves nothing behind.
+    np.testing.assert_array_equal(np.stack(actions), _states(10, 30, 60))
+    engine.reset()
+    np.testing.assert_array_equal(engine.get_action({OBS_STATE: _states(20)[0]}), _states(20)[0])
+
+
+def test_engine_checks_the_chunks_of_the_test_case_in_order(tmp_path):
+    # The second chunk's action if the first one had carried nothing.
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        BundleEngine(_carry_bundle(tmp_path / "bundle", expected=np.full((1, 3), 2.0, np.float32)))
+
+
 @pytest.mark.parametrize(
     ("change", "error"),
     [
@@ -391,6 +448,10 @@ def test_engine_keeps_a_copy_of_each_past_frame(tmp_path):
         ({"history": {OBS_STATE: -1}}, "whole number of frames above 0"),
         ({"history": {OBS_STATE: 2.0}}, "whole number of frames above 0"),
         ({"history": {OBS_STATE: True}}, "whole number of frames above 0"),
+        ({"carry": {"total": 3}}, "shape of whole numbers"),
+        ({"carry": {"total": [3.0]}}, "shape of whole numbers"),
+        ({"carry": {"total": [-1]}}, "shape of whole numbers"),
+        ({"carry": {"total": [True]}}, "shape of whole numbers"),
     ],
 )
 def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
@@ -422,6 +483,13 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ),
         (_history_bundle, {"history": {OBS_ENV_STATE: 3}}, {}, rf"history of \['{OBS_ENV_STATE}'\]"),
         (_history_bundle, {}, {OBS_ENV_STATE: np.ones((3, 2), np.float32)}, "same number of frames"),
+        (_carry_bundle, {"carry": {"total": [3], "sum": [3]}}, {}, r"carries \['sum'\].*no run writes"),
+        (
+            _carry_bundle,
+            {"carry": {"total": [3], OBS_STATE: [3]}},
+            {},
+            r"carries \['observation.state'\] between chunks, which is the name",
+        ),
     ],
 )
 def test_engine_refuses_a_bundle_it_cannot_run(tmp_path, make, change, case, error):
