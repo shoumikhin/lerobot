@@ -180,6 +180,10 @@ class BundleManifest:
             programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
             reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
             only.
+        carry (`dict[str, list[int]]`, *optional*):
+            The values the runs pass from one chunk to the next, by name, with their shapes, such as the warm
+            start of a planner. After a reset each is float32 zeros. The runs read one like any value, and what
+            it holds after the last run is what the next chunk reads.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -200,7 +204,8 @@ class BundleManifest:
         test_case (`str`, *optional*, defaults to `"test.safetensors"`):
             The test case file: a frame, the noise, and the expected actions under `action`. With `history`,
             each frame value holds the frames of several control ticks, oldest first, and the actions are those
-            computed at the last one.
+            computed at the last one. With `carry`, the frame values and the noise hold those of several chunks,
+            oldest first, and the actions are those of the last chunk.
     """
 
     format_version: int = FORMAT_VERSION
@@ -214,6 +219,7 @@ class BundleManifest:
     task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
     history: dict[str, int] = field(default_factory=dict)
+    carry: dict[str, list[int]] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -235,6 +241,11 @@ class BundleManifest:
             raise ValueError("The manifest lists no run.")
         if not all(type(n) is int and n > 0 for n in self.history.values()):
             raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
+        if not all(
+            isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape)
+            for shape in self.carry.values()
+        ):
+            raise ValueError(f"The carry must give each value a shape of whole numbers, not {self.carry}.")
         names = [run.name for run in self.runs]
         if len(set(names)) != len(names):
             raise ValueError(f"The manifest names a run twice: {names}.")
