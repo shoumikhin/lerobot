@@ -232,8 +232,9 @@ def _module_param_dtype(module: nn.Module | None, default: torch.dtype) -> torch
         return default
 
 
-def _cuda_autocast(dtype: torch.dtype):
-    if torch.cuda.is_available():
+def _cuda_autocast(dtype: torch.dtype, device: torch.device):
+    # Only for CUDA tensors: it changes no other op, and torch.export cannot save an empty region.
+    if device.type == "cuda":
         return torch.autocast("cuda", dtype=dtype)
     return nullcontext()
 
@@ -574,7 +575,7 @@ class LatentWorldPolicyBackend(nn.Module):
         device = prepared_batch["input_ids"].device
         act_query, flow_query = self._prepare_queries(device=device, vlm_stage_dtype=vlm_stage_dtype)
 
-        with _cuda_autocast(vlm_stage_dtype):
+        with _cuda_autocast(vlm_stage_dtype, device):
             vlm_out_dict = self._run_vlm_stage(
                 input_ids=prepared_batch["input_ids"],
                 attention_mask=prepared_batch["attention_mask"],
@@ -589,7 +590,7 @@ class LatentWorldPolicyBackend(nn.Module):
         h_vlm = vlm_out_dict["h_vlm"]
         pred_action_emb = vlm_out_dict["pred_latent"]
 
-        with _cuda_autocast(lam_stage_dtype):
+        with _cuda_autocast(lam_stage_dtype, device):
             if lam_features_with_no_grad:
                 with torch.no_grad():
                     features = self.lam.extract_vision_features(primary_visual_input)
@@ -670,7 +671,7 @@ class LatentWorldPolicyBackend(nn.Module):
             lam_features_with_no_grad=True,
         )
 
-        with _cuda_autocast(lam_stage_dtype):
+        with _cuda_autocast(lam_stage_dtype, device):
             loss_distill = torch.tensor(0.0, device=device, dtype=lam_stage_dtype)
             if bool(self.model_cfg.enable_loss_distill):
                 loss_distill = self._compute_distill_loss(
@@ -691,7 +692,7 @@ class LatentWorldPolicyBackend(nn.Module):
         )
         attn_flow = prepared_batch["attention_mask"] == 1
 
-        with _cuda_autocast(flow_stage_dtype):
+        with _cuda_autocast(flow_stage_dtype, attn_flow.device):
             repeat_steps = int(self.model_cfg.repeated_diffusion_steps)
             h_t_rep = shared.h_t.repeat(repeat_steps, *([1] * (shared.h_t.ndim - 1)))
             h_t1_pred_rep = shared.h_t1_pred.repeat(repeat_steps, *([1] * (shared.h_t1_pred.ndim - 1)))
@@ -771,7 +772,7 @@ class LatentWorldPolicyBackend(nn.Module):
         )
         attn_flow = prepared_batch["attention_mask"] == 1
 
-        with _cuda_autocast(flow_stage_dtype):
+        with _cuda_autocast(flow_stage_dtype, attn_flow.device):
             actions = self.flow.sample_actions_cfg(
                 h_t=shared.h_t,
                 h_t1_star=shared.h_t1_pred,

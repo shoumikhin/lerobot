@@ -1198,15 +1198,12 @@ def test_action_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatc
         with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(PredictActionChunk(None), args, strict=False)
         program = torch.export.export(PredictActionChunk(grid), args, strict=False)
-        decomposed = program.run_decompositions()
-        # LaWAM turns on CUDA autocast whenever CUDA is available, and torch.export cannot save the empty
-        # autocast regions that leaves in the program.
-        saved = [] if torch.cuda.is_available() else [save_and_load(program)]
-        for exact in (program, *saved):
+        decomposed, saved = program.run_decompositions(), save_and_load(program)
+        for exact in (program, saved):
             assert torch.equal(exact.module()(*args), expected)
         # The decompositions round differently.
         torch.testing.assert_close(decomposed.module()(*args), expected)
-        for lowered in (program, *saved, decomposed):
+        for lowered in (program, saved, decomposed):
             for wrong in (malformed, moved):
                 with pytest.raises(RuntimeError, match="Runtime assertion failed"):
                     lowered.module()(args[0], *(wrong[key] for key in keys))
