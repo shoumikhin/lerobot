@@ -247,6 +247,38 @@ If you want to change `world_model_num_views` to a value other than 2, load the 
 
 ---
 
+## Export with torch.export
+
+`torch.export` cannot trace VLA-JEPA's prediction as it is: the Qwen3-VL processor tokenizes in Python, and
+the stock vision tower reads the image grid (`image_grid_thw`) into Python numbers. Make the processor tensors
+and the grid data once, from a preprocessed batch with the camera layout you deploy, and pass both to
+`predict_action_chunk`:
+
+```python
+import torch
+
+from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid
+from lerobot.utils.constants import OBS_STATE
+
+qwen_inputs = dict(policy.qwen_inputs(batch))
+qwen_inputs.pop("mm_token_type_ids", None)  # not read on a grid
+grid = Qwen3VisionGrid.build(policy.model.qwen.model.model.visual, qwen_inputs["image_grid_thw"])
+
+
+class Predict(torch.nn.Module):
+    def forward(self, state, qwen_inputs):
+        return policy.predict_action_chunk({OBS_STATE: state}, qwen_inputs=qwen_inputs, vision_grid=grid)
+
+
+with torch.no_grad():
+    program = torch.export.export(Predict(), (batch[OBS_STATE], qwen_inputs), strict=False)
+```
+
+The program refuses inputs whose image grid differs from the one `grid` was built for, attention masks that
+hide more than padding, and prompts without the template's embodied action tokens. It keeps the batch size and
+prompt length (in tokens) it was exported with. Its inputs are made by `policy.qwen_inputs`, which needs the
+policy and its Qwen3-VL processor.
+
 ## Citation
 
 ```bibtex
