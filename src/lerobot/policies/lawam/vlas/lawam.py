@@ -132,8 +132,10 @@ class VLMToLAMQFormer(nn.Module):
         for norm_q, norm_kv, xattn, ffn in zip(
             self.norm_qs, self.norm_kvs, self.cross_attns, self.ffns, strict=True
         ):
-            q = norm_q(queries)
-            kv = norm_kv(context)
+            # LaWAM only autocasts on CUDA (`_cuda_autocast`), where these norms already run in float32.
+            # Cast here, not where the queries are built, so the queries keep the VLM's dtype under autocast.
+            q = norm_q(queries.to(self.query.dtype))
+            kv = norm_kv(context.to(self.query.dtype))
             attn_out, _ = xattn(q, kv, kv)
             queries = queries + attn_out
             queries = queries + ffn(queries)
