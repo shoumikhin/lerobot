@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1123,3 +1124,74 @@ def test_vlm_stage_refuses_a_vision_grid_built_for_another_grid() -> None:
             stage._run_vlm_stage(**changed, vision_grid=grid)
         with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(VLMStage(None), tuple(inputs[key] for key in keys), strict=False)
+
+
+def test_action_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatch) -> None:
+    from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid
+    from lerobot.policies.lawam.vlas import lawam
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK_NODES
+
+    qwen, _, inputs = _vlm_stage_setup()
+    # The policy loads its VLM by model id; the tiny one stands in, with the stage setup's action token.
+    monkeypatch.setattr(lawam, "_load_vlm_and_processor", lambda cfg, model_id: (qwen, None, 10))
+    # A small latent action model and flow head for the tiny VLM and 32x32 images. With four flow layers the
+    # actions attend to the VLM tokens and to the image tokens.
+    config = replace(
+        make_config(),
+        num_action_queries=2,
+        flow_action_num_queries=2,
+        lam_dim=32,
+        lam_num_heads=4,
+        lam_enc_layers=1,
+        lam_code_dim=8,
+        lam_dec_layers=1,
+        lam_image_hw=(32, 32),
+        dinov3_hidden_size=32,
+        dinov3_intermediate_size=64,
+        dinov3_num_hidden_layers=2,
+        dinov3_num_attention_heads=4,
+        flow_hidden_dim=16,
+        flow_num_layers=4,
+        flow_attention_heads=2,
+        flow_vlm_dim=64,
+        flow_vision_dim=32,
+        flow_num_vision_tokens=4,
+        flow_num_inference_steps=2,
+    )
+    policy = LaWAMPolicy(config).eval()
+    batch = {
+        **{key: value for key, value in inputs.items() if not key.endswith("_query")},
+        "primary_image": torch.rand(2, 3, 32, 32),
+        "state": torch.zeros(2, 32),
+        "state_mask": torch.zeros(2, 32, dtype=torch.bool),
+        "action_hz": torch.full((2,), 20.0),
+        "embodiment_id": torch.full((2,), 25),
+    }
+    keys = sorted(batch)
+    args = (torch.randn(2, config.chunk_size, config.flow_action_dim), *(batch[key] for key in keys))
+
+    class PredictActionChunk(nn.Module):
+        def __init__(self, grid):
+            super().__init__()
+            self.policy, self.grid = policy, grid
+
+        def forward(self, noise, *tensors):
+            return self.policy.predict_action_chunk(
+                dict(zip(keys, tensors, strict=True)), noise=noise, vision_grid=self.grid
+            )
+
+    grid = Qwen3VisionGrid.build(qwen.model.visual, batch["image_grid_thw"])
+    with torch.no_grad():
+        expected = PredictActionChunk(None)(*args)
+        assert torch.equal(PredictActionChunk(grid)(*args), expected)
+    # The runtime asserts must not depend on transformers' own checks, which this switch turns off.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="needs a vision_grid"):
+            torch.export.export(PredictActionChunk(None), args, strict=False)
+        program = torch.export.export(PredictActionChunk(grid), args, strict=False)
+        assert torch.equal(program.module()(*args), expected)
+        # The decompositions round differently.
+        torch.testing.assert_close(program.run_decompositions().module()(*args), expected)
+    assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
