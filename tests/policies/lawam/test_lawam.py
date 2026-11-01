@@ -1245,16 +1245,37 @@ def test_action_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatc
         with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(PredictActionChunk(None), args, strict=False)
         program = torch.export.export(PredictActionChunk(grid), args, strict=False)
-        decomposed = program.run_decompositions()
-        # LaWAM turns on CUDA autocast whenever CUDA is available, and torch.export cannot save the empty
-        # autocast regions that leaves in the program.
-        saved = [] if torch.cuda.is_available() else [save_and_load(program)]
-        for exact in (program, *saved):
+        decomposed, saved = program.run_decompositions(), save_and_load(program)
+        for exact in (program, saved):
             assert torch.equal(exact.module()(*args), expected)
         # The decompositions round differently.
         torch.testing.assert_close(decomposed.module()(*args), expected)
-        for lowered in (program, *saved, decomposed):
+        for lowered in (program, saved, decomposed):
             for wrong in (malformed, moved, changed):
                 with pytest.raises(RuntimeError, match="Runtime assertion failed"):
                     lowered.module()(args[0], *(wrong[key] for key in keys))
     assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
+
+
+@require_cuda
+def test_action_prediction_on_cuda_runs_each_stage_under_its_autocast(monkeypatch) -> None:
+    policy, batch, noise = _tiny_lawam(monkeypatch)
+    backend = policy.to("cuda").model.policy_backend
+    autocast = {}
+
+    def recording(name, method):
+        def run(*args, **kwargs):
+            autocast[name] = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+            return method(*args, **kwargs)
+
+        return run
+
+    for name, owner, method in (
+        ("vlm", backend, "_run_vlm_stage"),
+        ("lam", backend.lam, "extract_vision_features"),
+        ("flow", backend.flow, "sample_actions_cfg"),
+    ):
+        monkeypatch.setattr(owner, method, recording(name, getattr(owner, method)))
+    with torch.no_grad():
+        policy.predict_action_chunk({key: value.cuda() for key, value in batch.items()}, noise=noise.cuda())
+    assert autocast == {"vlm": backend.model_cfg.vlm_dtype, "lam": torch.bfloat16, "flow": torch.float32}
