@@ -46,6 +46,8 @@ from lerobot.bundle.manifest import (
 from lerobot.bundle.task_tokens import TaskEncoder, clean
 from lerobot.export.bundle import write_bundle
 from lerobot.export.recipe import TaskTokenData
+from lerobot.inference import FeatureSpec, ObservationSnapshot
+from lerobot.remote_inference.bundle import BundleRunner
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle, record_places
 from tests.torch_free import assert_runs_without_torch, refusing_torch
@@ -269,7 +271,7 @@ def task_bundle(tmp_path):
     return bundle.path, table
 
 
-def test_engine_runs_the_task_it_is_given(tmp_path):
+def test_engine_runs_the_task_it_is_given(tmp_path, monkeypatch):
     path, table = task_bundle(tmp_path)
     state = np.array([1.0, 2.0], np.float32)
     pick, place, pick_it = (expected(state, table, ids) for ids in (PICK, PLACE, PICK_IT))
@@ -280,6 +282,29 @@ def test_engine_runs_the_task_it_is_given(tmp_path):
     np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), place, rtol=1e-5)
     with pytest.raises(ValueError, match="tokens long"):
         BundleEngine(Bundle.read(path), task="pick the cube and then place it")
+    # A new task runs from the next chunk on, so the rest of the old task's chunk plays first.
+    engine.set_task("pick the cube")
+    np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), place, rtol=1e-5)
+    np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), pick, rtol=1e-5)
+    # A task over the budget is refused, and the engine keeps running the one it had.
+    with pytest.raises(ValueError, match="tokens long"):
+        engine.set_task("pick the cube and then place it")
+    assert engine.task == "pick the cube"
+    np.testing.assert_allclose(engine.predict_chunk({OBS_STATE: state}), [pick, pick], rtol=1e-5)
+    # A task of another token count, so the programs read its length too.
+    engine.set_task("pick it")
+    np.testing.assert_allclose(engine.predict_chunk({OBS_STATE: state}), [pick_it, pick_it], rtol=1e-5)
+
+    # A task whose values fail to reach a program is refused too, also after a reset.
+    def out_of_memory(runs, values):
+        raise MemoryError("the device is out of memory")
+
+    with monkeypatch.context() as patch, pytest.raises(MemoryError):
+        patch.setattr(engine, "_place", out_of_memory)
+        engine.set_task("place_the box")
+    engine.reset()
+    assert engine.task == "pick it"
+    np.testing.assert_allclose(engine.predict_chunk({OBS_STATE: state}), [pick_it, pick_it], rtol=1e-5)
 
 
 def test_engine_refuses_a_run_that_writes_the_task_values(tmp_path):
@@ -292,6 +317,22 @@ def test_engine_refuses_a_run_that_writes_the_task_values(tmp_path):
         ValueError, match=r"run 'retask' writes \['task_embeddings'\], which the bundle makes"
     ):
         BundleEngine(Bundle.read(path))
+
+
+def test_a_served_bundle_runs_the_task_of_each_observation(tmp_path):
+    path, table = task_bundle(tmp_path)
+    names = ("motor_1.pos", "motor_2.pos")
+    runner = BundleRunner(
+        BundleEngine(Bundle.read(path)),
+        action_interval=1 / 30,
+        features=(FeatureSpec(OBS_STATE, (2,), "float32", names=names, semantics="units-v1"),),
+        action_feature=FeatureSpec(ACTION, (2,), "float32", names=names, semantics="units-v1"),
+    )
+    state = np.array([1.0, 2.0], np.float32)
+    # An empty task is the bundle's own, "pick the cube".
+    for task, tokens in [("place the box", PLACE), ("", PICK)]:
+        actions = runner.predict(ObservationSnapshot({OBS_STATE: state}, 0.0, task)).canonical_actions
+        np.testing.assert_allclose(actions, [expected(state, table, tokens)] * 2, rtol=1e-5)
 
 
 def test_engine_places_the_task_values_once(tmp_path, monkeypatch):
