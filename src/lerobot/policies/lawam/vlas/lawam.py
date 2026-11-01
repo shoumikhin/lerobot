@@ -566,6 +566,7 @@ class LatentWorldPolicyBackend(nn.Module):
         primary_visual_input: torch.Tensor,
         source: str,
         lam_features_with_no_grad: bool,
+        vision_grid: Qwen3VisionGrid | None = None,
     ) -> PolicyEncodingState:
         vlm_stage_dtype = self.model_cfg.vlm_dtype
         lam_stage_dtype = torch.bfloat16
@@ -583,6 +584,7 @@ class LatentWorldPolicyBackend(nn.Module):
                 flow_placeholder_mask=prepared_batch["flow_placeholder_mask"],
                 act_query=act_query,
                 flow_query=flow_query,
+                vision_grid=vision_grid,
             )
         h_vlm = vlm_out_dict["h_vlm"]
         pred_action_emb = vlm_out_dict["pred_latent"]
@@ -638,12 +640,14 @@ class LatentWorldPolicyBackend(nn.Module):
         prepared_batch: LatentWorldPolicyInferBatch,
         source: str,
         lam_features_with_no_grad: bool,
+        vision_grid: Qwen3VisionGrid | None = None,
     ) -> PolicyEncodingState:
         return self._run_shared_encoding_core(
             prepared_batch=prepared_batch,
             primary_visual_input=prepared_batch["primary_image"],
             source=source,
             lam_features_with_no_grad=lam_features_with_no_grad,
+            vision_grid=vision_grid,
         )
 
     def forward(
@@ -747,7 +751,10 @@ class LatentWorldPolicyBackend(nn.Module):
         guidance_scale: float | None = None,
         num_inference_steps: int | None = None,
         noise: torch.Tensor | None = None,
+        vision_grid: Qwen3VisionGrid | None = None,
     ) -> torch.Tensor:
+        """`vision_grid`, built by `Qwen3VisionGrid.build(self.vlm.model.visual, batch["image_grid_thw"])`,
+        runs the Qwen3-VL model without reading `image_grid_thw` on the host, as `torch.export` needs."""
         flow_stage_dtype = torch.float32
         prepared_batch = batch
 
@@ -760,6 +767,7 @@ class LatentWorldPolicyBackend(nn.Module):
             prepared_batch=prepared_batch,
             source="LatentWorldPolicyBackend.predict_action",
             lam_features_with_no_grad=False,
+            vision_grid=vision_grid,
         )
         attn_flow = prepared_batch["attention_mask"] == 1
 

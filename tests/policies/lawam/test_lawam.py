@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1152,3 +1153,108 @@ def test_vlm_stage_refuses_a_vision_grid_built_for_another_grid() -> None:
             stage._run_vlm_stage(**changed, vision_grid=grid)
         with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(VLMStage(None), tuple(inputs[key] for key in keys), strict=False)
+
+
+def _tiny_lawam(monkeypatch) -> tuple[LaWAMPolicy, dict[str, torch.Tensor], torch.Tensor]:
+    """A tiny random LaWAM on the CPU, a batch of two samples, and the starting noise of the flow."""
+    from lerobot.policies.lawam.vlas import lawam
+
+    qwen, _, inputs = _vlm_stage_setup()
+    # The policy loads its VLM by model id; the tiny one stands in, with the stage setup's action token.
+    monkeypatch.setattr(lawam, "_load_vlm_and_processor", lambda cfg, model_id: (qwen, None, 10))
+    # A small latent action model and flow head for the tiny VLM and 32x32 images. With four flow layers the
+    # actions attend to the VLM tokens and to the image tokens.
+    config = replace(
+        make_config(),
+        num_action_queries=2,
+        flow_action_num_queries=2,
+        lam_dim=32,
+        lam_num_heads=4,
+        lam_enc_layers=1,
+        lam_code_dim=8,
+        lam_dec_layers=1,
+        lam_image_hw=(32, 32),
+        dinov3_hidden_size=32,
+        dinov3_intermediate_size=64,
+        dinov3_num_hidden_layers=2,
+        dinov3_num_attention_heads=4,
+        flow_hidden_dim=16,
+        flow_num_layers=4,
+        flow_attention_heads=2,
+        flow_vlm_dim=64,
+        flow_vision_dim=32,
+        flow_num_vision_tokens=4,
+        flow_num_inference_steps=2,
+    )
+    policy = LaWAMPolicy(config).eval()
+    # The decoder blocks of the latent action model start as the identity (zero gates); with gates, the
+    # decoder and the predicted latent action reach the actions.
+    for block in policy.model.policy_backend.lam.decoder.dec_layers:
+        nn.init.normal_(block.adaLN_modulation[-1].weight, std=0.02)
+    batch = {
+        **{key: value for key, value in inputs.items() if not key.endswith("_query")},
+        "primary_image": torch.rand(2, 3, 32, 32),
+        "state": torch.zeros(2, 32),
+        "state_mask": torch.zeros(2, 32, dtype=torch.bool),
+        "action_hz": torch.full((2,), 20.0),
+        "embodiment_id": torch.full((2,), 25),
+    }
+    return policy, batch, torch.randn(2, config.chunk_size, config.flow_action_dim)
+
+
+def test_action_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatch) -> None:
+    from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid
+    from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK_NODES
+
+    policy, batch, noise = _tiny_lawam(monkeypatch)
+    # A policy built on a machine with CUDA keeps "cuda" in its config after its model moves to the CPU.
+    policy.config.device = "cuda"
+    keys = sorted(batch)
+    args = (noise, *(batch[key] for key in keys))
+
+    class PredictActionChunk(nn.Module):
+        def __init__(self, grid):
+            super().__init__()
+            self.policy, self.grid = policy, grid
+
+        def forward(self, noise, *tensors):
+            return self.policy.predict_action_chunk(
+                dict(zip(keys, tensors, strict=True)), noise=noise, vision_grid=self.grid
+            )
+
+    grid = Qwen3VisionGrid.build(policy.model.policy_backend.vlm.model.visual, batch["image_grid_thw"])
+    # The query checks: a sample without action placeholders, and one placeholder moved from the second sample
+    # to the first (the total is right, the samples are not).
+    malformed = {**batch, "act_placeholder_mask": batch["act_placeholder_mask"].clone()}
+    malformed["act_placeholder_mask"][1] = False
+    moved = {**batch, "act_placeholder_mask": batch["act_placeholder_mask"].clone()}
+    moved["act_placeholder_mask"][1, moved["act_placeholder_mask"][1].nonzero()[0, 0]] = False
+    moved["act_placeholder_mask"][0, 0] = True
+    # The second image transposed: same image and token counts, another grid.
+    changed = {**batch, "image_grid_thw": batch["image_grid_thw"].clone()}
+    changed["image_grid_thw"][1, 1:] = changed["image_grid_thw"][1, 1:].flip(0)
+    with torch.no_grad():
+        expected = PredictActionChunk(None)(*args)
+        # The actions stay on the model's device.
+        assert expected.device.type == "cpu"
+        assert torch.equal(PredictActionChunk(grid)(*args), expected)
+    # The runtime asserts must not depend on transformers' own checks, which this switch turns off.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="needs a vision_grid"):
+            torch.export.export(PredictActionChunk(None), args, strict=False)
+        program = torch.export.export(PredictActionChunk(grid), args, strict=False)
+        decomposed = program.run_decompositions()
+        # LaWAM turns on CUDA autocast whenever CUDA is available, and torch.export cannot save the empty
+        # autocast regions that leaves in the program.
+        saved = [] if torch.cuda.is_available() else [save_and_load(program)]
+        for exact in (program, *saved):
+            assert torch.equal(exact.module()(*args), expected)
+        # The decompositions round differently.
+        torch.testing.assert_close(decomposed.module()(*args), expected)
+        for lowered in (program, *saved, decomposed):
+            for wrong in (malformed, moved, changed):
+                with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                    lowered.module()(args[0], *(wrong[key] for key in keys))
+    assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
