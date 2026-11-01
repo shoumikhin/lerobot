@@ -83,14 +83,17 @@ def export_config(task: str = "") -> SimpleNamespace:
 
 
 def make(
-    policy_class=ACTPolicy, task: str = "", extra_step: ProcessorStep | None = None
+    policy_class=ACTPolicy,
+    task: str = "",
+    extra_step: ProcessorStep | None = None,
+    recipe_class: type[ActionChunkRecipe] = ActionChunkRecipe,
 ) -> ActionChunkRecipe:
     torch.manual_seed(0)
     config = act_config()
     preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
     if extra_step is not None:
         preprocessor.steps.insert(0, extra_step)
-    return ActionChunkRecipe(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
+    return recipe_class(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
 
 
 class TaskCodes(ProcessorStep):
@@ -130,6 +133,22 @@ class SamplingACT(ACTPolicy):
         return actions + torch.multinomial(actions[0].softmax(-1), 1).float()
 
 
+def seeded_noise() -> Tensor:
+    return torch.randn(1, 4, 5, generator=torch.Generator().manual_seed(0))
+
+
+class SeededACT(ACTPolicy):
+    """ACT that adds a starting noise it draws from a generator it seeds on every call."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        return super().predict_action_chunk(batch) + (seeded_noise() if noise is None else noise)[..., :1]
+
+
+class SeededNoiseRecipe(ActionChunkRecipe):
+    def _seeded_noise(self) -> Tensor:
+        return seeded_noise()
+
+
 def test_recipe_measures_the_action_scale_from_the_postprocessor():
     np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
 
@@ -157,6 +176,18 @@ def test_recipe_refuses_a_policy_that_draws_two_noises():
 def test_recipe_refuses_a_policy_that_samples_categories_itself():
     with pytest.raises(ValueError, match=r"draws 1 random tensors shaped \[\(2, 4, 3\)\]"):
         make(SamplingACT)
+
+
+def test_recipe_holds_the_noise_of_a_policy_that_seeds_its_draws():
+    recipe = make(SeededACT, recipe_class=SeededNoiseRecipe)
+    assert recipe.test_case().noise is None
+    [part] = recipe.parts()  # checks the program against the policy, bit for bit, on two frames
+    assert part.inputs == [IMAGE, OBS_STATE]
+    program = torch.export.export(part.module, part.example_inputs).module()
+    with torch.no_grad():
+        # A noise drawn inside the program would differ on the second run.
+        for _ in range(2):
+            np.testing.assert_array_equal(program(*part.example_inputs).numpy(), recipe.test_case().actions)
 
 
 def test_replayed_draws_read_the_noise_in_order():
