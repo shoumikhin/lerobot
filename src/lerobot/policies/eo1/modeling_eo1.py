@@ -693,7 +693,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
                 vlm.config.image_token_id,
                 image_temporal_scale=image_temporal_scale,
             )
-            image_embeds = qwen2_5_vision_forward(vlm.visual, pixel_values.type(vlm.visual.dtype), grid)
+            image_embeds = qwen2_5_vision_forward(vlm.visual, pixel_values.type(vlm.visual.dtype), image_grid_thw, grid)
             image_mask = input_ids == vlm.config.image_token_id
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))

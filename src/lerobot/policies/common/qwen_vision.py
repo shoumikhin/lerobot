@@ -95,10 +95,28 @@ class FixedImageGrid:
     grid_thw: list[list[int]]
     device: torch.device
     dtype: torch.dtype
+    layout: tuple
 
     @classmethod
     def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> Self:
         raise NotImplementedError
+
+    @staticmethod
+    def layout_of(visual: nn.Module) -> tuple:
+        """The tower settings besides the grid that the cached metadata depends on."""
+        raise NotImplementedError
+
+    def check(self, visual: nn.Module, grid_thw: Tensor) -> None:
+        """Refuse a call whose vision tower or image grid is not the one this cache was built for."""
+        if len(self.grid_thw) != grid_thw.shape[0]:
+            raise ValueError(
+                f"The cache was built for {len(self.grid_thw)} images, but the call has {grid_thw.shape[0]}."
+            )
+        if (self.device, self.dtype, self.layout) != (visual.device, visual.dtype, self.layout_of(visual)):
+            raise ValueError("The cache was built for another device, dtype or tower layout.")
+        check_input(
+            grid_thw == grid_thw.new_tensor(self.grid_thw), "The image grid differs from the cached one."
+        )
 
     @classmethod
     def build(cls, visual: nn.Module, grid_thw: Tensor) -> Self:
@@ -129,10 +147,14 @@ class FixedImageGrid:
                     f"the prepared grid has {len(cache.grid_thw)} images but the export inputs have "
                     f"{grid_thw.shape[0]} (another batch size or camera count)"
                 )
-            elif (cache.device, cache.dtype) != (visual.device, visual.dtype):
+            elif (cache.device, cache.dtype, cache.layout) != (
+                visual.device,
+                visual.dtype,
+                cls.layout_of(visual),
+            ):
                 problem = (
                     f"the grid was prepared for {cache.device} {cache.dtype}, but the tower is now on "
-                    f"{visual.device} {visual.dtype}"
+                    f"{visual.device} {visual.dtype} or has another layout"
                 )
             else:
                 check_input(
@@ -146,7 +168,8 @@ class FixedImageGrid:
             )
         if is_preparing_image_grid() and (
             cache is None
-            or (cache.device, cache.dtype) != (visual.device, visual.dtype)
+            or (cache.device, cache.dtype, cache.layout)
+            != (visual.device, visual.dtype, cls.layout_of(visual))
             or cache.grid_thw != grid_thw.tolist()
         ):
             return cls.build(visual, grid_thw)

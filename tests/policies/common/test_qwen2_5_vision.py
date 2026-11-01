@@ -84,7 +84,7 @@ class FixedGridVision(torch.nn.Module):
 
     def forward(self, pixel_values, grid_thw):
         grid = Qwen2_5VisionGrid.track(self.grid, self.visual, grid_thw)
-        return qwen2_5_vision_forward(self.visual, pixel_values, grid)
+        return qwen2_5_vision_forward(self.visual, pixel_values, grid_thw, grid)
 
 
 # Two images of 18x18 patches (as WALL-X gives for 224 px cameras) have uneven attention windows; the

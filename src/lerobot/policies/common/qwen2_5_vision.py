@@ -68,6 +68,15 @@ class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
     full_lengths: list[int]
     window_lengths: list[int]
 
+    @staticmethod
+    def layout_of(visual: nn.Module) -> tuple:
+        return (
+            visual.window_size,
+            visual.spatial_merge_size,
+            visual.patch_size,
+            tuple(visual.fullatt_block_indexes),
+        )
+
     @classmethod
     def _from_grid(cls, visual: nn.Module, grid_thw: list[list[int]]) -> Self:
         grid = torch.tensor(grid_thw, device=visual.device)
@@ -82,6 +91,7 @@ class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
             grid_thw=grid_thw,
             device=visual.device,
             dtype=visual.dtype,
+            layout=cls.layout_of(visual),
             position_embeddings=(emb.cos(), emb.sin()),
             window_index=window_index,
             reverse_index=torch.argsort(window_index),
@@ -91,8 +101,11 @@ class Qwen2_5VisionGrid(FixedImageGrid):  # noqa: N801
         )
 
 
-def qwen2_5_vision_forward(visual: nn.Module, pixel_values: Tensor, grid: Qwen2_5VisionGrid) -> Tensor:
+def qwen2_5_vision_forward(
+    visual: nn.Module, pixel_values: Tensor, grid_thw: Tensor, grid: Qwen2_5VisionGrid
+) -> Tensor:
     """`visual(pixel_values, grid_thw).pooler_output` for the prepared `grid`, traceable by `torch.export`."""
+    grid.check(visual, grid_thw)
     hidden_states = visual.patch_embed(pixel_values)
     seq_len, unit = hidden_states.shape[0], visual.spatial_merge_unit
     hidden_states = hidden_states.reshape(seq_len // unit, unit, -1)[grid.window_index].reshape(seq_len, -1)
