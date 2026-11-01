@@ -628,3 +628,25 @@ def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path, monkeypat
     assert case[IMAGE].shape == (2, 32, 32, 3) and case[OBS_STATE].shape == (2, 3)
     engine = BundleEngine(bundle)
     engine.check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_recipe_carries_values_from_chunk_to_chunk(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported to start from the sum of its noises: the bundle's own check plays three chunks in order."""
+    use_plugins(monkeypatch, "carry_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.carry == {"noise_total": [4, 1]}
+    # The noise of one chunk, though the test case holds the noise of each of its chunks.
+    assert bundle.manifest.noise_shape == [4, 1]
+    case = load_file(bundle.path / bundle.manifest.test_case)
+    assert case[IMAGE].shape == (3, 32, 32, 3) and case[NOISE].shape == (3, 4, 1)
+    engine = BundleEngine(bundle)
+    rng = np.random.default_rng(0)
+    frame = {
+        IMAGE: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+        OBS_STATE: rng.random(3, dtype=np.float32),
+    }
+    # Two chunks, the second reading what the first carried, each with the noise the bundle draws.
+    actions = np.stack([engine.get_action(dict(frame)) for _ in range(8)])
+    assert actions.shape == (8, 3) and np.isfinite(actions).all()

@@ -205,6 +205,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot
   "task_tokens": null,
   "noise_shape": null,
   "history": {},
+  "carry": {},
   "task": null,
   "action_names": null,
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
@@ -285,6 +286,10 @@ The export also compares the chain's actions with the whole policy's own, which 
 Diffusion Policy, Multi-Task DiT and VQ-BeT read the last few frames, not only the current one. In PyTorch the policy keeps them in queues that fill on every control tick. A compiled program keeps nothing between runs, so the bundle names those frames in its manifest under `history`, with how many to keep. `lerobot-rollout` then keeps them on every tick and passes them to the programs, oldest first. A policy that samples random numbers inside its steps reads them from the bundle's `noise`, so the compiled policy samples like the PyTorch one.
 
 Diffusion Policy and Multi-Task DiT run their encoder once per chunk, and one denoising step many times in a loop, the same way the pi0.5 chain runs its `step`.
+
+### Values kept between chunks
+
+Some policies keep a value from one chunk to the next, such as a planner that starts each plan from where its previous one ended. A compiled program keeps nothing between runs, so such a program takes the value as an input and returns the new one. The bundle names these values in its manifest under `carry`, with their shapes. `lerobot-rollout` passes each one from a chunk to the next, and starts it again from zeros after a reset. The test case of such a bundle holds a few chunks, and the check plays them in order, so it also checks what is passed on.
 
 ### Tasks
 
@@ -458,7 +463,8 @@ Two optional methods cover bigger policies:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree;
   - `constants`: named arrays the runs read, such as time values;
   - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;
-  - `history`: how many past frames of each frame key the programs read.
+  - `history`: how many past frames of each frame key the programs read;
+  - `carry`: the values the runs pass from one chunk to the next, with their shapes.
 
 `tests/export/chain_recipe.py` is a small working example of a chain with a repeated part and constants. `policies/pi05/export_pi05.py`, `policies/groot/export_groot.py` and `policies/smolvla/export_smolvla.py` are full ones. `policies/diffusion/export_diffusion.py` shows a recipe that reads past frames, and `policies/gaussian_actor/export_gaussian_actor.py` a small change to the default recipe.
 

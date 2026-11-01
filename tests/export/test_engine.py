@@ -29,7 +29,15 @@ from safetensors.numpy import load_file, save_file
 from torch import Tensor, nn
 
 from lerobot.bundle.engine import BundleEngine
-from lerobot.bundle.manifest import MANIFEST, NOISE, TEST_CASE, Bundle
+from lerobot.bundle.manifest import (
+    MANIFEST,
+    NOISE,
+    TEST_CASE,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.export.torch_backend import make_bundle
 
@@ -493,3 +501,84 @@ def test_engine_refuses_a_test_case_with_uneven_ticks(tmp_path):
     bundle = make_bundle(tmp_path / "bundle", History(), frame, history={OBS_STATE: 3})
     with pytest.raises(ValueError, match="same number of frames for each key"):
         BundleEngine(bundle)
+
+
+class Accumulate(nn.Module):
+    """A chunk of one action: the state plus the states of the chunks before, whose sum the bundle carries."""
+
+    def forward(self, state: Tensor, total: Tensor) -> tuple[Tensor, Tensor]:
+        return (state + total)[None], total + state
+
+
+# Two chunks, so the check passes only if the second one reads what the first one carried.
+CHUNKS = {OBS_STATE: np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], np.float32)}
+
+
+def _carry_bundle(folder, expected: np.ndarray | None = None) -> Bundle:
+    """A bundle of `Accumulate` whose test case plays `CHUNKS` and expects `expected`, by default the right actions."""
+    folder.mkdir(parents=True)
+    module = Accumulate()
+    total = torch.zeros(3)
+    for state in torch.from_numpy(CHUNKS[OBS_STATE]):
+        actions, total = module(state, total)
+    torch.export.save(torch.export.export(module, (torch.ones(3), torch.zeros(3))), folder / "model.pt2")
+    save_file({**CHUNKS, ACTION: actions.numpy() if expected is None else expected}, folder / TEST_CASE)
+    manifest = BundleManifest(
+        backend="torch_test",
+        runtime="torch_test",
+        runtime_imports=["tests.export.torch_backend"],
+        programs={"model": ProgramFiles("model.pt2")},
+        runs=[ProgramRun("model", "model", [OBS_STATE, "total"], [ACTION, "total"])],
+        carry={"total": [3]},
+        action_scale=[1.0] * 3,
+        tolerance=1e-4,
+    )
+    Bundle(folder, manifest).write()
+    return Bundle.read(folder)
+
+
+def test_engine_carries_values_from_chunk_to_chunk(tmp_path):
+    engine = BundleEngine(_carry_bundle(tmp_path / "bundle"))
+    actions = [engine.get_action({OBS_STATE: state}) for state in _states(10, 20, 30)]
+    # From zeros at the first chunk: the check of the test case leaves nothing behind.
+    np.testing.assert_array_equal(np.stack(actions), _states(10, 30, 60))
+
+
+def test_engine_starts_the_carried_values_again_after_a_reset(tmp_path):
+    engine = BundleEngine(_carry_bundle(tmp_path / "bundle"))
+    engine.get_action({OBS_STATE: np.full(3, 10.0, np.float32)})
+    engine.reset()
+    np.testing.assert_array_equal(
+        engine.get_action({OBS_STATE: np.full(3, 20.0, np.float32)}), _states(20)[0]
+    )
+
+
+def test_engine_checks_the_chunks_of_the_test_case_in_order(tmp_path):
+    # The second chunk's action if the first one had carried nothing.
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        BundleEngine(_carry_bundle(tmp_path / "bundle", expected=np.full((1, 3), 2.0, np.float32)))
+
+
+def test_engine_refuses_a_carried_value_no_run_writes(tmp_path):
+    bundle = _carry_bundle(tmp_path / "bundle")
+    run = {"name": "model", "program": "model", "inputs": [OBS_STATE, "total"], "outputs": [ACTION, "sum"]}
+    _edit(bundle, runs=[run])
+    with pytest.raises(ValueError, match=r"carries \['total'\] between chunks, but no run writes"):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+def test_engine_refuses_a_carried_value_with_the_name_of_a_frame_key(tmp_path):
+    bundle = _carry_bundle(tmp_path / "bundle")
+    _edit(bundle, carry={"total": [3], OBS_STATE: [3]})
+    with pytest.raises(
+        ValueError, match=r"carries \['observation.state'\] between chunks, which is the name"
+    ):
+        BundleEngine(Bundle.read(bundle.path))
+
+
+@pytest.mark.parametrize("carry", [{"total": 3}, {"total": [3.0]}, {"total": [-1]}, {"total": [True]}])
+def test_bundle_refuses_a_carried_value_without_a_shape(tmp_path, carry):
+    bundle = _carry_bundle(tmp_path / "bundle")
+    _edit(bundle, carry=carry)
+    with pytest.raises(ValueError, match="shape of whole numbers"):
+        Bundle.read(bundle.path)

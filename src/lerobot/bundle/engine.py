@@ -42,9 +42,10 @@ class BundleEngine:
     """Inline inference with a bundle: one run of its programs per action chunk.
 
     It plays the chunk one action per call, as [`SyncInferenceEngine`] plays the PyTorch policy's action
-    queue, and keeps the past frames of a bundle with `history` the way the policy's own queues keep them.
-    Before it runs, it replays the bundle's test case and refuses to start if the actions differ from the ones
-    PyTorch computed by more than the bundle's tolerance. It is an
+    queue, keeps the past frames of a bundle with `history` the way the policy's own queues keep them, and
+    passes the values of a bundle's `carry` from each chunk to the next. Before it runs, it replays the bundle's
+    test case and refuses to start if the actions differ from the ones PyTorch computed by more than the
+    bundle's tolerance. It is an
     [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the same
     helpers as `lerobot-rollout`.
 
@@ -105,21 +106,24 @@ class BundleEngine:
                 "The bundle's test case holds no valid expected actions: finite numbers shaped "
                 f"[execution_steps, {len(self._scale)}]. Export the policy again."
             )
+        frames = [case]
+        if manifest.history or manifest.carry:
+            ticks = {value.shape[0] if value.ndim else 0 for value in case.values()}
+            if len(ticks) != 1 or 0 in ticks:
+                raise ValueError(
+                    "The bundle keeps a frame history or carries values between chunks, but its test case does "
+                    "not hold the same number of frames for each key. Export the policy again."
+                )
+            frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
         expected_noise = None if manifest.noise_shape is None else tuple(manifest.noise_shape)
+        if expected_noise is not None and manifest.carry:
+            # A chunk of the test case at each frame, each with its own noise.
+            expected_noise = (len(frames), *expected_noise)
         if (None if noise is None else noise.shape) != expected_noise:
             raise ValueError(
                 f"The bundle's test case holds noise shaped {None if noise is None else noise.shape}, but its "
                 f"programs take noise shaped {expected_noise}. Export the policy again."
             )
-        frames = [case]
-        if manifest.history:
-            ticks = {value.shape[0] if value.ndim else 0 for value in case.values()}
-            if len(ticks) != 1 or 0 in ticks:
-                raise ValueError(
-                    "The bundle keeps a frame history, but its test case does not hold the same number of "
-                    "frames for each key. Export the policy again."
-                )
-            frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
         self._frame_spec = {name: value.shape for name, value in frames[-1].items()}
         if unknown := sorted(set(manifest.history) - set(self._frame_spec)):
             raise ValueError(
@@ -129,6 +133,8 @@ class BundleEngine:
         self._history: dict[str, deque[np.ndarray]] = {
             name: deque(maxlen=size) for name, size in manifest.history.items()
         }
+        self._carry_shapes = {name: tuple(shape) for name, shape in manifest.carry.items()}
+        self._carry = self._reset_carry()
         self._task_values = self._encode(task)
         _check_dataflow(
             manifest,
@@ -217,6 +223,7 @@ class BundleEngine:
             for name in self._frame_spec
         }
         values.update(task_values)
+        values.update(self._carry)
         if noise is None and self._noise_shape is not None and not self._draws_noise:
             noise = np.random.standard_normal(self._noise_shape).astype(np.float32)
         if noise is not None:
@@ -235,6 +242,8 @@ class BundleEngine:
                     values[name] = program.place(index, values[name])
                 inputs.append(values[name])
             values.update(zip(run.outputs, program(*inputs), strict=True))
+        # Left where the runs wrote them, so the next chunk reads them without a copy.
+        self._carry = {name: values[name] for name in self._carry_shapes}
         actions = self._runs[-1][1].to_numpy(values[ACTION])
         if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] != len(self._scale):
             raise RuntimeError(
@@ -258,11 +267,17 @@ class BundleEngine:
     def _check(
         self, frames: list[dict], noise: np.ndarray | None, expected: np.ndarray, tolerance: float
     ) -> None:
-        for frame in frames:
-            self._observe(frame)
-        actual = self._run_chunk(frames[-1], self._encode(self._fixed_task or ""), noise)
-        for history in self._history.values():
-            history.clear()
+        task_values = self._encode(self._fixed_task or "")
+        if self._carry_shapes:
+            # A chunk at each frame, so the last one reads what the chunks before it passed on.
+            for index, frame in enumerate(frames):
+                self._observe(frame)
+                actual = self._run_chunk(frame, task_values, None if noise is None else noise[index])
+        else:
+            for frame in frames:
+                self._observe(frame)
+            actual = self._run_chunk(frames[-1], task_values, noise)
+        self.reset()
         if actual.shape != expected.shape:
             raise RuntimeError(
                 f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
@@ -319,10 +334,14 @@ class BundleEngine:
         """Inline inference has nothing to do when an action reaches the robot."""
 
     def reset(self) -> None:
-        """Drop the queued actions and the past frames."""
+        """Drop the queued actions and the past frames, and start the carried values again from zeros."""
         self._actions.clear()
         for frames in self._history.values():
             frames.clear()
+        self._carry = self._reset_carry()
+
+    def _reset_carry(self) -> dict[str, Any]:
+        return {name: np.zeros(shape, np.float32) for name, shape in self._carry_shapes.items()}
 
     def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
         """The next action of the chunk, running the programs when the chunk is used up."""
@@ -340,8 +359,16 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
 
     The constants and the values `task_tokens` makes are placed once where each run reads them, so a run that
     wrote one would not change what a later run reads.
+    A value carried between chunks must have a name of its own, and some run must write it.
     """
     available = {*frame, *constants, *([NOISE] if noise else [])}
+    if clashes := sorted(set(manifest.carry) & {*available, NOISE}):
+        raise ValueError(
+            f"The bundle carries {clashes} between chunks, which is the name of a value the frame, the noise or "
+            "the constants give. Export the policy again."
+        )
+    available.update(manifest.carry)
+    written: set[str] = set()
     tasks = manifest.task_tokens is not None
     for run in manifest.runs:
         if shadowed := sorted(set(run.outputs) & set(constants)):
@@ -359,5 +386,10 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
                 "constants nor an earlier run gives. Export the policy again."
             )
         available.update(run.outputs)
+        written.update(run.outputs)
+    if unwritten := sorted(set(manifest.carry) - written):
+        raise ValueError(
+            f"The bundle carries {unwritten} between chunks, but no run writes them. Export the policy again."
+        )
     if ACTION not in manifest.runs[-1].outputs:
         raise ValueError(f"The bundle's last run, {manifest.runs[-1].name!r}, gives no {ACTION!r}.")
