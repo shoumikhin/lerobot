@@ -319,6 +319,8 @@ class ActionChunkRecipe(ExportRecipe):
 
     def parts(self) -> Iterator[Part]:
         """The one part, after checking that it computes what PyTorch does for two different frames."""
+        from lerobot.policies.common.qwen_vision import prepare_image_grid
+
         module = _ActionChunk(
             self.predict_chunk,
             self.policy,
@@ -331,13 +333,15 @@ class ActionChunkRecipe(ExportRecipe):
             self._held_noise,
         )
         frame, noise = random_frame(self._features, self._generator), self._random_noise()
-        for case_frame, case_noise, expected in (
-            (self._case.frame, self._case.noise, self._case.actions),
-            (frame, noise, self._reference(frame, noise)),
-        ):
-            with torch.no_grad():
-                actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
-            self._check_program(actions, expected)
+        # A vision tower that exports on a prepared image grid prepares it in these eager runs.
+        with prepare_image_grid():
+            for case_frame, case_noise, expected in (
+                (self._case.frame, self._case.noise, self._case.actions),
+                (frame, noise, self._reference(frame, noise)),
+            ):
+                with torch.no_grad():
+                    actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
+                self._check_program(actions, expected)
         inputs = [*self._features, *([NOISE] if self._noise_shape else [])]
         yield Part("model", module, self._inputs(self._case.frame, self._case.noise), inputs, [ACTION])
 

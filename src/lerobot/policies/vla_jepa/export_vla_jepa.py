@@ -23,13 +23,12 @@ per-frame input. The vision tower reads the patch grid prepared by an eager call
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import replace
 
 import torch
 
 from lerobot.export.configs import ExportConfig
-from lerobot.export.recipe import ActionChunkRecipe, Part
+from lerobot.export.recipe import ActionChunkRecipe
 from lerobot.processor import (
     EnvTransition,
     PolicyProcessorPipeline,
@@ -39,7 +38,6 @@ from lerobot.processor import (
 )
 
 from ..common.fixed_prompt import FixedPromptStep
-from ..common.qwen_vision import prepare_image_grid
 from .modeling_vla_jepa import VLAJEPAPolicy
 
 
@@ -64,12 +62,6 @@ class VLAJEPAExportRecipe(ActionChunkRecipe):
             for step in self.preprocessor.steps
         ]
         return replace(self.preprocessor, steps=steps)
-
-    def parts(self) -> Iterator[Part]:
-        """The default recipe's part, checked inside `prepare_image_grid()` so the checks prepare the grid."""
-        with prepare_image_grid():
-            (part,) = super().parts()
-        yield part
 
 
 class _QwenInputsStep(ProcessorStep):
