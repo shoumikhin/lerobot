@@ -30,10 +30,9 @@ import pytest
 import lerobot.policies
 from lerobot.utils.import_utils import _datasets_available
 
-pytestmark = [
-    pytest.mark.dataset,
-    pytest.mark.skipif(not _datasets_available, reason="lerobot-train needs the dataset extra"),
-]
+# Only the tests that run lerobot-train or lerobot.rl need the dataset extra, so the others also run in the
+# base tier, without it.
+NEEDS_DATASETS = pytest.mark.skipif(not _datasets_available, reason="lerobot-train needs the dataset extra")
 
 PARSE = """
 import sys
@@ -161,6 +160,8 @@ def run_train_parse(*args: str) -> subprocess.CompletedProcess:
     return run_python(PARSE, *args)
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 @pytest.mark.parametrize("policy_type", [["--policy.type=act"], ["--policy.type", "act"]])
 def test_policy_type_loads_only_that_policy(policy_type):
     result = run_train_parse(*policy_type, "--policy.device=cpu", "--dataset.repo_id=u/d")
@@ -350,6 +351,8 @@ print(json.dumps([sorted(c.__name__ for c in registered - exported), sorted(c.__
     assert json.loads(result.stdout.splitlines()[-1]) == [[], []]
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_override_with_type_from_a_config_directory(tmp_path):
     (tmp_path / "train_config.json").write_text(
         json.dumps({"dataset": {"repo_id": "u/d"}, "policy": {"type": "act", "push_to_hub": False}})
@@ -469,6 +472,8 @@ print("POLICY_CLASS", get_policy_class(PolicyName.ACT).__name__)
     assert "POLICY_CLASS ACTPolicy" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 @pytest.mark.parametrize("name", ["nope", "foo.bar"])
 def test_unknown_policy_type_lists_every_policy(name):
     result = run_train_parse(f"--policy.type={name}", "--dataset.repo_id=u/d")
@@ -587,6 +592,8 @@ def test_saved_pipeline_with_a_policy_step_loads(tmp_path):
     assert "STEPS ['Pi0NewLineProcessor']" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_repeated_policy_type_uses_the_last_one():
     result = run_train_parse(
         "--policy.type=act", "--policy.device=cpu", "--dataset.repo_id=u/d", "--policy.type=diffusion"
@@ -595,6 +602,8 @@ def test_repeated_policy_type_uses_the_last_one():
     assert "POLICY DiffusionConfig cpu" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 @pytest.mark.parametrize("flags", [["--optimizer.group_grad_clip_norm=2.5"], []])
 def test_policy_optimizer_named_in_a_config_file(tmp_path, flags):
     config = {
@@ -611,6 +620,8 @@ def test_policy_optimizer_named_in_a_config_file(tmp_path, flags):
     assert ("group_grad_clip_norm=2.5" in result.stdout) == bool(flags)
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_optimizer_and_scheduler_registered_by_another_policy():
     result = run_train_parse(
         "--policy.type=act",
@@ -630,6 +641,8 @@ def test_optimizer_and_scheduler_registered_by_another_policy():
     assert "REGISTERED act,molmoact2\n" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_optimizer_flags_without_a_type_load_only_the_policies_that_add_optimizers(tmp_path):
     config = {
         "dataset": {"repo_id": "u/d"},
@@ -644,6 +657,8 @@ def test_optimizer_flags_without_a_type_load_only_the_policies_that_add_optimize
     assert "REGISTERED act,lawam,molmoact2\n" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 @pytest.mark.parametrize(
     ("flag", "listed"),
     [
@@ -665,6 +680,8 @@ def test_unknown_optimizer_or_scheduler_name_lists_every_choice(flag, listed):
     assert listed in result.stderr
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 @pytest.mark.parametrize("flag", ["--help", "-h", "-help"])
 def test_help_lists_every_policy(flag):
     result = run_train_parse(flag)
@@ -683,6 +700,8 @@ def test_help_lists_every_policy(flag):
     assert set(ChoicesFromPolicies.POLICY_CHOICES) <= listed
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_nested_policy_type_written_with_a_space():
     result = run_python(
         NESTED_PARSE,
@@ -696,6 +715,8 @@ def test_nested_policy_type_written_with_a_space():
     assert "NESTED ACTConfig" in result.stdout
 
 
+@pytest.mark.dataset
+@NEEDS_DATASETS
 def test_override_of_a_nested_policy_with_type_from_a_file(tmp_path):
     config_file = tmp_path / "train_config.json"
     config_file.write_text(
