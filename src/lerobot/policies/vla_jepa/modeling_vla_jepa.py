@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -42,6 +43,10 @@ from .action_head import VLAJEPAActionHead
 from .configuration_vla_jepa import VLAJEPAConfig
 from .qwen_interface import Qwen3VLInterface
 from .world_model import ActionConditionedVideoPredictor
+
+# The Qwen3-VL processor tensors of a prompt with images that `predict_action_chunk` can take. The processor
+# also makes `mm_token_type_ids`, which may be left out: it is rebuilt from `input_ids` when needed.
+QWEN_INPUTS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
 
 # ============================================================================
 # Native VLA-JEPA Model - follows original starVLA VLA_JEPA.py implementation
@@ -156,10 +161,14 @@ class VLAJEPAModel(nn.Module):
             h = output[0] if isinstance(output, tuple) else output
             captured.append(h)
 
-        last_layer = self.qwen.model.model.language_model.layers[-1]
-        handle = last_layer.register_forward_hook(_hook)
+        qwen = self.qwen.model.model
+        if "image_grid_thw" in qwen_inputs and "mm_token_type_ids" not in qwen_inputs:
+            # The stock call needs it with images; rebuilt from `input_ids` as GR00T N1.7 does.
+            image_tokens = qwen_inputs["input_ids"] == qwen.config.image_token_id
+            qwen_inputs = {**qwen_inputs, "mm_token_type_ids": image_tokens.to(torch.int32)}
+        handle = qwen.language_model.layers[-1].register_forward_hook(_hook)
         try:
-            self.qwen.model.model(**qwen_inputs)
+            qwen(**qwen_inputs)
         finally:
             handle.remove()
 
@@ -167,16 +176,33 @@ class VLAJEPAModel(nn.Module):
 
     # ---- Native VLA-JEPA forward (follows original VLA_JEPA.py) ----
 
+    def qwen_inputs(self, images: list[list[Tensor]], instructions: list[str]) -> dict[str, Tensor]:
+        """The Qwen3-VL processor tensors of `images`, per sample and per view, and `instructions`.
+
+        The images are float [0,1] [C, H, W] tensors, resized to `resize_images_to` first when it is set.
+        """
+        if self.config.resize_images_to is not None:
+            hw = tuple(self.config.resize_images_to)
+            images = [
+                [
+                    img if tuple(img.shape[-2:]) == hw else F.interpolate(img[None], size=hw, mode="area")[0]
+                    for img in views
+                ]
+                for views in images
+            ]
+        return dict(
+            self.qwen.build_inputs(
+                images=images,
+                instructions=instructions,
+                action_prompt=self.replace_prompt,
+                embodied_prompt=self.embodied_replace_prompt,
+            )
+        )
+
     def _encode_qwen(
-        self, images: list[list[Tensor]], instructions: list[str], *, need_action_tokens: bool
+        self, qwen_inputs: dict[str, Tensor], *, need_action_tokens: bool
     ) -> tuple[Tensor, Tensor | None]:
         """Run Qwen and gather the embodied-action (and optionally action) token hidden states."""
-        qwen_inputs = self.qwen.build_inputs(
-            images=images,
-            instructions=instructions,
-            action_prompt=self.replace_prompt,
-            embodied_prompt=self.embodied_replace_prompt,
-        )
         input_ids = qwen_inputs["input_ids"]
         embodied_idx = (input_ids == self.embodied_action_token_id).nonzero(as_tuple=True)
         action_idx = None
@@ -333,7 +359,7 @@ class VLAJEPAModel(nn.Module):
         returns scalar losses.
         """
         embodied_action_tokens, action_tokens = self._encode_qwen(
-            images, instructions, need_action_tokens=self.config.enable_world_model
+            self.qwen_inputs(images, instructions), need_action_tokens=self.config.enable_world_model
         )
 
         if self.config.enable_world_model and videos is not None:
@@ -362,14 +388,20 @@ class VLAJEPAModel(nn.Module):
         noise: Tensor | None = None,
     ) -> Tensor:
         """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors."""
-        if self.config.resize_images_to is not None:
-            height, width = self.config.resize_images_to
-            images = [
-                [F.interpolate(img[None], size=(height, width), mode="area")[0] for img in views]
-                for views in images
-            ]
+        return self.predict_action_from_qwen_inputs(
+            self.qwen_inputs(images, instructions), state, noise=noise
+        )
 
-        embodied_action_tokens, _ = self._encode_qwen(images, instructions, need_action_tokens=False)
+    @torch.no_grad()
+    def predict_action_from_qwen_inputs(
+        self,
+        qwen_inputs: Mapping[str, Tensor],
+        state: Tensor | None = None,
+        *,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        """Predict an action chunk from the Qwen3-VL processor tensors that `qwen_inputs()` makes."""
+        embodied_action_tokens, _ = self._encode_qwen(qwen_inputs, need_action_tokens=False)
         return self.action_model.predict_action(
             embodied_action_tokens.float(), state.float() if state is not None else None, noise=noise
         )
@@ -511,14 +543,22 @@ class VLAJEPAPolicy(PreTrainedPolicy):
             if (pad := batch.get("action_is_pad")) is not None:
                 inputs["action_is_pad"] = pad
 
-        state = batch.get(OBS_STATE)
+        state = self._current_state(batch)
         if state is not None:
-            if state.ndim > 2:
-                # deltas are forward-looking here, so index 0 is the current observation, not -1.
-                state = state[:, 0, :]
-            inputs["state"] = (state.unsqueeze(1) if state.ndim == 2 else state).float()  # [B, 1, dim]
+            inputs["state"] = state
 
         return inputs
+
+    @staticmethod
+    def _current_state(batch: dict[str, Tensor]) -> Tensor | None:
+        """The batch's current `observation.state` as float [B, 1, state_dim], or None without one."""
+        state = batch.get(OBS_STATE)
+        if state is None:
+            return None
+        if state.ndim > 2:
+            # deltas are forward-looking here, so index 0 is the current observation, not -1.
+            state = state[:, 0, :]
+        return (state.unsqueeze(1) if state.ndim == 2 else state).float()  # [B, 1, dim]
 
     # ---- LeRobot Policy Interface ----
 
@@ -538,19 +578,40 @@ class VLAJEPAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.model.parameters()
 
+    def qwen_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """The Qwen3-VL processor tensors (`QWEN_INPUTS`) that `predict_action_chunk` takes for a batch."""
+        inputs = self._prepare_model_inputs(batch, training=False)
+        qwen_inputs = self.model.qwen_inputs(inputs["images"], inputs["instructions"])
+        return {key: qwen_inputs[key] for key in QWEN_INPUTS}
+
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        noise: Tensor | None = None,
+        qwen_inputs: Mapping[str, Tensor] | None = None,
+    ) -> Tensor:
         """LeRobot inference: convert → native predict → return as Tensor.
 
         `noise` is the starting sample of the flow, shaped `(batch_size, chunk_size, action_dim)`.
         When it is None, it is drawn with `torch.randn`.
+
+        `qwen_inputs` are the Qwen3-VL processor tensors that `qwen_inputs()` makes for this batch (all of
+        `QWEN_INPUTS`; `mm_token_type_ids` may be left out). With them, the batch's camera frames and task
+        are neither needed nor read, only its state. Without them, they are made here from the cameras and
+        the task.
         """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
-        inputs = self._prepare_model_inputs(batch, training=False)
-        actions = self.model.predict_action(
-            inputs["images"], inputs["instructions"], inputs.get("state"), noise=noise
+        if qwen_inputs is None:
+            inputs = self._prepare_model_inputs(batch, training=False)
+            qwen_inputs = self.model.qwen_inputs(inputs["images"], inputs["instructions"])
+        elif missing := [key for key in QWEN_INPUTS if key not in qwen_inputs]:
+            raise ValueError(f"qwen_inputs must hold all of {QWEN_INPUTS}, missing {missing}.")
+        actions = self.model.predict_action_from_qwen_inputs(
+            qwen_inputs, self._current_state(batch), noise=noise
         )
         return actions.to(device=self.config.device, dtype=torch.float32)
 
