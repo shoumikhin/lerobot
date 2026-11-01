@@ -366,6 +366,8 @@ class Natten3D(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rope(q, k)
+        # CUDA autocast keeps RMSNorm in float32, and NATTEN takes q, k and v in one dtype.
+        q, k = q.to(v.dtype), k.to(v.dtype)
 
         if t == 1:
             q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
