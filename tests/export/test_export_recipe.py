@@ -202,6 +202,51 @@ def test_replayed_draws_read_the_noise_in_order():
             torch.randn(1, 2)
 
 
+def test_replayed_draws_of_different_shapes_read_one_tensor_each():
+    noise = [torch.randn(1, 2), torch.randn(3)]
+    with ReplayDraws(noise) as draws:
+        drawn = [torch.randn(1, 2), torch.randn_like(torch.ones(3))]
+    assert all(map(torch.equal, drawn, noise)) and draws.shapes == [(1, 2), (3,)]
+    with (
+        pytest.raises(ValueError, match=r"Draw 1 reads noise shaped \[1, 2\], but the noise holds \[3\]"),
+        ReplayDraws(noise),
+    ):
+        torch.randn(1, 2)
+        torch.randn(1, 2)
+
+
+def test_replayed_integers_are_equally_likely():
+    noise = torch.randn(1, 2, 40000, 4, generator=torch.Generator().manual_seed(0))
+    with ReplayDraws(noise) as draws:
+        drawn = torch.randint(3, 7, size=(40000,))
+    assert draws.shapes == [(2, 40000, 4)] and drawn.dtype == torch.int64
+    counts = torch.bincount(drawn - 3, minlength=4) / 40000
+    torch.testing.assert_close(counts, torch.full((4,), 0.25), atol=0.01, rtol=0)
+
+
+def test_integers_are_drawn_as_usual_and_recorded_without_a_noise():
+    with ReplayDraws() as draws:
+        drawn = [
+            torch.randint(5, (2, 3)),
+            torch.randint(0, 5, size=(2,)),
+            torch.randint(low=1, high=4, size=(6,)),
+        ]
+    assert draws.shapes == [(2, 2, 3, 5), (2, 2, 5), (2, 6, 3)]
+    assert [tuple(x.shape) for x in drawn] == [(2, 3), (2,), (6,)]
+
+
+def test_a_program_draws_integers_from_its_noise_input():
+    class Pick(torch.nn.Module):
+        def forward(self, values: Tensor, noise: Tensor) -> Tensor:
+            with ReplayDraws(noise):
+                return values[torch.randint(0, 5, size=(2,))]
+
+    values, noise = torch.randn(5, 3), torch.randn(1, 2, 2, 5)
+    program = torch.export.export(Pick(), (values, noise))
+    assert "randint" not in str(program.graph)
+    assert torch.equal(program.module()(values, noise), Pick()(values, noise))
+
+
 def test_pytorch_samples_one_category_by_an_exponential_race():
     """What `ReplayDraws` relies on to sample categories as PyTorch does."""
     probs = torch.softmax(torch.randn(64, 16) / 0.3, -1)

@@ -20,7 +20,7 @@ import abc
 import inspect
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -72,6 +72,7 @@ _IMAGE_CELLS = (6, 8)
 _PROBE_TASKS = ("pick up the red cube", "stop")
 _RANDOM_NORMAL = {torch.randn, torch.randn_like, torch.normal, Tensor.normal_}
 _MULTINOMIAL = {torch.multinomial, Tensor.multinomial}
+_RANDOM_INTEGERS = {torch.randint}
 
 
 @dataclass
@@ -507,16 +508,18 @@ class ReplayDraws(TorchFunctionMode):
       `Tensor.normal_(mean, std)`, which also writes it into its tensor;
     - a multinomial draw of one category per row is made the way PyTorch makes it, `argmax(p / q)` with `q`
       exponentially distributed, and takes `q = (a**2 + b**2) / 2` from the two halves of `noise[k]`, shaped
-      `[2, *p.shape]`.
+      `[2, *p.shape]`;
+    - a random integer tensor `torch.randint(low, high, size)` draws each value like a category of
+      `high - low` equally likely ones, reading `noise[k]` shaped `[2, *size, high - low]`.
 
     Without a noise, the draws are made as usual and `shapes` records the shape each would read.
 
     Args:
-        noise (`Tensor`, *optional*):
-            The draws, stacked on the first axis.
+        noise (`Tensor` or `Sequence[Tensor]`, *optional*):
+            The draws, stacked on the first axis, or one tensor per draw for draws of different shapes.
     """
 
-    def __init__(self, noise: Tensor | None = None) -> None:
+    def __init__(self, noise: Tensor | Sequence[Tensor] | None = None) -> None:
         """Read the draws from `noise`, or make them as usual and record their shapes without one."""
         super().__init__()
         self.noise = noise
@@ -539,6 +542,15 @@ class ReplayDraws(TorchFunctionMode):
                 return func(*args, **kwargs)
             first, second = self._next((2, *probs.shape))
             return torch.argmax(probs / ((first * first + second * second) / 2), dim=-1, keepdim=True)
+        if func in _RANDOM_INTEGERS:
+            low, high, size = _integer_range(args, kwargs)
+            if self.noise is None:
+                self.shapes.append((2, *size, high - low))
+                return func(*args, **kwargs)
+            first, second = self._next((2, *size, high - low))
+            # The multinomial draw above with equal probabilities: the smallest exponential wins.
+            picked = torch.argmin(first * first + second * second, dim=-1)
+            return (low + picked).to(kwargs.get("dtype") or torch.int64)
         result = func(*args, **kwargs)
         if func in _RANDOM_NORMAL:
             if self.noise is None:
@@ -558,13 +570,26 @@ class ReplayDraws(TorchFunctionMode):
 
     def _next(self, shape: tuple[int, ...]) -> Tensor:
         drawn = len(self.shapes)
-        if self.noise is None or drawn == len(self.noise) or tuple(self.noise.shape[1:]) != shape:
+        if self.noise is None or drawn == len(self.noise):
             raise ValueError(
-                f"Draw {drawn} reads noise shaped {list(shape)}, which the noise "
-                f"{None if self.noise is None else list(self.noise.shape)} does not hold."
+                f"Draw {drawn} reads noise shaped {list(shape)}, but the noise holds only "
+                f"{0 if self.noise is None else len(self.noise)} draws."
+            )
+        if tuple(self.noise[drawn].shape) != shape:
+            raise ValueError(
+                f"Draw {drawn} reads noise shaped {list(shape)}, but the noise holds "
+                f"{list(self.noise[drawn].shape)} for it."
             )
         self.shapes.append(shape)
         return self.noise[drawn]
+
+
+def _integer_range(args: tuple, kwargs: dict[str, Any]) -> tuple[int, int, tuple[int, ...]]:
+    """The `low`, `high` and `size` of a call `torch.randint(high, size)` or `torch.randint(low, high, size)`."""
+    named = {"low", "high", "size"} & kwargs.keys()
+    order = ("low", "high", "size") if len(args) + len(named) == 3 else ("high", "size")
+    values = {"low": 0, **dict(zip(order, args, strict=False)), **{name: kwargs[name] for name in named}}
+    return values["low"], values["high"], tuple(values["size"])
 
 
 def _default_tolerance(policy: PreTrainedPolicy, bfloat16_tolerance: float) -> float:
