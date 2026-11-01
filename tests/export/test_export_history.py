@@ -20,7 +20,6 @@ same random draws, for many chunks, so both what it carries and the noise are ex
 """
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -43,7 +42,10 @@ from lerobot.processor import ProcessorStep, TransitionKey
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
-from tests.export import torch_backend  # noqa: F401  # registers torch_test for the in-process trace step
+from tests.export import (
+    tiny_multi_task_dit,
+    torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
+)
 from tests.export.backends import BACKENDS as EXECUTORCH_BACKENDS, GPU_BACKENDS
 from tests.export.plugins import use_plugins
 
@@ -145,9 +147,10 @@ def multi_task_dit_checkpoint(path, **sampler) -> None:
         num_layers=1,
         num_heads=2,
         timestep_embed_dim=16,
-        # CLIP takes 224 x 224 images; the policy resizes the camera's.
-        image_resize_shape=(224, 224),
+        # The tiny CLIP takes square images of its own size; the policy resizes the camera's.
+        image_resize_shape=(tiny_multi_task_dit.IMAGE_SIZE, tiny_multi_task_dit.IMAGE_SIZE),
         image_crop_shape=None,
+        tokenizer_max_length=8,
         device="cpu",
         **sampler,
     )
@@ -156,7 +159,9 @@ def multi_task_dit_checkpoint(path, **sampler) -> None:
         OBS_STATE: _min_max(2),
         ACTION: _min_max(2),
     }
-    _save(config, stats, path)
+    with pytest.MonkeyPatch.context() as patch:
+        tiny_multi_task_dit.use_tiny_clip(patch)
+        _save(config, stats, path)
 
 
 def tdmpc_checkpoint(path, features: dict[str, PolicyFeature], **changes) -> None:
@@ -205,21 +210,19 @@ class Checkpoint:
     """A tiny checkpoint that `save` writes into a folder, and how its bundle plays.
 
     The bundle is exported with each of `backends`, and is reset with the policy at the tick `reset_at`.
-    `programs` are the bundle's program files, if checked.
+    `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. `programs` are the
+    bundle's program files, if checked.
     """
 
     save: Callable[[Path], object]
     backends: tuple[str, ...] = ("torch_test", "executorch_xnnpack", "executorch_tensorrt")
     reset_at: int | None = None
+    plugins: tuple[str, ...] = ()
+    tiny: Callable[[pytest.MonkeyPatch], None] | None = None
     programs: list[str] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
-# Multi-Task DiT loads its CLIP encoders from the Hub, so like its own tests it does not run in CI.
-CLIP = pytest.mark.skipif(
-    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="Multi-Task DiT downloads CLIP from the Hub",
-)
 # Diffusion Policy and Multi-Task DiT sample with the schedulers of diffusers, an optional package.
 DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="diffusers not installed")
 # Multi-Task DiT also encodes the task and the images with CLIP from transformers.
@@ -254,7 +257,9 @@ CHECKPOINTS = {
     ),
     "multi_task_dit_flow": Checkpoint(
         lambda path: multi_task_dit_checkpoint(path, objective="flow_matching", num_integration_steps=5),
-        marks=(CLIP, DIFFUSERS, TRANSFORMERS),
+        plugins=("tiny_multi_task_dit",),
+        tiny=tiny_multi_task_dit.use_tiny_clip,
+        marks=(DIFFUSERS, TRANSFORMERS),
     ),
     # The defaults: the first action of each plan, repeated.
     "tdmpc_repeats": Checkpoint(
@@ -278,6 +283,8 @@ CHECKPOINTS = {
 def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> list[float]:
     """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws, in
     normalized action units."""
+    if checkpoint.tiny is not None:
+        checkpoint.tiny(monkeypatch)
     policy = get_policy_class(PreTrainedConfig.from_pretrained(path).type).from_pretrained(path)
     reference = SyncInferenceEngine(
         policy, *make_pre_post_processors(policy.config, path), {}, [], bundle.manifest.task or "", "cpu", ""
@@ -340,7 +347,7 @@ def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> lis
 def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp_path, monkeypatch):
     checkpoint, path = CHECKPOINTS[name], tmp_path / "checkpoint"
     checkpoint.save(path)
-    use_plugins(monkeypatch, "torch_backend")
+    use_plugins(monkeypatch, "torch_backend", *checkpoint.plugins)
     export(
         [
             f"--backend.type={backend}",
