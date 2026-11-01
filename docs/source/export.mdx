@@ -310,6 +310,8 @@ Some policies keep a value from one chunk to the next, such as a planner that st
 
 TD-MPC is such a planner. It plans each chunk by refining a guess over a few rounds, and starts that guess from where its previous plan ended, or from zeros after a reset. Its random numbers come from the bundle's `noise`, like those of the policies above.
 
+Some policies also compute their first chunks after a reset in another way, such as one that builds a cache from its first frames. Their bundle lists the runs of those chunks under `first_runs`, one list per chunk, and later chunks run `runs`. A value that the first chunk writes, in its own type and on its own device, is listed under `carry` without a shape, so it never starts from zeros. The test case of such a bundle plays a few chunks from a reset tick by tick, as a robot would, and holds the action played at each tick, so the check covers every chunk.
+
 ### Tasks
 
 A vision-language-action policy reads a task such as "pick up the cube". To read it, the policy first splits the text into **tokens** (word pieces) with its **tokenizer**, and looks up a vector for each token in its **embedding table**. A compiled program cannot run a tokenizer, so a bundle handles the task in one of two ways:

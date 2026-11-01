@@ -650,3 +650,31 @@ def test_a_recipe_carries_values_from_chunk_to_chunk(checkpoint, tmp_path, monke
     # Two chunks, the second reading what the first carried, each with the noise the bundle draws.
     actions = np.stack([engine.get_action(dict(frame)) for _ in range(8)])
     assert actions.shape == (8, 3) and np.isfinite(actions).all()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported to start the sum of its noises in a first chunk of its own: the check plays three chunks."""
+    use_plugins(monkeypatch, "first_runs_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.carry == {"noise_total": None} and manifest.noise_shape == [4, 1]
+    (first,) = manifest.first_runs
+    assert first[-1].program == "begin" and manifest.runs[-1].program == "model"
+    # On a GPU every chunk draws its noise first, in a run of its own.
+    draws = [runs[0].outputs == [NOISE] for runs in (first, manifest.runs)]
+    assert draws == [backend == "executorch_cuda"] * 2
+    case = load_file(tmp_path / "b" / manifest.test_case)
+    assert (
+        case[IMAGE].shape == (12, 32, 32, 3)
+        and case[ACTION].shape == (12, 3)
+        and case[NOISE].shape == (3, 4, 1)
+    )
+    engine = BundleEngine(Bundle.read(tmp_path / "b"))
+    rng = np.random.default_rng(0)
+    frame = {
+        IMAGE: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+        OBS_STATE: rng.random(3, dtype=np.float32),
+    }
+    actions = np.stack([engine.get_action(dict(frame)) for _ in range(8)])
+    assert actions.shape == (8, 3) and np.isfinite(actions).all()

@@ -108,12 +108,14 @@ class TestCase:
             The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
             `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
             actions are those computed at the last one. For one whose plan has a `carry`, likewise the frames of
-            several chunks, each one's first tick; the actions are those of the last chunk.
+            several chunks, each one's first tick; the actions are those of the last chunk. For one whose plan
+            has `first_runs`, the frames of every tick of several chunks from a reset.
         noise (`np.ndarray`, *optional*):
-            The starting noise, for a policy that takes one. With a `carry`, the noise of each chunk, stacked on
-            a new first axis like the frames.
+            The starting noise, for a policy that takes one. With a `carry` or `first_runs`, the noise of each
+            chunk, stacked on a new first axis like the frames.
         actions (`np.ndarray`):
-            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`.
+            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`. With
+            `first_runs`, the action played at each tick.
         action_scale (`np.ndarray`):
             For each action component, the robot units of one step of the policy's normalized actions.
     """
@@ -174,6 +176,9 @@ class RunPlan:
             The runs in order, each naming the part it runs as its program. A part may run several times, for
             example a denoising step. `None` runs each part once, in the order it was yielded, with its own
             names.
+        first_runs (`list[list[ProgramRun]]`):
+            The runs of each of the first chunks after a reset, for a policy whose first chunks compute
+            otherwise (see `BundleManifest.first_runs`).
         constants (`dict[str, np.ndarray]`):
             Named arrays the runs can read, such as each step's timestep.
         task_tokens (`TaskTokenData`, *optional*):
@@ -185,17 +190,18 @@ class RunPlan:
         history (`dict[str, int]`):
             For each key of the frame the parts read with its past values, how many frames: the parts take it
             as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
-        carry (`dict[str, tuple[int, ...]]`):
-            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset
-            (see `BundleManifest.carry`).
+        carry (`dict[str, tuple[int, ...] | None]`):
+            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset,
+            or, without a shape, what the first chunk's runs write (see `BundleManifest.carry`).
     """
 
     runs: list[ProgramRun] | None = None
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
     action_tokens: ActionTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)
-    carry: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    carry: dict[str, tuple[int, ...] | None] = field(default_factory=dict)
 
 
 class ExportRecipe(abc.ABC):
