@@ -37,43 +37,20 @@ from ..utils import resolve_weights
 from .positional import prc_vid, scatter_ids, times_to_ids
 
 if TYPE_CHECKING or _natten_available:
-    from natten import backends as nb
     from natten.functional import na2d, na3d
 
 logger = logging.getLogger(__name__)
 
 _norm_layer = partial(nn.LayerNorm, eps=1e-5)
 
-# NATTEN neighborhood-attention backend, resolved at first use per tensor
-# layout (2D/3D). Prebuilt NATTEN wheels only carry fused CUTLASS kernels for
-# some GPU architectures, so the fastest supported backend is probed at
-# runtime: blackwell (SM100) > hopper (SM90) > generic CUTLASS > flex-attention
-# (pure torch, runs everywhere at a speed/memory cost). Set $F3_NATTEN_BACKEND
-# (blackwell-fna | hopper-fna | cutlass-fna | flex-fna) to override.
+# NATTEN picks the fastest backend the GPU and the wheel support on every call (blackwell > hopper > CUTLASS >
+# flex-attention). Set $F3_NATTEN_BACKEND (blackwell-fna | hopper-fna | cutlass-fna | flex-fna) to choose one.
 _NATTEN_BACKEND_ENV = "F3_NATTEN_BACKEND"
-_PERSISTENT_KERNEL_BACKENDS = ("blackwell-fna", "hopper-fna")
-_natten_backends: dict[int, str] = {}
 
 
-def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
-    backend = _natten_backends.get(q.ndim)
-    if backend is None:
-        backend = os.environ.get(_NATTEN_BACKEND_ENV)
-        if not backend:
-            if nb.can_run_cutlass_blackwell_fna(q, k, v):
-                backend = "blackwell-fna"
-            elif nb.can_run_cutlass_hopper_fna(q, k, v):
-                backend = "hopper-fna"
-            elif nb.can_run_cutlass_fna(q, k, v):
-                backend = "cutlass-fna"
-            else:
-                backend = "flex-fna"  # universal fallback, no compiled kernels needed
-        logger.info("natten backend (%dD tokens): %s", q.ndim - 3, backend)
-        _natten_backends[q.ndim] = backend
-    kwargs: dict[str, str | bool] = {"backend": backend}
-    if backend in _PERSISTENT_KERNEL_BACKENDS:
-        kwargs["run_persistent_kernel"] = True
-    return kwargs
+def _natten_kernel_kwargs() -> dict[str, str]:
+    backend = os.environ.get(_NATTEN_BACKEND_ENV)
+    return {"backend": backend} if backend else {}
 
 
 @dataclass
@@ -374,7 +351,7 @@ class Natten3D(nn.Module):
                 k2,
                 v2,
                 kernel_size=self.window_size[1:],
-                attention_kwargs=_natten_attention_kwargs(q2, k2, v2),
+                **_natten_kernel_kwargs(),
             ).unsqueeze(1)
         else:
             out = na3d(
@@ -383,7 +360,7 @@ class Natten3D(nn.Module):
                 v,
                 is_causal=[self.causal, False, False],
                 kernel_size=self.window_size,
-                attention_kwargs=_natten_attention_kwargs(q, k, v),
+                **_natten_kernel_kwargs(),
             )
         out = out.reshape(b, t, h, w, c)
         return self.proj(out)

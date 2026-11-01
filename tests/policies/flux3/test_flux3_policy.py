@@ -48,6 +48,7 @@ from lerobot.policies.flux3.f3 import (
     packing,
     sampling,
     stream_of_key,
+    video_vae,
 )
 from lerobot.policies.flux3.f3.wiring import (
     head_parameter_names,
@@ -503,6 +504,25 @@ def test_frozen_warmup_constant_scheduler():
         freeze_steps=0, num_warmup_steps=0, warmup_steps_heads=0, cooldown_steps=10
     ).lr_lambda(0, 0, cooldown=10, total_steps=100)
     assert cool(89) == 1.0 and math.isclose(cool(95), 0.5)
+
+
+@pytest.mark.parametrize("frames", [1, 3])
+@pytest.mark.parametrize("backend", [None, "flex-fna"])
+def test_natten_kernels_get_the_backend_of_the_environment(frames, backend, monkeypatch):
+    calls = []
+
+    def kernel(q, k, v, kernel_size, is_causal=None, backend=None):  # stands in for NATTEN's na2d and na3d
+        calls.append(backend)
+        return v
+
+    monkeypatch.setattr(video_vae, "na2d", kernel, raising=False)
+    monkeypatch.setattr(video_vae, "na3d", kernel, raising=False)
+    if backend is None:
+        monkeypatch.delenv("F3_NATTEN_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("F3_NATTEN_BACKEND", backend)
+    video_vae.Natten3D(16, [3, 3, 3], 2)(torch.randn(1, frames, 4, 4, 16))
+    assert calls == [backend]
 
 
 # ---------------------------------------------------------------- tiny end-to-end model
