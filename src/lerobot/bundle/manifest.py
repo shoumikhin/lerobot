@@ -175,6 +175,11 @@ class BundleManifest:
             reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
             only. The test case then holds the frames of several control ticks in each frame value, oldest first,
             and the actions computed at the last one.
+        carry (`dict[str, list[int]]`, *optional*):
+            The values the runs pass from one chunk to the next, by name, with their shapes, such as the warm
+            start of a planner. After a reset each is float32 zeros. The runs read one like any value, and what
+            it holds after the last run is what the next chunk reads. The test case then holds the frame values
+            and the noise of several chunks, oldest first, and the actions of the last chunk.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -204,6 +209,7 @@ class BundleManifest:
     task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
     history: dict[str, int] = field(default_factory=dict)
+    carry: dict[str, list[int]] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -224,6 +230,11 @@ class BundleManifest:
             raise ValueError("The manifest lists no run.")
         if not all(type(n) is int and n > 0 for n in self.history.values()):
             raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
+        if not all(
+            isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape)
+            for shape in self.carry.values()
+        ):
+            raise ValueError(f"The carry must give each value a shape of whole numbers, not {self.carry}.")
         names = [run.name for run in self.runs]
         if len(set(names)) != len(names):
             raise ValueError(f"The manifest names a run twice: {names}.")
@@ -332,6 +343,7 @@ def _check_form(data: dict[str, Any]) -> None:
             and task_tokens["max_tokens"] > 0
         ),
         "history": isinstance(data.get("history", {}), dict),
+        "carry": isinstance(data.get("carry", {}), dict),
     }
     if wrong := [name for name, right in form.items() if not right]:
         raise ValueError(
