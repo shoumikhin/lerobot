@@ -61,7 +61,7 @@ class BundleEngine:
     It is an
     [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the same
     helpers as `lerobot-rollout`, and like `SyncInferenceEngine` it times each run of its programs in
-    `latency` for the status log.
+    `latency` for the status log. `chunk_length` is the number of actions of each chunk after the first ones.
 
     Args:
         bundle (`Bundle`):
@@ -187,15 +187,13 @@ class BundleEngine:
         # The runs of each chunk since a reset; the last list runs for every chunk after the first ones.
         self._chunk_runs = [[(run, programs[run.program]) for run in runs] for runs in chunks]
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
-        # So do the values of the task, which stays the same for the whole run: first those of the exported
+        # So do the values of the task, which stays the same until `set_task`: first those of the exported
         # task, which the test case runs.
         exported = {**constants, **self._encode(self._fixed_task or "")}
         self._placed = [self._place(runs, exported) for runs in self._chunk_runs]
-        self._check(frames, noise, expected, manifest.tolerance)
+        self.chunk_length = self._check(frames, noise, expected, manifest.tolerance)
         if task != (self._fixed_task or ""):
-            for runs, placed_runs in zip(self._chunk_runs, self._placed, strict=True):
-                for placed, task_placed in zip(placed_runs, self._place(runs, task_values), strict=True):
-                    placed.update(task_placed)
+            self._place_task(task_values)
         logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
 
     def check_frame(self, frame: Mapping[str, np.ndarray]) -> None:
@@ -311,7 +309,8 @@ class BundleEngine:
 
     def _check(
         self, frames: list[dict], noise: np.ndarray | None, expected: np.ndarray, tolerance: float
-    ) -> None:
+    ) -> int:
+        """Replay the test case as the robot would, and return the number of actions of a chunk."""
         # The test case's noise stands in for a draw when the chunks replay, so each draw runs once here.
         draws = {
             id(program): program for runs in self._chunk_runs for run, program in runs if NOISE in run.outputs
@@ -320,7 +319,7 @@ class BundleEngine:
             _check_noise_draw(program.to_numpy(program()[0]), self._noise_shape)
         first_runs = len(self._chunk_runs) > 1
         if first_runs:
-            actual = self._play(frames, noise)
+            actual, chunk_length = self._play(frames, noise)
         elif self._carry_shapes:
             # A chunk at each frame, so the last one reads what the chunks before it passed on.
             for index, frame in enumerate(frames):
@@ -330,6 +329,8 @@ class BundleEngine:
             for frame in frames:
                 self._observe(frame)
             actual = self._run_chunk(frames[-1], noise)
+        if not first_runs:
+            chunk_length = len(actual)
         self.reset()
         if actual.shape != expected.shape:
             raise RuntimeError(
@@ -343,11 +344,12 @@ class BundleEngine:
                 f"The exported policy does not reproduce its test case ({error:.2e} > {tolerance}). "
                 "Export it again on this device."
             )
+        return chunk_length
 
-    def _play(self, frames: list[dict], noise: np.ndarray | None) -> np.ndarray:
-        """The action played at each of `frames` from a reset, as `get_action` plays them.
+    def _play(self, frames: list[dict], noise: np.ndarray | None) -> tuple[np.ndarray, int]:
+        """The action played at each of `frames` from a reset, as `get_action` plays them, and the chunk length.
 
-        Each chunk reads the next of `noise`.
+        Each chunk reads the next of `noise`. The chunk length is the number of actions of the last chunk.
         """
         played = []
         chunks = 0
@@ -359,7 +361,8 @@ class BundleEngine:
                         f"The bundle's test case holds the noise of {len(noise)} chunks, but its ticks play "
                         "more. Export the policy again."
                     )
-                self._actions.extend(self._run_chunk(frame, None if noise is None else noise[chunks]))
+                chunk = self._run_chunk(frame, None if noise is None else noise[chunks])
+                self._actions.extend(chunk)
                 chunks += 1
             played.append(self._actions.popleft())
         if noise is not None and chunks != len(noise):
@@ -372,7 +375,7 @@ class BundleEngine:
                 f"The bundle's test case plays {chunks} chunks, all of them first runs, so the runs of every "
                 "later chunk would first run on the robot. Export the policy again."
             )
-        return np.stack(played)
+        return np.stack(played), len(chunk)
 
     @staticmethod
     def _place(
@@ -406,7 +409,7 @@ class BundleEngine:
 
     @property
     def task(self) -> str:
-        """The task the programs run, set when the bundle loads."""
+        """The task the programs run, set when the bundle loads and by `set_task`."""
         return self._task
 
     def dispatch_allowed(self) -> bool:
@@ -418,6 +421,53 @@ class BundleEngine:
 
     def record_dispatch(self) -> None:
         """Inline inference has nothing to do when an action reaches the robot."""
+
+    @property
+    def frame_dtypes(self) -> dict[str, str]:
+        """The observations the bundle reads, by the bundle's names, with the dtype its programs take."""
+        return {name: str(dtype) for name, dtype in self._frame_dtypes.items()}
+
+    @property
+    def frame_shapes(self) -> dict[str, tuple[int, ...]]:
+        """The observations the bundle reads, by the bundle's names, with the shape of one frame.
+
+        A bundle with `history` stacks the past frames of a key on a new first axis for its programs.
+        """
+        return dict(self._frame_spec)
+
+    @property
+    def action_names(self) -> list[str] | None:
+        """The components of each action, in order, when the export named them."""
+        return self._action_names
+
+    @property
+    def action_dim(self) -> int:
+        """The number of components of each action."""
+        return len(self._scale)
+
+    def set_task(self, task: str) -> None:
+        """Run `task` from the next chunk on. A bundle without `task_tokens` runs only its own task."""
+        self._check_task(task)
+        values = self._encode(task)
+        self._place_task(values)
+        self._task = task
+
+    def _place_task(self, values: Mapping[str, np.ndarray]) -> None:
+        # All placed before any is kept, so a failure leaves the task that runs whole.
+        placements = [self._place(runs, values) for runs in self._chunk_runs]
+        for placed_runs, task_placed_runs in zip(self._placed, placements, strict=True):
+            for placed, task_placed in zip(placed_runs, task_placed_runs, strict=True):
+                placed.update(task_placed)
+
+    def predict_chunk(self, obs_frame: Mapping[str, np.ndarray]) -> np.ndarray:
+        """Run the programs once on a frame of the robot and return the whole chunk of actions.
+
+        For a caller that plays the chunk itself, such as a policy server. A bundle with `history` takes each
+        call as one control tick.
+        """
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
+        return self._run_chunk(frame)
 
     def reset(self) -> None:
         """Drop the queued actions and the past frames, and start the carried values and the chunks again."""

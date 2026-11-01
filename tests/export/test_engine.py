@@ -106,6 +106,7 @@ def _noisy_bundle(folder: Path) -> Bundle:
 
 def test_engine_plays_a_chunk_then_runs_again(tmp_path):
     engine = BundleEngine(_chunk_bundle(tmp_path / "bundle"))
+    assert engine.chunk_length == 3
     # No frame yet, so the control loop holds; no chunk runs.
     assert engine.get_action(None) is None
     actions = [engine.get_action({OBS_STATE: np.ones(3, np.float32)}) for _ in range(4)]
@@ -636,6 +637,8 @@ def _first_runs_bundle(folder, expected: np.ndarray | None = None, noise: np.nda
 
 def test_engine_runs_the_first_chunks_after_a_reset_with_their_own_runs(tmp_path):
     engine = BundleEngine(_first_runs_bundle(tmp_path / "bundle"))
+    # The chunks after the first one, not the 5 ticks of the test case.
+    assert engine.chunk_length == 2
     states = _states(10, 20, 30, 40, 50, 60)
     np.random.seed(0)
     actions = [engine.get_action({OBS_STATE: state}) for state in states[:4]]
