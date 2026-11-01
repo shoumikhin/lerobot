@@ -67,6 +67,13 @@ def get_dtype_from_parameters(module: nn.Module) -> torch.dtype:
     return next(iter(module.parameters())).dtype
 
 
+def is_exporting() -> bool:
+    """Whether non-strict `torch.export` is tracing: not eager mode, `torch.compile` or strict export."""
+    # torch.compile and strict export run Dynamo. PyTorch 2.11 also reports is_exporting() under torch.compile
+    # (pytorch/pytorch#176347, fixed in 2.12 by pytorch/pytorch#176499).
+    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
+
+
 def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
     """
     Calculates the output shape of a PyTorch module given an input shape.
