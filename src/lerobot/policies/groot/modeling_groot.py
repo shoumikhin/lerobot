@@ -148,6 +148,34 @@ class GrootPolicy(PreTrainedPolicy):
 
     def _create_groot_model(self) -> GR00TN17:
         """Create and initialize the GR00T N1.7 model using the ported components."""
+        if self.config.pretrained_path is not None and os.environ.get("GROOT_PROTO_CONVENTION") == "1":
+            from transformers.initialization import no_init_weights
+
+            groot_config = GR00TN17Config.from_pretrained(
+                self._base_config_path, **self._groot_config_overrides(self.config)
+            )
+            build_kwargs: dict[str, Any] = {}
+            if self.config.dtype == torch.float32:
+                build_kwargs["dtype"] = torch.float32
+            with no_init_weights():
+                model = GR00TN17._from_config(
+                    groot_config, load_backbone_weights=False, transformers_loading_kwargs={}, **build_kwargs
+                )
+            tuning = self._groot_tuning_kwargs(self.config)
+            model.backbone.set_trainable_parameters(
+                tune_visual=tuning["tune_visual"],
+                tune_llm=tuning["tune_llm"],
+                tune_top_llm_layers=model.config.tune_top_llm_layers,
+            )
+            model.action_head.set_trainable_parameters(
+                tune_projector=tuning["tune_projector"],
+                tune_diffusion_model=tuning["tune_diffusion_model"],
+                tune_vlln=tuning["tune_vlln"],
+            )
+            _tie_unused_qwen_lm_head(model.backbone.model)
+            if self.config.dtype == torch.float32:
+                self._cast_model_parameters_to_fp32(model)
+            return model
         model = GR00TN17.from_pretrained(
             pretrained_model_name_or_path=self.config.base_model_path,
             # The same files the horizon reads and a save writes, so a save describes the model built here.
@@ -418,7 +446,9 @@ class GrootPolicy(PreTrainedPolicy):
             )
             policy = None
             try:
-                if force_download and not os.path.isdir(model_id):
+                if os.environ.get("GROOT_PROTO_CONVENTION") == "1":
+                    pass
+                elif force_download and not os.path.isdir(model_id):
                     # The weights above were downloaded without forcing, so only the regular load honors
                     # force_download. A local folder has nothing to download.
                     logger.info("force_download is set, so the checkpoint loads the regular way.")
