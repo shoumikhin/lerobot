@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The recipes of the policies that read past frames, end to end on tiny checkpoints.
+"""The recipes of the policies that carry something from frame to frame, end to end on tiny checkpoints: past
+frames or a warm-started plan.
 
 Each bundle is played next to the PyTorch policy in `lerobot-rollout`'s engines, on the same frames and the
-same random draws, for more ticks than one chunk, so both the history and the noise are exercised.
+same random draws, for many chunks, so both what it carries and the noise are exercised.
 """
 
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -40,7 +42,7 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.common.export_history import HistoryChunkRecipe
 from lerobot.policies.factory import get_policy_class
 from lerobot.scripts.lerobot_export import export
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export import torch_backend  # noqa: F401  # registers torch_test for the in-process trace step
 from tests.export.plugins import use_plugins
@@ -51,11 +53,16 @@ IMAGE = "observation.images.front"
 FRAME = (96, 96)
 CROP = (84, 84)
 TASK = "pick up the cube"
-TICKS = 20
+TICKS = 24
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
 BACKENDS = {
     "torch_test": [],
     "executorch_xnnpack": [pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")],
+    "executorch_cuda": [
+        pytest.mark.skipif(
+            not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch and a CUDA GPU"
+        )
+    ],
     "executorch_tensorrt": [
         pytest.mark.skipif(
             not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch and a CUDA GPU"
@@ -66,7 +73,7 @@ BACKENDS = {
         ),
     ],
 }
-GPU_BACKENDS = ("executorch_tensorrt",)
+GPU_BACKENDS = ("executorch_cuda", "executorch_tensorrt")
 
 
 def _min_max(size: int) -> dict[str, torch.Tensor]:
@@ -170,6 +177,30 @@ def multi_task_dit_checkpoint(path, **sampler) -> None:
     _save(config, stats, path)
 
 
+def tdmpc_checkpoint(path, features: dict[str, PolicyFeature], **changes) -> None:
+    from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+
+    config = TDMPCConfig(
+        input_features=features,
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))},
+        image_encoder_hidden_dim=8,
+        state_encoder_hidden_dim=16,
+        latent_dim=8,
+        mlp_dim=16,
+        horizon=3,
+        cem_iterations=2,
+        n_gaussian_samples=16,
+        n_pi_samples=4,
+        n_elites=4,
+        # More than two, so the planner also draws which of them value the end of each trajectory.
+        q_ensemble_size=3,
+        device="cpu",
+        **changes,
+    )
+    stats = {ACTION: {"min": torch.full((2,), -2.0), "max": torch.full((2,), 3.0)}}
+    _save(config, stats, path)
+
+
 def _save(config, stats, path) -> None:
     torch.manual_seed(0)
     policy = get_policy_class(config.type)(config)
@@ -178,6 +209,10 @@ def _save(config, stats, path) -> None:
         for name, parameter in policy.named_parameters():
             if "adaLN_modulation" in name:
                 torch.nn.init.normal_(parameter, std=0.1)
+    if config.type == "tdmpc":
+        # Untrained, the reward and value heads are zero, so every trajectory would score the same.
+        for head in [policy.model._reward, *policy.model._Qs]:
+            torch.nn.init.normal_(head[-1].weight)
     policy.save_pretrained(path)
     for processor in make_pre_post_processors(config, dataset_stats=stats):
         processor.save_pretrained(path)
@@ -185,9 +220,15 @@ def _save(config, stats, path) -> None:
 
 @dataclass
 class Checkpoint:
-    """A tiny checkpoint that `save` writes into a folder, and the `programs` its bundle holds, if checked."""
+    """A tiny checkpoint that `save` writes into a folder, and how its bundle plays.
+
+    The bundle is exported with each of `backends`, and is reset with the policy at the tick `reset_at`.
+    `programs` are the bundle's program files, if checked.
+    """
 
     save: Callable[[Path], object]
+    backends: tuple[str, ...] = ("torch_test", "executorch_xnnpack", "executorch_tensorrt")
+    reset_at: int | None = None
     programs: list[str] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
@@ -203,6 +244,17 @@ DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="di
 TRANSFORMERS = pytest.mark.skipif(
     not is_package_available("transformers"), reason="transformers not installed"
 )
+# TD-MPC's image encoder needs a square image of at least 64 pixels.
+TDMPC_CAMERA = {
+    OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+    OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+}
+TDMPC_KEYPOINTS = {
+    OBS_ENV_STATE: PolicyFeature(type=FeatureType.ENV, shape=(4,)),
+    OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+}
+# Within the first chunk after it, so the bundle and the policy both start planning again from nothing.
+TDMPC_RESET = 13
 CHECKPOINTS = {
     "vqbet": Checkpoint(vqbet_checkpoint),
     "diffusion": Checkpoint(
@@ -219,10 +271,26 @@ CHECKPOINTS = {
         lambda path: multi_task_dit_checkpoint(path, objective="flow_matching", num_integration_steps=5),
         marks=(CLIP, DIFFUSERS, TRANSFORMERS),
     ),
+    # The defaults: the first action of each plan, repeated.
+    "tdmpc_repeats": Checkpoint(
+        lambda path: tdmpc_checkpoint(path, TDMPC_CAMERA),
+        ("torch_test", "executorch_xnnpack", *GPU_BACKENDS),
+        reset_at=TDMPC_RESET,
+    ),
+    "tdmpc_steps": Checkpoint(
+        lambda path: tdmpc_checkpoint(path, TDMPC_KEYPOINTS, n_action_repeats=1, n_action_steps=2),
+        ("torch_test", "executorch_xnnpack"),
+        reset_at=TDMPC_RESET,
+    ),
+    "tdmpc_policy_only": Checkpoint(
+        lambda path: tdmpc_checkpoint(path, TDMPC_CAMERA, use_mpc=False),
+        ("torch_test", "executorch_xnnpack"),
+        reset_at=TDMPC_RESET,
+    ),
 }
 
 
-def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
+def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> list[float]:
     """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws, in
     normalized action units."""
     policy = get_policy_class(PreTrainedConfig.from_pretrained(path).type).from_pretrained(path)
@@ -240,24 +308,36 @@ def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
         }
         for _ in range(TICKS)
     ]
+    with ReplayDraws() as recorded:
+        reference.get_action(dict(frames[0]))
+    reference.reset()
+    shapes = recorded.shapes
     engine = BundleEngine(bundle)
     draws: list[np.ndarray] = []
-    standard_normal = np.random.standard_normal
+    # Seeded, so every run replays the same draws: the TD-MPC planner picks among candidates, and on another
+    # draw two of them could score close enough for rounding to pick another one.
+    standard_normal = np.random.default_rng(1).standard_normal
     monkeypatch.setattr(
         np.random, "standard_normal", lambda shape: draws.append(standard_normal(shape)) or draws[-1]
     )
     scale = np.asarray(bundle.manifest.action_scale, dtype=np.float32)
     differences = []
-    for frame in frames:
+    for tick, frame in enumerate(frames):
+        if tick == checkpoint.reset_at:
+            engine.reset()
+            reference.reset()
         drawn = len(draws)
         actual = engine.get_action(dict(frame))
         if len(draws) == drawn:
             expected = reference.get_action(dict(frame))
         else:
-            noise = torch.from_numpy(draws[-1].astype(np.float32))
-            with ReplayDraws(noise) as replay:
+            noise = torch.from_numpy(draws[-1].astype(np.float32)).flatten()
+            pieces = noise.split([math.prod(shape) for shape in shapes])
+            with ReplayDraws(
+                [piece.view(shape) for piece, shape in zip(pieces, shapes, strict=True)]
+            ) as replay:
                 expected = reference.get_action(dict(frame))
-            assert len(replay.shapes) == len(noise)
+            assert len(replay.shapes) == len(shapes)
         differences.append(float((np.abs(actual - expected.numpy()) / scale).max()))
     return differences
 
@@ -267,7 +347,7 @@ def play(path: Path, bundle: Bundle, monkeypatch) -> list[float]:
     [
         pytest.param(name, backend, marks=[*checkpoint.marks, *BACKENDS[backend]])
         for name, checkpoint in CHECKPOINTS.items()
-        for backend in BACKENDS
+        for backend in checkpoint.backends
     ],
 )
 def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp_path, monkeypatch):
@@ -286,13 +366,13 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
     bundle = Bundle.read(tmp_path / "b")
     if backend in GPU_BACKENDS:
         # The GPU draws the noise, which the PyTorch policy cannot replay, so the export's own check of the
-        # test case, made with the recorded noise, is the comparison.
+        # test case, made with the recorded noise of each chunk, is the comparison.
         assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
         return
     if checkpoint.programs is not None:
         assert sorted(bundle.manifest.programs) == checkpoint.programs
     # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
-    assert max(play(path, bundle, monkeypatch)) <= bundle.manifest.tolerance
+    assert max(play(checkpoint, path, bundle, monkeypatch)) <= bundle.manifest.tolerance
 
 
 @DIFFUSERS
