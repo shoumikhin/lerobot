@@ -106,9 +106,11 @@ class TestCase:
         frame (`dict[str, np.ndarray]`):
             The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
             `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
-            actions are those computed at the last one.
+            actions are those computed at the last one. For one whose plan has a `carry`, likewise the frames of
+            several chunks, each one's first tick; the actions are those of the last chunk.
         noise (`np.ndarray`, *optional*):
-            The starting noise, for a policy that takes one.
+            The starting noise, for a policy that takes one. With a `carry`, the noise of each chunk, stacked on
+            a new first axis like the frames.
         actions (`np.ndarray`):
             The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`.
         action_scale (`np.ndarray`):
@@ -164,12 +166,16 @@ class RunPlan:
         history (`dict[str, int]`):
             For each key of the frame the parts read with its past values, how many frames: the parts take it
             as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
+        carry (`dict[str, tuple[int, ...]]`):
+            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset
+            (see `BundleManifest.carry`).
     """
 
     runs: list[ProgramRun] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)
+    carry: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 class ExportRecipe(abc.ABC):
