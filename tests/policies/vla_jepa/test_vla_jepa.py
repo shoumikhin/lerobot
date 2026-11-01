@@ -48,9 +48,12 @@ from conftest import (  # noqa: E402
     make_train_batch,
     set_seed_all,
 )
+from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid  # noqa: E402
 from lerobot.policies.vla_jepa.configuration_vla_jepa import VLAJEPAConfig  # noqa: E402
 from lerobot.policies.vla_jepa.modeling_vla_jepa import QWEN_INPUTS, VLAJEPAModel, VLAJEPAPolicy  # noqa: E402
-from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE  # noqa: E402
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load  # noqa: E402
+from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK_NODES  # noqa: E402
 
 PRETRAINED_REPO_ID = "ginwind/VLA-JEPA"
 PRETRAINED_SUBFOLDER = "LIBERO"
@@ -186,11 +189,18 @@ def test_predict_action_chunk_always_finite(patch_vla_jepa_external_models: None
         assert torch.isfinite(chunk).all(), f"non-finite actions with seed={seed}"
 
 
-def _tiny_qwen_policy(config: VLAJEPAConfig) -> tuple[VLAJEPAPolicy, dict, Tensor]:
-    """The policy on the tiny Qwen3-VL, a batch of two prompts of different lengths, and its noise."""
+def _tiny_qwen_policy(config: VLAJEPAConfig, wrist: bool = False) -> tuple[VLAJEPAPolicy, dict, Tensor]:
+    """The policy on the tiny Qwen3-VL, a batch of two prompts of different lengths, and its noise.
+
+    `wrist` adds a second camera.
+    """
+    if wrist:
+        config.input_features[WRIST] = config.input_features[f"{OBS_IMAGES}.laptop"]
     set_seed_all(0)
     policy = VLAJEPAPolicy(config).eval()
     batch = make_inference_batch(image_size=TINY_QWEN_IMAGE_SIZE)
+    if wrist:
+        batch[WRIST] = torch.rand(BATCH_SIZE, 3, TINY_QWEN_IMAGE_SIZE, TINY_QWEN_IMAGE_SIZE)
     # One more word in the second task, so the processor pads the first prompt.
     batch["task"] = ["pick up the cube", "pick up the red cube"]
     return policy, batch, torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM)
@@ -242,6 +252,178 @@ def test_build_qwen_inputs_resizes_the_images_to_resize_images_to(tiny_qwen_conf
     assert native.keys() == small.keys()
     for key, value in native.items():
         assert torch.equal(value, small[key]), key
+
+
+WRIST = f"{OBS_IMAGES}.wrist"
+
+
+class _PredictActionChunk(nn.Module):
+    """`predict_action_chunk` taking the state and the Qwen3-VL tensors positionally, for torch.export."""
+
+    def __init__(self, policy: VLAJEPAPolicy, vision_grid: Qwen3VisionGrid | None) -> None:
+        super().__init__()
+        self.policy, self.vision_grid = policy, vision_grid
+
+    def forward(self, noise: Tensor, state: Tensor, *tensors: Tensor) -> Tensor:
+        qwen_inputs = dict(zip(QWEN_INPUTS, tensors, strict=True))
+        return self.policy.predict_action_chunk(
+            {OBS_STATE: state}, noise=noise, qwen_inputs=qwen_inputs, vision_grid=self.vision_grid
+        )
+
+    @staticmethod
+    def inputs(noise: Tensor, state: Tensor, qwen_inputs: dict) -> tuple[Tensor, ...]:
+        return (noise, state, *(qwen_inputs[key] for key in QWEN_INPUTS))
+
+
+@pytest.mark.parametrize("wrist", [False, True], ids=["one-camera", "two-cameras"])
+def test_prediction_on_a_vision_grid_exports_and_matches_eager(
+    tiny_qwen_config: VLAJEPAConfig, monkeypatch: pytest.MonkeyPatch, wrist: bool
+) -> None:
+    policy, batch, noise = _tiny_qwen_policy(tiny_qwen_config, wrist)
+    qwen_inputs, state = policy.qwen_inputs(batch), batch[OBS_STATE]
+    grid = Qwen3VisionGrid.build(policy.model.qwen.model.model.visual, qwen_inputs["image_grid_thw"])
+    # The program takes the state and the processor tensors, not the camera frames, nor `mm_token_type_ids`,
+    # which the model does not read on a grid.
+    module = _PredictActionChunk(policy, grid)
+    input_ids = qwen_inputs["input_ids"]
+    no_embodied = {
+        **qwen_inputs,
+        "input_ids": input_ids.masked_fill(input_ids == policy.model.embodied_action_token_id, 0),
+    }
+    hidden_image = {**qwen_inputs, "attention_mask": qwen_inputs["attention_mask"].clone()}
+    first_image_token = (input_ids[1] == policy.model.qwen.model.config.image_token_id).nonzero()[0, 0]
+    hidden_image["attention_mask"][1, first_image_token] = 0
+    changed_grid = {**qwen_inputs, "image_grid_thw": qwen_inputs["image_grid_thw"].clone()}
+    changed_grid["image_grid_thw"][..., 1:] = torch.tensor([2, 8])
+    with torch.no_grad():
+        expected = policy.predict_action_chunk(batch, noise=noise)
+        # The action head reads the last hidden states of the embodied action tokens, in prompt order.
+        hidden = []
+        last_hidden = policy.model._qwen_last_decoder_hidden
+
+        def recording(*args):
+            hidden.append(last_hidden(*args))
+            return hidden[-1]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(policy.model, "_qwen_last_decoder_hidden", recording)
+            embodied, _ = policy.model._encode_qwen(qwen_inputs, need_action_tokens=False, vision_grid=grid)
+        is_embodied = input_ids == policy.model.embodied_action_token_id
+        assert torch.equal(embodied, hidden[0][is_embodied].view_as(embodied))
+        # On the grid, eager prediction runs the export path, with its checks, from the given tensors or
+        # from the cameras.
+        assert torch.equal(module(*module.inputs(noise, state, qwen_inputs)), expected)
+        assert torch.equal(policy.predict_action_chunk(batch, noise=noise, vision_grid=grid), expected)
+        wrong_grid = Qwen3VisionGrid.build(
+            policy.model.qwen.model.model.visual, changed_grid["image_grid_thw"]
+        )
+        with pytest.raises(ValueError, match="image grid differs"):
+            policy.predict_action_chunk(batch, noise=noise, vision_grid=wrong_grid)
+        with pytest.raises(ValueError, match="must hide only padding"):
+            module(*module.inputs(noise, state, hidden_image))
+        with pytest.raises(ValueError, match="image grid differs"):
+            module(*module.inputs(noise, state, changed_grid))
+        # A prompt without its embodied action tokens is refused, with and without a grid.
+        for vision_grid in (None, grid):
+            with pytest.raises(ValueError, match="must hold 3 embodied action tokens"):
+                policy.predict_action_chunk(
+                    batch, noise=noise, qwen_inputs=no_embodied, vision_grid=vision_grid
+                )
+        # The runtime asserts must not depend on transformers' own checks, which this switch turns off.
+        monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+        program = torch.export.export(module, module.inputs(noise, state, qwen_inputs), strict=False)
+        assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
+        actions = program.module()(*module.inputs(noise, state, qwen_inputs))
+        torch.testing.assert_close(actions, expected, rtol=0, atol=0)
+        # Same shapes, other frames and state, and the tasks swapped, so the padded row and the image token
+        # positions move: the program computes them from its inputs.
+        other = {
+            key: torch.rand_like(value) if key.startswith(OBS_IMAGES) else value
+            for key, value in batch.items()
+        }
+        other.update({OBS_STATE: torch.randn_like(state), "task": batch["task"][::-1]})
+        other_qwen = policy.qwen_inputs(other)
+        assert not torch.equal(other_qwen["attention_mask"], qwen_inputs["attention_mask"])
+        other_inputs = module.inputs(noise, other[OBS_STATE], other_qwen)
+        other_expected = policy.predict_action_chunk(other, noise=noise)
+        torch.testing.assert_close(program.module()(*other_inputs), other_expected, rtol=0, atol=0)
+        for lowered in (program, save_and_load(program), program.run_decompositions()):
+            # The decompositions round differently.
+            torch.testing.assert_close(lowered.module()(*module.inputs(noise, state, qwen_inputs)), expected)
+            torch.testing.assert_close(lowered.module()(*other_inputs), other_expected)
+            for refused in (no_embodied, hidden_image, changed_grid):
+                with pytest.raises(RuntimeError, match="Runtime assertion failed"):
+                    lowered.module()(*module.inputs(noise, state, refused))
+
+
+def test_export_without_qwen_inputs_or_a_vision_grid_is_refused(tiny_qwen_config: VLAJEPAConfig) -> None:
+    policy, batch, noise = _tiny_qwen_policy(tiny_qwen_config)
+    qwen_inputs = policy.qwen_inputs(batch)
+    grid = Qwen3VisionGrid.build(policy.model.qwen.model.model.visual, qwen_inputs["image_grid_thw"])
+    camera = f"{OBS_IMAGES}.laptop"
+
+    class FromCameras(nn.Module):
+        def forward(self, noise: Tensor, image: Tensor) -> Tensor:
+            return policy.predict_action_chunk({**batch, camera: image}, noise=noise, vision_grid=grid)
+
+    without_grid = _PredictActionChunk(policy, None)
+    refused = (
+        (FromCameras(), (noise, batch[camera]), "needs `qwen_inputs`"),
+        (without_grid, without_grid.inputs(noise, batch[OBS_STATE], qwen_inputs), "needs a vision_grid"),
+    )
+    for module, inputs, message in refused:
+        with torch.no_grad(), pytest.raises(ValueError, match=message):
+            torch.export.export(module, inputs, strict=False)
+
+
+def test_export_recipe_of_the_docs_runs(tiny_qwen_config: VLAJEPAConfig) -> None:
+    policy, batch, _ = _tiny_qwen_policy(tiny_qwen_config)
+    state = batch[OBS_STATE]
+    # As in docs/source/vla_jepa.mdx.
+    qwen_inputs = policy.qwen_inputs(batch)
+    grid = Qwen3VisionGrid.build(policy.model.qwen.model.model.visual, qwen_inputs["image_grid_thw"])
+
+    class Predict(nn.Module):
+        def forward(self, state, qwen_inputs):
+            return policy.predict_action_chunk({OBS_STATE: state}, qwen_inputs=qwen_inputs, vision_grid=grid)
+
+    with torch.no_grad():
+        program = torch.export.export(Predict(), (state, qwen_inputs), strict=False)
+        # The program draws its noise as eager prediction does.
+        torch.manual_seed(0)
+        expected = policy.predict_action_chunk(batch)
+        torch.manual_seed(0)
+        actions = program.module()(state, policy.qwen_inputs(batch))
+        torch.testing.assert_close(actions, expected, rtol=0, atol=0)
+        # Extra left padding, hidden by the attention mask, changes the actions only by rounding.
+        pad_token_id = policy.model.qwen.processor.tokenizer.pad_token_id
+        padded = {
+            **qwen_inputs,
+            "input_ids": nn.functional.pad(qwen_inputs["input_ids"], (2, 0), value=pad_token_id),
+            "attention_mask": nn.functional.pad(qwen_inputs["attention_mask"], (2, 0)),
+        }
+        torch.manual_seed(0)
+        actions = policy.predict_action_chunk({OBS_STATE: state}, qwen_inputs=padded, vision_grid=grid)
+        torch.testing.assert_close(actions, expected)
+
+
+def test_training_counts_the_embodied_action_tokens_of_the_prompt_template(
+    tiny_qwen_config: VLAJEPAConfig,
+) -> None:
+    # A template that holds them twice trains.
+    tiny_qwen_config.prompt_template += " {e_actions}"
+    set_seed_all(0)
+    policy = VLAJEPAPolicy(tiny_qwen_config).train()
+    batch = make_train_batch()
+    # Under mixed precision, as training runs: only autocast feeds the bfloat16 Qwen3-VL states to the float32
+    # action head.
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss, _ = policy.forward(batch)
+        assert torch.isfinite(loss)
+        # A task that holds one more is refused.
+        batch["task"] = [f"pick up the {tiny_qwen_config.embodied_action_token}"] * BATCH_SIZE
+        with pytest.raises(ValueError, match=r"must hold 6 embodied action tokens, got \[7, 7\]"):
+            policy.forward(batch)
 
 
 # ---------------------------------------------------------------------------

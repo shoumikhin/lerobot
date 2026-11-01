@@ -56,6 +56,21 @@ def test_freeze_qwen_warns_about_fixed_embodied_action_readouts(caplog: pytest.L
     assert "domain shift" in caplog.text
 
 
+def test_prompt_template_must_hold_the_embodied_action_token() -> None:
+    template, token = VLAJEPAConfig.prompt_template, VLAJEPAConfig.embodied_action_token
+    # No field, an escaped one, or none per field: refused.
+    for refused in (
+        {"prompt_template": template.replace("{e_actions}", "")},
+        {"prompt_template": template.replace("{e_actions}", "{{e_actions}}")},
+        {"num_embodied_action_tokens_per_instruction": 0},
+    ):
+        with pytest.raises(ValueError, match="must hold the embodied action token"):
+            VLAJEPAConfig(**refused)
+    # Spelled out in the template, they count too.
+    spelled = VLAJEPAConfig(prompt_template=template.replace("{e_actions}", token * 2))
+    assert spelled.num_embodied_action_tokens == 2
+
+
 def test_validate_features_no_image_raises() -> None:
     config = VLAJEPAConfig(
         input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(STATE_DIM,))},
