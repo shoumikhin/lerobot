@@ -514,6 +514,7 @@ def test_unknown_policy_type_when_another_policy_fails_to_import(tmp_path):
     code = """
 import importlib.abc, sys
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.factory import get_policy_class
 
 class BreakVQBeT(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
@@ -521,7 +522,12 @@ class BreakVQBeT(importlib.abc.MetaPathFinder):
             raise ImportError("vqbet cannot be imported")
 
 sys.meta_path.insert(0, BreakVQBeT())
-for lookup, arg in [(PreTrainedConfig.get_choice_class, "nope"), (PreTrainedConfig.from_pretrained, sys.argv[1])]:
+lookups = [
+    (PreTrainedConfig.get_choice_class, "nope"),
+    (PreTrainedConfig.from_pretrained, sys.argv[1]),
+    (get_policy_class, "nope"),
+]
+for lookup, arg in lookups:
     try:
         lookup(arg)
     except (KeyError, ValueError) as e:
@@ -530,9 +536,9 @@ print("ACT", PreTrainedConfig.get_choice_class("act").__name__)
 """
     result = run_python(code, str(tmp_path))
     assert result.returncode == 0, result.stderr
-    assert "RAISED KeyError\nRAISED ValueError\nACT ACTConfig\n" in result.stdout
+    assert "RAISED KeyError\nRAISED ValueError\nRAISED ValueError\nACT ACTConfig\n" in result.stdout
     # One warning per failed lookup: each imports every policy once.
-    assert result.stderr.count("Skipping lerobot.policies.vqbet") == 2
+    assert result.stderr.count("Skipping lerobot.policies.vqbet") == 3
 
 
 def test_policy_step_lookup_imports_only_the_module_that_registers_it():
@@ -622,6 +628,20 @@ def test_optimizer_and_scheduler_registered_by_another_policy():
     assert "OPTIMIZER MolmoAct2AdamWConfig" in result.stdout
     assert "SCHEDULER MolmoAct2CosineWithWarmupSchedulerConfig" in result.stdout
     assert "REGISTERED act,molmoact2\n" in result.stdout
+
+
+def test_optimizer_flags_without_a_type_load_only_the_policies_that_add_optimizers(tmp_path):
+    config = {
+        "dataset": {"repo_id": "u/d"},
+        "policy": {"type": "act", "device": "cpu", "push_to_hub": False},
+        "use_policy_training_preset": False,
+        "optimizer": {"type": "adamw"},
+    }
+    (tmp_path / "train_config.json").write_text(json.dumps(config))
+    result = run_train_parse(f"--config_path={tmp_path / 'train_config.json'}", "--optimizer.lr=0.5")
+    assert result.returncode == 0, result.stderr
+    assert "OPTIMIZER AdamWConfig(lr=0.5," in result.stdout
+    assert "REGISTERED act,lawam,molmoact2\n" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -914,6 +934,55 @@ def test_plugin_cannot_take_a_builtin_policy_name():
     assert "REJECTED" in result.stdout
     assert "ACT ACTConfig" in result.stdout
     assert "POLICY_CLASS ACTPolicy" in result.stdout
+
+
+def test_names_stay_reserved_when_their_owner_fails_to_import():
+    code = """
+import importlib.abc, sys
+from dataclasses import dataclass
+
+class BreakOwners(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name in {"lerobot.policies.act", "lerobot.policies.molmoact2", "lerobot.policies.pi0.processor_pi0"}:
+            raise ImportError(f"{name} cannot be imported")
+
+sys.meta_path.insert(0, BreakOwners())
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.optim.optimizers import OptimizerConfig
+from lerobot.processor.pipeline import ProcessorStepRegistry
+
+def register_policy():
+    @PreTrainedConfig.register_subclass("act")
+    @dataclass
+    class PluginACTConfig(PreTrainedConfig):
+        pass
+
+def register_optimizer():
+    @OptimizerConfig.register_subclass("molmoact2_adamw")
+    @dataclass
+    class PluginOptimizer(OptimizerConfig):
+        def build(self, params):
+            return None
+
+def register_step():
+    @ProcessorStepRegistry.register("pi0_new_line_processor")
+    class PluginStep:
+        pass
+
+for register in [register_policy, register_optimizer, register_step]:
+    try:
+        register()
+    except ValueError as e:
+        print("REJECTED", e)
+ProcessorStepRegistry.unregister("pi0_new_line_processor")
+print("UNREGISTERED")
+"""
+    result = run_python(code)
+    assert result.returncode == 0, result.stderr
+    rejected = [line for line in result.stdout.splitlines() if line.startswith("REJECTED")]
+    assert len(rejected) == 3, result.stdout
+    assert all("is reserved for lerobot.policies." in line for line in rejected), rejected
+    assert "UNREGISTERED" in result.stdout
 
 
 def test_unknown_or_non_string_policy_type_raises_value_error():

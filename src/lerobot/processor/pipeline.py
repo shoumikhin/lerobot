@@ -30,6 +30,7 @@ The core components are:
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import re
@@ -165,7 +166,13 @@ class ProcessorStepRegistry:
             owner = BUILTIN_STEP_MODULES.get(registration_name)
             if owner is not None and step_class.__module__ != f"lerobot.{owner}":
                 # Register the built-in first, so another class cannot take its name just by loading earlier.
-                import_on_demand(f"lerobot.{owner}")
+                try:
+                    import_on_demand(f"lerobot.{owner}")
+                except ImportError as e:
+                    raise ValueError(
+                        f"Processor step '{registration_name}' is reserved for lerobot.{owner}. "
+                        f"Use a different name."
+                    ) from e
             if registration_name in cls._registry:
                 raise ValueError(
                     f"Processor step '{registration_name}' is already registered. "
@@ -212,8 +219,10 @@ class ProcessorStepRegistry:
             name: The name of the step to unregister.
         """
         if name in BUILTIN_STEP_MODULES:
-            # Load the built-in first, or it would register again the first time it is looked up.
-            import_on_demand(f"lerobot.{BUILTIN_STEP_MODULES[name]}")
+            # Load the built-in first, or it would register again the first time it is looked up. A module
+            # that fails to import cannot register it either.
+            with contextlib.suppress(ImportError):
+                import_on_demand(f"lerobot.{BUILTIN_STEP_MODULES[name]}")
         cls._registry.pop(name, None)
 
     @classmethod

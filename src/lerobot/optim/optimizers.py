@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
+import logging
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ from lerobot.utils.import_utils import import_on_demand
 from lerobot.utils.io_utils import deserialize_json_into_object, write_json
 from lerobot.utils.utils import flatten_dict, unflatten_dict
 
+logger = logging.getLogger(__name__)
+
 # Type alias for parameters accepted by optimizer build() methods.
 # This matches PyTorch's optimizer signature while also supporting:
 # - dict[str, Parameter]: Named parameters for differential LR by name (e.g., XVLA)
@@ -48,8 +51,8 @@ class ChoicesFromPolicies(ChoiceRegistryBase):
     """Base for a draccus registry that policy packages add choices to, like the optimizers and schedulers.
 
     Policies are imported on demand, so a name a policy registers imports that policy first, and a name that
-    is still not registered then imports every policy before the lookup fails, so the error can list every
-    choice. It is not a `draccus.ChoiceRegistry` itself, since the registries that use it would then share
+    is still not registered then imports every policy in `POLICY_CHOICES` before the lookup fails, so the
+    error can list every choice. It is not a `draccus.ChoiceRegistry` itself, since the registries that use it would then share
     one set of choices.
     """
 
@@ -72,7 +75,12 @@ class ChoicesFromPolicies(ChoiceRegistryBase):
             and not choice_type.__module__.startswith(f"lerobot.policies.{owner}.")
         ):
             # Register the built-in first, so another class cannot take its name just by loading earlier.
-            import_on_demand(f"lerobot.policies.{owner}")
+            try:
+                import_on_demand(f"lerobot.policies.{owner}")
+            except ImportError as e:
+                raise ValueError(
+                    f"'{name}' is reserved for lerobot.policies.{owner}. Use a different name."
+                ) from e
         return super().register_subclass(name, choice_type)
 
     @classmethod
@@ -87,9 +95,13 @@ class ChoicesFromPolicies(ChoiceRegistryBase):
 
     @classmethod
     def load_all_choices(cls) -> None:
-        from lerobot.configs.policies import PreTrainedConfig
-
-        PreTrainedConfig.load_all_choices()
+        """Import the packages in `POLICY_CHOICES`, the only policies that add choices here. A package that fails
+        to import is skipped with a warning, as in `PreTrainedConfig.load_all_choices`."""
+        for owner in sorted(set(cls.POLICY_CHOICES.values())):
+            try:
+                import_on_demand(f"lerobot.policies.{owner}")
+            except ImportError as e:
+                logger.warning(f"Skipping lerobot.policies.{owner}, which failed to import: {e}")
 
 
 @dataclass

@@ -82,7 +82,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     try:
         config_cls = PreTrainedConfig.get_choice_class(name)
     except KeyError:
-        PreTrainedConfig.load_all_choices()  # a non-string name fails before any policy is imported
+        if not isinstance(name, str):
+            PreTrainedConfig.load_all_choices()  # a non-string name fails before any policy is imported
         raise ValueError(
             f"Unknown policy name '{name}'. Available policies: {PreTrainedConfig.get_known_choices()}"
         ) from None

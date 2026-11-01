@@ -191,9 +191,10 @@ def import_on_demand(name: str) -> ModuleType:
     Two threads importing different modules for the first time can both be inside a shared dependency, such
     as torchvision, at once, and Python then hands one of them a partly initialized module. A module that is
     already imported, or that another thread is still importing, skips the lock, so Python's own module lock
-    makes this thread wait for it. Code that runs while a module is being imported must not call this for a
-    module that is not imported yet: if the thread holding the lock is waiting for the module being imported,
-    both wait forever, since Python cannot see this lock.
+    makes this thread wait for it. Code that runs while a module is being imported, like a plugin's register
+    decorator for a reserved name, may call this for a module that is not imported yet only if no on-demand
+    import in another thread needs the module being imported: the thread holding the lock would wait for that
+    module and this thread for the lock, forever, since Python cannot see this lock.
     """
     if name in sys.modules:
         return importlib.import_module(name)
@@ -210,12 +211,23 @@ def lazy_exports(
     absolute or relative to the calling package. Import the same names under `if TYPE_CHECKING:` and assign
     these in its `else:` branch, so type checkers read the real imports and still report names that do not
     exist. The names never become module globals, so the module's own code imports them where it uses them,
-    and `typing.get_type_hints` cannot resolve an annotation that uses them.
+    and `typing.get_type_hints` cannot resolve an annotation that uses them. In a package, a name that is not
+    in `exports` but names a submodule imports and returns it, as if the package had imported it.
+
+    A name is imported in the thread that first uses it, without the lock of `import_on_demand`: module code
+    reads these names while the module is being imported, and a lock there could wait forever for a thread
+    that waits for that module. So resolve the names a thread uses before starting threads, since a thread
+    that first uses one while another thread imports can get a partly initialized module.
     """
     module = sys.modules[module_name]
+    is_package = module.__spec__ is not None and module.__spec__.submodule_search_locations is not None
 
     def module_getattr(name: str) -> Any:
         if name not in exports:
+            submodule = f"{module_name}.{name}"
+            may_be_submodule = is_package and name.isidentifier() and not name.startswith("__")
+            if may_be_submodule and importlib.util.find_spec(submodule):
+                return importlib.import_module(submodule)
             raise AttributeError(f"module {module_name!r} has no attribute {name!r}")
         module_path, _, attribute = exports[name].rpartition(".")
         try:

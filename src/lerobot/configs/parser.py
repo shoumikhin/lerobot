@@ -259,18 +259,20 @@ def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
     choices on demand: the policies, and the optimizers and schedulers that policy packages add to.
 
     Every top-level `--<field>.type` value is looked up in its registry, which loads that choice, or
-    everything it could come from for an unknown name. Registries with a `load_all_choices()` also load everything for
-    `--help` and for `--<field>.*` flags given without that field's `.type`, since its type may then come
-    from a config file and draccus needs that class to accept the flags. The same holds for
-    `--<field>.<sub>.*` flags when `<field>` is a plain dataclass, or a choice with a registered class, that
-    holds such a registry. Apart from that nested check, a field with a path and no `--<field>.type` is
-    skipped: its config is read from that path later. The `torch.dtype` codecs are registered too once torch
-    is loaded, since a config can only hold a `torch.dtype` field after something imported torch."""
+    everything it could come from for an unknown name. Registries with a `load_all_choices()` also load
+    everything: all of them for `--help`, and a field's own for `--<field>.*` flags given without that field's
+    `.type`, since its type may then come from a config file and draccus needs that class to accept the flags.
+    The same holds for `--<field>.<sub>.*` flags, for the registries a plain dataclass `<field>`, or a
+    registered class of a choice `<field>`, holds. Apart from that nested check, a field with a path and no
+    `--<field>.type` is skipped: its config is read from that path later. The `torch.dtype` codecs are
+    registered too once torch is loaded, since a config can only hold a `torch.dtype` field after something
+    imported torch."""
     if "torch" in sys.modules:
         register_torch_dtype_codecs()
     hints = get_type_hints(config_class)
     # argparse reads a short option group that starts with -h, such as -help, as -h too.
-    load_all = any(arg == "--help" or arg.startswith("-h") for arg in cli_args)
+    help_flag = any(arg == "--help" or arg.startswith("-h") for arg in cli_args)
+    to_load = _lazy_registries(config_class) if help_flag else set()
     for field in dataclasses.fields(config_class):
         candidates = get_args(hints[field.name]) or (hints[field.name],)
         types = [t for t in candidates if draccus.utils.is_choice_type(t)]
@@ -279,8 +281,9 @@ def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
             arg.partition("=")[0].startswith(f"--{field.name}.") and arg.partition("=")[0].count(".") >= 2
             for arg in cli_args
         )
-        if nested_flags and any(_holds_lazy_registry(t) for t in candidates):
-            load_all = True
+        if nested_flags:
+            for candidate in candidates:
+                to_load |= _held_lazy_registries(candidate)
         if not types:
             continue
         names = get_type_args(field.name, cli_args)
@@ -290,22 +293,19 @@ def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
             for choice_type in types:
                 with contextlib.suppress(KeyError):  # draccus reports unknown names itself
                     choice_type.get_choice_class(name)
-        if not names and lazy and any(arg.startswith(f"--{field.name}.") for arg in cli_args):
-            load_all = True
-    if load_all:
-        for registry in _lazy_registries(config_class):
-            registry.load_all_choices()
+        if not names and any(arg.startswith(f"--{field.name}.") for arg in cli_args):
+            to_load.update(lazy)
+    for registry in to_load:
+        registry.load_all_choices()
 
 
-def _holds_lazy_registry(field_type: Any) -> bool:
-    """Whether a dataclass, or any registered class of a choice type, has a field with an on-demand registry."""
+def _held_lazy_registries(field_type: Any) -> set[Any]:
+    """The on-demand registries in the fields of a dataclass, or of any registered class of a choice type."""
     if draccus.utils.is_choice_type(field_type):
-        return any(_lazy_registries(choice) for choice in field_type.get_known_choices().values())
-    return (
-        isinstance(field_type, type)
-        and dataclasses.is_dataclass(field_type)
-        and bool(_lazy_registries(field_type))
-    )
+        return set().union(*(_lazy_registries(choice) for choice in field_type.get_known_choices().values()))
+    if isinstance(field_type, type) and dataclasses.is_dataclass(field_type):
+        return _lazy_registries(field_type)
+    return set()
 
 
 def _lazy_registries(config_class: type, seen: set[type] | None = None) -> set[Any]:

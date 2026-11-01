@@ -95,6 +95,26 @@ def test_a_failing_import_keeps_its_cause(make_module):
     assert isinstance(error.value.__cause__, AttributeError)
 
 
+def test_a_package_returns_submodules_not_in_its_table(make_module):
+    pkg = make_module({})
+    (pkg / "__init__.py").write_text(
+        "from lerobot.utils.import_utils import lazy_exports\n\n"
+        "__getattr__, __dir__ = lazy_exports(__name__, {'helper': '.heavy.helper'})\n"
+    )
+    lazy_pkg = importlib.import_module("lazy_pkg")
+    mod = importlib.import_module("lazy_pkg.mod")
+    assert "lazy_pkg.heavy" not in sys.modules
+    assert "heavy" not in dir(lazy_pkg)
+
+    assert lazy_pkg.heavy is sys.modules["lazy_pkg.heavy"]
+    for missing in ["missing", "__missing__"]:
+        with pytest.raises(AttributeError):
+            getattr(lazy_pkg, missing)
+    # Only a package has submodules.
+    with pytest.raises(AttributeError):
+        _ = mod.heavy
+
+
 def test_works_without_source_files(make_module):
     pkg = make_module({"helper": ".heavy.helper"})
     assert compileall.compile_dir(pkg, legacy=True, quiet=1)

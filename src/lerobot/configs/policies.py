@@ -143,7 +143,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # Built-in names stay reserved: the built-in registers first, so a plugin that reuses its name fails.
         # The decorator form calls this first with only the name, then again with the class.
         if choice_type is not None and name not in cls._choice_registry:
-            cls._import_builtin_policy(name)
+            try:
+                cls._import_builtin_policy(name)
+            except ImportError as e:
+                raise ValueError(
+                    f"'{name}' is reserved for lerobot.policies.{name}. Use a different name."
+                ) from e
         return super().register_subclass(name, choice_type)
 
     @classmethod
