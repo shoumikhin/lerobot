@@ -367,8 +367,10 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
         bundle = Bundle(bundle.path, replace(manifest, programs=programs, runs=manifest.runs[1:]))
     if checkpoint.programs is not None:
         assert sorted(bundle.manifest.programs) == checkpoint.programs
+    differences = play(checkpoint, path, bundle, monkeypatch)
     # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
-    assert max(play(checkpoint, path, bundle, monkeypatch)) <= bundle.manifest.tolerance
+    # Not `max`, which skips a NaN that does not come first.
+    assert np.all(np.array(differences) <= bundle.manifest.tolerance), differences
 
 
 @DIFFUSERS
