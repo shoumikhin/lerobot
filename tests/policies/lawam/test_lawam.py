@@ -1245,16 +1245,62 @@ def test_action_prediction_on_a_vision_grid_exports_and_matches_eager(monkeypatc
         with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(PredictActionChunk(None), args, strict=False)
         program = torch.export.export(PredictActionChunk(grid), args, strict=False)
-        decomposed = program.run_decompositions()
-        # LaWAM turns on CUDA autocast whenever CUDA is available, and torch.export cannot save the empty
-        # autocast regions that leaves in the program.
-        saved = [] if torch.cuda.is_available() else [save_and_load(program)]
-        for exact in (program, *saved):
+        decomposed, saved = program.run_decompositions(), save_and_load(program)
+        for exact in (program, saved):
             assert torch.equal(exact.module()(*args), expected)
         # The decompositions round differently.
         torch.testing.assert_close(decomposed.module()(*args), expected)
-        for lowered in (program, *saved, decomposed):
+        for lowered in (program, saved, decomposed):
             for wrong in (malformed, moved, changed):
                 with pytest.raises(RuntimeError, match="Runtime assertion failed"):
                     lowered.module()(args[0], *(wrong[key] for key in keys))
     assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_each_stage_runs_under_its_autocast_only_on_cuda(monkeypatch, device) -> None:
+    """On CUDA each stage runs under its autocast, in prediction and in training; on the CPU none does, also on
+    a machine with CUDA."""
+    policy, batch, noise = _tiny_lawam(monkeypatch)
+    backend = policy.to(device).model.policy_backend
+    autocast = {}
+
+    def recording(name, method):
+        def run(*args, **kwargs):
+            state = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+            autocast.setdefault(name, set()).add(state)
+            return method(*args, **kwargs)
+
+        return run
+
+    for name, owner, method in (
+        ("vlm", backend, "_run_vlm_stage"),
+        ("lam", backend.lam, "extract_vision_features"),
+        ("flow", backend.flow, "sample_actions_cfg"),
+        ("flow loss", backend.flow, "forward"),
+    ):
+        monkeypatch.setattr(owner, method, recording(name, getattr(owner, method)))
+    batch = {key: value.to(device) for key, value in batch.items()}
+    on_cuda = device == "cuda"
+    vlm, lam, flow = (backend.model_cfg.vlm_dtype, torch.bfloat16, torch.float32) if on_cuda else (None,) * 3
+    with torch.no_grad():
+        policy.predict_action_chunk(batch, noise=noise.to(device))
+    assert autocast == {"vlm": {vlm}, "lam": {lam}, "flow": {flow}}
+
+    autocast.clear()
+    actions = torch.randn_like(noise).to(device)
+    train_batch = {key: value for key, value in batch.items() if key != "primary_image"}
+    train_batch |= {
+        "primary_video": torch.rand(2, 2, 3, 32, 32, device=device),
+        "actions": actions,
+        "actions_mask": torch.ones_like(actions, dtype=torch.bool),
+    }
+    losses = backend(batch=train_batch)
+    assert torch.isfinite(losses["loss_total"])
+    assert autocast == {"vlm": {vlm}, "lam": {lam}, "flow loss": {flow}}
