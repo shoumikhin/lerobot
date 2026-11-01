@@ -247,6 +247,42 @@ If you want to change `world_model_num_views` to a value other than 2, load the 
 
 ---
 
+## Export with torch.export
+
+`torch.export` cannot trace VLA-JEPA's prediction as it is: the Qwen3-VL processor tokenizes in Python, and
+the stock vision tower reads the image grid (`image_grid_thw`) into Python numbers. Build the grid data once,
+from a preprocessed batch with the camera layout you deploy. Make the processor tensors with
+`policy.qwen_inputs` for every call, since they hold the camera frames, and pass both to
+`predict_action_chunk`:
+
+```python
+import torch
+
+from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid
+from lerobot.utils.constants import OBS_STATE
+
+qwen_inputs = policy.qwen_inputs(batch)
+grid = Qwen3VisionGrid.build(policy.model.qwen.model.model.visual, qwen_inputs["image_grid_thw"])
+
+
+class Predict(torch.nn.Module):
+    def forward(self, state, qwen_inputs):
+        return policy.predict_action_chunk({OBS_STATE: state}, qwen_inputs=qwen_inputs, vision_grid=grid)
+
+
+with torch.no_grad():
+    program = torch.export.export(Predict(), (batch[OBS_STATE], qwen_inputs), strict=False)
+```
+
+The program refuses inputs whose image grid differs from the one `grid` was built for, attention masks that
+hide more than padding, and prompts without the template's embodied action tokens. Making its inputs with
+`policy.qwen_inputs` needs the policy and its Qwen3-VL processor.
+
+The program also keeps the batch size and prompt length (in tokens) it was exported with, and refuses other
+shapes. The processor pads a batch to its longest prompt, so to serve prompts of different lengths, left-pad
+`input_ids` (with the tokenizer's pad token) and `attention_mask` (with zeros) to one fixed length, for the
+export and for each call. Extra left padding changes the actions only by rounding.
+
 ## Citation
 
 ```bibtex
