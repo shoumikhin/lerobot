@@ -776,6 +776,24 @@ def test_lam_modal_mask_allows_query_and_same_modality_attention() -> None:
     assert not mask[0, 1]
 
 
+def test_vlm_to_lam_head_takes_bfloat16_hidden_states_on_the_cpu() -> None:
+    from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
+
+    # LaWAM builds this head in float32 and feeds it the hidden states of its bfloat16 VLM.
+    torch.manual_seed(0)
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    hidden = torch.randn(2, 5, 64).bfloat16()
+    with torch.no_grad():
+        latent = head(hidden)
+        # The same values in float32, with the queries rounded to bfloat16 like the hidden states.
+        reference = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+        reference.load_state_dict(head.state_dict())
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(hidden.float())
+    assert latent.dtype == torch.float32
+    torch.testing.assert_close(latent, expected, rtol=0, atol=0)
+
+
 def test_qwen3vl_freeze_and_layer_selection() -> None:
     model = _FakeQwen3VL()
 
