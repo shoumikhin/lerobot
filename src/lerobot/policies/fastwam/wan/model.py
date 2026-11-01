@@ -18,6 +18,30 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
+class Float32Linear(nn.Linear):
+    """`nn.Linear` computed in float32, whatever the dtype of its weights and any outer autocast.
+
+    Wan computes its time embedding and output head in float32 even when the model is bfloat16. Upstream does
+    that with CUDA float32 autocast regions, which do nothing on other devices; the layer does it everywhere.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        bias = None if self.bias is None else self.bias.float()
+        with torch.amp.autocast(input.device.type, enabled=False):
+            return nn.functional.linear(input.float(), self.weight.float(), bias)
+
+
+def float32_autocast(device: torch.device) -> torch.amp.autocast:
+    """Upstream's CUDA float32 autocast region, so PEFT adapters on the layers inside compute in float32 too.
+
+    Autocast has no float32 on other devices, so it is off there instead, and an adapter computes in the dtype
+    of its own weights: float32, as `wrap_with_peft` makes them, unless something else casts them.
+    """
+    if device.type == "cuda":
+        return torch.amp.autocast("cuda", dtype=torch.float32)
+    return torch.amp.autocast(device.type, enabled=False)
+
+
 @torch.amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     if dim % 2 != 0:
@@ -154,7 +178,7 @@ class Head(nn.Module):
         # layers
         out_dim = math.prod(patch_size) * out_dim
         self.norm = WanLayerNorm(dim, eps)
-        self.head = nn.Linear(dim, out_dim)
+        self.head = Float32Linear(dim, out_dim)
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
@@ -165,7 +189,7 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with float32_autocast(x.device):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
         return x
@@ -253,8 +277,8 @@ class WanModel(nn.Module):
             nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
         )
 
-        self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.time_embedding = nn.Sequential(Float32Linear(freq_dim, dim), nn.SiLU(), Float32Linear(dim, dim))
+        self.time_projection = nn.Sequential(nn.SiLU(), Float32Linear(dim, dim * 6))
 
         # blocks
         self.blocks = nn.ModuleList(

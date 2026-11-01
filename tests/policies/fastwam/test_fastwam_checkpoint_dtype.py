@@ -34,7 +34,9 @@ from lerobot.policies.fastwam import modeling_fastwam
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
 from lerobot.policies.fastwam.wan import LiteKVFusion
+from lerobot.policies.fastwam.wan.model import float32_autocast, sinusoidal_embedding_1d
 
+REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA dtype coverage requires CUDA")
 DOT_FLAGS = {
     "action_expert_layers": 1,
     "lite_kv_fusion": True,
@@ -114,24 +116,22 @@ def training_batch():
 
 @pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
 @pytest.mark.parametrize(
-    "device,dtype",
+    "device,dtype,autocast",
     [
-        ("cpu", torch.float32),
-        ("cpu", torch.bfloat16),
-        pytest.param(
-            "cuda",
-            torch.bfloat16,
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="CUDA dtype coverage requires CUDA"
-            ),
-        ),
+        ("cpu", torch.float32, False),
+        ("cpu", torch.bfloat16, True),
+        ("cpu", torch.bfloat16, False),
+        pytest.param("cuda", torch.bfloat16, True, marks=REQUIRES_CUDA),
+        pytest.param("cuda", torch.bfloat16, False, marks=REQUIRES_CUDA),
     ],
 )
-def test_public_dtype_train_infer_and_checkpoint(offline_components, tmp_path, flags, device, dtype):
+def test_public_dtype_train_infer_and_checkpoint(
+    offline_components, tmp_path, flags, device, dtype, autocast
+):
     torch.manual_seed(1234)
     policy = FastWAMPolicy(tiny_config(dtype=dtype, device=device, **flags))
     batch = training_batch()
-    with torch.autocast(device, dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+    with torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
         loss, _ = policy(batch)
     loss.backward()
     assert torch.isfinite(loss)
@@ -152,7 +152,7 @@ def test_public_dtype_train_infer_and_checkpoint(offline_components, tmp_path, f
         assert policy.model.mot.lite_kv_fusion is None
         assert policy.model.action_expert.text_embedding is not None
     noise = torch.randn(1, 8, 3)
-    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
         policy.eval()
         action = policy.predict_action_chunk(batch, noise=noise)
         policy.save_pretrained(tmp_path)
@@ -162,6 +162,84 @@ def test_public_dtype_train_infer_and_checkpoint(offline_components, tmp_path, f
     assert torch.isfinite(action).all()
     torch.testing.assert_close(reloaded_action, action, rtol=0, atol=0)
     assert loaded.config.dtype == dtype
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=REQUIRES_CUDA)])
+def test_bfloat16_time_embedding_and_head_compute_in_float32(offline_components, device):
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.bfloat16, device=device))
+    video = policy.model.video_expert
+    # The head's weight starts at zero, which would hide the dtype it computes in.
+    nn.init.normal_(video.head.head.weight)
+    loss, _ = policy(training_batch())
+    loss.backward()
+    for layer in (video.time_embedding, video.time_projection, video.head.head):
+        assert all(param.grad is not None and param.grad.abs().sum() > 0 for param in layer.parameters())
+    # They compute in float32 from the bfloat16 weights cast up, with and without an outer autocast. The
+    # first latent frame's tokens get timestep 0, the second frame's the given one.
+    position = sinusoidal_embedding_1d(video.freq_dim, torch.tensor([0.0, 500.0], device=device)).float()
+    inputs = {
+        "x": torch.randn(1, 4, 2, 8, 16, device=device),
+        "timestep": torch.tensor([500.0], device=device),
+        "context": torch.randn(1, 4, 8, device=device),
+        "fuse_vae_embedding_in_latents": True,
+    }
+    with torch.no_grad():
+        expected_t = deepcopy(video.time_embedding).float()(position)
+        expected_t_mod = deepcopy(video.time_projection).float()(expected_t)
+        state = video.pre_dit(**inputs)
+        tokens = torch.randn(state["t"].shape, dtype=torch.bfloat16, device=device)
+        expected_head = deepcopy(video.head).float()(tokens, state["t"])
+    for autocast in (False, True):
+        with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
+            t = video.pre_dit(**inputs)["t"]
+            head = video.head(tokens, state["t"])
+            t_mod = video.time_projection(expected_t)
+        assert t.dtype == head.dtype == t_mod.dtype == torch.float32
+        torch.testing.assert_close(t[0, [0, -1]], expected_t)
+        torch.testing.assert_close(t_mod, expected_t_mod)
+        torch.testing.assert_close(head, expected_head)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=REQUIRES_CUDA)])
+def test_bfloat16_policy_with_peft_on_the_float32_layers_runs(offline_components, tmp_path, device, autocast):
+    peft = pytest.importorskip("peft")
+    torch.manual_seed(1234)
+    FastWAMPolicy(tiny_config(dtype=torch.bfloat16, device=device)).save_pretrained(tmp_path)
+    policy = FastWAMPolicy.from_pretrained(tmp_path).wrap_with_peft(
+        peft.LoraConfig(
+            r=2,
+            target_modules=r".*mixtures\.video\.(time_projection\.1|head\.head)",
+            modules_to_save=["mixtures.video.time_embedding"],
+        )
+    )
+    adapters = [module for name, module in policy.named_modules() if name.endswith("lora_B.default")]
+    adapter_dtypes = set()
+    for adapter in adapters:
+        adapter.register_forward_hook(lambda module, args, output: adapter_dtypes.add(output.dtype))
+    with torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
+        loss, _ = policy(training_batch())
+    # The adapters compute in float32 too, also under the outer autocast.
+    assert len(adapters) == 2 and adapter_dtypes == {torch.float32}
+    loss.backward()
+    trained = [param for param in policy.parameters() if param.requires_grad]
+    assert trained and all(param.grad is not None and torch.isfinite(param.grad).all() for param in trained)
+    policy.eval()
+    batch = training_batch()
+    del batch["action"]
+    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
+        action = policy.predict_action_chunk(batch, noise=torch.randn(1, 8, 3))
+    assert torch.isfinite(action).all()
+
+
+@REQUIRES_CUDA
+def test_float32_region_runs_bfloat16_adapters_in_float32_on_cuda():
+    # As upstream's CUDA float32 autocast region did, also for an adapter that FSDP2 mixed precision made
+    # bfloat16.
+    adapter = nn.Linear(4, 4, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16), float32_autocast(torch.device("cuda")):
+        assert adapter(torch.randn(2, 4, device="cuda", dtype=torch.bfloat16)).dtype == torch.float32
 
 
 def test_cli_backbone_conversion_loads_weights_and_trains(offline_components, tmp_path, monkeypatch):
