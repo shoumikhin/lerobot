@@ -55,6 +55,7 @@ from lerobot.policies.lawam.vlas.flowmatching_expert import (
     ConditionalFlowMatchingHead,
     build_time_grid,
 )
+from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
 from lerobot.policies.lawam.vlas.qwen3vl import (
     freeze_qwen3vl,
     keep_first_n_llm_layers,
@@ -795,6 +796,36 @@ def test_lam_modal_mask_allows_query_and_same_modality_attention() -> None:
     assert mask[0, 2]
     assert mask[1, 3]
     assert not mask[0, 1]
+
+
+def test_vlm_to_lam_head_takes_bfloat16_hidden_states_on_the_cpu() -> None:
+    # LaWAM builds this head in float32 and feeds it the hidden states of its bfloat16 VLM.
+    torch.manual_seed(0)
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    hidden = torch.randn(2, 5, 64).bfloat16().requires_grad_()
+    latent = head(hidden)
+    with torch.no_grad():
+        # The same values in float32, with the queries rounded to bfloat16 like the hidden states.
+        reference = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+        reference.load_state_dict(head.state_dict())
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(hidden.float())
+    torch.testing.assert_close(latent, expected, rtol=0, atol=0)
+    # The VLM trains through this head, so the gradient has to reach its hidden states.
+    (latent * torch.randn_like(latent)).sum().backward()
+    assert hidden.grad is not None and hidden.grad.any()
+
+
+@require_cuda
+def test_vlm_to_lam_head_keeps_its_residual_in_bfloat16_under_cuda_autocast() -> None:
+    # LaWAM's checkpoints were trained under CUDA autocast with the residual in the VLM's dtype. The casts
+    # belong on the norm inputs, so the residual reaching the feed-forward must stay bfloat16.
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2).cuda()
+    residual_dtypes = []
+    head.ffns[0].register_forward_pre_hook(lambda module, args: residual_dtypes.append(args[0].dtype))
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        head(torch.randn(2, 5, 64, device="cuda", dtype=torch.bfloat16))
+    assert residual_dtypes == [torch.bfloat16]
 
 
 def test_qwen3vl_freeze_and_layer_selection() -> None:
