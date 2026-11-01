@@ -54,6 +54,7 @@ from lerobot.policies.lawam.vlas.flowmatching_expert import (
     ConditionalFlowMatchingHead,
     build_time_grid,
 )
+from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
 from lerobot.policies.lawam.vlas.qwen3vl import (
     freeze_qwen3vl,
     keep_first_n_llm_layers,
@@ -774,6 +775,35 @@ def test_lam_modal_mask_allows_query_and_same_modality_attention() -> None:
     assert mask[0, 2]
     assert mask[1, 3]
     assert not mask[0, 1]
+
+
+def test_vlm_to_lam_head_takes_bfloat16_hidden_states_on_the_cpu() -> None:
+    # LaWAM builds this head in float32 and feeds it the hidden states of its bfloat16 VLM.
+    torch.manual_seed(0)
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    hidden = torch.randn(2, 5, 64).bfloat16()
+    with torch.no_grad():
+        latent = head(hidden)
+        # The same values in float32, with the queries rounded to bfloat16 like the hidden states.
+        reference = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+        reference.load_state_dict(head.state_dict())
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(hidden.float())
+    assert latent.dtype == torch.float32
+    torch.testing.assert_close(latent, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_vlm_to_lam_head_keeps_its_bfloat16_queries_under_cuda_autocast() -> None:
+    # The casts for the CPU must not change the GPU path, where the queries stay in the VLM's bfloat16.
+    torch.manual_seed(0)
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2).cuda()
+    query_dtypes = []
+    for ffn in head.ffns:
+        ffn.register_forward_hook(lambda module, args, output: query_dtypes.append(args[0].dtype))
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        head(torch.randn(2, 5, 64, device="cuda").bfloat16())
+    assert query_dtypes == [torch.bfloat16] * len(head.ffns)
 
 
 def test_qwen3vl_freeze_and_layer_selection() -> None:

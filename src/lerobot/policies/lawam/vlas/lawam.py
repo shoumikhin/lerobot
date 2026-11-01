@@ -132,8 +132,10 @@ class VLMToLAMQFormer(nn.Module):
         for norm_q, norm_kv, xattn, ffn in zip(
             self.norm_qs, self.norm_kvs, self.cross_attns, self.ffns, strict=True
         ):
-            q = norm_q(queries)
-            kv = norm_kv(context)
+            # In the head's own dtype, float32 as LaWAM builds it: CUDA autocast runs these norms in float32,
+            # and CPU tensors get no autocast.
+            q = norm_q(queries.to(self.query.dtype))
+            kv = norm_kv(context.to(self.query.dtype))
             attn_out, _ = xattn(q, kv, kv)
             queries = queries + attn_out
             queries = queries + ffn(queries)
