@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -930,3 +931,20 @@ def test_select_action_uses_action_queue_before_refill() -> None:
     assert first.shape == (1, 7)
     assert second.shape == (1, 7)
     assert not torch.equal(first, second)
+
+
+def test_vlm_to_lam_head_takes_bfloat16_hidden_states_on_the_cpu() -> None:
+    from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
+
+    # LaWAM builds this head in float32 and feeds it the hidden states of its bfloat16 VLM.
+    torch.manual_seed(0)
+    head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    hidden = torch.randn(2, 5, 64).bfloat16()
+    with torch.no_grad():
+        latent = head(hidden)
+        # The same values in float32, with the queries rounded to bfloat16 like the hidden states.
+        reference = deepcopy(head)
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(hidden.float())
+    assert latent.dtype == torch.float32
+    torch.testing.assert_close(latent, expected, rtol=0, atol=0)
