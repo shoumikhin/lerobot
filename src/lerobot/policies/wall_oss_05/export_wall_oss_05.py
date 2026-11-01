@@ -30,18 +30,16 @@ The vision tower reads the patch grid prepared by an eager call inside `prepare_
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
 
 import torch
 from torch import Tensor
 
-from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe, Part
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
 from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
-from ..common.qwen_vision import prepare_image_grid
 from ..common.state_prompt import StatePromptStep, StatePromptTokens, uniform_bins
 from .processor_wall_oss_05 import WALL_OSS_ACTION_TOKEN, WallOSS05TokenizerStep
 
@@ -55,12 +53,6 @@ class WallOSS05ExportRecipe(ActionChunkRecipe):
     exact = False
     # Wall-OSS runs ten bfloat16 denoising steps.
     bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
-
-    def parts(self) -> Iterator[Part]:
-        """The default recipe's part, checked inside `prepare_image_grid()` so the checks prepare the grid."""
-        with prepare_image_grid():
-            (part,) = super().parts()
-        yield part
 
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its tokenizer step replaced by [`_StatePromptStep`]."""
