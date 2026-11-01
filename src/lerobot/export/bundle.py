@@ -30,6 +30,7 @@ from safetensors.numpy import save
 from safetensors.torch import save_file
 
 from lerobot.bundle.manifest import (
+    ACTION_TOKENIZER,
     ACTIONS_MASK,
     CONSTANTS,
     CONTINUOUS_ACTIONS,
@@ -46,7 +47,7 @@ from lerobot.bundle.manifest import (
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION
 
-from .recipe import TaskTokenData, TestCase
+from .recipe import ActionTokenData, TaskTokenData, TestCase
 
 
 def write_bundle(
@@ -55,8 +56,9 @@ def write_bundle(
     config: PreTrainedConfig,
     constants: dict[str, np.ndarray] | None = None,
     task_tokens: TaskTokenData | None = None,
+    action_tokens: ActionTokenData | None = None,
 ) -> None:
-    """Write the test case, the constants, the task's files and the policy config into the bundle folder.
+    """Write the test case, the constants, the task's and the actions' files and the policy config into the bundle.
 
     Args:
         bundle (`Bundle`):
@@ -69,6 +71,8 @@ def write_bundle(
             Named arrays the programs read, written to `constants.safetensors` when there are any.
         task_tokens (`TaskTokenData`, *optional*):
             The tokenizer, embedding table and known tasks, written to the bundle's task token files.
+        action_tokens (`ActionTokenData`, *optional*):
+            The FAST tokenizer, written to `action_tokenizer.json`.
     """
     folder, manifest = bundle.path, bundle.manifest
     if (manifest.task_tokens is None) != (task_tokens is None):
@@ -99,6 +103,8 @@ def write_bundle(
         save_file({"embeddings": task_tokens.embeddings.detach().cpu().contiguous()}, embeddings)
         shutil.copymode(folder / TEST_CASE, embeddings)
         (folder / KNOWN_TASKS).write_text(json.dumps(task_tokens.known_tasks))
+    if manifest.action_tokens is not None and action_tokens is not None:
+        (folder / ACTION_TOKENIZER).write_text(action_tokens.tokenizer, encoding="utf-8")
     # Without the exporter's checkpoint path, and with each other absolute path, such as a model's local copy
     # or a folder of the machine that trained the policy, cut to its last part, since the folders above it can
     # name a user. Running a bundle reads none of them.

@@ -30,6 +30,16 @@ if sys.platform == "linux":
     assert not mapped, f"PyTorch libraries are mapped: {sorted(mapped)}"
 """
 
+# `lerobot-check-bundle argv[1]`: loads a bundle's programs and replays its test case.
+CHECK_BUNDLE = """
+import sys
+
+from lerobot.scripts.lerobot_check_bundle import main
+
+sys.argv = ["lerobot-check-bundle", sys.argv[1]]
+main()
+"""
+
 
 def checking_torch_unloaded(code: str) -> str:
     """`code` that fails if it loaded PyTorch, for a child process that the code under test starts."""

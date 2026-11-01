@@ -50,6 +50,12 @@ PROMPT_OPS: dict[str, int | None] = {
 }
 # The kinds of character `["keep", ...]` names besides one literal character.
 KEEP_KINDS = frozenset({"alnum", "space"})
+# The token ids the runs of a policy that writes its actions as tokens generate, and the actions the bundle decodes
+# from them (see `ActionTokens`).
+GENERATED_TOKENS = "generated_tokens"
+DECODED_ACTIONS = "decoded_actions"
+# The file of `action_tokens`, as the export writes it.
+ACTION_TOKENIZER = "action_tokenizer.json"
 # For a policy whose postprocessor thresholds an action, such as a LIBERO gripper to -1 or 1: the actions of the
 # last run with its threshold steps left out, which the test case also holds, and the test case's mask of the
 # thresholded actions far enough from their threshold to be compared (see `engine.action_difference`).
@@ -125,6 +131,51 @@ class TaskTokens:
 
 
 @dataclass
+class ActionTokens:
+    """How the token ids the runs write as `generated_tokens` become the actions later runs read as `decoded_actions`.
+
+    pi0-FAST writes its action chunk as text: `Action: `, the chunk's FAST tokens, then an end marker. FAST quantizes
+    the discrete cosine transform (DCT) of each action component over the chunk, writes each coefficient as one
+    character, and compresses the characters with byte-pair encoding. The bundle keeps the ids before the first end
+    marker, drops every `Action: `, turns each id into its FAST token, joins the tokens' characters back into the
+    coefficients and inverts the DCT, without PyTorch (see `lerobot.bundle.action_tokens`). It decodes once every run
+    that writes `generated_tokens` has run, before the first run that reads `decoded_actions`. The bundle holds the
+    FAST tokenizer as `action_tokenizer.json`, a byte-level BPE in the format of the `tokenizers` library.
+
+    Args:
+        clean_up_spaces (`bool`):
+            Whether the decoded text drops the space before punctuation, as the policy's Transformers tokenizer
+            does when it decodes.
+        id_offset (`int`):
+            The FAST token of a generated id is `id_offset - id`.
+        end (`int`):
+            The id of the end marker.
+        prefix (`list[int]`):
+            The ids of `Action: `, dropped wherever they appear.
+        start (`list[int]`):
+            The ids the generated tokens must start with, or none for a policy that does not check.
+        min_token (`int`):
+            The coefficient of the character `chr(0)`.
+        scale (`float`):
+            What the coefficients were multiplied by before they were rounded.
+        horizon (`int`):
+            The number of actions the decoding makes: the rows of `decoded_actions`.
+        action_dim (`int`):
+            The components of one action: the columns of `decoded_actions`.
+    """
+
+    clean_up_spaces: bool
+    id_offset: int
+    end: int
+    prefix: list[int]
+    start: list[int]
+    min_token: int
+    scale: float
+    horizon: int
+    action_dim: int
+
+
+@dataclass
 class Target:
     """The GPU a bundle's programs were built on, when they run only on that kind of GPU.
 
@@ -165,6 +216,9 @@ class BundleManifest:
         task_tokens (`TaskTokens`, *optional*):
             How the task becomes the programs' `task_embeddings` and `task_length`. A bundle with it can run
             any task; one without it runs only `task`.
+        action_tokens (`ActionTokens`, *optional*):
+            How the token ids the runs generate become the actions later runs take, for a policy that writes its
+            actions as tokens.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
@@ -207,6 +261,7 @@ class BundleManifest:
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
     task_tokens: TaskTokens | None = None
+    action_tokens: ActionTokens | None = None
     noise_shape: list[int] | None = None
     history: dict[str, int] = field(default_factory=dict)
     carry: dict[str, list[int]] = field(default_factory=dict)
@@ -261,6 +316,7 @@ class BundleManifest:
         target = data.get("target")
         task_tokens = data.get("task_tokens")
         prompt_ops = (task_tokens or {}).get("prompt_ops", [])
+        action_tokens = data.get("action_tokens")
         # A key added later can change how the programs run, so a reader that does not know it stops.
         unknown = (
             sorted(set(data) - {f.name for f in fields(cls)})
@@ -275,6 +331,7 @@ class BundleManifest:
                 {kind for name, *kinds in prompt_ops if name == "keep" for kind in kinds if len(kind) != 1}
                 - KEEP_KINDS
             )
+            + sorted(set(action_tokens or {}) - {f.name for f in fields(ActionTokens)})
         )
         if unknown:
             raise ValueError(
@@ -287,6 +344,7 @@ class BundleManifest:
                 "runs": [ProgramRun(**run) for run in runs],
                 "target": None if target is None else Target(**target),
                 "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
+                "action_tokens": None if action_tokens is None else ActionTokens(**action_tokens),
             }
         )
 
@@ -344,6 +402,7 @@ def _check_form(data: dict[str, Any]) -> None:
         ),
         "history": isinstance(data.get("history", {}), dict),
         "carry": isinstance(data.get("carry", {}), dict),
+        "action_tokens": isinstance(data.get("action_tokens"), dict | None),
     }
     if wrong := [name for name, right in form.items() if not right]:
         raise ValueError(
