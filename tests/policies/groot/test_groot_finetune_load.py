@@ -32,7 +32,7 @@ pytest.importorskip("diffusers")
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies import pretrained
-from lerobot.policies.groot import modeling_groot
+from lerobot.policies.groot import configuration_groot, modeling_groot
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config
 from lerobot.policies.groot.modeling_groot import GrootPolicy
@@ -189,7 +189,7 @@ def _cache_as_hub_repo(monkeypatch, tmp_path, finetune):
             (snapshot / name).symlink_to(os.path.relpath(blob, (snapshot / name).parent))
         return str(snapshot)
 
-    monkeypatch.setattr(modeling_groot, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(configuration_groot, "snapshot_download", snapshot_download)
     return {"cache_dir": tmp_path / "hub", "local_files_only": True}, fetched
 
 
@@ -299,6 +299,43 @@ def test_load_reads_the_copies_of_the_checkpoint_it_loads(tmp_path, monkeypatch)
     assert config.pretrained_path == tmp_path / "adapter"
 
 
+def test_config_reads_the_same_horizon_before_and_after_a_hub_load(tmp_path, monkeypatch):
+    base = _write_tiny_base(tmp_path)
+    _cap_action_horizon(base, [0, 1])
+    GrootPolicy(_policy_config(base)).save_pretrained(tmp_path / "finetune")
+    hub, _ = _cache_as_hub_repo(monkeypatch, tmp_path, tmp_path / "finetune")
+    _cap_action_horizon(base, [0])
+    # As in lerobot-train with --policy.path=<repo id>: the dataset reads the horizon before the load, and the
+    # sampler after it.
+    config = PreTrainedConfig.from_pretrained("someone/groot-finetune", **hub)
+    before = (config.action_delta_indices, config.drop_n_last_frames)
+
+    policy = GrootPolicy.from_pretrained("someone/groot-finetune", config=config, **hub)
+
+    assert before == (config.action_delta_indices, config.drop_n_last_frames) == ([0, 1], 1)
+    assert policy._action_queue_steps == 2
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_load_leaves_no_folder_on_the_config(tmp_path, fails):
+    _, finetune = _save_finetune(tmp_path)
+    if fails:
+        from safetensors.torch import load_file, save_file
+
+        weights = load_file(finetune / "model.safetensors")
+        weights.pop(next(k for k in weights if "action_head" in k))
+        save_file(weights, finetune / "model.safetensors")
+    config = GrootConfig.from_pretrained(finetune)
+
+    if fails:
+        with pytest.raises(RuntimeError, match="Missing key"):
+            GrootPolicy.from_pretrained(finetune, config=config)
+    else:
+        GrootPolicy.from_pretrained(finetune, config=config)
+
+    assert config._loaded_base_config_path is None
+
+
 def test_hub_checkpoint_without_cached_copies_reads_the_base_model(tmp_path, monkeypatch):
     base, finetune = _save_finetune(tmp_path)
     expected = _tensors(_load_regular(finetune, monkeypatch))
@@ -308,7 +345,7 @@ def test_hub_checkpoint_without_cached_copies_reads_the_base_model(tmp_path, mon
         # Offline, huggingface_hub raises a subclass of this when its cached file list names files it lacks.
         raise LocalEntryNotFoundError("Some files of the snapshot are not cached.")
 
-    monkeypatch.setattr(modeling_groot, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(configuration_groot, "snapshot_download", snapshot_download)
     (base / "model.safetensors").unlink()
     policy = GrootPolicy.from_pretrained("someone/groot-finetune", **hub)
 
@@ -443,7 +480,7 @@ def test_force_download_downloads_once_and_loads_the_regular_way(tmp_path, monke
     model_config = json.loads((base / "config.json").read_text())
     (base / "config.json").write_text(json.dumps({**model_config, "action_horizon": 2}))
     forced = []
-    serve_copies = modeling_groot.snapshot_download
+    serve_copies = configuration_groot.snapshot_download
 
     def snapshot_download(repo_id, force_download=False, **kwargs):
         forced.append(force_download)
@@ -453,7 +490,7 @@ def test_force_download_downloads_once_and_loads_the_regular_way(tmp_path, monke
         forced.append(force_download)
         return str(finetune / filename)
 
-    monkeypatch.setattr(modeling_groot, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(configuration_groot, "snapshot_download", snapshot_download)
     monkeypatch.setattr(modeling_groot, "hf_hub_download", download)
     monkeypatch.setattr(pretrained, "hf_hub_download", download)
     built = _record_builds(monkeypatch)
@@ -726,18 +763,46 @@ def test_save_that_stops_halfway_leaves_no_copies_in_use(tmp_path, monkeypatch, 
     assert loaded.config.action_delta_indices == [0]
 
 
-def test_save_does_not_copy_a_file_that_links_out_of_the_checkpoint(tmp_path, caplog):
-    base, finetune = _save_finetune(tmp_path)
+@pytest.mark.parametrize("layout", ["file_link", "under_a_snapshots_folder", "folder_link"])
+def test_save_does_not_copy_a_file_that_links_out_of_the_checkpoint(tmp_path, caplog, layout):
+    root = tmp_path / "snapshots" / "project" if layout == "under_a_snapshots_folder" else tmp_path
+    root.mkdir(parents=True, exist_ok=True)
+    _, finetune = _save_finetune(root)
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps({"secret": "do not publish"}))
-    (finetune / modeling_groot._BASE_CONFIG_DIR / "processor_config.json").symlink_to(outside)
+    copies = finetune / modeling_groot._BASE_CONFIG_DIR
+    if layout == "folder_link":
+        elsewhere = shutil.move(copies, tmp_path / "elsewhere")
+        copies.symlink_to(elsewhere)
+        shutil.copyfile(outside, elsewhere / "processor_config.json")
+    else:
+        (copies / "processor_config.json").symlink_to(outside)
 
     with caplog.at_level(logging.WARNING):
         GrootPolicy.from_pretrained(finetune).save_pretrained(tmp_path / "resaved")
 
     saved = tmp_path / "resaved" / modeling_groot._BASE_CONFIG_DIR
-    assert sorted(path.name for path in saved.iterdir()) == ["config.json"]
+    assert sorted(path.name for path in saved.iterdir()) == ([] if layout == "folder_link" else ["config.json"])
     assert "links outside" in caplog.text
+
+
+def test_save_copies_a_base_model_that_links_to_a_cache_snapshot(tmp_path):
+    base = _write_tiny_base(tmp_path)
+    _cap_action_horizon(base, [0, 1])
+    # The base laid out like the Hugging Face cache, and given by a link to its snapshot.
+    repo = tmp_path / "hub" / "models--someone--groot-base"
+    snapshot = repo / "snapshots" / ("0" * 40)
+    (repo / "blobs").mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    for path in list(base.iterdir()):
+        blob = shutil.move(path, repo / "blobs" / path.name)
+        (snapshot / path.name).symlink_to(os.path.relpath(blob, snapshot))
+    (tmp_path / "linked_base").symlink_to(snapshot)
+
+    GrootPolicy(_policy_config(tmp_path / "linked_base")).save_pretrained(tmp_path / "finetune")
+
+    saved = tmp_path / "finetune" / modeling_groot._BASE_CONFIG_DIR
+    assert sorted(path.name for path in saved.iterdir()) == ["config.json", "processor_config.json"]
 
 
 @pytest.mark.parametrize("subclass", [False, True])

@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
+from huggingface_hub.constants import CONFIG_NAME
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError, LocalEntryNotFoundError
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, DiffuserSchedulerConfig
@@ -57,6 +60,9 @@ GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 GROOT_ACTION_DECODE_TRANSFORM_AUTO = "auto"
 # A fine-tune checkpoint keeps copies of the base model config files in this subfolder.
 _BASE_CONFIG_DIR = "groot_base_config"
+# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR. config.json
+# comes last, as it marks a complete copy (see resolve_groot_base_config_path).
+_BASE_CONFIG_FILES = ("processor_config.json", CONFIG_NAME)
 
 _GROOT_MODEL_VERSION_ALIASES = {
     "n1.7": GROOT_N1_7,
@@ -144,9 +150,25 @@ def resolve_groot_base_config_path(checkpoint: str | Path | None, base_model_pat
     """
     if checkpoint is not None:
         copies = Path(checkpoint) / _BASE_CONFIG_DIR
-        if (copies / "config.json").is_file():
+        if (copies / CONFIG_NAME).is_file():
             return str(copies)
     return base_model_path
+
+
+def fetch_groot_base_config_copies(repo_id: str, **hub_kwargs) -> str | None:
+    """Download the base config copies of a Hub checkpoint and return its snapshot folder, or None if that fails.
+
+    The copies are optional: without them (an older checkpoint, or a cache that lacks them), base_model_path is read.
+    """
+    try:
+        return snapshot_download(
+            repo_id=repo_id,
+            allow_patterns=[f"{_BASE_CONFIG_DIR}/{name}" for name in _BASE_CONFIG_FILES],
+            **hub_kwargs,
+        )
+    except (LocalEntryNotFoundError, HfHubHTTPError, HFValidationError):
+        logger.warning("Could not get the base config copies of %s; reading base_model_path.", repo_id)
+        return None
 
 
 def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
@@ -470,18 +492,28 @@ class GrootConfig(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
-        # Set by GrootPolicy.from_pretrained to the folder it read the base config files from. Not saved.
+        # Neither is saved. GrootPolicy.from_pretrained sets the first while it builds the policy.
         self._loaded_base_config_path: str | None = None
+        self._fetched_copies: tuple[tuple[str, str | None] | None, str | None] = (None, None)
 
     @property
     def base_config_path(self) -> str | None:
         """Return where the base model config files are read.
 
-        The folder a load used, else the copies in a local checkpoint folder, else base_model_path.
+        While GrootPolicy.from_pretrained builds a policy, the folder of the checkpoint it loads. Otherwise the
+        copies in the checkpoint that pretrained_path names (fetched once for a Hub repo id), else
+        base_model_path. A load does not change the answer, so a run reads the same horizon before and after it.
         """
         if self._loaded_base_config_path is not None:
             return self._loaded_base_config_path
-        return resolve_groot_base_config_path(self.pretrained_path, self.base_model_path)
+        checkpoint = self.pretrained_path
+        if checkpoint is not None and not Path(checkpoint).is_dir():
+            key = (str(checkpoint), self.pretrained_revision)
+            if self._fetched_copies[0] != key:
+                folder = fetch_groot_base_config_copies(str(checkpoint), revision=self.pretrained_revision)
+                self._fetched_copies = (key, folder)
+            checkpoint = self._fetched_copies[1]
+        return resolve_groot_base_config_path(checkpoint, self.base_model_path)
 
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""

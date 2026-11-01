@@ -32,9 +32,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, Unpack
 
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
 from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError, HFValidationError, LocalEntryNotFoundError
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError
 from safetensors import safe_open
 from torch import Tensor
 
@@ -47,6 +47,7 @@ from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
     _BASE_CONFIG_DIR,
+    _BASE_CONFIG_FILES,
     GROOT_N1_5,
     GROOT_N1_5_REMOVAL_GUIDANCE,
     GROOT_N1_7,
@@ -54,6 +55,7 @@ from .configuration_groot import (
     infer_groot_model_version,
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
+    fetch_groot_base_config_copies,
     resolve_groot_base_config_path,
 )
 from .groot_n1_7 import GR00TN17, GR00TN17Config, _tie_unused_qwen_lm_head
@@ -73,9 +75,20 @@ _TIED_WEIGHT_NAMES = (
     "backbone.model.model.language_model.embed_tokens.weight",
 )
 
-# Loading a fine-tune reads these base model files, so saving it copies them into _BASE_CONFIG_DIR. config.json
-# comes last, as it marks a complete copy (see resolve_groot_base_config_path).
-_BASE_CONFIG_FILES = ("processor_config.json", CONFIG_NAME)
+
+
+def _link_root(folder: Path) -> Path | None:
+    """Return the folder that the files read from `folder` must resolve into to be copied, or None for none."""
+    real = folder.resolve()
+    if folder.name == _BASE_CONFIG_DIR and not real.is_relative_to(folder.parent.resolve()):
+        # A checkpoint's copies folder that links out of the checkpoint.
+        return None
+    for snapshot in (real, *real.parents):
+        repo = snapshot.parent.parent
+        if snapshot.parent.name == "snapshots" and repo.name.startswith("models--") and (repo / "blobs").is_dir():
+            # The Hugging Face cache links the files of a snapshot into the blobs folder of its repo.
+            return repo
+    return real
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -260,12 +273,10 @@ class GrootPolicy(PreTrainedPolicy):
         if os.path.isdir(base_config_path):
             folder = Path(base_config_path)
             # A save writes these files into the next checkpoint, so a link out of the folder is not followed.
-            # The Hugging Face cache links the files of a snapshot into its repo folder.
-            snapshots = next((parent for parent in folder.parents if parent.name == "snapshots"), None)
-            root = folder if snapshots is None else snapshots.parent
+            root = _link_root(folder)
             files: list[Path] = []
             for path in (folder / name for name in _BASE_CONFIG_FILES):
-                if path.resolve().is_relative_to(root.resolve()):
+                if root is not None and path.resolve().is_relative_to(root):
                     files.append(path)
                 else:
                     logger.warning("%s links outside %s, so a save does not copy it.", path, folder)
@@ -323,8 +334,7 @@ class GrootPolicy(PreTrainedPolicy):
         Args:
             pretrained_name_or_path: Path to the GR00T model or fine-tuned checkpoint
             config: Optional GrootConfig. If None, loads from checkpoint or creates default. For a fine-tuned
-                checkpoint, it records the folder the base config files are read from
-                (see GrootConfig.base_config_path).
+                checkpoint, a config without a pretrained_path is given this checkpoint and its revision.
             force_download: Force download even if cached
             resume_download: Resume interrupted download
             proxies: Proxy settings
@@ -386,57 +396,58 @@ class GrootPolicy(PreTrainedPolicy):
                     revision=revision,
                     **kwargs,
                 )
+            elif config.pretrained_path is None:
+                # As PreTrainedConfig.from_pretrained does, so the config reads this checkpoint's copies too.
+                config.pretrained_path, config.pretrained_revision = Path(model_id), revision
             if not os.path.isdir(model_id):
-                try:
-                    # Fetched into the snapshot folder that holds the weights file found above.
-                    snapshot_download(
-                        repo_id=model_id,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        force_download=force_download,
-                        proxies=proxies,
-                        token=token,
-                        local_files_only=local_files_only,
-                        allow_patterns=[f"{_BASE_CONFIG_DIR}/{name}" for name in _BASE_CONFIG_FILES],
-                    )
-                except (LocalEntryNotFoundError, HfHubHTTPError):
-                    logger.warning(
-                        "Could not get the checkpoint's base config copies; reading base_model_path."
-                    )
-            # Every way of building the policy below reads the base config files there, as does the config.
+                # Into the snapshot folder that holds the weights file found above.
+                fetch_groot_base_config_copies(
+                    model_id,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+            # Every way of building the policy below reads the base config files there. Only while it builds, so
+            # the config gives the same horizon before and after the load.
             config._loaded_base_config_path = resolve_groot_base_config_path(
                 os.path.dirname(model_file), config.base_model_path
             )
-            if force_download and not os.path.isdir(model_id):
-                # The weights above were downloaded without forcing, so only the regular load honors
-                # force_download. A local folder has nothing to download.
-                logger.info("force_download is set, so the checkpoint loads the regular way.")
-            elif cls is GrootPolicy:
-                groot_model = cls._build_groot_model_from_checkpoint(config, model_file)
-                if groot_model is not None:
-                    policy = cls(config, _groot_model=groot_model, **kwargs)
-                    policy.to(config.device)
-                    policy.eval()
-                    return policy
-            else:
-                # A subclass may build its own model or add weights, so it keeps the regular load.
-                logger.info(
-                    "%s is a subclass, so it builds its own model from the base weights before loading.",
-                    cls.__name__,
+            try:
+                if force_download and not os.path.isdir(model_id):
+                    # The weights above were downloaded without forcing, so only the regular load honors
+                    # force_download. A local folder has nothing to download.
+                    logger.info("force_download is set, so the checkpoint loads the regular way.")
+                elif cls is GrootPolicy:
+                    groot_model = cls._build_groot_model_from_checkpoint(config, model_file)
+                    if groot_model is not None:
+                        policy = cls(config, _groot_model=groot_model, **kwargs)
+                        policy.to(config.device)
+                        policy.eval()
+                        return policy
+                else:
+                    # A subclass may build its own model or add weights, so it keeps the regular load.
+                    logger.info(
+                        "%s is a subclass, so it builds its own model from the base weights before loading.",
+                        cls.__name__,
+                    )
+                return super().from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    config=config,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    strict=strict,
+                    **kwargs,
                 )
-            return super().from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                config=config,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                strict=strict,
-                **kwargs,
-            )
+            finally:
+                config._loaded_base_config_path = None
 
         # This is a base GR00T model - load it fresh
         logger.info("Detected base GR00T model, loading from HuggingFace...")
