@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -998,6 +999,29 @@ def test_vlm_stage_takes_placeholder_masks_on_the_host() -> None:
         output = backend()._run_vlm_stage(**inputs)
     action_hidden = output["h_vlm"][inputs["act_placeholder_mask"].cuda()].view(2, 2, -1)
     assert torch.equal(output["pred_latent"], action_hidden)
+
+
+def test_vlm_stage_feeds_a_bfloat16_vlm_to_the_float32_head_on_the_cpu() -> None:
+    from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
+
+    qwen, backend, inputs = _vlm_stage_setup()
+    # As LaWAM builds them: the VLM and its queries in `vlm_dtype` (bfloat16 by default), the head in float32.
+    qwen.to(torch.bfloat16)
+    for name in ("act_query", "flow_query"):
+        inputs[name] = inputs[name].bfloat16()
+    stage = backend()
+    stage.vlm_to_lam = head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    with torch.no_grad():
+        output = stage._run_vlm_stage(**inputs)
+    assert output["h_vlm"].dtype == torch.bfloat16
+    # The head computes in float32 from the same values, with its queries in the hidden states' dtype.
+    reference = deepcopy(head)
+    action_hidden = output["h_vlm"][inputs["act_placeholder_mask"]].view(2, 2, -1)
+    with torch.no_grad():
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(action_hidden.float())
+    assert output["pred_latent"].dtype == torch.float32
+    torch.testing.assert_close(output["pred_latent"], expected, rtol=0, atol=0)
 
 
 def test_prepared_vlm_stage_exports_and_matches_stock_qwen(monkeypatch) -> None:
