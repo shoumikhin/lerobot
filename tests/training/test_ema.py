@@ -26,6 +26,7 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.distributed.checkpoint import load_sharded_ema, save_sharded_ema
 from lerobot.optim.ema import EMA, ConstantEMAConfig, PowerEMAConfig, WarmupEMAConfig
 from lerobot.utils.constants import (
     EMA_STATE,
@@ -86,6 +87,35 @@ def test_ema_decay_schedules():
     assert WarmupEMAConfig().get_decay(10**9) == 0.9999
     # sigma_rel 0.1 is gamma 6.94 in EDM2.
     assert PowerEMAConfig(sigma_rel=0.1).get_decay(11) == pytest.approx((10 / 11) ** (6.9372 + 1), rel=1e-4)
+
+
+def test_ema_loads_averages_saved_under_torch_compile_wrapper_names():
+    """A run that wrapped a module with torch.compile resumes with the module compiled in place or eager."""
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    # The wrapper compiles on its first call, so here it only renames the parameters.
+    wrapped = torch.nn.Sequential(torch.compile(model[0]))
+    saved = EMA(wrapped, ConstantEMAConfig(decay=0.9))
+    with torch.no_grad():
+        model[0].weight.fill_(1.0)
+    saved.step(wrapped)
+    assert list(saved.averages) == ["0._orig_mod.weight", "0._orig_mod.bias"]
+
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+        model[0].bias.fill_(2.0)
+    ema = EMA(model, ConstantEMAConfig(decay=0.9))
+    ema.load_state_dict(saved.state_dict())
+    assert ema.num_updates == 1
+    assert torch.equal(ema.averages["0.weight"], torch.ones(4, 4))
+    assert torch.equal(ema.averages["0.bias"], saved.averages["0._orig_mod.bias"])
+
+
+def test_sharded_ema_saved_under_torch_compile_wrapper_names_says_how_to_resume(tmp_path):
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    wrapped = EMA(torch.nn.Sequential(torch.compile(model[0])), ConstantEMAConfig(decay=0.9))
+    save_sharded_ema(wrapped, tmp_path)
+    with pytest.raises(ValueError, match="delete it to resume"):
+        load_sharded_ema(EMA(model, ConstantEMAConfig(decay=0.9)), tmp_path)
 
 
 def make_dummy_dataset(tmp_path):

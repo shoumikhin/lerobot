@@ -276,7 +276,16 @@ def load_sharded_ema(ema: EMA, input_dir: Path) -> None:
         return
     import torch.distributed.checkpoint as dcp
 
-    dcp.load({"ema": ema}, checkpoint_id=input_dir / EMA_SHARDED_STATE)  # nosec B614
+    checkpoint = input_dir / EMA_SHARDED_STATE
+    saved = dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata
+    wrapped = any("._orig_mod." in key for key in saved)
+    if wrapped and not any("._orig_mod." in name for name in ema.averages):
+        raise ValueError(
+            f"{checkpoint} holds the EMA averages under torch.compile's wrapper names (`._orig_mod.`), "
+            "which a sharded resume cannot map: delete it to resume, and the EMA restarts from the resumed "
+            "weights."
+        )
+    dcp.load({"ema": ema}, checkpoint_id=checkpoint)  # nosec B614
 
 
 def dcp_to_safetensors(dcp_dir: Path, output_dir: Path, *, delete_dcp: bool = False) -> Path:
