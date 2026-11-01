@@ -28,7 +28,7 @@ from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION
 
-from .recipe import TaskTokenData, TestCase
+from .recipe import ActionTokenData, TaskTokenData, TestCase
 
 
 def write_bundle(
@@ -37,8 +37,9 @@ def write_bundle(
     config: PreTrainedConfig,
     constants: dict[str, np.ndarray] | None = None,
     task_tokens: TaskTokenData | None = None,
+    action_tokens: ActionTokenData | None = None,
 ) -> None:
-    """Write the test case, the constants, the task's files and the policy config into the bundle folder.
+    """Write the test case, the constants, the task's and the actions' files and the policy config into the bundle.
 
     Args:
         bundle (`Bundle`):
@@ -52,6 +53,8 @@ def write_bundle(
         task_tokens (`TaskTokenData`, *optional*):
             The tokenizer, embedding table and known tasks, written to the files the manifest names in
             `task_tokens`.
+        action_tokens (`ActionTokenData`, *optional*):
+            The FAST tokenizer, written to the file the manifest names in `action_tokens`.
     """
     folder, manifest = bundle.path, bundle.manifest
     case = {**test_case.frame, ACTION: test_case.actions}
@@ -72,5 +75,7 @@ def write_bundle(
             save_torch({"embeddings": task_tokens.embeddings.detach().cpu().contiguous()})
         )
         (folder / manifest.task_tokens.known_tasks).write_text(json.dumps(task_tokens.known_tasks))
+    if manifest.action_tokens is not None and action_tokens is not None:
+        (folder / manifest.action_tokens.tokenizer).write_text(action_tokens.tokenizer, encoding="utf-8")
     config.save_pretrained(folder)
     (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)
