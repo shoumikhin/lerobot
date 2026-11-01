@@ -219,6 +219,9 @@ class BundleManifest:
             The compiled programs, by name.
         runs (`list[ProgramRun]`):
             The runs of the programs, in order.
+        first_runs (`list[list[ProgramRun]]`, *optional*):
+            For a policy whose first chunks after a reset compute otherwise than the later ones, the runs of each
+            of them, one list per chunk. The chunks after them run `runs`.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
         task_tokens (`TaskTokens`, *optional*):
@@ -236,10 +239,11 @@ class BundleManifest:
             programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
             reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
             only.
-        carry (`dict[str, list[int]]`, *optional*):
+        carry (`dict[str, list[int] | None]`, *optional*):
             The values the runs pass from one chunk to the next, by name, with their shapes, such as the warm
             start of a planner. After a reset each is float32 zeros. The runs read one like any value, and what
-            it holds after the last run is what the next chunk reads.
+            it holds after the last run is what the next chunk reads. A value without a shape has none after a
+            reset: the runs of the first chunk write it, in its own type and where they run, such as a cache.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -261,7 +265,9 @@ class BundleManifest:
             The test case file: a frame, the noise, and the expected actions under `action`. With `history`,
             each frame value holds the frames of several control ticks, oldest first, and the actions are those
             computed at the last one. With `carry`, the frame values and the noise hold those of several chunks,
-            oldest first, and the actions are those of the last chunk.
+            oldest first, and the actions are those of the last chunk. With `first_runs`, the test case plays
+            several chunks from a reset as a robot would: the frame values hold the frames of every control
+            tick, the noise that of each chunk, and the actions the one played at each tick.
     """
 
     format_version: int = FORMAT_VERSION
@@ -271,12 +277,13 @@ class BundleManifest:
     runtime_options: dict[str, dict[str, bool | int | str]] = field(default_factory=dict)
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
     constants: str | None = None
     task_tokens: TaskTokens | None = None
     action_tokens: ActionTokens | None = None
     noise_shape: list[int] | None = None
     history: dict[str, int] = field(default_factory=dict)
-    carry: dict[str, list[int]] = field(default_factory=dict)
+    carry: dict[str, list[int] | None] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -296,18 +303,31 @@ class BundleManifest:
             raise ValueError("The manifest names a different number of actions than it scales.")
         if not self.runs:
             raise ValueError("The manifest lists no run.")
+        if not all(self.first_runs):
+            raise ValueError("The manifest lists no run for one of the first chunks.")
         if not all(type(n) is int and n > 0 for n in self.history.values()):
             raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
         if not all(
-            isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape)
+            shape is None or (isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape))
             for shape in self.carry.values()
         ):
             raise ValueError(f"The carry must give each value a shape of whole numbers, not {self.carry}.")
-        names = [run.name for run in self.runs]
-        if len(set(names)) != len(names):
-            raise ValueError(f"The manifest names a run twice: {names}.")
-        if unknown := sorted({run.program for run in self.runs} - set(self.programs)):
-            raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+        for runs in (*self.first_runs, self.runs):
+            names = [run.name for run in runs]
+            if len(set(names)) != len(names):
+                raise ValueError(f"The manifest names a run twice: {names}.")
+            if unknown := sorted({run.program for run in runs} - set(self.programs)):
+                raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+        files = [self.test_case, self.constants]
+        files += [name for program in self.programs.values() for name in (program.file, program.data)]
+        if self.task_tokens is not None:
+            files += [self.task_tokens.tokenizer, self.task_tokens.embeddings, self.task_tokens.known_tasks]
+        if self.action_tokens is not None:
+            files.append(self.action_tokens.tokenizer)
+        if outside := [
+            name for name in files if name is not None and (Path(name).anchor or ".." in Path(name).parts)
+        ]:
+            raise ValueError(f"The manifest names files outside the bundle folder: {outside}.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleManifest:
@@ -326,6 +346,7 @@ class BundleManifest:
         _check_form(data)
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
+        first_runs = data.get("first_runs") or []
         target = data.get("target")
         task_tokens = data.get("task_tokens")
         prompt_ops = (task_tokens or {}).get("prompt_ops", [])
@@ -336,7 +357,10 @@ class BundleManifest:
             + sorted(
                 {key for files in programs.values() for key in files} - {f.name for f in fields(ProgramFiles)}
             )
-            + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
+            + sorted(
+                {key for run in [*runs, *(run for chunk in first_runs for run in chunk)] for key in run}
+                - {f.name for f in fields(ProgramRun)}
+            )
             + sorted(set(target or {}) - {f.name for f in fields(Target)})
             + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokens)})
             + sorted({op[0] for op in prompt_ops} - PROMPT_OPS.keys())
@@ -355,6 +379,7 @@ class BundleManifest:
                 **data,
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
+                "first_runs": [[ProgramRun(**run) for run in chunk] for chunk in first_runs],
                 "target": None if target is None else Target(**target),
                 "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
                 "action_tokens": None if action_tokens is None else ActionTokens(**action_tokens),
@@ -414,6 +439,8 @@ def _check_form(data: dict[str, Any]) -> None:
             and task_tokens["max_tokens"] > 0
         ),
         "action_tokens": isinstance(data.get("action_tokens"), dict | None),
+        "first_runs": _list_of(data.get("first_runs") or [], list)
+        and all(_list_of(runs, dict) for runs in data.get("first_runs") or []),
     }
     if wrong := [name for name, right in form.items() if not right]:
         raise ValueError(

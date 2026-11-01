@@ -246,7 +246,7 @@ def test_a_part_or_a_run_cannot_take_the_name_of_the_noise_draw():
         Part("noise", torch.nn.Identity(), (torch.zeros(2),), ["a"], ["y"])
     named = ProgramRun("noise", "model", ["observation.state"], ["action"])
     running = ProgramRun("draw", "noise", [], ["noise"])
-    for plan in ({"runs": [named]}, {"runs": [running]}):
+    for plan in ({"runs": [named]}, {"first_runs": [[named]]}, {"runs": [running]}):
         with pytest.raises(ValueError, match="A run cannot be named noise or run a program so named"):
             RunPlan(**plan)
 

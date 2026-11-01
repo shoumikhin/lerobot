@@ -156,15 +156,20 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             )
         test_case = recipe.test_case()
         runs = runs if plan.runs is None else plan.runs
-        # A test case with values carried between chunks holds the noise of each of its chunks.
-        chunk_noise = test_case.noise if test_case.noise is None or not plan.carry else test_case.noise[0]
+        first_runs = plan.first_runs
+        # A test case with values carried between chunks, or of the first chunks from a reset, holds the noise of
+        # each of its chunks.
+        several = plan.carry or plan.first_runs
+        chunk_noise = test_case.noise if test_case.noise is None or not several else test_case.noise[0]
         if chunk_noise is not None and cfg.backend.device == "cuda":
             # Drawn where the programs read it, so a chunk uploads only the robot's frame.
             noise = torch.from_numpy(chunk_noise)
             draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
             torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
             programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
-            runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
+            draw_run = ProgramRun(NOISE, NOISE, [], [NOISE])
+            runs = [draw_run, *runs]
+            first_runs = [[draw_run, *chunk] for chunk in first_runs]
         task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
@@ -173,6 +178,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runtime_options=cfg.backend.runtime_options,
             programs=programs,
             runs=runs,
+            first_runs=first_runs,
             constants=CONSTANTS if plan.constants else None,
             task_tokens=None
             if task_tokens is None
@@ -182,7 +188,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             action_tokens=None if action_tokens is None else action_tokens.spec,
             noise_shape=None if chunk_noise is None else list(chunk_noise.shape),
             history=plan.history,
-            carry={name: list(shape) for name, shape in plan.carry.items()},
+            carry={name: None if shape is None else list(shape) for name, shape in plan.carry.items()},
             task=recipe.task,
             action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
             action_scale=test_case.action_scale.tolist(),

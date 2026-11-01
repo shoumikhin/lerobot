@@ -40,12 +40,14 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
-from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from tests.export.backends import (
+    GPU_BACKENDS,
     needs_executorch,
     needs_executorch_coreml,
     needs_executorch_cuda,
     needs_executorch_openvino,
+    needs_executorch_tensorrt,
 )
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
@@ -961,3 +963,34 @@ def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(
         # The permissions of a new folder, not the private ones of the temporary folder the bundle was.
         assert stat.S_IMODE(bundle.path.stat().st_mode) == stat.S_IMODE((tmp_path / "new").stat().st_mode)
         assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "torch_test",
+        pytest.param("executorch_xnnpack", marks=needs_executorch),
+        pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+        pytest.param("executorch_tensorrt", marks=needs_executorch_tensorrt),
+    ],
+)
+def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported to start the sum of its noises in a first chunk of its own: the check plays three chunks."""
+    use_plugins(monkeypatch, "first_runs_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.carry == {"noise_total": None} and manifest.noise_shape == [4, 1]
+    (first,) = manifest.first_runs
+    assert first[-1].program == "begin" and manifest.runs[-1].program == "model"
+    # On a GPU every chunk draws its noise first, in a run of its own.
+    draws = [runs[0].outputs == [NOISE] for runs in (first, manifest.runs)]
+    assert draws == [backend in GPU_BACKENDS] * 2
+    case = load_file(tmp_path / "b" / manifest.test_case)
+    assert (
+        case[IMAGE].shape == (12, 32, 32, 3)
+        and case[ACTION].shape == (12, 3)
+        and case[NOISE].shape == (3, 4, 1)
+    )
+    engine = BundleEngine(Bundle.read(tmp_path / "b"))
+    actions = np.stack([engine.get_action(robot_frame()) for _ in range(8)])
+    assert actions.shape == (8, 3) and np.isfinite(actions).all()

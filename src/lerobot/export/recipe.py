@@ -134,12 +134,14 @@ class TestCase:
             The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
             `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
             actions are those computed at the last one. For one whose plan has a `carry`, likewise the frames of
-            several chunks, each one's first tick; the actions are those of the last chunk.
-        noise (`np.ndarray`, *optional*):
-            The starting noise, for a policy that takes one. With a `carry`, the noise of each chunk, stacked on
-            a new first axis like the frames.
+            several chunks, each one's first tick; the actions are those of the last chunk. For one whose plan
+            has `first_runs`, the frames of every tick of several chunks from a reset.
+        noise (`np.ndarray`):
+            The starting noise, for a policy that takes one, or `None`. With a `carry` or `first_runs`, the noise of each
+            chunk, stacked on a new first axis like the frames.
         actions (`np.ndarray`):
-            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`.
+            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`. With
+            `first_runs`, the action played at each tick.
         action_scale (`np.ndarray`):
             For each action component, the robot units of one step of the policy's normalized actions.
     """
@@ -199,14 +201,18 @@ class ActionTokenData:
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
-    No run is named `noise` or runs a program so named: on CUDA, that is the noise draw.
+    No run, in `runs` or `first_runs`, is named `noise` or runs a program so named: on CUDA, that is the noise
+    draw.
 
     Args:
         runs (`list[ProgramRun]`, *optional*):
             The runs in order, each naming the part it runs as its program. A part may run several times, for
             example a denoising step. `None` runs each part once, in the order it was yielded, with its own
             names.
-        constants (`dict[str, np.ndarray]`):
+        first_runs (`list[list[ProgramRun]]`, *optional*):
+            The runs of each of the first chunks after a reset, for a policy whose first chunks compute
+            otherwise (see `BundleManifest.first_runs`).
+        constants (`dict[str, np.ndarray]`, *optional*):
             Named arrays the runs can read, such as each step's timestep.
         task_tokens (`TaskTokenData`, *optional*):
             How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
@@ -214,24 +220,27 @@ class RunPlan:
         action_tokens (`ActionTokenData`, *optional*):
             How the token ids the runs generate become the actions later runs take, for a policy that writes its
             actions as tokens.
-        history (`dict[str, int]`):
+        history (`dict[str, int]`, *optional*):
             For each key of the frame the parts read with its past values, how many frames: the parts take it
             as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
-        carry (`dict[str, tuple[int, ...]]`):
-            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset
-            (see `BundleManifest.carry`).
+        carry (`dict[str, tuple[int, ...] | None]`, *optional*):
+            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset,
+            or, without a shape, what the first chunk's runs write (see `BundleManifest.carry`).
     """
 
     runs: list[ProgramRun] | None = None
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
     action_tokens: ActionTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)
-    carry: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    carry: dict[str, tuple[int, ...] | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Refuse a run named like the one that draws a bundle's noise on CUDA, or a run of its program."""
-        if any(NOISE in (run.name, run.program) for run in self.runs or []):
+        if any(
+            NOISE in (run.name, run.program) for runs in (self.runs or [], *self.first_runs) for run in runs
+        ):
             raise ValueError(
                 f"A run cannot be named {NOISE} or run a program so named: on CUDA, a bundle draws its noise "
                 "with a run and a program so named."
