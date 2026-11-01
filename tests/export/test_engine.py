@@ -622,6 +622,7 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
         ({"exact_runtime_modules": "tensorrt"}, "exact_runtime_modules"),
         ({"task_tokens": {"prompt_ops": ["strip"]}}, "task_tokens"),
         ({"task_tokens": {"prompt_ops": [[]]}}, "task_tokens"),
+        ({"action_tokens": ["fast"]}, "action_tokens"),
     ],
 )
 def test_bundle_refuses_a_manifest_in_a_form_it_does_not_read(tmp_path, change, wrong):

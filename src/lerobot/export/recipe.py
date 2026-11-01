@@ -31,7 +31,7 @@ import torch
 from torch import Tensor, nn
 from torch.overrides import TorchFunctionMode
 
-from lerobot.bundle.manifest import NOISE, ProgramRun
+from lerobot.bundle.manifest import NOISE, ActionTokens, ProgramRun
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, is_depth_map
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.processor import (
@@ -181,6 +181,21 @@ class TaskTokenData:
 
 
 @dataclass
+class ActionTokenData:
+    """How the token ids a policy generates become its actions, which the bundle decodes without PyTorch.
+
+    Args:
+        tokenizer (`str`):
+            The policy's FAST tokenizer, as the JSON the `tokenizers` library saves.
+        spec (`ActionTokens`):
+            The manifest's `action_tokens`, naming the file `tokenizer` is written to.
+    """
+
+    tokenizer: str
+    spec: ActionTokens
+
+
+@dataclass
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
@@ -196,6 +211,9 @@ class RunPlan:
         task_tokens (`TaskTokenData`, *optional*):
             How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
             reads it.
+        action_tokens (`ActionTokenData`, *optional*):
+            How the token ids the runs generate become the actions later runs take, for a policy that writes its
+            actions as tokens.
         history (`dict[str, int]`):
             For each key of the frame the parts read with its past values, how many frames: the parts take it
             as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
@@ -207,6 +225,7 @@ class RunPlan:
     runs: list[ProgramRun] | None = None
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
+    action_tokens: ActionTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)
     carry: dict[str, tuple[int, ...]] = field(default_factory=dict)
 

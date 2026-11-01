@@ -23,7 +23,16 @@ from pathlib import Path
 import numpy as np
 from safetensors.numpy import save_file
 
-from lerobot.bundle.manifest import TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.manifest import (
+    DECODED_ACTIONS,
+    GENERATED_TOKENS,
+    TEST_CASE,
+    ActionTokens,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+)
 from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -31,13 +40,13 @@ RUNTIME = "numpy"
 
 
 class ScaleProgram:
-    """A chunk of actions from a state: the state times each row of the scale the program file holds."""
+    """The array the program file holds, times the input as NumPy broadcasts them if the program takes one."""
 
     def __init__(self, path: Path, data: Path | None = None):
         self._scale = np.load(path)
 
-    def __call__(self, state: np.ndarray) -> tuple[np.ndarray, ...]:
-        return (state[None] * self._scale,)
+    def __call__(self, *inputs: np.ndarray) -> tuple[np.ndarray, ...]:
+        return (inputs[0] * self._scale if inputs else self._scale,)
 
     def to_numpy(self, value: np.ndarray) -> np.ndarray:
         return np.asarray(value)
@@ -66,6 +75,36 @@ def make_numpy_bundle(
         runs=[ProgramRun("model", "model", [OBS_STATE], [ACTION])],
         action_names=action_names,
         action_scale=[1.0] * n_motors,
+        tolerance=1e-6,
+    )
+    Bundle(path, manifest).write()
+    return path
+
+
+def make_token_bundle(
+    path: Path, tokenizer: str, spec: ActionTokens, tokens: np.ndarray, actions: np.ndarray
+) -> Path:
+    """A bundle of a policy that writes its actions as tokens, whose test case expects `actions`.
+
+    One program generates `tokens`, the bundle decodes them with the FAST tokenizer file `tokenizer` as `spec` says,
+    and another program plays the decoded actions.
+    """
+    path.mkdir(parents=True)
+    np.save(path / "tokens.npy", tokens)
+    np.save(path / "actions.npy", np.ones(spec.action_dim, np.float32))
+    (path / spec.tokenizer).write_text(tokenizer, encoding="utf-8")
+    save_file({OBS_STATE: np.zeros(1, np.float32), ACTION: actions}, path / TEST_CASE)
+    manifest = BundleManifest(
+        backend="numpy",
+        runtime=RUNTIME,
+        runtime_imports=[__name__],
+        programs={"tokens": ProgramFiles("tokens.npy"), "actions": ProgramFiles("actions.npy")},
+        runs=[
+            ProgramRun("tokens", "tokens", [], [GENERATED_TOKENS]),
+            ProgramRun("actions", "actions", [DECODED_ACTIONS], [ACTION]),
+        ],
+        action_tokens=spec,
+        action_scale=[1.0] * spec.action_dim,
         tolerance=1e-6,
     )
     Bundle(path, manifest).write()

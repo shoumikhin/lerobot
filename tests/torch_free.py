@@ -64,6 +64,15 @@ _CHECK_REFUSED = """
 assert not _torch_attempts, "torch import attempted:\\n" + _torch_attempts[0]
 """
 
+# `python -m lerobot.bundle argv[1]`: loads a bundle's programs and replays its test case.
+CHECK_BUNDLE = """
+import runpy
+import sys
+
+sys.argv = ["lerobot.bundle", sys.argv[1]]
+runpy.run_module("lerobot.bundle", run_name="__main__")
+"""
+
 
 def refusing_torch(code: str) -> str:
     """`code` that fails if it tries to load PyTorch, for a child process that the code under test starts."""

@@ -30,8 +30,17 @@ from safetensors.numpy import load_file
 
 from lerobot.utils.constants import ACTION
 
-from .manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Bundle, BundleManifest
-from .runtime import prepare_runtime
+from .action_tokens import ActionDecoder
+from .manifest import (
+    DECODED_ACTIONS,
+    GENERATED_TOKENS,
+    NOISE,
+    TASK_EMBEDDINGS,
+    TASK_LENGTH,
+    Bundle,
+    BundleManifest,
+)
+from .runtime import Program, prepare_runtime
 from .target import check_runtime_versions, check_target
 from .task_tokens import TaskEncoder
 
@@ -76,6 +85,11 @@ class BundleEngine:
         self._fixed_task = manifest.task
         self._task_encoder = (
             None if manifest.task_tokens is None else TaskEncoder(bundle.path, manifest.task_tokens)
+        )
+        self._action_decoder = (
+            None
+            if manifest.action_tokens is None
+            else ActionDecoder.read(bundle.path, manifest.action_tokens)
         )
         task = task or self._fixed_task or ""
         self._check_task(task)
@@ -228,10 +242,19 @@ class BundleEngine:
             noise = np.random.standard_normal(self._host_noise_shape).astype(np.float32)
         if noise is not None:
             values[NOISE] = noise
+        # The program that wrote the generated tokens, which turns them into a host array.
+        token_writer: Program | None = None
         for (run, program), placed in zip(self._runs, self._placed, strict=True):
             if NOISE in values and NOISE in run.outputs:
                 # The test case's recorded noise stands in for the draw.
                 continue
+            if (
+                self._action_decoder is not None
+                and DECODED_ACTIONS in run.inputs
+                and DECODED_ACTIONS not in values
+            ):
+                tokens = cast(Program, token_writer).to_numpy(values[GENERATED_TOKENS])
+                values[DECODED_ACTIONS] = self._action_decoder(tokens)
             inputs = []
             for index, name in enumerate(run.inputs):
                 if index in placed:
@@ -242,6 +265,8 @@ class BundleEngine:
                     values[name] = program.place(index, values[name])
                 inputs.append(values[name])
             values.update(zip(run.outputs, program(*inputs), strict=True))
+            if GENERATED_TOKENS in run.outputs:
+                token_writer = program
         # Left where the runs wrote them, so the next chunk reads them without a copy.
         self._carry = {name: values[name] for name in self._carry_shapes}
         actions = self._runs[-1][1].to_numpy(values[ACTION])
@@ -388,6 +413,8 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
     The constants and the values `task_tokens` makes are placed once where each run reads them, so a run that
     wrote one would not change what a later run reads.
     A value carried between chunks must have a name of its own, and some run must write it.
+    The decoded actions of `action_tokens` count as given once a run of the same chunk has written the
+    generated tokens, which the bundle decodes once: no run may write them after one read the decoded actions.
     """
     if clashes := sorted(set(constants) & {*frame, NOISE}):
         raise ValueError(
@@ -402,7 +429,9 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
         )
     available.update(manifest.carry)
     written: set[str] = set()
+    decodes = manifest.action_tokens is not None
     tasks = manifest.task_tokens is not None
+    tokens_written = decoded = False
     for run in manifest.runs:
         if NOISE in run.outputs and (others := sorted(set(run.outputs) - {NOISE})):
             raise ValueError(
@@ -419,10 +448,29 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
             raise ValueError(
                 f"The bundle's run {run.name!r} writes the constants {shadowed}. Export the policy again."
             )
+        if decodes and DECODED_ACTIONS in run.outputs:
+            raise ValueError(
+                f"The bundle's run {run.name!r} writes {DECODED_ACTIONS!r}, which the bundle decodes itself. "
+                "Export the policy again."
+            )
         if tasks and (retasked := sorted(set(run.outputs) & {TASK_EMBEDDINGS, TASK_LENGTH})):
             raise ValueError(
                 f"The bundle's run {run.name!r} writes {retasked}, which the bundle makes from the task "
                 "itself. Export the policy again."
+            )
+        if decodes and DECODED_ACTIONS in run.inputs:
+            if not tokens_written:
+                raise ValueError(
+                    f"The bundle's run {run.name!r} reads {DECODED_ACTIONS!r}, but no earlier run of "
+                    f"its chunk writes {GENERATED_TOKENS!r}, which the bundle decodes. Export the policy "
+                    "again."
+                )
+            available.add(DECODED_ACTIONS)
+            decoded = True
+        if decodes and decoded and GENERATED_TOKENS in run.outputs:
+            raise ValueError(
+                f"The bundle's run {run.name!r} writes {GENERATED_TOKENS!r} after a run read their "
+                "decoded actions, which the bundle decodes only once. Export the policy again."
             )
         if missing := [name for name in run.inputs if name not in available]:
             raise ValueError(
@@ -431,6 +479,7 @@ def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[
             )
         available.update(run.outputs)
         written.update(run.outputs)
+        tokens_written |= GENERATED_TOKENS in run.outputs
     if unwritten := sorted(set(manifest.carry) - written):
         raise ValueError(
             f"The bundle carries {unwritten} between chunks, but no run writes them. Export the policy again."
