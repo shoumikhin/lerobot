@@ -168,11 +168,28 @@ class VLAJEPAConfig(PreTrainedConfig):
             )
         if self.n_action_steps > self.chunk_size:
             raise ValueError("`n_action_steps` must be <= `chunk_size`.")
+        if self.num_embodied_action_tokens == 0:
+            raise ValueError(
+                f"Prompts must hold the embodied action token {self.embodied_action_token}: put "
+                f"{{e_actions}} in `prompt_template` ({self.prompt_template!r}) and set "
+                "`num_embodied_action_tokens_per_instruction` "
+                f"({self.num_embodied_action_tokens_per_instruction}) above 0."
+            )
         if self.num_video_frames < 2 * self.jepa_tubelet_size:
             raise ValueError(
                 f"`video_horizon` ({self.num_video_frames}) must be >= 2 * `jepa_tubelet_size` "
                 f"({self.jepa_tubelet_size}) to have at least one context and one GT temporal position."
             )
+
+    @property
+    def num_embodied_action_tokens(self) -> int:
+        """How many embodied action tokens each prompt holds; their hidden states condition the action head."""
+        prompt = self.prompt_template.format(
+            instruction="",
+            actions="",
+            e_actions=self.embodied_action_token * self.num_embodied_action_tokens_per_instruction,
+        )
+        return prompt.count(self.embodied_action_token)
 
     @property
     def num_world_model_views(self) -> int:
