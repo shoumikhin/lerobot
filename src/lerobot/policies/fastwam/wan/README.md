@@ -18,6 +18,10 @@ Copied files:
 - `get_sampling_sigmas` in `video_dit.py` (was `wan/utils/fm_solvers.py`), inlined
   next to its only caller.
 
+In `model.py`, the time embedding, time projection and head use `Float32Linear`
+(defined there) with autocast off, in place of upstream's CUDA float32 autocast
+regions, so they compute in float32 on every device.
+
 This subset only backs FastWAM's **custom MoT video DiT**. The Wan2.2 VAE,
 UMT5 text encoder, and tokenizer are no longer vendored - they come from
 `diffusers.AutoencoderKLWan`, `transformers.UMT5EncoderModel`, and
