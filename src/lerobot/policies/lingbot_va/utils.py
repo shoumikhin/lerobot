@@ -627,13 +627,11 @@ class WanAttention(nn.Module):
     def restore_cache(self, cache_name, slots):
         self.attn_caches[cache_name]["mask"][slots] = False
 
-    def forward(self, q, k, v, rotary_emb, update_cache=0, cache_name="pos"):
-        kv_cache = (
-            self.attn_caches[cache_name]
-            if (self.attn_caches is not None) and (cache_name in self.attn_caches)
-            else None
-        )
+    def project(self, q, k, v, rotary_emb):
+        """The ``(B, S, H, D)`` queries, keys and values.
 
+        The queries and keys are normalized and, with ``rotary_emb``, rotated; the values are only split into heads.
+        """
         query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
         # From torch 2.12, CUDA autocast runs RMSNorm in float32, which the KV cache and flash-attn reject.
         query = self.norm_q(query).to(value.dtype)
@@ -652,6 +650,24 @@ class WanAttention(nn.Module):
 
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
+        return query, key, value
+
+    def output(self, hidden_states, query):
+        """The ``(B, S, H, D)`` attention output merged over the heads and projected back to the model width."""
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[1](hidden_states)
+        return hidden_states
+
+    def forward(self, q, k, v, rotary_emb, update_cache=0, cache_name="pos"):
+        kv_cache = (
+            self.attn_caches[cache_name]
+            if (self.attn_caches is not None) and (cache_name in self.attn_caches)
+            else None
+        )
+
+        query, key, value = self.project(q, k, v, rotary_emb)
         slots = None
         if kv_cache is not None and kv_cache["k"] is not None:
             slots = self.update_cache(cache_name, key, value, is_pred=(update_cache == 1))
@@ -667,11 +683,7 @@ class WanAttention(nn.Module):
         if update_cache == 0 and kv_cache is not None and kv_cache["k"] is not None:
             self.restore_cache(cache_name, slots)
 
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
-        hidden_states = self.to_out[0](hidden_states)
-        hidden_states = self.to_out[1](hidden_states)
-        return hidden_states
+        return self.output(hidden_states, query)
 
 
 # Dual-stream Wan2.2 transformer
@@ -735,6 +747,23 @@ class WanTransformerBlock(nn.Module):
     def forward(
         self, hidden_states, encoder_hidden_states, temb, rotary_emb, update_cache=0, cache_name="pos"
     ) -> torch.Tensor:
+        def self_attention(norm_hidden_states):
+            return self.attn1(
+                norm_hidden_states,
+                norm_hidden_states,
+                norm_hidden_states,
+                rotary_emb,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
+
+        return self.forward_with(hidden_states, encoder_hidden_states, temb, self_attention)
+
+    def forward_with(self, hidden_states, encoder_hidden_states, temb, self_attention) -> torch.Tensor:
+        """The block with ``self_attention``, which maps the normalized hidden states to their attention output.
+
+        ``forward`` passes ``attn1`` with the KV cache; an export passes the same attention over its own cache.
+        """
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = rearrange(
             temb_scale_shift_table, "b l n c -> b n l c"
@@ -749,26 +778,12 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1.0 + scale_msa) + shift_msa).type_as(
             hidden_states
         )
-        attn_output = self.attn1(
-            norm_hidden_states,
-            norm_hidden_states,
-            norm_hidden_states,
-            rotary_emb,
-            update_cache=update_cache,
-            cache_name=cache_name,
-        )
+        attn_output = self_attention(norm_hidden_states)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(
-            norm_hidden_states,
-            encoder_hidden_states,
-            encoder_hidden_states,
-            None,
-            update_cache=0,
-            cache_name=cache_name,
-        )
+        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, encoder_hidden_states, None)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward

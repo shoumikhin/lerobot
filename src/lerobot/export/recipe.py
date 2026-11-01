@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
@@ -1185,6 +1186,57 @@ class _ActionChunk(nn.Module):
         noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else self.noise
         actions = self.predict_chunk(self.policy, self.preprocessor(observation), noise)
         return self.postprocess(actions[:, : self.execution_steps])
+
+
+def play_from_reset(
+    modules: dict[str, nn.Module],
+    chunk_runs: Sequence[Sequence[ProgramRun]],
+    constants: dict[str, np.ndarray],
+    history: dict[str, int],
+    carry: Sequence[str],
+    frames: dict[str, np.ndarray],
+    noise: np.ndarray,
+    examples: dict[str, tuple[Tensor, ...]],
+    device: torch.device,
+) -> np.ndarray:
+    """The actions `modules` play at each tick of `frames` from a reset, run as the bundle runs a plan.
+
+    As with the plan's `first_runs`, chunk `i` runs `chunk_runs[i]`, and every later chunk the last of them.
+
+    `history` names each key the programs take as its last frames, with how many; `carry` names the values a
+    chunk passes to the next. The last inputs each program gets are kept in `examples`.
+    """
+    held = {name: torch.from_numpy(value).to(device) for name, value in constants.items()}
+    past: dict[str, deque[Tensor]] = {name: deque(maxlen=size) for name, size in history.items()}
+    carried: dict[str, Tensor] = {}
+    queued: deque[np.ndarray] = deque()
+    played = []
+    chunk = 0
+    with torch.no_grad():
+        for tick in range(len(next(iter(frames.values())))):
+            for name, frames_of_key in past.items():
+                value = torch.from_numpy(frames[name][tick]).to(device)
+                frames_of_key.extend([value] * (frames_of_key.maxlen or 0) if not frames_of_key else [value])
+            if not queued:
+                values: dict[str, Tensor] = {
+                    **held,
+                    **carried,
+                    NOISE: torch.from_numpy(noise[chunk]).to(device),
+                }
+                values.update(
+                    {name: torch.stack(list(frames_of_key)) for name, frames_of_key in past.items()}
+                )
+                for run in chunk_runs[min(chunk, len(chunk_runs) - 1)]:
+                    inputs = tuple(values[name] for name in run.inputs)
+                    examples[run.program] = inputs
+                    outputs = modules[run.program](*inputs)
+                    outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+                    values.update(zip(run.outputs, outputs, strict=True))
+                queued.extend(values[ACTION].cpu().numpy())
+                carried = {name: values[name] for name in carry}
+                chunk += 1
+            played.append(queued.popleft())
+    return np.stack(played)
 
 
 class ReplayDraws(TorchFunctionMode):
