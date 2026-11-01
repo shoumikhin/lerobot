@@ -121,7 +121,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
             programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
             runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
-        task_tokens = plan.task_tokens
+        task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
@@ -134,6 +134,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             else TaskTokens(
                 task_tokens.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, task_tokens.max_tokens
             ),
+            action_tokens=None if action_tokens is None else action_tokens.spec,
             noise_shape=None if chunk_noise is None else list(chunk_noise.shape),
             history=plan.history,
             carry={name: list(shape) for name, shape in plan.carry.items()},
@@ -144,7 +145,9 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             target=cfg.backend.target(),
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
         )
-        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens)
+        write_bundle(
+            Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens, action_tokens
+        )
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         shutil.rmtree(traced, ignore_errors=True)

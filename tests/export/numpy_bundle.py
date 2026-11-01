@@ -25,13 +25,23 @@ from pathlib import Path
 import numpy as np
 from safetensors.numpy import save_file
 
-from lerobot.bundle.manifest import TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.manifest import (
+    DECODED_ACTIONS,
+    GENERATED_TOKENS,
+    TEST_CASE,
+    ActionTokens,
+    Bundle,
+    BundleManifest,
+    ProgramFiles,
+    ProgramRun,
+)
 from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.robots import RobotConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
 
 RUNTIME = "numpy"
+ARRAY_RUNTIME = "numpy_array"
 
 
 class ScaleProgram:
@@ -51,6 +61,25 @@ class ScaleProgram:
 
 
 register_runtime(RUNTIME, Runtime(ScaleProgram))
+
+
+class ArrayProgram:
+    """The array the program file holds: alone for a program that takes nothing, or times the one input it takes."""
+
+    def __init__(self, path: Path, data: Path | None = None):
+        self._array = np.load(path)
+
+    def __call__(self, *inputs: np.ndarray) -> tuple[np.ndarray, ...]:
+        return (inputs[0] * self._array if inputs else self._array,)
+
+    def to_numpy(self, value: np.ndarray) -> np.ndarray:
+        return np.asarray(value)
+
+    def place(self, index: int, value: np.ndarray) -> np.ndarray:
+        return value
+
+
+register_runtime(ARRAY_RUNTIME, Runtime(ArrayProgram))
 
 
 def make_numpy_bundle(
@@ -74,6 +103,36 @@ def make_numpy_bundle(
         runs=[ProgramRun("model", "model", [OBS_STATE], [ACTION])],
         action_names=action_names,
         action_scale=[1.0] * n_motors,
+        tolerance=1e-6,
+    )
+    Bundle(path, manifest).write()
+    return path
+
+
+def make_token_bundle(
+    path: Path, tokenizer: str, spec: ActionTokens, tokens: np.ndarray, actions: np.ndarray
+) -> Path:
+    """A bundle of a policy that writes its actions as tokens, whose test case expects `actions`.
+
+    One program generates `tokens`, the bundle decodes them with the FAST tokenizer file `tokenizer` as `spec` says,
+    and another program plays the decoded actions.
+    """
+    path.mkdir(parents=True)
+    np.save(path / "tokens.npy", tokens)
+    np.save(path / "actions.npy", np.ones(spec.action_dim, np.float32))
+    (path / spec.tokenizer).write_text(tokenizer)
+    save_file({OBS_STATE: np.zeros(1, np.float32), ACTION: actions}, path / TEST_CASE)
+    manifest = BundleManifest(
+        backend="numpy",
+        runtime=ARRAY_RUNTIME,
+        runtime_imports=[__name__],
+        programs={"tokens": ProgramFiles("tokens.npy"), "actions": ProgramFiles("actions.npy")},
+        runs=[
+            ProgramRun("tokens", "tokens", [], [GENERATED_TOKENS]),
+            ProgramRun("actions", "actions", [DECODED_ACTIONS], [ACTION]),
+        ],
+        action_tokens=spec,
+        action_scale=[1.0] * spec.action_dim,
         tolerance=1e-6,
     )
     Bundle(path, manifest).write()
