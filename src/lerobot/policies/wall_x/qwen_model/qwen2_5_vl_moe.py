@@ -26,6 +26,8 @@ It is rebased on the native ``transformers.models.qwen2_5_vl`` classes and only 
   causal-mask override (tokens of type 1 — the action tokens — attend to each other bidirectionally,
   everything else stays causal).
 - ``Qwen2_5_VLACausalLMOutputWithPast``: output dataclass with the extra Wall-X loss fields.
+- ``float32_eager_attention_forward``: eager attention computed in float32, which importing this module
+  registers with transformers as ``wall_x_eager``, the text model's attention.
 """
 
 from __future__ import annotations
@@ -39,13 +41,15 @@ import torch.nn as nn
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
+    from transformers import AttentionInterface, AttentionMaskInterface
     from transformers.activations import ACT2FN
     from transformers.cache_utils import Cache, DynamicCache
-    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask, eager_mask
     from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
         Qwen2_5_VLDecoderLayer,
         Qwen2_5_VLTextModel,
+        eager_attention_forward,
     )
     from transformers.utils.generic import merge_with_config_defaults
     from transformers.utils.output_capturing import capture_outputs
@@ -68,6 +72,47 @@ else:
 
 
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig
+
+WALL_X_ATTENTION = "wall_x_eager"
+
+
+def float32_eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager attention in float32 (float64 for float64 inputs), with its output in the input dtype.
+
+    Stock eager attention rounds bfloat16 scores before the softmax, which the FlashAttention-2 kernel Wall-X
+    was released with never does; on a bfloat16 policy that moves the actions far from the float32 policy.
+    Autocast is off here, or mixed-precision training would multiply the queries and keys in bfloat16. The
+    weights keep the compute dtype: only `output_attentions` reads them, and casting them would cost a pass
+    over them on every call. With TF32 off, the float32 matrix multiplications make it about twice as slow
+    on CUDA.
+    """
+    dtype = torch.promote_types(query.dtype, torch.float32)
+    with torch.autocast(query.device.type, enabled=False):
+        output, weights = eager_attention_forward(
+            module,
+            query.to(dtype),
+            key.to(dtype),
+            value.to(dtype),
+            attention_mask,
+            scaling,
+            dropout,
+            **kwargs,
+        )
+    return output.to(query.dtype), weights
+
+
+if _transformers_available:
+    AttentionInterface.register(WALL_X_ATTENTION, float32_eager_attention_forward)
+    AttentionMaskInterface.register(WALL_X_ATTENTION, eager_mask)
 
 
 @dataclass
@@ -218,8 +263,9 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
         self._require_eager_attention(text_config._attn_implementation)
         # Transformers selects SDPA automatically when no implementation is
         # requested. Wall-X's action-token islands require an explicit 4D
-        # mask, so opt into eager before PreTrainedModel performs that choice.
-        text_config._attn_implementation = "eager"
+        # mask, so opt into its float32 eager attention before PreTrainedModel
+        # performs that choice.
+        text_config._attn_implementation = WALL_X_ATTENTION
         super().__init__(text_config)
         # Free the parent-allocated dense layers before replacing them (pi_gemma.py precedent).
         del self.layers
@@ -234,7 +280,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
 
     @staticmethod
     def _require_eager_attention(attn_implementation: str | None) -> None:
-        if attn_implementation not in {None, "eager"}:
+        if attn_implementation not in {None, "eager", WALL_X_ATTENTION}:
             raise ValueError(
                 "Wall-X currently supports only attn_implementation='eager'. "
                 "Its bidirectional action-token islands cannot be represented "
@@ -263,7 +309,12 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
         cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
-        self._require_eager_attention(self.config._attn_implementation)
+        if self.config._attn_implementation != WALL_X_ATTENTION:
+            raise ValueError(
+                f"Wall-X's text model must run {WALL_X_ATTENTION!r}, its float32 eager attention, which it "
+                f"sets when it is built; got {self.config._attn_implementation!r}. Do not change it after "
+                "the build; to get the attention weights, pass `output_attentions=True` to the forward call."
+            )
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
