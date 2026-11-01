@@ -296,6 +296,7 @@ class ActionChunkRecipe(ExportRecipe):
             self._visual,
             self.task,
             self._steps,
+            self._held_noise,
         )
         frame, noise = random_frame(self._features, self._generator), self._random_noise()
         for case_frame, case_noise, expected in (
@@ -358,7 +359,8 @@ class ActionChunkRecipe(ExportRecipe):
 
     def _make_case(self, frame: dict[str, np.ndarray]) -> TestCase:
         """The test case of `frame`: a random noise, if the policy takes one, and the actions PyTorch computes."""
-        self._noise_shape = self._sampled_noise_shape(frame)
+        self._held_noise = self._seeded_noise()
+        self._noise_shape = None if self._held_noise is not None else self._sampled_noise_shape(frame)
         noise = self._random_noise()
         actions = self._reference(frame, noise)
         if not np.array_equal(actions, self._reference(frame, noise)):
@@ -389,6 +391,15 @@ class ActionChunkRecipe(ExportRecipe):
             for name, value in first.items()
             if isinstance(value, Tensor)
         )
+
+    def _seeded_noise(self) -> Tensor | None:
+        """The noise of a policy that draws the same noise for every chunk, as `predict_chunk` takes it.
+
+        Such a policy seeds its own generator each time it predicts a chunk, so it computes the same chunk from
+        the same frame. Its program holds this noise instead of taking one, and its bundle does the same. `None`,
+        the default, for a policy that draws other noise each time, which its bundle draws afresh for each chunk.
+        """
+        return None
 
     def _sampled_noise_shape(self, frame: dict[str, np.ndarray]) -> tuple[int, ...] | None:
         """The shape of the one starting noise the policy draws for a chunk, or `None` if it takes none.
@@ -455,6 +466,7 @@ class _ActionChunk(nn.Module):
         visual: set[str],
         task: str | None,
         execution_steps: int,
+        noise: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.predict_chunk = predict_chunk
@@ -465,6 +477,7 @@ class _ActionChunk(nn.Module):
         self.visual = visual
         self.task = task or ""
         self.execution_steps = execution_steps
+        self.noise = noise
 
     def forward(self, *inputs: Tensor) -> Tensor:
         observation: dict[str, Any] = {
@@ -473,7 +486,7 @@ class _ActionChunk(nn.Module):
         }
         observation["task"] = self.task
         observation["robot_type"] = ""
-        noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else None
+        noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else self.noise
         actions = self.predict_chunk(self.policy, self.preprocessor(observation), noise)
         return self.postprocessor(actions[:, : self.execution_steps])[0].float()
 
