@@ -24,19 +24,17 @@ prompt does not depend on it. The vision tower reads the patch grid prepared by 
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe, Part
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
 from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.import_utils import _transformers_available
 
 from ..common.fixed_prompt import FixedPromptStep
-from ..common.qwen_vision import prepare_image_grid
 from .processor_eo1 import EO1PrepareModelMessagesStep, EO1QwenProcessorStep
 
 if TYPE_CHECKING or _transformers_available:
@@ -62,12 +60,6 @@ class EO1ExportRecipe(ActionChunkRecipe):
             for step in self.preprocessor.steps
         ]
         return replace(self.preprocessor, steps=steps)
-
-    def parts(self) -> Iterator[Part]:
-        """The default recipe's part, checked inside `prepare_image_grid()` so the checks prepare the grid."""
-        with prepare_image_grid():
-            (part,) = super().parts()
-        yield part
 
 
 class _PixelValues:
