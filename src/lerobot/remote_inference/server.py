@@ -53,6 +53,7 @@ from lerobot.transport import (
     ZenohTransport,
 )
 
+from .bundle import BundleRunner
 from .chunk_contract import (
     CHUNK_ALIGNMENT,
     RTC_MODEL_SPACE,
@@ -129,7 +130,7 @@ class SessionWorker:
 
     def __init__(
         self,
-        runner: PolicyRunner,
+        runner: PolicyRunner | BundleRunner,
         *,
         deployment: str,
         artifact_identity: str,
@@ -662,6 +663,9 @@ class SessionWorker:
                         self._session.faulted = True
                 else:
                     response = self._execute(message)
+            except ProtocolError as exc:
+                # A refused request, such as a task a bundle cannot run, leaves the model as it was.
+                response = message.error(exc.code, str(exc), details=exc.details)
             except Exception as exc:
                 logger.exception(
                     "Policy worker failure instance=%s session=%s request=%s",
