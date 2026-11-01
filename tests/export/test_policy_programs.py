@@ -97,6 +97,9 @@ RECIPES = {
     "evo1": Recipe(
         "tests.policies.evo1.test_export_evo1", ("monkeypatch",), reads_task=True, marks=(OLD_TORCH,)
     ),
+    "fastwam": Recipe(
+        "tests.policies.fastwam.test_export_fastwam", ("monkeypatch",), seeded=True, reads_task=True
+    ),
 }
 
 
