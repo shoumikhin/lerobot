@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The recipes of the policies that carry something from frame to frame, end to end on tiny checkpoints: past
-frames or a warm-started plan.
+"""Bundles played next to their PyTorch policies, tick by tick, end to end on tiny checkpoints.
 
-Each bundle is played next to the PyTorch policy in `lerobot-rollout`'s engines, on the same frames and the
-same random draws, for many chunks, so both what it carries and the noise are exercised.
+Each bundle and its policy run in `lerobot-rollout`'s engines on the same frames and the same random draws,
+for many chunks, so what the bundle carries from frame to frame (past frames or a warm-started plan), the
+programs it runs for each chunk and its noise are all exercised.
 """
 
 import math
@@ -44,7 +44,10 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
-from tests.export import torch_backend  # noqa: F401  # registers torch_test for the in-process trace step
+from tests.export import (
+    tiny_pi0_fast,
+    torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
+)
 from tests.export.plugins import use_plugins
 
 IMAGE = "observation.images.front"
@@ -218,18 +221,33 @@ def _save(config, stats, path) -> None:
         processor.save_pretrained(path)
 
 
+def pi0_fast_checkpoint(path) -> None:
+    with pytest.MonkeyPatch.context() as patch:
+        tiny_pi0_fast.save_checkpoint(path, patch)
+
+
+def some_answers_hold_fast_tokens(policy: torch.nn.Module, bundle: Bundle, played: np.ndarray) -> None:
+    chunks = played.reshape(-1, policy.config.n_action_steps, played.shape[-1])
+    # Some chunks' answers hold FAST tokens, so the comparison covers the bundle's decoding too.
+    assert len({chunk.tobytes() for chunk in chunks if np.abs(chunk).max() > 0.1}) >= 2
+
+
 @dataclass
 class Checkpoint:
     """A tiny checkpoint that `save` writes into a folder, and how its bundle plays.
 
     The bundle is exported with each of `backends`, and is reset with the policy at the tick `reset_at`.
-    `programs` are the bundle's program files, if checked.
+    `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. `programs` are the
+    bundle's program files, if checked, and `check` checks the actions it played.
     """
 
     save: Callable[[Path], object]
     backends: tuple[str, ...] = ("torch_test", "executorch_xnnpack", "executorch_tensorrt")
     reset_at: int | None = None
+    plugins: tuple[str, ...] = ()
+    tiny: Callable[[pytest.MonkeyPatch], None] | None = None
     programs: list[str] | None = None
+    check: Callable[[torch.nn.Module, Bundle, np.ndarray], None] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
@@ -244,6 +262,8 @@ DIFFUSERS = pytest.mark.skipif(not is_package_available("diffusers"), reason="di
 TRANSFORMERS = pytest.mark.skipif(
     not is_package_available("transformers"), reason="transformers not installed"
 )
+# pi0-FAST decodes its actions with a discrete cosine transform from scipy.
+SCIPY = pytest.mark.skipif(not is_package_available("scipy"), reason="scipy not installed")
 # TD-MPC's image encoder needs a square image of at least 64 pixels.
 TDMPC_CAMERA = {
     OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
@@ -288,12 +308,25 @@ CHECKPOINTS = {
         ("torch_test", "executorch_xnnpack"),
         reset_at=TDMPC_RESET,
     ),
+    "pi0_fast": Checkpoint(
+        pi0_fast_checkpoint,
+        ("torch_test",),
+        plugins=("tiny_pi0_fast",),
+        tiny=tiny_pi0_fast.use_tiny_pi0_fast,
+        programs=["actions", "prefill", "step"],
+        check=some_answers_hold_fast_tokens,
+        marks=(TRANSFORMERS, SCIPY),
+    ),
 }
 
 
-def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> list[float]:
-    """The largest difference on each tick between the bundle and the PyTorch policy, on the same draws, in
-    normalized action units."""
+def play(
+    checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch
+) -> tuple[torch.nn.Module, np.ndarray, list[float]]:
+    """The PyTorch policy, the bundle's action on each tick, and the largest difference on each tick between
+    the bundle and the policy, on the same draws, in normalized action units."""
+    if checkpoint.tiny is not None:
+        checkpoint.tiny(monkeypatch)
     policy = get_policy_class(PreTrainedConfig.from_pretrained(path).type).from_pretrained(path)
     reference = SyncInferenceEngine(
         policy, *make_pre_post_processors(policy.config, path), {}, [], bundle.manifest.task or "", "cpu", ""
@@ -322,7 +355,7 @@ def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> lis
         np.random, "standard_normal", lambda shape: draws.append(standard_normal(shape)) or draws[-1]
     )
     scale = np.asarray(bundle.manifest.action_scale, dtype=np.float32)
-    differences = []
+    played, differences = [], []
     for tick, frame in enumerate(frames):
         if tick == checkpoint.reset_at:
             engine.reset()
@@ -339,8 +372,9 @@ def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> lis
             ) as replay:
                 expected = reference.get_action(dict(frame))
             assert len(replay.shapes) == len(shapes)
+        played.append(actual)
         differences.append(float((np.abs(actual - expected.numpy()) / scale).max()))
-    return differences
+    return policy, np.stack(played), differences
 
 
 @pytest.mark.parametrize(
@@ -354,13 +388,13 @@ def play(checkpoint: Checkpoint, path: Path, bundle: Bundle, monkeypatch) -> lis
 def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp_path, monkeypatch):
     checkpoint, path = CHECKPOINTS[name], tmp_path / "checkpoint"
     checkpoint.save(path)
-    use_plugins(monkeypatch, "torch_backend")
+    use_plugins(monkeypatch, "torch_backend", *checkpoint.plugins)
     export(
         [
             f"--backend.type={backend}",
             f"--policy.path={path}",
             f"--output_dir={tmp_path / 'b'}",
-            # Multi-Task DiT reads the task; the others ignore it.
+            # Multi-Task DiT and pi0-FAST read the task; the others ignore it.
             f"--task={TASK}",
         ]
     )
@@ -372,8 +406,11 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
         return
     if checkpoint.programs is not None:
         assert sorted(bundle.manifest.programs) == checkpoint.programs
+    policy, played, differences = play(checkpoint, path, bundle, monkeypatch)
     # A compiled backend sums in another order than PyTorch, so hold it to the tolerance the bundle was checked with.
-    assert max(play(checkpoint, path, bundle, monkeypatch)) <= bundle.manifest.tolerance
+    assert max(differences) <= bundle.manifest.tolerance
+    if checkpoint.check is not None:
+        checkpoint.check(policy, bundle, played)
 
 
 @DIFFUSERS
