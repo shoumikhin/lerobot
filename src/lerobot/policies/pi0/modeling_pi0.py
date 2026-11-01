@@ -816,10 +816,14 @@ class PI0Policy(PreTrainedPolicy):
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
         revision: str | None = None,
-        strict: bool = True,
+        strict: bool = False,
         **kwargs,
     ) -> T:
-        """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+        """Override the from_pretrained method to handle key remapping and display important disclaimer.
+
+        With `strict`, a checkpoint that leaves a weight of the policy unfilled raises instead of loading with a
+        warning. Weights the policy does not have are skipped either way.
+        """
         print(
             "The PI0 model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
@@ -864,6 +868,8 @@ class PI0Policy(PreTrainedPolicy):
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
+                if strict:
+                    raise
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
@@ -887,7 +893,11 @@ class PI0Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            if strict and missing_keys:
+                raise RuntimeError(
+                    f"{resolved_file} does not hold these weights of {cls.__name__}: {missing_keys}"
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -913,6 +923,8 @@ class PI0Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
+            if strict:
+                raise
             print(f"Warning: Could not load state dict: {e}")
 
         return model

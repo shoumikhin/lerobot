@@ -108,8 +108,7 @@ def load_complete_checkpoint(
     of them. Returns None, before reading any weight, when the file cannot be read, it misses a key the policy
     has or holds one with another shape, or the policy shares a parameter or computed a buffer from one.
     `from_pretrained` then builds the policy and calls `load_state_dict`. Errors while reading the weights
-    raise. Weights the policy does not have are skipped. The regular path gives the same weights: it copies
-    every other weight, then catches the error about the extra ones.
+    raise. Weights the policy does not have are skipped, as the regular path skips them.
 
     Only a class that sets `_supports_meta_load` in its own body takes this path, so a subclass has to opt in.
     That promises the constructor never reads, moves or holds on to a parameter, that
