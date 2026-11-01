@@ -20,7 +20,7 @@ import pickle
 import subprocess
 import sys
 import zipfile
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -297,7 +297,7 @@ def test_engine_places_the_constants_at_load_and_a_frame_value_once_per_chunk(tm
 
 def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
     engine = BundleEngine(_chunk_bundle(tmp_path / "bundle"))
-    program = engine._runs[-1][1]
+    program = engine._chunk_runs[-1][-1][1]
     monkeypatch.setattr(program, "to_numpy", lambda value: np.ones((3, 2), np.float32))
     with pytest.raises(RuntimeError, match=r"shaped \(3, 2\), not \[execution_steps, 3\]"):
         engine.get_action(FRAME)
@@ -385,6 +385,93 @@ def test_engine_carries_values_from_chunk_to_chunk_until_a_reset(tmp_path):
     np.testing.assert_array_equal(engine.get_action({OBS_STATE: _states(20)[0]}), _states(20)[0])
 
 
+class Begin(nn.Module):
+    """The first chunk after a reset: one action, the state plus its noise, which starts the total."""
+
+    def forward(self, state: Tensor, noise: Tensor) -> tuple[Tensor, Tensor]:
+        total = state + noise
+        return total[None], total
+
+
+class Continue(nn.Module):
+    """A later chunk: two actions, the total with the state and its noise added, then that plus one."""
+
+    def forward(self, state: Tensor, noise: Tensor, total: Tensor) -> tuple[Tensor, Tensor]:
+        total = total + state + noise
+        return torch.stack([total, total + 1]), total
+
+
+# Three chunks from a reset: one action at tick 0, then two at ticks 1 and 2, and two at ticks 3 and 4.
+TICK_STATES = np.arange(15, dtype=np.float32).reshape(5, 3)
+CHUNK_NOISE = np.random.default_rng(0).standard_normal((3, 3)).astype(np.float32)
+BEGIN = ProgramRun("begin", "begin", [OBS_STATE, NOISE], [ACTION, "total"])
+CONTINUE = ProgramRun("continue", "continue", [OBS_STATE, NOISE, "total"], [ACTION, "total"])
+
+
+def _played(states: list[np.ndarray], noises: list[np.ndarray]) -> np.ndarray:
+    """The actions `Begin` then `Continue` play at each of `states`, each chunk reading the next of `noises`."""
+    actions: list[np.ndarray] = []
+    total = None
+    noises = iter(noises)
+    for tick, state in enumerate(states):
+        if tick == len(actions):
+            noise = next(noises)
+            total = state + noise if total is None else total + state + noise
+            actions += [total] if tick == 0 else [total, total + 1]
+    return np.stack(actions[: len(states)])
+
+
+def _first_runs_bundle(folder, expected: np.ndarray | None = None, noise: np.ndarray = CHUNK_NOISE) -> Bundle:
+    """A bundle whose first chunk after a reset runs `Begin`, which writes the total `Continue` carries on."""
+    folder.mkdir(parents=True)
+    torch.export.save(torch.export.export(Begin(), (torch.ones(3), torch.ones(3))), folder / "begin.pt2")
+    inputs = (torch.ones(3), torch.ones(3), torch.ones(3))
+    torch.export.save(torch.export.export(Continue(), inputs), folder / "continue.pt2")
+    actions = _played(list(TICK_STATES), list(CHUNK_NOISE)) if expected is None else expected
+    save_file({OBS_STATE: TICK_STATES, NOISE: noise, ACTION: actions}, folder / TEST_CASE)
+    manifest = BundleManifest(
+        backend="torch_test",
+        runtime="torch_test",
+        runtime_imports=["tests.export.torch_backend"],
+        programs={"begin": ProgramFiles("begin.pt2"), "continue": ProgramFiles("continue.pt2")},
+        runs=[CONTINUE],
+        first_runs=[[BEGIN]],
+        carry={"total": None},
+        noise_shape=[3],
+        action_scale=[1.0] * 3,
+        tolerance=1e-4,
+    )
+    Bundle(folder, manifest).write()
+    return Bundle.read(folder)
+
+
+def test_engine_runs_the_first_chunks_after_a_reset_with_their_own_runs(tmp_path):
+    engine = BundleEngine(_first_runs_bundle(tmp_path / "bundle"))
+    states = _states(10, 20, 30, 40, 50, 60)
+    np.random.seed(0)
+    actions = [engine.get_action({OBS_STATE: state}) for state in states[:4]]
+    engine.reset()
+    actions += [engine.get_action({OBS_STATE: state}) for state in states[4:]]
+    draws = np.random.RandomState(0)
+    noises = [draws.standard_normal(3).astype(np.float32) for _ in range(5)]
+    # Three chunks, then from the reset `Begin` again, which reads no total left from before.
+    expected = [*_played(states[:4], noises[:3]), *_played(states[4:], noises[3:])]
+    np.testing.assert_allclose(np.stack(actions), expected, rtol=1e-6)
+
+
+def test_engine_checks_the_action_of_every_tick_of_its_test_case(tmp_path):
+    expected = _played(list(TICK_STATES), list(CHUNK_NOISE))
+    # Only the first chunk's action is wrong.
+    expected[0] += 1.0
+    with pytest.raises(RuntimeError, match="does not reproduce its test case"):
+        BundleEngine(_first_runs_bundle(tmp_path / "bundle", expected=expected))
+
+
+def test_engine_refuses_a_test_case_whose_ticks_play_more_chunks_than_it_has_noises(tmp_path):
+    with pytest.raises(RuntimeError, match="holds the noise of 2 chunks, but its ticks play more"):
+        BundleEngine(_first_runs_bundle(tmp_path / "bundle", noise=CHUNK_NOISE[:2]))
+
+
 @pytest.mark.parametrize(
     ("change", "error"),
     [
@@ -398,6 +485,7 @@ def test_engine_carries_values_from_chunk_to_chunk_until_a_reset(tmp_path):
         ({"tolerance": float("nan")}, "tolerance must be a finite number"),
         ({"history": {OBS_STATE: 0}}, "whole number of frames above 0"),
         ({"carry": {"total": 3}}, "shape of whole numbers"),
+        ({"first_runs": [[]]}, "no run for one of the first chunks"),
     ],
 )
 def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
@@ -434,6 +522,7 @@ def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
             {},
             r"carries \['observation.state'\] between chunks, which is the name",
         ),
+        (_first_runs_bundle, {"first_runs": [[asdict(CONTINUE)]]}, {}, r"'continue' reads \['total'\]"),
     ],
 )
 def test_engine_refuses_a_bundle_it_cannot_run(tmp_path, make, change, case, error):
