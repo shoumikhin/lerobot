@@ -42,6 +42,7 @@ from conftest import (  # noqa: E402
     N_ACTION_STEPS,
     QWEN_HIDDEN_SIZE,
     STATE_DIM,
+    TINY_QWEN_IMAGE_SIZE,
     make_config,
     make_inference_batch,
     make_train_batch,
@@ -49,7 +50,7 @@ from conftest import (  # noqa: E402
 )
 from lerobot.policies.vla_jepa.configuration_vla_jepa import VLAJEPAConfig  # noqa: E402
 from lerobot.policies.vla_jepa.modeling_vla_jepa import VLAJEPAModel, VLAJEPAPolicy  # noqa: E402
-from lerobot.utils.constants import ACTION  # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: E402
 
 PRETRAINED_REPO_ID = "ginwind/VLA-JEPA"
 PRETRAINED_SUBFOLDER = "LIBERO"
@@ -183,6 +184,62 @@ def test_predict_action_chunk_always_finite(patch_vla_jepa_external_models: None
         set_seed_all(seed)
         chunk = policy.predict_action_chunk(make_inference_batch())
         assert torch.isfinite(chunk).all(), f"non-finite actions with seed={seed}"
+
+
+def _tiny_qwen_policy(config: VLAJEPAConfig) -> tuple[VLAJEPAPolicy, dict, Tensor]:
+    """The policy on the tiny Qwen3-VL, a batch of two prompts of different lengths, and its noise."""
+    set_seed_all(0)
+    policy = VLAJEPAPolicy(config).eval()
+    batch = make_inference_batch(image_size=TINY_QWEN_IMAGE_SIZE)
+    # One more word in the second task, so the processor pads the first prompt.
+    batch["task"] = ["pick up the cube", "pick up the red cube"]
+    return policy, batch, torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM)
+
+
+@torch.no_grad()
+def test_predict_action_chunk_runs_on_given_qwen_inputs(
+    tiny_qwen_config: VLAJEPAConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy, batch, noise = _tiny_qwen_policy(tiny_qwen_config)
+    expected = policy.predict_action_chunk(batch, noise=noise)
+    qwen_inputs = policy.qwen_inputs(batch)
+    other = {**qwen_inputs, "pixel_values": qwen_inputs["pixel_values"].flip(0)}
+    # Processor tensors left in the batch are not read: without `qwen_inputs`, the cameras and the task are.
+    assert torch.equal(policy.predict_action_chunk({**batch, **other}, noise=noise), expected)
+
+    def no_processor(*args, **kwargs):
+        raise AssertionError("The Qwen processor ran although qwen_inputs were given.")
+
+    monkeypatch.setattr(policy.model.qwen, "build_inputs", no_processor)
+    # Given them, the cameras are not needed, nor `mm_token_type_ids`, which is rebuilt from `input_ids`.
+    without_cameras = {key: value for key, value in batch.items() if not key.startswith(OBS_IMAGES)}
+    without_types = {key: value for key, value in qwen_inputs.items() if key != "mm_token_type_ids"}
+    for given in (qwen_inputs, without_types):
+        actions = policy.predict_action_chunk(without_cameras, noise=noise, qwen_inputs=given)
+        assert torch.equal(actions, expected)
+    # Other pixel values move the actions: Qwen reads the given tensors.
+    actions = policy.predict_action_chunk(without_cameras, noise=noise, qwen_inputs=other)
+    assert not torch.equal(actions, expected)
+    # Some of the tensors are refused rather than run without the images.
+    text_only = {key: qwen_inputs[key] for key in ("input_ids", "attention_mask")}
+    with pytest.raises(ValueError, match="must hold all of"):
+        policy.predict_action_chunk(batch, noise=noise, qwen_inputs=text_only)
+    # The model takes the tensors, not images and instructions, and says so.
+    with pytest.raises(TypeError, match="processor tensors"):
+        policy.model.predict_action([[batch[f"{OBS_IMAGES}.laptop"][0]]], ["pick up the cube"])
+
+
+@torch.no_grad()
+def test_model_qwen_inputs_resize_the_images_to_resize_images_to(tiny_qwen_config: VLAJEPAConfig) -> None:
+    size = TINY_QWEN_IMAGE_SIZE
+    tiny_qwen_config.resize_images_to = (size, size)
+    model = VLAJEPAPolicy(tiny_qwen_config).model
+    image = torch.rand(3, 2 * size, 2 * size)
+    resized = nn.functional.interpolate(image[None], size=(size, size), mode="area")[0]
+    native, small = (model.qwen_inputs([[frame]], ["pick up the cube"]) for frame in (image, resized))
+    assert native.keys() == small.keys()
+    for key, value in native.items():
+        assert torch.equal(value, small[key]), key
 
 
 # ---------------------------------------------------------------------------
