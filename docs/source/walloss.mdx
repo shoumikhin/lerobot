@@ -135,7 +135,7 @@ schema and available recipes.
 | `--policy.repo_id`                 | Your Hugging Face Hub repo ID where the trained model will be pushed                                                                                          |
 | `--policy.pretrained_name_or_path` | Path to pretrained WallX weights to initialize from (the official WALL-OSS checkpoint)                                                                        |
 | `--policy.prediction_mode`         | The action prediction strategy: `diffusion` or `fast` - `diffusion` uses iterative denoising for action generation, `fast` uses next token prediction instead |
-| `--policy.attn_implementation`     | Attention implementation backend - `eager` uses standard PyTorch attention (alternatives include `flash_attention_2` or `sdpa`)                               |
+| `--policy.attn_implementation`     | Attention implementation backend - `eager`, the only one Wall-X supports, runs PyTorch attention with float32 scores (keep TF32 on for speed)                 |
 | `--steps`                          | Total number of training steps to run                                                                                                                         |
 | `--policy.device`                  | Device to train on (`cuda` for GPU, `cpu` for CPU)                                                                                                            |
 | `--batch_size`                     | Number of samples per training batch                                                                                                                          |
