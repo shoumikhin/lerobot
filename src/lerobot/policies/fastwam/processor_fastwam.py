@@ -63,6 +63,10 @@ class FastWAMActionToggleProcessorStep(ActionProcessorStep):
             processed_action[..., resolved_dim] = torch.sign(-value)
         return processed_action
 
+    def without_threshold(self) -> FastWAMActionToggleProcessorStep | None:
+        """Nothing: the toggle is the threshold, which `lerobot-export`'s check leaves out (see `action_pipelines`)."""
+        return None if self.toggle_dimensions else self
+
     def get_config(self) -> dict[str, Any]:
         return {"toggle_dimensions": self.toggle_dimensions}
 
