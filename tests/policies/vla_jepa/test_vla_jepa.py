@@ -42,6 +42,7 @@ from conftest import (  # noqa: E402
     N_ACTION_STEPS,
     QWEN_HIDDEN_SIZE,
     STATE_DIM,
+    TINY_QWEN_IMAGE_SIZE,
     make_config,
     make_inference_batch,
     make_train_batch,
@@ -49,7 +50,7 @@ from conftest import (  # noqa: E402
 )
 from lerobot.policies.vla_jepa.configuration_vla_jepa import VLAJEPAConfig  # noqa: E402
 from lerobot.policies.vla_jepa.modeling_vla_jepa import VLAJEPAModel, VLAJEPAPolicy  # noqa: E402
-from lerobot.utils.constants import ACTION  # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: E402
 
 PRETRAINED_REPO_ID = "ginwind/VLA-JEPA"
 PRETRAINED_SUBFOLDER = "LIBERO"
@@ -183,6 +184,40 @@ def test_predict_action_chunk_always_finite(patch_vla_jepa_external_models: None
         set_seed_all(seed)
         chunk = policy.predict_action_chunk(make_inference_batch())
         assert torch.isfinite(chunk).all(), f"non-finite actions with seed={seed}"
+
+
+def _tiny_qwen_policy(config: VLAJEPAConfig) -> tuple[VLAJEPAPolicy, dict, Tensor]:
+    """The policy on the tiny Qwen3-VL, a batch of two prompts of different lengths, and its noise."""
+    set_seed_all(0)
+    policy = VLAJEPAPolicy(config).eval()
+    batch = make_inference_batch(image_size=TINY_QWEN_IMAGE_SIZE)
+    # One more word in the second task, so the processor pads the first prompt.
+    batch["task"] = ["pick up the cube", "pick up the red cube"]
+    return policy, batch, torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM)
+
+
+@torch.no_grad()
+def test_predict_action_chunk_runs_on_the_qwen_inputs_of_its_batch(
+    tiny_qwen_config: VLAJEPAConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy, batch, noise = _tiny_qwen_policy(tiny_qwen_config)
+    expected = policy.predict_action_chunk(batch, noise=noise)
+    qwen_inputs = policy.qwen_inputs(batch)
+
+    def no_processor(*args, **kwargs):
+        raise AssertionError("The Qwen processor ran although the batch holds its tensors.")
+
+    monkeypatch.setattr(policy.model.qwen, "build_inputs", no_processor)
+    # The camera frames are not needed then.
+    without_cameras = {key: value for key, value in batch.items() if not key.startswith(OBS_IMAGES)}
+    assert torch.equal(policy.predict_action_chunk({**without_cameras, **qwen_inputs}, noise=noise), expected)
+    # Other pixel values in the batch move the actions: Qwen reads the batch's tensors.
+    other = {**without_cameras, **qwen_inputs, "pixel_values": qwen_inputs["pixel_values"].flip(0)}
+    assert not torch.equal(policy.predict_action_chunk(other, noise=noise), expected)
+    # Some of the tensors are refused rather than run without the images.
+    text_only = {key: qwen_inputs[key] for key in ("input_ids", "attention_mask")}
+    with pytest.raises(ValueError, match="must hold all of"):
+        policy.predict_action_chunk({**batch, **text_only}, noise=noise)
 
 
 # ---------------------------------------------------------------------------
