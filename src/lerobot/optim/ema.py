@@ -194,14 +194,20 @@ class EMA:
         return {"num_updates": self.num_updates, "averages": self.averages}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if state_dict["averages"].keys() != self.averages.keys():
+        # A module wrapped by torch.compile names its parameters `<module>._orig_mod.<name>`. A run that
+        # wrapped a module saved its averages under those names, and may resume with the module unwrapped.
+        saved = {
+            name if name in self.averages else name.replace("._orig_mod.", "."): average
+            for name, average in state_dict["averages"].items()
+        }
+        if saved.keys() != self.averages.keys():
             raise ValueError(
                 "The saved EMA averages a different set of parameters: "
-                f"{sorted(state_dict['averages'].keys() ^ self.averages.keys())[:5]}..."
+                f"{sorted(saved.keys() ^ self.averages.keys())[:5]}..."
             )
         self.num_updates = state_dict["num_updates"]
         for name, average in self.averages.items():
-            average.copy_(state_dict["averages"][name])
+            average.copy_(saved[name])
 
 
 def save_ema_state(ema: EMA, save_dir: Path) -> None:
