@@ -15,8 +15,8 @@
 """Bundles played next to their PyTorch policies, tick by tick, end to end on tiny checkpoints.
 
 Each bundle and its policy run in `lerobot-rollout`'s engines on the same frames and the same random draws,
-for many chunks, so what the bundle carries from frame to frame (past frames or a warm-started plan), the
-programs it runs for each chunk and its noise are all exercised.
+for many chunks, so what the bundle carries from frame to frame (past frames, a warm-started plan or
+caches), the programs it runs for each chunk and its noise are all exercised.
 """
 
 import math
@@ -43,6 +43,7 @@ from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export import (
+    tiny_lingbot_va,
     tiny_multi_task_dit,
     tiny_pi0_fast,
     torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
@@ -56,7 +57,6 @@ IMAGE = "observation.images.front"
 FRAME = (96, 96)
 CROP = (84, 84)
 TASK = "pick up the cube"
-TICKS = 24
 BACKENDS = {"torch_test": [], **{name: [mark] for name, mark in EXECUTORCH_BACKENDS.items()}}
 
 
@@ -224,17 +224,47 @@ def some_answers_hold_fast_tokens(policy: torch.nn.Module, bundle: Bundle, playe
     assert policy.action_tokenizer.bpe_tokenizer.clean_up_tokenization_spaces
 
 
+def lingbot_va_programs_hold_one_copy_of_their_weights(
+    policy: torch.nn.Module, bundle: Bundle, played: np.ndarray
+) -> None:
+    config = policy.config
+    policy._ensure_frozen_modules()
+    weight = policy.transformer.blocks[0].attn1.to_q.weight
+    parameters = [*policy.parameters(), *policy._vae.parameters()]
+    sizes, holders = {}, []
+    for name, files in bundle.manifest.programs.items():
+        program = torch.export.load(bundle.path / files.file)
+        weights = list(program.state_dict.values())
+        sizes[name] = sum(t.numel() for t in weights)
+        holders += [name for t in weights if t.shape == weight.shape and torch.equal(t, weight)]
+        # A tensor a program holds as a plain attribute is a constant, outside its state dict: none is a weight.
+        for t in program.constants.values():
+            assert not any(
+                isinstance(t, torch.Tensor) and t.shape == p.shape and torch.equal(t, p) for p in parameters
+            ), name
+    assert holders == ["blocks"]
+    # The blocks and the projected text of the task and of the negative prompt.
+    projected_text = 2 * config.max_sequence_length * config.num_attention_heads * config.attention_head_dim
+    assert sizes["blocks"] == sum(p.numel() for p in policy.transformer.blocks.parameters()) + projected_text
+    # The VAE's encoder, without its decoder.
+    encoder = sum(p.numel() for m in (policy._vae.encoder, policy._vae.quant_conv) for p in m.parameters())
+    assert sizes["encode_first"] == sizes["encode_start"] == sizes["encode_next"] == encoder
+
+
 @dataclass
 class Checkpoint:
     """A tiny checkpoint that `save` writes into a folder, and how its bundle plays.
 
-    The bundle is exported with each of `backends`, and is reset with the policy at the tick `reset_at`.
-    `plugins` make the policy tiny in the export's own processes, as `tiny` does in this one. `programs` are the
-    bundle's program files, if checked, and `check` checks the actions it played.
+    The bundle is exported for `task` with each of `backends`, and plays `ticks` frames, reset with the
+    policy at the tick `reset_at`. `plugins` make the policy tiny in the export's own processes, as `tiny` does
+    in this one. `programs` are the bundle's program names, if checked, and `check` checks what else it holds
+    or plays.
     """
 
     save: Callable[[Path], object]
     backends: tuple[str, ...] = ("torch_test", "executorch_xnnpack", "executorch_tensorrt")
+    task: str = TASK
+    ticks: int = 24
     reset_at: int | None = None
     plugins: tuple[str, ...] = ()
     tiny: Callable[[pytest.MonkeyPatch], None] | None = None
@@ -308,6 +338,16 @@ CHECKPOINTS = {
         check=some_answers_hold_fast_tokens,
         marks=(TRANSFORMERS, SCIPY),
     ),
+    # Past the KV cache's first eviction, then a reset and two more chunks.
+    "lingbot_va": Checkpoint(
+        tiny_lingbot_va.save_checkpoint,
+        ("torch_test",),
+        task=tiny_lingbot_va.TASK,
+        ticks=48,
+        reset_at=36,
+        check=lingbot_va_programs_hold_one_copy_of_their_weights,
+        marks=(DIFFUSERS, TRANSFORMERS),
+    ),
 }
 
 
@@ -331,7 +371,7 @@ def play(
             else rng.random(shape, dtype=np.float32)
             for name, shape in frame_shapes(features).items()
         }
-        for _ in range(TICKS)
+        for _ in range(checkpoint.ticks)
     ]
     with ReplayDraws() as recorded:
         reference.get_action(dict(frames[0]))
@@ -387,8 +427,7 @@ def test_bundle_plays_like_the_pytorch_policy_over_many_ticks(name, backend, tmp
             f"--backend.type={backend}",
             f"--policy.path={path}",
             f"--output_dir={tmp_path / 'b'}",
-            # Multi-Task DiT and pi0-FAST read the task; the others ignore it.
-            f"--task={TASK}",
+            f"--task={checkpoint.task}",
         ]
     )
     bundle = Bundle.read(tmp_path / "b")
