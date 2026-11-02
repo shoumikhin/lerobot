@@ -59,8 +59,10 @@ keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artifici
 
 dependencies = [
     # Core ML
-    "torch>=2.7,<2.12.0",
-    "torchvision>=0.22.0,<0.27.0",
+    "torch>=2.7,<2.16.0; sys_platform != 'darwin'",
+    "torch>=2.7,<2.12.0; sys_platform == 'darwin'",
+    "torchvision>=0.22.0,<0.30.0; sys_platform != 'darwin'",
+    "torchvision>=0.22.0,<0.27.0; sys_platform == 'darwin'",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
     "Pillow>=10.0.0,<14.0.0",
@@ -90,7 +92,7 @@ dependencies = [
 
     # Build tools (required by opencv-python-headless on some platforms)
     "cmake>=3.29.0.1,<4.2.0",
-    "setuptools>=71.0.0,<82.0.0",  # torch 2.11 requires setuptools<82; a higher cap makes the resolver downgrade torch
+    "setuptools>=71.0.0,<82.0.0",  # torch 2.11/2.12 cap setuptools<82; the darwin ceiling pins torch to 2.11
 ]
 
 # Optional dependencies
@@ -117,11 +119,22 @@ dataset = [
     #   - linux aarch64/arm64              : wheels since 0.11.0 (needs torch>=2.11).
     #   - macOS x86_64 (Intel) and linux armv7l: no wheels in any released version -> fall through to the PyAV decoder.
     # Each platform gets its own line so the resolver picks the minimum version that has a wheel for it.
-
-    # Other torch/torchcodec pairings (informational): 0.8.1 = ffmpeg>=8 support, 0.10 = system-wide ffmpeg support, 0.12 needs torch==2.12.
-    "torchcodec>=0.3.0,<0.12.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    "torchcodec>=0.7.0,<0.12.0; sys_platform == 'win32'",
-    "torchcodec>=0.11.0,<0.12.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64')",
+    #
+    # On Linux x86_64, uv installs of this project take TorchCodec from the CPU-only index in
+    # [tool.uv.sources], so there the <0.14 cap does not decide CUDA linkage. It does wherever
+    # TorchCodec comes from PyPI, such as a pip install or the x86_64 cu129 recipe in the
+    # installation guide: PyPI 0.13 links no CUDA library, while 0.14 and newer link CUDA 13
+    # (so did 0.11.0, which the range still allows).
+    # It is not a CUDA 12 guarantee on aarch64: PyPI 0.13 already needs CUDA 13 there.
+    # TorchCodec does not declare a torch dependency, so CUDA 12 installs must follow
+    # the platform-specific package pairing in the installation guide.
+    "torchcodec>=0.3.0,<0.14.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
+    # macOS arm64: torch 2.12+, torchvision 0.27+ and torchcodec 0.12+ ship only
+    # macosx_14_0 wheels, so the darwin ceilings stay below those to keep the
+    # macOS 11-13 support that the current ranges already provide.
+    "torchcodec>=0.3.0,<0.12.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "torchcodec>=0.7.0,<0.14.0; sys_platform == 'win32'",
+    "torchcodec>=0.11.0,<0.14.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64')",
     "jsonlines>=4.0.0,<5.0.0",
 ]
 training = [
@@ -253,7 +266,7 @@ fastwam = [
     "lerobot[diffusers-dep]",
 ]
 # flux3 (FLUX 3 Action): Qwen3-VL text encoder via transformers. The video
-# VAE additionally needs NATTEN (`natten`, torch-matched wheel, not on PyPI for every platform): see
+# VAE runs faster with NATTEN (`natten`, torch-matched wheel, not on PyPI for every platform): see
 # docs/source/flux3.mdx.
 flux3 = [
     "lerobot[transformers-dep]",
@@ -282,6 +295,10 @@ lawam = [
 # Remote inference transport and serialization.
 remote = ["eclipse-zenoh>=1.9.0,<1.11.0", "msgpack>=1.1.0,<2.0.0"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
+# NOTE: `export` (ExecuTorch, to run a bundle written by lerobot-export) is not an extra yet. It needs
+# `executorch>=1.6.0,<1.7.0; sys_platform == 'linux'`, which needs torchao 0.19; neither is on PyPI yet, so
+# the lock cannot resolve it. Torch-TensorRT stays out of it even then: it pins one torch minor version, which uv's single lock
+# would impose on every extra, as vllm would (see `annotations`).
 
 # Annotation pipeline (lerobot-annotate). The only backend is ``openai``,
 # which talks to any OpenAI-compatible server (``vllm serve`` /
@@ -401,33 +418,27 @@ lerobot-train="lerobot.scripts.lerobot_train:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"
 lerobot-info="lerobot.scripts.lerobot_info:main"
+lerobot-check-bundle="lerobot.scripts.lerobot_check_bundle:main"
 lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
-lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-rollout="lerobot.scripts.lerobot_rollout_entry:main"
+lerobot-export="lerobot.scripts.lerobot_export:main"
 lerobot-policy-server="lerobot.scripts.lerobot_policy_server:main"
 
 # ---------------- Tool Configurations ----------------
 
-# cu128 wheels keep broad hardware reach; the driver floor is 570.86.
-# To use a different CUDA variant, reinstall torch with an explicit index, e.g.:
-#   uv pip install --force-reinstall torch torchvision \
-#       --index-url https://download.pytorch.org/whl/cu130
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
+# torch/torchvision resolve from PyPI. A pinned CUDA index caps the torch version (cu128
+# published nothing above 2.11), and no single index covers >=2.7 on both architectures, so
+# the CUDA variant is left to the installer; see docs/source/installation.mdx.
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
-torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 # LeRobot decodes videos on CPU; avoid GPU-only TorchCodec dependencies without changing GPU training.
 torchcodec = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')" }]
 
@@ -537,7 +548,7 @@ exclude_dirs = [
 skips = ["B101", "B311", "B404", "B603", "B615"]
 
 [tool.typos]
-default.extend-words = { trak = "trak", nd = "nd" }
+default.extend-words = { trak = "trak", nd = "nd", ptd = "ptd" }
 default.extend-ignore-re = [
     "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",                      # spellchecker:disable-line
     "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on", # spellchecker:<on|off>

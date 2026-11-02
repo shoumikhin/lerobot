@@ -14,16 +14,9 @@ Copied files:
 
 - `model.py` (was `wan/modules/model.py`), trimmed: the flash-attention path
   (the vendored `attention.py` and the block/model `forward`s) was removed.
-  FastWAM's DiT uses SDPA instead (see `video_dit.py`). `rope_apply` and
-  `unpatchify` take the grid sizes as a list of `(f, h, w)` tuples instead of a
-  `[B, 3]` tensor, so torch.export does not read them back from a tensor.
+  FastWAM's DiT uses SDPA instead (see `video_dit.py`).
 - `get_sampling_sigmas` in `video_dit.py` (was `wan/utils/fm_solvers.py`), inlined
   next to its only caller.
-
-In `model.py`, the time embedding, time projection and head use `Float32Linear`
-(defined there), so they compute in float32 on every device. Upstream's CUDA
-float32 autocast regions around them stay; on other devices they turn autocast
-off instead (`float32_autocast`).
 
 This subset only backs FastWAM's **custom MoT video DiT**. The Wan2.2 VAE,
 UMT5 text encoder, and tokenizer are no longer vendored - they come from

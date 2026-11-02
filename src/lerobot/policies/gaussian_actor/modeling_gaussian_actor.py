@@ -21,12 +21,11 @@ from dataclasses import asdict
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions import Independent, Normal, TanhTransform, Transform, TransformedDistribution
+from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
 
 from lerobot.configs import PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
-from ..common.export_utils import is_non_strict_exporting
 from ..pretrained import PreTrainedPolicy
 from ..utils import get_device_from_parameters
 from .configuration_gaussian_actor import GaussianActorConfig, is_image_feature
@@ -655,14 +654,11 @@ class RescaleFromTanh(Transform):
 
 class TanhMultivariateNormalDiag(TransformedDistribution):
     def __init__(self, loc, scale_diag, low=None, high=None):
-        # scale_diag is used as the covariance diagonal, so each action dimension is an independent normal with
-        # its square root as the standard deviation. That needs no factorization, triangular solve or matrix
-        # product. The root is computed in at least float32, so log_prob keeps its precision under autocast.
+        # scale_diag is used as the covariance diagonal, as before, so its Cholesky factor is its square root.
+        # Passing that skips the factorization and its validation check, which torch.export cannot trace.
+        # Like the factorization under autocast, it is computed in at least float32.
         cov_diag = scale_diag.to(torch.promote_types(scale_diag.dtype, torch.float32))
-        # The argument checks read tensor values, which torch.export cannot trace on PyTorch 2.11 and older
-        # and keeps as runtime asserts on 2.15. Eager calls still run them.
-        validate_args = False if is_non_strict_exporting() else None
-        base_dist = Independent(Normal(loc, cov_diag.sqrt(), validate_args=validate_args), 1)
+        base_dist = MultivariateNormal(loc, scale_tril=torch.diag_embed(cov_diag.sqrt()))
 
         transforms = [TanhTransform(cache_size=1)]
 
@@ -673,7 +669,7 @@ class TanhMultivariateNormalDiag(TransformedDistribution):
 
             transforms.insert(0, RescaleFromTanh(low, high))
 
-        super().__init__(base_dist, transforms, validate_args=validate_args)
+        super().__init__(base_dist, transforms)
 
     def mode(self):
         # Mode is mean of base distribution, passed through transforms

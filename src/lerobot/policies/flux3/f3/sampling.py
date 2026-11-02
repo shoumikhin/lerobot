@@ -68,7 +68,7 @@ def cfg_two_pass(
 
 def euler_timesteps(n_steps: int, alpha: float) -> list[float]:
     """The shifted Euler grid as Python floats, the form ``euler`` takes."""
-    return rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1, device="cpu"), alpha).tolist()
+    return rational_time_shift(torch.linspace(1.0, 0.0, n_steps + 1), alpha).tolist()
 
 
 def euler(

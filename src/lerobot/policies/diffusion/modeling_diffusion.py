@@ -43,7 +43,6 @@ else:
     DDIMScheduler = None
     DDPMScheduler = None
 
-from ..common.ddpm_scheduler import ExportableDDPMScheduler, InferenceStepsMixin
 from ..pretrained import PreTrainedPolicy
 from ..utils import (
     get_device_from_parameters,
@@ -185,7 +184,7 @@ def _make_noise_scheduler(name: str, **kwargs: Any) -> "DDPMScheduler | DDIMSche
     require_package("diffusers", extra="diffusion")
 
     if name == "DDPM":
-        return ExportableDDPMScheduler(**kwargs)
+        return DDPMScheduler(**kwargs)
     elif name == "DDIM":
         return DDIMScheduler(**kwargs)
     else:
@@ -202,7 +201,7 @@ def _action_dim(config: DiffusionConfig) -> int:
     return action_feature.shape[0]
 
 
-class DiffusionModel(InferenceStepsMixin, nn.Module):
+class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig) -> None:
         super().__init__()
         self.config = config
@@ -250,6 +249,18 @@ class DiffusionModel(InferenceStepsMixin, nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+    def _load_from_state_dict(
+        self, state_dict: dict[str, Tensor], prefix: str, *args: Any, **kwargs: Any
+    ) -> None:
+        # torch.compile wraps the U-Net, which adds `_orig_mod.` to the names of its weights, so a checkpoint
+        # trained with `compile_model` and one trained without it name them differently.
+        unet = f"{prefix}unet."
+        wrapper = "_orig_mod." if hasattr(self.unet, "_orig_mod") else ""
+        for key in [key for key in state_dict if key.startswith(unet)]:
+            name = key.removeprefix(unet).removeprefix("_orig_mod.")
+            state_dict[unet + wrapper + name] = state_dict.pop(key)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     # ========= inference  ============
     def conditional_sample(
         self,
@@ -273,7 +284,9 @@ class DiffusionModel(InferenceStepsMixin, nn.Module):
             )
         )
 
-        for t in self.inference_timesteps():
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+
+        for t in self.noise_scheduler.timesteps:
             # Predict model output.
             model_output = self.unet(
                 sample,

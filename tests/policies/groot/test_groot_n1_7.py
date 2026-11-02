@@ -17,6 +17,7 @@
 import inspect
 import json
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -217,6 +218,106 @@ def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypa
             select_layer=0,
             use_flash_attention=False,
         )
+
+
+def _tiny_n1_7_backbone(monkeypatch):
+    from transformers import Qwen3VLForConditionalGeneration
+
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from tests.policies.common.qwen3_vl_helpers import tiny_qwen3_vl_config
+
+    torch.manual_seed(0)
+    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
+    monkeypatch.setattr(
+        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
+    )
+    return groot_n1_7.Qwen3Backbone(select_layer=2).eval()
+
+
+def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from transformers.feature_extraction_utils import BatchFeature
+
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
+    from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts
+
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
+    positions = []
+
+    def record_positions(module, args, kwargs):
+        positions.append(kwargs["position_ids"])
+
+    backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
+
+    class Backbone(torch.nn.Module):
+        def __init__(self, keys):
+            super().__init__()
+            self.keys = keys
+
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(self.keys, tensors, strict=True))))["backbone_features"]
+
+    keys = sorted(prompts)
+    inputs = tuple(prompts[key] for key in keys)
+    builds = count_grid_builds(monkeypatch)
+    with torch.no_grad():
+        expected = backbone(BatchFeature(prompts))["backbone_features"]
+        with prepare_image_grid():
+            assert torch.equal(Backbone(keys)(*inputs), expected)
+        exported = torch.export.export(Backbone(keys), inputs, strict=False)
+        torch.testing.assert_close(exported.module()(*inputs), expected)
+        with pytest.raises(ValueError, match="image inputs only"):
+            torch.export.export(
+                Backbone([*keys, "pixel_values_videos"]), (*inputs, prompts["pixel_values"]), strict=False
+            )
+    # The stock path adds the legacy text row as a fourth row; the exported path must pass the same.
+    assert torch.equal(backbone._fixed_grid_position_ids(prompts, backbone._vision_grid), positions[0])
+    assert positions[-1].shape == positions[0].shape
+    assert len(builds) == 1
+    assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
+
+
+def test_n1_7_backbone_refuses_hidden_image_tokens_also_after_export(monkeypatch):
+    pytest.importorskip("transformers")
+
+    from transformers.feature_extraction_utils import BatchFeature
+
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
+    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID, image_prompts
+
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
+    keys = sorted(prompts)
+    image_tokens = (prompts["input_ids"][1] == IMAGE_TOKEN_ID).nonzero()[:, 0].tolist()
+
+    def hide(tokens):
+        attention_mask = prompts["attention_mask"].clone()
+        attention_mask[1, tokens] = 0
+        return tuple({**prompts, "attention_mask": attention_mask}[key] for key in keys)
+
+    class Backbone(torch.nn.Module):
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
+
+    # In the second prompt: an image token, the text token between its images (eager would join them into one
+    # image), and every token.
+    refused = (hide(image_tokens[:1]), hide([image_tokens[3] + 1]), hide(slice(None)))
+    with torch.no_grad():
+        with prepare_image_grid():
+            Backbone()(*(prompts[key] for key in keys))
+            for inputs in refused:
+                with pytest.raises(ValueError, match="must hide only padding"):
+                    Backbone()(*inputs)
+        program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False).module()
+        for inputs in refused:
+            with pytest.raises(RuntimeError):
+                program(*inputs)
+        # Hiding the first token of the unpadded prompt only adds padding.
+        more_padding = hide([0])
+        torch.testing.assert_close(program(*more_padding), Backbone()(*more_padding))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):
@@ -1928,6 +2029,31 @@ def test_groot_n1_7_vlm_encode_builds_frames_on_target_device(device):
             )
 
 
+def test_groot_n1_7_vlm_encode_runs_on_the_cpu_where_its_saved_device_is_missing(monkeypatch):
+    # A checkpoint trained on a GPU saves this step with device="cuda", and loads on machines without one.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    class FakeProcessor:
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, return_tensors, padding):
+            self.image_devices = {image.device.type for image in images}
+            return {"input_ids": torch.zeros(len(text), 1, dtype=torch.long)}
+
+    step = GrootN17VLMEncodeStep(device="cuda")
+    step._proc = FakeProcessor()
+    transition = {
+        TransitionKey.OBSERVATION: {"video": np.zeros((1, 1, 1, 2, 2, 3), dtype=np.uint8)},
+        TransitionKey.COMPLEMENTARY_DATA: {"language": ["task"]},
+    }
+
+    output = step(transition)
+
+    assert step._proc.image_devices == {"cpu"}
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["input_ids"].shape == (1, 1)
+
+
 @pytest.mark.parametrize(
     "device",
     [
@@ -3140,3 +3266,82 @@ def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     inference_inputs = {key: value for key, value in inputs.items() if key != "action"}
     action_output = model.get_action(inference_inputs)
     assert action_output["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+
+def test_action_encoder_takes_one_time_encoding_for_the_chunk():
+    from lerobot.policies.groot.groot_n1_7 import MultiEmbodimentActionEncoder
+
+    torch.manual_seed(0)
+    encoder = MultiEmbodimentActionEncoder(action_dim=3, hidden_size=8, num_embodiments=2)
+    actions = torch.randn(1, 5, 3)
+    cat_ids = torch.tensor([1])
+    timestep = torch.tensor([7])
+
+    time_encoding = encoder.pos_encoding(timestep[:, None])
+
+    assert time_encoding.shape == (1, 1, 8)
+    torch.testing.assert_close(
+        encoder.encode(actions, time_encoding, cat_ids), encoder(actions, timestep, cat_ids), atol=0, rtol=0
+    )
+
+
+def _alternate_vl_dit_before_the_split(
+    model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+):
+    """`AlternateVLDiT.forward` as it was written before its blocks and output became methods."""
+    temb = model.timestep_encoder(timestep)
+    image_attention_mask = image_mask & mask
+    non_image_attention_mask = (~image_mask) & mask
+    for idx, block in enumerate(model.transformer_blocks):
+        if idx % 2 == 1:
+            hidden_states = block(hidden_states, temb=temb)
+        else:
+            encoder_mask = (
+                non_image_attention_mask
+                if idx % (2 * model.attend_text_every_n_blocks) == 0
+                else image_attention_mask
+            )
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_mask,
+                temb=temb,
+            )
+    shift, scale = model.proj_out_1(torch.nn.functional.silu(temb)).chunk(2, dim=1)
+    return model.proj_out_2(model.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None])
+
+
+def test_alternate_vl_dit_computes_what_it_did_before_the_split():
+    pytest.importorskip("diffusers")
+    from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
+
+    torch.manual_seed(0)
+    model = AlternateVLDiT(
+        output_dim=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        num_layers=4,
+        dropout=0.0,
+        final_dropout=False,
+        max_num_positional_embeddings=16,
+        interleave_self_attention=True,
+        cross_attention_dim=6,
+    ).eval()
+    hidden_states, encoder_hidden_states = torch.randn(2, 5, 8), torch.randn(2, 7, 6)
+    timestep = torch.tensor([3, 600])
+    image_mask = torch.tensor([[True, True, True, False, False, False, False]] * 2)
+    mask = torch.tensor([[True] * 7, [True] * 5 + [False] * 2])
+
+    with torch.no_grad():
+        actual = model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            image_mask=image_mask,
+            backbone_attention_mask=mask,
+        )
+        expected = _alternate_vl_dit_before_the_split(
+            model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

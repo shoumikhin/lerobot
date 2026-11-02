@@ -26,9 +26,9 @@ from .model import (
     WanLayerNorm,
     WanModel,
     WanRMSNorm,
-    float32_autocast,
     rope_apply,
     rope_params,
+    run_in_float32,
     sinusoidal_embedding_1d,
 )
 
@@ -276,10 +276,10 @@ def retract_video_rope(
                 f"`grid_sizes[{i}]` expands to {seq_len_i} tokens, more than the {seq_len} provided."
             )
         # Token coordinates in `rope_apply`'s t-major, y-then-x expansion order.
-        t = torch.arange(f, device=keys.device).repeat_interleave(h * w)
-        rem = torch.arange(seq_len_i, device=keys.device) % (h * w)
-        y = rem.div(w, rounding_mode="floor")
-        x = rem % w
+        t = torch.arange(int(f), device=keys.device).repeat_interleave(int(h) * int(w))
+        rem = torch.arange(seq_len_i, device=keys.device) % (int(h) * int(w))
+        y = rem.div(int(w), rounding_mode="floor")
+        x = rem % int(w)
         coords = (t, y, x)
         counts = (c_t, c_h, c_w)
         multiplier = torch.ones(seq_len_i, c, dtype=torch.complex128, device=keys.device)
@@ -790,13 +790,16 @@ class WanVideoDiT(WanModel):
         ) * timestep.to(dtype=model_dtype).view(batch_size, 1, 1)
         token_timesteps[:, 0, :] = 0
         token_timesteps = token_timesteps.reshape(batch_size, -1)
-        # Wan computes the time embedding in float32 even when the model runs in bfloat16 (its layers are
-        # `Float32Linear`), for the numerical stability of the head's scale and shift. The per-block
-        # modulation goes back to model_dtype, so the bfloat16 attention blocks are not upcast to float32.
-        with float32_autocast(token_timesteps.device):
+        # Wan keeps the time embedding in fp32: the AdaLN modulation in the vendored
+        # Head/Block asserts e.dtype == float32 (numerical stability of the scale/shift).
+        # Upstream guarantees this via an fp32 autocast region, so it holds even when the
+        # model runs in bf16. Mirror that here, with `run_in_float32` for the CPU, which CUDA
+        # autocast does not cover, then cast the per-block modulation back to model_dtype so
+        # the bf16 attention blocks are not upcast to fp32.
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1)).float()
-            t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
-            t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
+            t = run_in_float32(self.time_embedding, token_t_emb).reshape(batch_size, -1, self.hidden_dim)
+            t_mod = run_in_float32(self.time_projection, t).unflatten(2, (6, self.hidden_dim))
         t_mod = t_mod.to(dtype=model_dtype)
 
         x = self.patchify(x)

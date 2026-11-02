@@ -111,6 +111,8 @@
 - sections:
   - local: inference
     title: Policy Deployment (lerobot-rollout)
+  - local: export
+    title: Compiled Policies (lerobot-export)
   - local: remote_inference
     title: Remote Inference
   - local: rtc

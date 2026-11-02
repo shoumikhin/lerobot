@@ -38,7 +38,6 @@ from torch import Tensor
 
 from lerobot.utils.import_utils import _diffusers_available, _transformers_available, require_package
 
-from ..common.ddpm_scheduler import ExportableDDPMScheduler, InferenceStepsMixin
 from .configuration_multi_task_dit import MultiTaskDiTConfig
 from .processor_multi_task_dit import OBS_LANGUAGE_ROW_INDEX
 
@@ -663,7 +662,7 @@ class DiffusionTransformer(nn.Module):
 # -- Objectives --
 
 
-class DiffusionObjective(InferenceStepsMixin, nn.Module):
+class DiffusionObjective(nn.Module):
     """Standard diffusion (DDPM/DDIM) objective implementation."""
 
     def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
@@ -684,7 +683,7 @@ class DiffusionObjective(InferenceStepsMixin, nn.Module):
         }
 
         if config.noise_scheduler_type == "DDPM":
-            self.noise_scheduler: DDPMScheduler | DDIMScheduler = ExportableDDPMScheduler(**scheduler_kwargs)
+            self.noise_scheduler: DDPMScheduler | DDIMScheduler = DDPMScheduler(**scheduler_kwargs)
         elif config.noise_scheduler_type == "DDIM":
             self.noise_scheduler = DDIMScheduler(**scheduler_kwargs)
         else:
@@ -739,7 +738,8 @@ class DiffusionObjective(InferenceStepsMixin, nn.Module):
             )
         sample = noise.to(device=device, dtype=dtype)
 
-        for t in self.inference_timesteps():
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+        for t in self.noise_scheduler.timesteps:
             model_output = model(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),

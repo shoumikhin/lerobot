@@ -27,6 +27,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import ChunkPolicySpec
 from .configuration_fastwam import FastWAMConfig
 from .wan import (
     ActionDiT,
@@ -229,6 +230,19 @@ class FastWAMPolicy(PreTrainedPolicy):
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
 
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Serve the current frame and the configured action horizon.
+
+        The video frames in `observation_delta_indices` are future training targets. Inference predicts
+        the action chunk from the current frame alone.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("FastWAM chunk serving requires n_obs_steps=1.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.action_horizon,
+            execution_steps=self.config.n_action_steps,
+        )
+
     def _batch_to_training_sample(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Adapt a standard LeRobot batch to the FastWAM-native sample that
         `FastWAM.build_inputs` consumes (`video`, `action`, `context`/`context_mask`,
@@ -287,12 +301,10 @@ class FastWAMPolicy(PreTrainedPolicy):
         Args:
             batch (dict[str, Tensor]): Inference batch with `input_image` or
                 image observation keys, plus `context/context_mask` or `prompt`.
-                torch.export needs `context/context_mask`.
             noise (Tensor | None): Optional starting action sample of shape
                 `[B, action_horizon, action_dim]`. When None, each sample draws it with
                 the seed in `batch["seed"]`, or `config.inference_seed` if the batch has none.
-                torch.export needs it, so the exported program takes its noise as an input. Only
-                non-strict export checks this; strict export without it fails inside the generator.
+                torch.export needs it, so the exported program takes its noise as an input.
 
         Returns:
             Tensor: Action chunk with shape `[B, action_horizon, action_dim]`.

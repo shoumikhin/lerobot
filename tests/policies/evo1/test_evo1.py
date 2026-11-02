@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import io
 from types import SimpleNamespace
 
 import pytest
@@ -892,36 +891,6 @@ def test_flowmatching_rejects_out_of_range_embodiment_ids():
         )
 
 
-def test_flowmatching_head_with_several_embodiments_exports():
-    head = make_flowmatching_head(num_categories=2).eval()
-    gen = torch.Generator().manual_seed(0)
-    inputs = (
-        torch.randn(2, 4, EMBED_DIM, generator=gen),
-        torch.randn(2, STATE_DIM, generator=gen),
-        torch.tensor([0, 1]),
-        torch.rand(2, CHUNK_SIZE, ACTION_DIM, generator=gen),
-    )
-    action_mask = torch.ones(2, ACTION_DIM, dtype=torch.bool)
-
-    class GetAction(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.head = head
-
-        def forward(self, tokens, state, embodiment_id, noise):
-            return self.head.get_action(
-                tokens, state=state, embodiment_id=embodiment_id, action_mask=action_mask, noise=noise
-            )
-
-    model = GetAction()
-    exported = torch.export.export(model, inputs, strict=False).module()
-    assert torch.equal(exported(*inputs), model(*inputs))
-    tokens, state, _, noise = inputs
-    for bad in ([0, 2], [-1, 0]):  # export skips the range check, so the weight lookup must reject these
-        with pytest.raises(IndexError):
-            exported(tokens, state, torch.tensor(bad), noise)
-
-
 def test_evo1_batched_pixel_values_shape_and_zero_padding():
     torch.manual_seed(0)
     batch_size, image_size, max_views = 2, 448, 3
@@ -972,38 +941,28 @@ def test_internvl3_embedder_loads_default_rope_that_matches_dynamic_and_exports(
         InternVL3Embedder(device="cpu", use_flash_attn=False, max_text_length=1024)
     default = loaded["config"].text_config
     assert default.rope_parameters == {"rope_type": "default", "rope_theta": 1e6}
-    # Past max_position_embeddings dynamic RoPE rescales its frequencies, so a longer prompt keeps it.
-    with pytest.raises(RuntimeError, match="config captured"):
-        InternVL3Embedder(device="cpu", use_flash_attn=False, max_text_length=4096)
-    assert loaded["config"].text_config.rope_parameters["rope_type"] == "dynamic"
 
     x, positions = torch.zeros(1, 1024, 32), torch.arange(1024)[None]
     expected = Qwen2RotaryEmbedding(text)(x, positions)
     rotary = Qwen2RotaryEmbedding(default)
     assert all(torch.equal(a, b) for a, b in zip(rotary(x, positions), expected, strict=True))
-    exported = torch.export.export(rotary, (x, positions), strict=False).module()
+    exported = torch.export.export(rotary, (x, positions)).module()
     assert all(torch.equal(a, b) for a, b in zip(exported(x, positions), expected, strict=True))
-    # Dynamic RoPE applies partial_rotary_factor and Qwen2's default RoPE ignores it, so it stays dynamic.
-    text.rope_parameters = {**rope, "partial_rotary_factor": 0.5}
-    with pytest.raises(RuntimeError, match="config captured"):
-        InternVL3Embedder(device="cpu", use_flash_attn=False, max_text_length=1024)
-    assert loaded["config"].text_config.rope_parameters["rope_type"] == "dynamic"
 
 
-def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_length_prompt():
+def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_length_prompt(monkeypatch):
     transformers = pytest.importorskip("transformers")
 
     class Tokenizer:  # one id per image placeholder, then one per word
-        @torch.compiler.disable  # a real tokenizer breaks the graph too, so the check after it is compiled
         def __call__(self, prompts, *, max_length, **kwargs):
             rows = []
             for prompt in prompts:
                 words = prompt.rsplit("\n", 1)[-1].split()
                 ids = [7] * prompt.count(internvl3_embedder.IMG_CONTEXT_TOKEN) + [3] * len(words)
                 rows.append(ids[:max_length])
-            masks = [[1] * len(row) for row in rows]
-            encoding = {"input_ids": rows, "attention_mask": masks}
-            return transformers.BatchEncoding(encoding, tensor_type=kwargs.get("return_tensors"))
+            tokens = torch.tensor(rows)
+            mask = torch.ones_like(tokens)
+            return transformers.BatchEncoding({"input_ids": tokens, "attention_mask": mask})
 
     class VLM(nn.Module):
         def __init__(self):
@@ -1031,15 +990,13 @@ def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_len
 
     model, pixels, masks = Embed(), torch.rand(2, 3, 8, 8), torch.tensor([[True, False]])
     embedder.max_text_length = 3  # cuts into the 4 image tokens of the two views
-    for run in (model, torch.compile(model, backend="eager")):
-        with pytest.raises(ValueError, match="cut into the image placeholder tokens"):
-            run(pixels, masks)
     with pytest.raises(ValueError, match="cut into the image placeholder tokens"):
-        torch.export.export(model, (pixels, masks), strict=False)
+        model(pixels, masks)
     embedder.max_text_length = 8  # exactly the prompt, so the check runs and passes
-    program = torch.export.export(model, (pixels, masks), strict=False)
-    buffer = io.BytesIO()
-    torch.export.save(program, buffer)
-    buffer.seek(0)
-    for exported in (torch.export.load(buffer).module(), program.run_decompositions().module()):
-        assert torch.equal(exported(pixels, masks), model(pixels, masks))
+    exported = torch.export.export(model, (pixels, masks)).module()
+    assert torch.equal(exported(pixels, masks), model(pixels, masks))
+    # Eager mode keeps the check even with the switch that turns off the transformers checks.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    embedder.max_text_length = 3
+    with pytest.raises(ValueError, match="cut into the image placeholder tokens"):
+        model(pixels, masks)
