@@ -85,6 +85,8 @@ pytest -sv tests -m dataset
 
 The GPU Tests CI only runs tests marked `gpu`. Every test under `tests/policies` and every `@require_cuda` test gets it automatically; mark any other test that uses CUDA with `@pytest.mark.gpu`.
 
+The export tests that compile with ExecuTorch, Torch-TensorRT or both are marked `executorch` automatically when they skip without ExecuTorch. They run in their own jobs, which install those packages: Fast Export Tests on the CPU for every pull request, and GPU Export Tests with the GPU Tests (`-m "executorch and gpu"`). For a test that needs a backend, use its skip mark from `tests/export/backends.py`.
+
 ## Submitting Issues & Pull Requests
 
 Use the templates for required fields and examples.

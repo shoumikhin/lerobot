@@ -38,6 +38,15 @@ env:
   UV_VERSION: "0.11.30"
   PYTHON_VERSION: "3.12"
   DOCKER_IMAGE_NAME: huggingface/lerobot-gpu
+  # ExecuTorch and Torch-TensorRT are not in uv.lock (see the `export` note in pyproject.toml). Their CUDA 13.2 builds
+  # match PyPI's torch 2.15.0; the 1.6 and 2.15 release candidates are on PyTorch's test index only, so replace these
+  # with `executorch==1.6.0` and `torch-tensorrt==2.15.0` once those releases are on PyPI. ExecuTorch's CUDA backend
+  # compiles kernels at export, with the CUDA compiler of `nvidia-cuda-nvcc`. Until ExecuTorch has
+  # pytorch/executorch#24314 and Torch-TensorRT has pytorch/TensorRT#4953, and a torch-tensorrt-executorch-runtime takes
+  # ExecuTorch 1.6.0, every test this job selects skips and names the change it needs.
+  EXECUTORCH_CUDA: "executorch @ https://download.pytorch.org/whl/test/cu132/executorch-1.6.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl"
+  TORCH_TENSORRT: "torch-tensorrt @ https://download.pytorch.org/whl/test/cu132/torch_tensorrt-2.15.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl"
+  CUDA_COMPILER: "nvidia-cuda-nvcc==13.2.86"
 
 # Ensures that only the latest action is built, canceling older runs.
 concurrency:
@@ -201,12 +210,44 @@ jobs:
       - name: Run end-to-end tests
         run: make test-end-to-end
 
+  # This job exports tiny policies with the GPU backends ExecuTorch runs and checks the bundles, on the image of GPU Tests
+  # with ExecuTorch and Torch-TensorRT installed over it (the CPU backends run in Fast Tests)
+  gpu-export-tests:
+    permissions: {}
+    name: GPU Export Tests
+    needs: [build-and-push-docker]
+    runs-on:
+      group: aws-g6-4xlarge-plus
+    env:
+      HF_HOME: /home/user_lerobot/.cache/huggingface
+      HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
+      TORCH_HOME: /home/user_lerobot/.cache/torch
+      TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
+      CUDA_HOME: /lerobot/.venv/lib/python3.12/site-packages/nvidia/cu13
+    container:
+      image: ${{ needs.build-and-push-docker.outputs.image_tag }} # zizmor: ignore[unpinned-images]
+      options: --gpus all --shm-size "16gb"
+      credentials:
+        username: ${{ secrets.DOCKERHUB_LEROBOT_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_LEROBOT_PASSWORD }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: /lerobot
+    steps:
+      - name: Install ExecuTorch and Torch-TensorRT
+        run: uv pip install "$EXECUTORCH_CUDA" "$TORCH_TENSORRT" "$CUDA_COMPILER"
+      - name: Fix ptxas permissions
+        run: chmod +x /lerobot/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas
+      - name: Run export tests on GPU
+        run: pytest tests -vv --maxfail=10 -m "executorch and gpu"
+
   # This job deletes the test image recently created
-  # It runs everytime after the gpu-tests have finished
+  # It runs everytime after the gpu-tests and gpu-export-tests have finished
   delete-pr-image:
     permissions: {}
     name: Delete PR Image
-    needs: [gpu-tests, build-and-push-docker]
+    needs: [gpu-tests, gpu-export-tests, build-and-push-docker]
     if: always() && ((github.event.review.state == 'approved') || (github.event_name == 'workflow_dispatch')) && needs.build-and-push-docker.result == 'success'
     runs-on: ubuntu-latest
     steps:
