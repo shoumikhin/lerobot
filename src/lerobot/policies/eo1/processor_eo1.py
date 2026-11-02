@@ -313,6 +313,18 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         # Supervised batches use right padding to match standard training collation.
         padding_side = "right" if self.transition.get(TransitionKey.ACTION) is not None else "left"
 
+        if not self.use_fast_processor:
+            # The slow image processor reads pixels with NumPy, but lerobot-rollout and lerobot-train
+            # send the batch on the policy device.
+            for row in messages:
+                for message in row:
+                    # A text-only message may give its content as a plain string.
+                    if isinstance(message["content"], str):
+                        continue
+                    for block in message["content"]:
+                        if isinstance(block.get("image"), torch.Tensor):
+                            block["image"] = block["image"].cpu()
+
         inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -337,6 +349,11 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
         complementary_data["mm_token_type_ids"] = inputs["mm_token_type_ids"]
         complementary_data["state_token_id"] = self._state_token_id
         complementary_data["action_token_id"] = self._action_token_id
+        if padding_side == "left":
+            # Left padding puts every row's action span at the same position.
+            action_tokens = inputs["input_ids"][0] == self._action_token_id
+            if action_tokens.any():
+                complementary_data["action_token_start"] = int(action_tokens.int().argmax())
         if has_text_targets:
             complementary_data["text_labels"] = _targeted_assistant_labels(
                 self._processor.tokenizer,

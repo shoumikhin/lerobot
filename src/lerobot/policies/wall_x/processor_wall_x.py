@@ -429,6 +429,19 @@ class WallXTokenizerStep(ProcessorStep):
             target_spans.append(spans)
         return texts, target_spans
 
+    def state_inputs(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The state as the model reads it, NaNs zeroed and padded to `max_state_dim`, and its mask."""
+        agent_pos = state.unsqueeze(1) if state.dim() == 2 else state
+        agent_pos_mask = (~torch.isnan(agent_pos)).float()
+        agent_pos = agent_pos.nan_to_num(nan=0.0)
+        if agent_pos.shape[-1] < self.max_state_dim:
+            pad = self.max_state_dim - agent_pos.shape[-1]
+            agent_pos = torch.nn.functional.pad(agent_pos, (0, pad))
+            agent_pos_mask = torch.nn.functional.pad(agent_pos_mask, (0, pad))
+        elif agent_pos.shape[-1] > self.max_state_dim:
+            raise ValueError("WALL-X state exceeds max_state_dim.")
+        return agent_pos, agent_pos_mask
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         processor, action_tokenizer = self._get_processors()
 
@@ -459,15 +472,7 @@ class WallXTokenizerStep(ProcessorStep):
             prompt_segments, (orig_height, orig_width, resized_height, resized_width)
         )
 
-        agent_pos = state.unsqueeze(1) if state.dim() == 2 else state
-        agent_pos_mask = (~torch.isnan(agent_pos)).float()
-        agent_pos = agent_pos.nan_to_num(nan=0.0)
-        if agent_pos.shape[-1] < self.max_state_dim:
-            pad = self.max_state_dim - agent_pos.shape[-1]
-            agent_pos = torch.nn.functional.pad(agent_pos, (0, pad))
-            agent_pos_mask = torch.nn.functional.pad(agent_pos_mask, (0, pad))
-        elif agent_pos.shape[-1] > self.max_state_dim:
-            raise ValueError("WALL-X state exceeds max_state_dim.")
+        agent_pos, agent_pos_mask = self.state_inputs(state)
 
         if action is not None:
             action = action.unsqueeze(1) if action.dim() == 2 else action
