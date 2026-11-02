@@ -17,7 +17,7 @@
 
 import abc
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,6 +130,17 @@ class PowerEMAConfig(EMAConfig):
         return float((1 - 1 / step) ** (self.gamma + 1))
 
 
+def match_saved_names(saved: Iterable[str], current: Iterable[str]) -> dict[str, str]:
+    """Map each saved parameter name to the current name of that parameter.
+
+    `torch.compile(module)` returns a wrapper that names the module's parameters `<module>._orig_mod.<name>`, so a
+    run may resume with a module wrapped that it saved unwrapped, or the other way round. Names are matched without
+    that part; a saved name that matches none is kept.
+    """
+    unwrapped = {name.replace("._orig_mod.", "."): name for name in current}
+    return {name: unwrapped.get(name.replace("._orig_mod.", "."), name) for name in saved}
+
+
 class EMA:
     """Float32 exponential moving average of the trainable parameters of a model.
 
@@ -194,14 +205,16 @@ class EMA:
         return {"num_updates": self.num_updates, "averages": self.averages}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if state_dict["averages"].keys() != self.averages.keys():
+        names = match_saved_names(state_dict["averages"], self.averages)
+        saved = {names[name]: average for name, average in state_dict["averages"].items()}
+        if saved.keys() != self.averages.keys():
             raise ValueError(
                 "The saved EMA averages a different set of parameters: "
-                f"{sorted(state_dict['averages'].keys() ^ self.averages.keys())[:5]}..."
+                f"{sorted(saved.keys() ^ self.averages.keys())[:5]}..."
             )
         self.num_updates = state_dict["num_updates"]
         for name, average in self.averages.items():
-            average.copy_(state_dict["averages"][name])
+            average.copy_(saved[name])
 
 
 def save_ema_state(ema: EMA, save_dir: Path) -> None:

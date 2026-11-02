@@ -30,12 +30,12 @@ Every function that touches sharded state is a collective and must run on ALL ra
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
-from lerobot.optim.ema import EMA
+from lerobot.optim.ema import EMA, match_saved_names
 from lerobot.utils.constants import EMA_SHARDED_STATE
 
 from .utils import is_main_process
@@ -262,11 +262,15 @@ def save_sharded_ema(ema: EMA, output_dir: Path) -> None:
 def load_sharded_ema(ema: EMA, input_dir: Path) -> None:
     """Load the DCP shards of the EMA averages, resharded to this topology. Collective: call on all ranks.
 
-    A checkpoint without them restarts the EMA from the resumed weights.
+    A checkpoint without them restarts the EMA from the resumed weights. Averages saved under the other
+    torch.compile names (see `match_saved_names`) load into the parameters they name.
 
     Args:
         ema (EMA): The EMA of the prepared (sharded) model to restore into.
         input_dir (Path): The directory containing the `ema_state/` shard subdirectory.
+
+    Raises:
+        ValueError: The renamed saved averages are not those of this model's parameters.
     """
     if not (input_dir / EMA_SHARDED_STATE).is_dir():
         if is_main_process():
@@ -276,7 +280,24 @@ def load_sharded_ema(ema: EMA, input_dir: Path) -> None:
         return
     import torch.distributed.checkpoint as dcp
 
-    dcp.load({"ema": ema}, checkpoint_id=input_dir / EMA_SHARDED_STATE)  # nosec B614
+    checkpoint = input_dir / EMA_SHARDED_STATE
+    prefix = "ema.averages."
+    metadata = dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata
+    saved_names = [key.removeprefix(prefix) for key in metadata if key.startswith(prefix)]
+    names = match_saved_names(saved_names, ema.averages)
+    if all(saved == name for saved, name in names.items()):
+        dcp.load({"ema": ema}, checkpoint_id=checkpoint)  # nosec B614
+        return
+    if sorted(names.values()) != sorted(ema.averages):
+        raise ValueError(
+            f"{checkpoint} averages a different set of parameters: "
+            f"{sorted(set(names.values()) ^ ema.averages.keys())[:5]}..."
+        )
+    # DCP loads into the given tensors in place, so these, keyed by the saved names, fill the averages.
+    averages = {saved: ema.averages[name] for saved, name in names.items()}
+    state: dict[str, Any] = {"num_updates": ema.num_updates, "averages": averages}
+    dcp.load({"ema": state}, checkpoint_id=checkpoint)  # nosec B614
+    ema.num_updates = state["num_updates"]
 
 
 def dcp_to_safetensors(dcp_dir: Path, output_dir: Path, *, delete_dcp: bool = False) -> Path:
