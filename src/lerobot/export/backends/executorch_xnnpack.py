@@ -40,4 +40,6 @@ class ExecuTorchXNNPACKConfig(ExecuTorchConfig):
         from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 
         edge = lower(program, XnnpackPartitioner())
-        path.write_bytes(edge.to_executorch().buffer)
+        compiled = edge.to_executorch()
+        with path.open("wb") as file:
+            compiled.write_to_file(file)

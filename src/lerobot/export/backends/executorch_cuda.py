@@ -49,7 +49,8 @@ class ExecuTorchCUDAConfig(ExecuTorchConfig):
         # The CUDA backend keeps every operator whole for its compiler, which the edge dialect check refuses.
         edge = lower(program, cuda_partitioner(path.stem), EdgeCompileConfig(_check_ir_validity=False))
         compiled = edge.to_executorch(gpu_memory_config())
-        path.write_bytes(compiled.buffer)
+        with path.open("wb") as file:
+            compiled.write_to_file(file)
         compiled.write_tensor_data_to_file(str(path.parent))
         data = path.with_suffix(".ptd")
         return data if data.exists() else None
