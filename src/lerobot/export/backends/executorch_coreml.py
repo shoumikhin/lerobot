@@ -82,4 +82,6 @@ class ExecuTorchCoreMLConfig(ExecuTorchConfig):
             compute_precision=ct.precision[self.compute_precision.upper()],
         )
         edge = lower(program, CoreMLPartitioner(compile_specs=compile_specs))
-        path.write_bytes(edge.to_executorch().buffer)
+        compiled = edge.to_executorch()
+        with path.open("wb") as file:
+            compiled.write_to_file(file)
