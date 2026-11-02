@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, final
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypeAlias, TypedDict, final
 
 import numpy as np
-import torch
+
+if TYPE_CHECKING:
+    import torch
 
 
 @final
@@ -37,7 +39,6 @@ class TransitionKey:
 
 
 # Kept as `TypeAlias` (not PEP 695 `type`): both are used in `isinstance()` checks.
-PolicyAction: TypeAlias = torch.Tensor  # noqa: UP040
 RobotAction = dict[str, Any]
 EnvAction: TypeAlias = np.ndarray  # noqa: UP040
 RobotObservation = dict[str, Any]
@@ -97,3 +98,11 @@ class EnvTransition(TypedDict):
     truncated: bool | torch.Tensor | None
     info: dict[str, Any] | None
     complementary_data: dict[str, Any] | None
+
+
+def __getattr__(name: str):
+    if name == "PolicyAction":
+        import torch
+
+        return torch.Tensor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

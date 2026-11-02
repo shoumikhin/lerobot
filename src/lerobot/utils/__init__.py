@@ -36,7 +36,6 @@ from .constants import (
     REWARD,
 )
 from .decorators import check_if_already_connected, check_if_not_connected
-from .device_utils import auto_select_torch_device, get_safe_torch_device, is_torch_device_available
 from .errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from .import_utils import is_package_available, register_third_party_plugins, require_package
 from .utils import init_logging
@@ -56,9 +55,6 @@ __all__ = [
     "QUERY_TEXT",
     "REWARD",
     # Device utilities
-    "auto_select_torch_device",
-    "get_safe_torch_device",
-    "is_torch_device_available",
     # Import guards
     "is_package_available",
     "register_third_party_plugins",
