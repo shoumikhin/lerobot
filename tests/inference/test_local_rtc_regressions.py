@@ -53,8 +53,9 @@ def test_unsupported_local_policy_explains_sync_fallback_before_hardware(monkeyp
         policy=ACTConfig(device="cpu", pretrained_path=Path("unused")),
         inference=RTCInferenceConfig(rtc=RTCConfig(enabled=False)),
         device="cpu",
+        tf32=None,
     )
-    monkeypatch.setattr(context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(context, "load_pretrained_policy", lambda _: policy)
 
     def unexpected_hardware(*args, **kwargs):
         pytest.fail("Policy compatibility must be checked before constructing hardware")

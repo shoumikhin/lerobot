@@ -1,0 +1,525 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Run a bundle written by `lerobot-export`: its programs, its test case, and the check of the robot.
+
+Like the rest of `lerobot.bundle`, this imports no PyTorch.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import deque
+from collections.abc import Mapping
+from threading import Event
+from typing import Any, cast
+
+import numpy as np
+from safetensors.numpy import load_file
+
+from lerobot.utils.constants import ACTION
+from lerobot.utils.latency import LatencyWindow
+
+from .action_tokens import ActionDecoder
+from .manifest import (
+    DECODED_ACTIONS,
+    GENERATED_TOKENS,
+    NOISE,
+    TASK_EMBEDDINGS,
+    TASK_LENGTH,
+    Bundle,
+    BundleManifest,
+    ProgramRun,
+)
+from .runtime import Program, prepare_runtime
+from .target import check_runtime_versions, check_target
+from .task_tokens import TaskEncoder
+
+logger = logging.getLogger(__name__)
+
+
+class BundleEngine:
+    """Inline inference with a bundle: one run of its programs per action chunk.
+
+    It plays the chunk one action per call, as [`SyncInferenceEngine`] plays the PyTorch policy's action
+    queue, keeps the past frames of a bundle with `history` the way the policy's own queues keep them, and
+    passes the values of a bundle's `carry` from each chunk to the next. It counts the chunks since the last
+    reset, so the first ones run their `first_runs`. Before it runs, it replays the bundle's test case and
+    refuses to start if the actions differ from the ones PyTorch computed by more than the bundle's tolerance.
+    It is an
+    [`~lerobot.utils.action_dispatch.ActionSource`], so a control loop dispatches its actions with the same
+    helpers as `lerobot-rollout`, and like `SyncInferenceEngine` it times each run of its programs in
+    `latency` for the status log.
+
+    Args:
+        bundle (`Bundle`):
+            The bundle to run.
+        task (`str`, *optional*, defaults to `""`):
+            The task, by default the one the bundle was exported for. A bundle without `task_tokens` runs
+            only that task.
+        rename_map (`dict[str, str]`, *optional*):
+            Renames the keys of the robot's frame to the names the bundle's programs take.
+        stop_event (`threading.Event`, *optional*):
+            Once set, no action may reach the robot, even one computed before it was set.
+    """
+
+    def __init__(
+        self,
+        bundle: Bundle,
+        task: str = "",
+        rename_map: dict[str, str] | None = None,
+        stop_event: Event | None = None,
+    ) -> None:
+        """Load the bundle's programs and check them against its test case."""
+        manifest = bundle.manifest
+        self._fixed_task = manifest.task
+        self._task_encoder = (
+            None if manifest.task_tokens is None else TaskEncoder(bundle.path, manifest.task_tokens)
+        )
+        self._action_decoder = (
+            None
+            if manifest.action_tokens is None
+            else ActionDecoder.read(bundle.path, manifest.action_tokens)
+        )
+        task = task or self._fixed_task or ""
+        self._check_task(task)
+        self._task = task
+        self._stop = stop_event or Event()
+        self._constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
+        self._noise_shape = manifest.noise_shape
+        chunks = [*manifest.first_runs, manifest.runs]
+        # A GPU bundle draws its noise in a run of its own; otherwise the engine draws it on the host.
+        self._draws_noise = any(NOISE in run.outputs for runs in chunks for run in runs)
+        self._action_names = manifest.action_names
+        self._scale = np.asarray(manifest.action_scale, dtype=np.float32)
+        if not (np.isfinite(self._scale) & (self._scale > 0)).all():
+            raise ValueError(
+                f"The bundle's action scale {manifest.action_scale} does not fit in 32-bit floats above 0. "
+                "Export the policy again."
+            )
+        self._rename = rename_map or {}
+        self._actions: deque[np.ndarray] = deque()
+        self.latency = LatencyWindow()
+        self._chunks = 0
+        case = load_file(bundle.path / manifest.test_case)
+        expected = case.pop(ACTION, None)
+        noise = case.pop(NOISE, None)
+        self._frame_dtypes = {name: value.dtype for name, value in case.items()}
+        if (
+            expected is None
+            or expected.ndim != 2
+            or expected.shape[0] == 0
+            or expected.shape[1] != len(self._scale)
+            or not np.isfinite(expected).all()
+        ):
+            raise ValueError(
+                "The bundle's test case holds no valid expected actions: finite numbers shaped "
+                f"[execution_steps, {len(self._scale)}]. Export the policy again."
+            )
+        frames = [case]
+        if manifest.history or manifest.carry or manifest.first_runs:
+            ticks = {value.shape[0] if value.ndim else 0 for value in case.values()}
+            if len(ticks) != 1 or 0 in ticks:
+                raise ValueError(
+                    "The bundle keeps a frame history or carries values between chunks, but its test case does "
+                    "not hold the same number of frames for each key. Export the policy again."
+                )
+            frames = [{name: value[tick] for name, value in case.items()} for tick in range(ticks.pop())]
+        expected_noise = None if manifest.noise_shape is None else tuple(manifest.noise_shape)
+        recorded = None if noise is None else noise.shape
+        if expected_noise is not None and manifest.first_runs:
+            # The noise of each chunk the test case's ticks play, which the check counts.
+            recorded = None if noise is None else noise.shape[1:]
+        elif expected_noise is not None and manifest.carry:
+            # A chunk of the test case at each frame, each with its own noise.
+            expected_noise = (len(frames), *expected_noise)
+        if recorded != expected_noise:
+            raise ValueError(
+                f"The bundle's test case holds noise shaped {None if noise is None else noise.shape}, but its "
+                f"programs take noise shaped {expected_noise}. Export the policy again."
+            )
+        self._frame_spec = {name: value.shape for name, value in frames[-1].items()}
+        if unknown := sorted(set(manifest.history) - set(self._frame_spec)):
+            raise ValueError(
+                f"The bundle keeps the history of {unknown}, which its frame does not hold. Export the policy "
+                "again."
+            )
+        self._history: dict[str, deque[np.ndarray]] = {
+            name: deque(maxlen=size) for name, size in manifest.history.items()
+        }
+        self._carry_shapes = {
+            name: None if shape is None else tuple(shape) for name, shape in manifest.carry.items()
+        }
+        self._carry = self._reset_carry()
+        self._task_values = self._encode(task)
+        _check_dataflow(
+            manifest,
+            [*self._frame_spec, *self._task_values],
+            list(self._constants),
+            manifest.noise_shape is not None and not self._draws_noise,
+        )
+        check_target(manifest.target)
+        check_runtime_versions(manifest.runtime_versions)
+        runtime = prepare_runtime(manifest.runtime, manifest.runtime_imports, manifest.runtime_options)
+        programs = {
+            name: runtime.load(
+                bundle.path / files.file, None if files.data is None else bundle.path / files.data
+            )
+            for name, files in manifest.programs.items()
+        }
+        self._first_runs = bool(manifest.first_runs)
+        # The runs of each chunk since a reset; the last list runs for every chunk after the first ones.
+        self._chunk_runs = [[(run, programs[run.program]) for run in runs] for runs in chunks]
+        # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
+        self._placed = [self._place(runs, self._constants) for runs in self._chunk_runs]
+        self._check(frames, noise, expected, manifest.tolerance)
+        self.chunk_length = len(expected)
+        # The task stays the same until `set_task`, so its values are placed once too, after the test case
+        # ran its own task.
+        self._place_task()
+        logger.info("Bundle loaded from %s (backend %s)", bundle.path, manifest.backend)
+
+    def check_frame(self, frame: Mapping[str, np.ndarray]) -> None:
+        """Refuse a robot frame whose values have other dtypes than the bundle's programs take.
+
+        A robot names the shape of each camera, which `check_robot` compares, but not its dtype, so this
+        checks a frame the robot sent.
+
+        Args:
+            frame (`Mapping[str, np.ndarray]`):
+                A frame of the robot, before `rename_map`.
+        """
+        renamed = {self._rename.get(name, name): np.asarray(value) for name, value in frame.items()}
+        if problems := [
+            f"{name} as {dtype} (the robot gives {renamed[name].dtype})"
+            for name, dtype in self._frame_dtypes.items()
+            if renamed[name].dtype != dtype
+        ]:
+            raise ValueError(
+                f"The robot's frame does not match the exported policy, which takes {'; '.join(problems)}."
+            )
+
+    def check_robot(self, observation_shapes: Mapping[str, tuple[int, ...]], action_names: list[str]) -> None:
+        """Refuse a robot whose frame or actions differ from what the bundle takes.
+
+        Args:
+            observation_shapes (`Mapping[str, tuple[int, ...]]`):
+                The shape of each key of the robot's frame, before `rename_map`.
+            action_names (`list[str]`):
+                The robot's action components, in the order the actions are sent.
+        """
+        renamed = [self._rename.get(name, name) for name in observation_shapes]
+        if collisions := sorted({name for name in renamed if renamed.count(name) > 1}):
+            raise ValueError(
+                f"--rename_map gives several of the robot's observations the name {collisions}; each name "
+                "must come from one observation."
+            )
+        shapes = dict(zip(renamed, map(tuple, observation_shapes.values()), strict=True))
+        problems = [
+            f"{name} {shape} (the robot gives {shapes.get(name)})"
+            for name, shape in self._frame_spec.items()
+            if shapes.get(name) != shape
+        ]
+        hint = (
+            " Give the robot's observations the bundle's names (lerobot-rollout takes --rename_map)."
+            if problems
+            else ""
+        )
+        if self._action_names is not None and list(action_names) != self._action_names:
+            problems.append(f"the actions {self._action_names} (the robot takes {list(action_names)})")
+        elif len(action_names) != len(self._scale):
+            problems.append(f"{len(self._scale)} action components (the robot takes {len(action_names)})")
+        if problems:
+            raise ValueError(
+                f"The robot does not match the exported policy, which takes {'; '.join(problems)}.{hint}"
+            )
+
+    def _run_chunk(
+        self,
+        frame: Mapping[str, np.ndarray],
+        task_values: Mapping[str, np.ndarray],
+        noise: np.ndarray | None = None,
+    ) -> np.ndarray:
+        values: dict[str, Any] = {
+            name: np.stack(self._history[name]) if name in self._history else frame[name]
+            for name in self._frame_spec
+        }
+        values.update(task_values)
+        values.update(self._carry)
+        if noise is None and self._noise_shape is not None and not self._draws_noise:
+            noise = np.random.standard_normal(self._noise_shape).astype(np.float32)
+        if noise is not None:
+            values[NOISE] = noise
+        chunk = min(self._chunks, len(self._chunk_runs) - 1)
+        runs = self._chunk_runs[chunk]
+        # The program that wrote each value, which turns it into a host array.
+        writers: dict[str, Program] = {}
+        for (run, program), placed in zip(runs, self._placed[chunk], strict=True):
+            if NOISE in values and NOISE in run.outputs:
+                # The test case's recorded noise stands in for the draw.
+                continue
+            if (
+                self._action_decoder is not None
+                and DECODED_ACTIONS in run.inputs
+                and DECODED_ACTIONS not in values
+            ):
+                tokens = writers[GENERATED_TOKENS].to_numpy(values[GENERATED_TOKENS])
+                values[DECODED_ACTIONS] = self._action_decoder(tokens)
+            inputs = []
+            for index, name in enumerate(run.inputs):
+                if index in placed:
+                    inputs.append(placed[index])
+                    continue
+                if isinstance(values[name], np.ndarray):
+                    # Placed once per chunk; a later run that reads it on the same device gets this copy.
+                    values[name] = program.place(index, values[name])
+                inputs.append(values[name])
+            values.update(zip(run.outputs, program(*inputs), strict=True))
+            writers.update(dict.fromkeys(run.outputs, program))
+        # Left where the runs wrote them, so the next chunk reads them without a copy.
+        self._carry = {name: values[name] for name in self._carry_shapes if name in values}
+        self._chunks += 1
+        actions = runs[-1][1].to_numpy(values[ACTION])
+        if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] != len(self._scale):
+            raise RuntimeError(
+                f"The exported policy returned actions shaped {actions.shape}, not [execution_steps, {len(self._scale)}]; "
+                "they were not sent."
+            )
+        if not np.isfinite(actions).all():
+            raise RuntimeError("The exported policy returned NaN or infinite actions; they were not sent.")
+        return actions
+
+    def _observe(self, frame: Mapping[str, np.ndarray]) -> None:
+        """Keep the frame's values that the programs read with their past ones, as `populate_queues` does."""
+        for name, frames in self._history.items():
+            # A copy, since a robot may write its next frame into the same array.
+            value = np.array(frame[name])
+            if frames:
+                frames.append(value)
+            else:
+                frames.extend([value] * cast(int, frames.maxlen))
+
+    def _check(
+        self, frames: list[dict], noise: np.ndarray | None, expected: np.ndarray, tolerance: float
+    ) -> None:
+        task_values = self._encode(self._fixed_task or "")
+        if self._first_runs:
+            actual = self._play(frames, task_values, noise)
+        elif self._carry_shapes:
+            # A chunk at each frame, so the last one reads what the chunks before it passed on.
+            for index, frame in enumerate(frames):
+                self._observe(frame)
+                actual = self._run_chunk(frame, task_values, None if noise is None else noise[index])
+        else:
+            for frame in frames:
+                self._observe(frame)
+            actual = self._run_chunk(frames[-1], task_values, noise)
+        self.reset()
+        if actual.shape != expected.shape:
+            raise RuntimeError(
+                f"The exported policy returns actions shaped {actual.shape}, but its test case expects "
+                f"{expected.shape}. Export it again."
+            )
+        error = float((np.abs(actual - expected) / self._scale).max())
+        logger.info("Bundle test case: largest difference %.2e (tolerance %g)", error, tolerance)
+        if not np.isfinite(error) or error > tolerance:
+            raise RuntimeError(
+                f"The exported policy does not reproduce its test case ({error:.2e} > {tolerance}). "
+                "Export it again on this device."
+            )
+
+    def _play(
+        self, frames: list[dict], task_values: Mapping[str, np.ndarray], noise: np.ndarray | None
+    ) -> np.ndarray:
+        """The action played at each of `frames` from a reset, as `get_action` plays them.
+
+        Each chunk reads the next of `noise`.
+        """
+        played = []
+        chunks = 0
+        for frame in frames:
+            self._observe(frame)
+            if not self._actions:
+                if noise is not None and chunks == len(noise):
+                    raise RuntimeError(
+                        f"The bundle's test case holds the noise of {len(noise)} chunks, but its ticks play "
+                        "more. Export the policy again."
+                    )
+                self._actions.extend(
+                    self._run_chunk(frame, task_values, None if noise is None else noise[chunks])
+                )
+                chunks += 1
+            played.append(self._actions.popleft())
+        if noise is not None and chunks != len(noise):
+            raise RuntimeError(
+                f"The bundle's test case holds the noise of {len(noise)} chunks, but its ticks play {chunks}. "
+                "Export the policy again."
+            )
+        return np.stack(played)
+
+    @staticmethod
+    def _place(
+        runs: list[tuple[ProgramRun, Program]], values: Mapping[str, np.ndarray]
+    ) -> list[dict[int, Any]]:
+        """`values` copied, for each of `runs`, where its program reads them."""
+        return [
+            {
+                index: program.place(index, values[name])
+                for index, name in enumerate(run.inputs)
+                if name in values
+            }
+            for run, program in runs
+        ]
+
+    def _encode(self, task: str) -> dict[str, np.ndarray]:
+        """The values the programs take for `task`: none for a bundle without task tokens."""
+        if self._task_encoder is None:
+            return {}
+        embeddings, length = self._task_encoder(task)
+        return {TASK_EMBEDDINGS: embeddings, TASK_LENGTH: length}
+
+    def _check_task(self, task: str) -> None:
+        if self._task_encoder is not None:
+            self._task_encoder.check(task)
+        elif self._fixed_task is not None and task != self._fixed_task:
+            raise ValueError(
+                f"This exported policy runs only the task it was exported for, {self._fixed_task!r}, "
+                f"not {task!r}. Export it again for the new task."
+            )
+
+    @property
+    def task(self) -> str:
+        """The task the programs run, set when the bundle loads and by `set_task`."""
+        return self._task
+
+    def dispatch_allowed(self) -> bool:
+        """Whether an action may reach the robot: until the stop event is set."""
+        return not self._stop.is_set()
+
+    def acknowledge_hold(self) -> None:
+        """Inline inference has no worker waiting for the hold."""
+
+    def record_dispatch(self) -> None:
+        """Inline inference has nothing to do when an action reaches the robot."""
+
+    @property
+    def frame_dtypes(self) -> dict[str, str]:
+        """The observations the bundle reads, by the bundle's names, with the dtype its programs take."""
+        return {name: str(dtype) for name, dtype in self._frame_dtypes.items()}
+
+    def set_task(self, task: str) -> None:
+        """Run `task` from the next chunk on. A bundle without `task_tokens` runs only its own task."""
+        self._check_task(task)
+        self._task = task
+        self._task_values = self._encode(task)
+        self._place_task()
+
+    def _place_task(self) -> None:
+        for runs, placed_runs in zip(self._chunk_runs, self._placed, strict=True):
+            for placed, task_placed in zip(placed_runs, self._place(runs, self._task_values), strict=True):
+                placed.update(task_placed)
+
+    def predict_chunk(self, obs_frame: Mapping[str, np.ndarray]) -> np.ndarray:
+        """Run the programs once on a frame of the robot and return the whole chunk of actions.
+
+        For a caller that plays the chunk itself, such as a policy server. A bundle with `history` takes each
+        call as one control tick.
+        """
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
+        return self._run_chunk(frame, self._task_values)
+
+    def reset(self) -> None:
+        """Drop the queued actions and the past frames, and start the carried values and the chunks again."""
+        self._actions.clear()
+        for frames in self._history.values():
+            frames.clear()
+        self._carry = self._reset_carry()
+        self._chunks = 0
+
+    def _reset_carry(self) -> dict[str, Any]:
+        return {
+            name: np.zeros(shape, np.float32)
+            for name, shape in self._carry_shapes.items()
+            if shape is not None
+        }
+
+    def get_action(self, obs_frame: dict | None) -> np.ndarray | None:
+        """The next action of the chunk, running the programs when the chunk is used up."""
+        if obs_frame is None:
+            return None
+        frame = {self._rename.get(name, name): value for name, value in obs_frame.items()}
+        self._observe(frame)
+        if not self._actions:
+            started = time.monotonic()
+            self._actions.extend(self._run_chunk(frame, self._task_values))
+            completed = time.monotonic()
+            self.latency.record(completed - started, completed)
+        return self._actions.popleft()
+
+
+def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[str], noise: bool) -> None:
+    """Refuse, before any program loads, runs that read a value nothing gives them or write a value placed once.
+
+    The constants and the values `task_tokens` makes are placed once where each run reads them, so a run that
+    wrote one would not change what a later run reads.
+    A value carried between chunks must have a name of its own, and some run must write it. One without a shape
+    has a value only once a chunk since the reset wrote it.
+    The decoded actions of `action_tokens` count as given once a run has written the generated tokens.
+    """
+    given = {*frame, *constants, *([NOISE] if noise else [])}
+    if clashes := sorted(set(manifest.carry) & {*given, NOISE}):
+        raise ValueError(
+            f"The bundle carries {clashes} between chunks, which is the name of a value the frame, the noise or "
+            "the constants give. Export the policy again."
+        )
+    carried = {name for name, shape in manifest.carry.items() if shape is not None}
+    written: set[str] = set()
+    decodes = manifest.action_tokens is not None
+    tasks = manifest.task_tokens is not None
+    # The last list runs again for every later chunk, after itself, which can only carry more.
+    for runs in (*manifest.first_runs, manifest.runs):
+        available = given | carried
+        for run in runs:
+            if shadowed := sorted(set(run.outputs) & set(constants)):
+                raise ValueError(
+                    f"The bundle's run {run.name!r} writes the constants {shadowed}. Export the policy again."
+                )
+            if decodes and DECODED_ACTIONS in run.outputs:
+                raise ValueError(
+                    f"The bundle's run {run.name!r} writes {DECODED_ACTIONS!r}, which the bundle decodes "
+                    "itself. Export the policy again."
+                )
+            if tasks and (retasked := sorted(set(run.outputs) & {TASK_EMBEDDINGS, TASK_LENGTH})):
+                raise ValueError(
+                    f"The bundle's run {run.name!r} writes {retasked}, which the bundle makes from the task "
+                    "itself. Export the policy again."
+                )
+            if decodes and GENERATED_TOKENS in available:
+                available.add(DECODED_ACTIONS)
+            if missing := [name for name in run.inputs if name not in available]:
+                raise ValueError(
+                    f"The bundle's run {run.name!r} reads {missing}, which neither the frame, the noise, the "
+                    "constants, an earlier chunk nor an earlier run gives. Export the policy again."
+                )
+            available.update(run.outputs)
+            written.update(run.outputs)
+        if ACTION not in runs[-1].outputs:
+            raise ValueError(f"The bundle's last run, {runs[-1].name!r}, gives no {ACTION!r}.")
+        carried |= set(manifest.carry) & available
+    if unwritten := sorted(set(manifest.carry) - written):
+        raise ValueError(
+            f"The bundle carries {unwritten} between chunks, but no run writes them. Export the policy again."
+        )

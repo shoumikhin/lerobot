@@ -64,6 +64,7 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
+from ..common.meta_load import load_complete_checkpoint
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -684,7 +685,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Compile model if requested
         if config.compile_model:
-            torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)  # type: ignore[method-assign]
@@ -823,8 +823,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, noisy_actions, timestep, adarms_cond=None):
+        """Embed noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        A caller that already holds the time conditioning for `timestep` passes it as `adarms_cond`, which skips
+        the time MLP.
+        """
         att_masks = []
 
         # Embed timestep using sine-cosine positional encoding
@@ -849,8 +853,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             x = self.time_mlp_out(x)
             return F.silu(x)
 
-        time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
-        adarms_cond = time_emb
+        if adarms_cond is None:
+            adarms_cond = self._apply_checkpoint(time_mlp_func, time_emb)
 
         bsize, action_time_dim = action_emb.shape[:2]
         pad_masks = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
@@ -1028,9 +1032,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        adarms_cond=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        """Apply one denoising step of the noise `x_t` at a given timestep, or its time conditioning if given."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t, timestep, adarms_cond
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1070,6 +1077,8 @@ class PI05Policy(PreTrainedPolicy):
     model_class = PI05Pytorch
     # Subclasses whose checkpoints are native LeRobot state dicts use the base loader.
     use_native_pretrained_loader = False
+    # Read from this class only, so each subclass opts in on its own.
+    _supports_meta_load = True
 
     def supports_rtc(self) -> bool:
         return True
@@ -1096,7 +1105,9 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # On the meta device, load_complete_checkpoint places the parameters and then moves the buffers.
+        if not next(self.model.parameters()).is_meta:
+            self.model.to(config.device)
 
         self.reset()
 
@@ -1140,19 +1151,29 @@ class PI05Policy(PreTrainedPolicy):
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
+        download_kwargs: dict[str, Any] = {
+            "force_download": force_download,
+            "resume_download": resume_download,
+            "proxies": proxies,
+            "token": token,
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "revision": revision,
+        }
         # Use provided config if available, otherwise create default config
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
+                pretrained_name_or_path=pretrained_name_or_path, **download_kwargs, **kwargs
             )
+
+        print(f"Loading model from: {pretrained_name_or_path}")
+        require_package("transformers", extra="pi")
+        from transformers.utils import cached_file
+
+        resolved_file = cached_file(pretrained_name_or_path, "model.safetensors", **download_kwargs)
+        model = load_complete_checkpoint(cls, resolved_file, config, **kwargs)
+        if model is not None:
+            return model
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
@@ -1160,21 +1181,7 @@ class PI05Policy(PreTrainedPolicy):
 
         # Load state dict (expects keys with "model." prefix)
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
             try:
-                from transformers.utils import cached_file
-
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
@@ -1255,7 +1262,11 @@ class PI05Policy(PreTrainedPolicy):
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
-        """Fix state dict keys to match current model architecture."""
+        """Fix state dict keys to match current model architecture.
+
+        Each key is handled on its own and values are only renamed, copied or dropped, which
+        `load_complete_checkpoint` relies on.
+        """
         import re
 
         fixed_state_dict = {}

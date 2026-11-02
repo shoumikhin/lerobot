@@ -14,14 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
-import torch
+# Imported inside each function, so that `lerobot.utils`, which re-exports some of these, loads without PyTorch.
+if TYPE_CHECKING:
+    import torch
 
 
 def auto_select_torch_device() -> torch.device:
     """Tries to select automatically a torch device."""
+    import torch
+
     if torch.cuda.is_available():
         logging.info("Cuda backend detected, using cuda.")
         return torch.device("cuda")
@@ -45,6 +52,8 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
             this machine (``AssertionError`` was previously used and is easy to
             mistake for a programmer bug under ``python -O`` where asserts vanish).
     """
+    import torch
+
     try_device = str(try_device)
     if try_device.startswith("cuda"):
         if not torch.cuda.is_available():
@@ -77,6 +86,8 @@ def resolve_safetensors_device(map_location: str | torch.device) -> str:
     accelerate/FSDP every rank would then load its weights onto GPU 0, OOMing it before sharding.
     Resolve "cuda" to the concrete current-device index so each rank loads onto its own GPU.
     """
+    import torch
+
     map_location = str(map_location)
     if map_location == "cuda" and torch.cuda.is_available():
         return f"cuda:{torch.cuda.current_device()}"
@@ -87,6 +98,8 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
     """
     mps is currently not compatible with float64
     """
+    import torch
+
     if isinstance(device, torch.device):
         device = device.type
     if device == "mps" and dtype == torch.float64:
@@ -111,6 +124,8 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
 
 
 def is_torch_device_available(try_device: str) -> bool:
+    import torch
+
     try_device = str(try_device)  # Ensure try_device is a string
     if try_device.startswith("cuda"):
         return torch.cuda.is_available()
@@ -133,7 +148,7 @@ def is_amp_available(device: str):
         raise ValueError(f"Unknown device '{device}.")
 
 
-def get_autocast_context(device_type: str, dtype: torch.dtype = torch.bfloat16):
+def get_autocast_context(device_type: str, dtype: torch.dtype | None = None):
     """Return a device-safe autocast context manager.
 
     A hardcoded `torch.autocast(dtype=torch.bfloat16)` breaks on backends without AMP (MPS) and
@@ -143,7 +158,14 @@ def get_autocast_context(device_type: str, dtype: torch.dtype = torch.bfloat16):
         `torch.autocast` would accept it and then warn-and-disable on every call
       - CUDA asking for bf16 on compute capability < 8.0: fall back to fp16
       - otherwise: `torch.autocast(device_type, dtype)`
+
+    `dtype` defaults to bfloat16.
     """
+    import torch
+
+    if dtype is None:
+        dtype = torch.bfloat16
+
     if not is_amp_available(device_type):
         return nullcontext()
     if device_type == "cpu" and dtype not in (torch.bfloat16, torch.float16):
