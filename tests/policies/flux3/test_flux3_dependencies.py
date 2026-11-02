@@ -32,6 +32,7 @@ def test_vae_dependency_errors(failure):
 
         failure = sys.argv[1]
         import_utils._natten_available = failure == "broken_natten"
+        import_utils._require_package_cache["natten"] = False
         original_import = builtins.__import__
 
         def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):

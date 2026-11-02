@@ -38,7 +38,7 @@ from lerobot.optim.ema import EMA, ConstantEMAConfig
 from lerobot.optim.schedulers import FrozenWarmupConstantSchedulerConfig
 from lerobot.policies import factory
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors
+from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors, modeling_flux3
 from lerobot.policies.flux3.f3 import (
     JointSingleSeq,
     JointSingleSeqParams,
@@ -49,6 +49,7 @@ from lerobot.policies.flux3.f3 import (
     sampling,
     stream_of_key,
 )
+from lerobot.policies.flux3.f3.text_encoder import TEXT_PAD_MULTIPLE
 from lerobot.policies.flux3.f3.wiring import (
     head_parameter_names,
     load_action_checkpoint,
@@ -62,6 +63,7 @@ from tests.policies.flux3.helpers import (
     FRAME_REFERENCE_SETTINGS,
     TINY_DIT,
     FakeVideoVAE,
+    MockTextEncoder,
     droid_config,
     droid_features,
     single_config,
@@ -430,15 +432,14 @@ def test_timestep_sampler_and_augmentation():
 
 def test_cosmos_unipc_schedule_and_solver():
     sigmas, ticks = sampling.cosmos_unipc_schedule(4, 5.0)
-    assert ticks.tolist() == [999, 937, 833, 624]
+    assert ticks == [999, 937, 833, 624]
     assert sigmas.shape == (5,) and sigmas[-1] == 0 and sigmas[0] > 0.999
     x0 = {"x_video": torch.randn(1, 6, 2), "x_a": torch.randn(1, 3, 2)}
     torch.manual_seed(0)
     samples = {k: torch.randn_like(v) for k, v in x0.items()}
-    tick_list = ticks.tolist()
 
     def predict(s, tick):  # a perfect velocity model of one sample
-        sigma = sigmas[tick_list.index(int(tick))]
+        sigma = sigmas[ticks.index(tick)]
         return {k: (s[k] - x0[k]) / sigma for k in s}
 
     out = sampling.cosmos_unipc_order2(samples, predict, n_steps=4, shift=5.0)
@@ -682,6 +683,106 @@ def test_policy_single_layout_relative_actions_and_cfg_one(fake_vae):
     assert torch.isfinite(loss) and info["n_valid_windows"] == 2
 
 
+def test_euler_schedule_follows_settings_and_survives_a_failed_export(fake_vae):
+    config = single_config(sampler="cosmos_unipc", num_inference_steps=1, sampler_shift=1.0)
+    policy = Flux3Policy(config).eval()
+    policy.config.sampler = "euler"
+    gen = torch.Generator().manual_seed(2)
+    obs = {
+        "observation.images.top": torch.rand(1, 3, 64, 96, generator=gen),
+        OBS_STATE: torch.rand(1, 6, generator=gen),
+        "task": ["stack the cubes"],
+    }
+
+    def velocity(samples, t):  # a stand-in for the DiT
+        return {"x": samples["x"] * float(t)}
+
+    class EulerSampler(nn.Module):
+        def forward(self, x):
+            return sampling.euler({"x": x}, velocity, timesteps=policy._euler_timesteps())["x"]
+
+    sampler, x = EulerSampler(), torch.randn(4)
+    # A freshly built policy exports without an eager prediction first.
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+    # dx/dt = x * t with no shift: one step from t=1 to 0 gives 0, two steps give 3x/8.
+    torch.testing.assert_close(sampler(x), torch.zeros_like(x))
+    policy.predict_action_chunk(obs)
+    policy.config.num_inference_steps = 2
+    with pytest.raises(RuntimeError, match="out of date"):
+        torch.export.export(sampler, (x,))
+    fresh = Flux3Policy(single_config(sampler="euler", num_inference_steps=2, sampler_shift=1.0)).eval()
+    fresh.load_state_dict(policy.state_dict())
+    assert torch.equal(policy.predict_action_chunk(obs), fresh.predict_action_chunk(obs))
+    assert torch.equal(torch.export.export(sampler, (x,)).module()(x), sampler(x))
+    torch.testing.assert_close(sampler(x), 3 * x / 8)
+
+
+def test_exported_policy_takes_its_noise_as_inputs_and_leaves_eager_inference_intact(fake_vae, monkeypatch):
+    # The mock draws from a generator, which torch.export cannot trace on PyTorch 2.11.
+    def plain_context(self, text, *, fixed_length=None):
+        shape = (1, fixed_length or TEXT_PAD_MULTIPLE, self.context_in_dim)
+        return torch.full(shape, len(text) / 10, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(MockTextEncoder, "forward_bucketed", plain_context)
+    policy = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    twin = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    twin.load_state_dict(policy.state_dict())
+    cfg, gen = policy.config, torch.Generator().manual_seed(3)
+    images, state = torch.rand(1, 3, 64, 96, generator=gen), torch.rand(1, 6, generator=gen)
+    n_pred = policy.packer.predicted_latent_frames(cfg)
+
+    def draw_noise():
+        return {
+            "noise": torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=gen),
+            "video_noise": torch.randn(1, packing.LATENT_CHANNELS, n_pred, *cfg.latent_hw, generator=gen),
+        }
+
+    class Predict(nn.Module):
+        def __init__(self, policy, task="stack the cubes"):
+            super().__init__()
+            # Kept outside the module tree, so export does not roll back the policy's Python state afterwards.
+            object.__setattr__(self, "policy", policy)
+            self.task = task
+
+        def forward(self, images, state, noise=None, video_noise=None):
+            batch = {"observation.images.top": images, OBS_STATE: state, "task": [self.task]}
+            return self.policy.predict_action_chunk(batch, noise=noise, video_noise=video_noise)
+
+    model, noise = Predict(policy), draw_noise()
+    with pytest.raises(ValueError, match="noise and video_noise"):
+        torch.export.export(model, (images, state))
+    # A fresh policy, so the text context is computed while tracing.
+    exported = torch.export.export(model, (images, state), kwargs=noise).module()
+    expected = Predict(twin)(images, state, **noise)
+    assert torch.equal(model(images, state, **noise), expected)
+    assert torch.equal(exported(images, state, **noise), expected)
+    assert torch.equal(exported(images, state, **noise), expected)
+    other = draw_noise()
+    assert torch.equal(exported(images, state, **other), model(images, state, **other))
+    # A stale schedule stops export, and the eager prediction its error asks for gives the right result.
+    policy.config.num_inference_steps = twin.config.num_inference_steps = 3
+    with pytest.raises(RuntimeError, match="out of date"):
+        torch.export.export(Predict(policy, "a new task"), (images, state), kwargs=noise)
+    new_task = Predict(policy, "a new task")(images, state, **noise)
+    assert torch.equal(new_task, Predict(twin, "a new task")(images, state, **noise))
+
+
+def test_torch_compile_keeps_the_text_context_cache(fake_vae):
+    policy = Flux3Policy(single_config(sampler="euler", num_inference_steps=2)).eval()
+    gen = torch.Generator().manual_seed(2)
+    obs = {
+        "observation.images.top": torch.rand(1, 3, 64, 96, generator=gen),
+        OBS_STATE: torch.rand(1, 6, generator=gen),
+        "task": ["stack the cubes"],
+    }
+    eager = policy.predict_action_chunk(obs)
+    captions = set(policy._ctx_cache)
+    policy._ctx_cache.clear()
+    compiled = torch.compile(policy.predict_action_chunk, backend="eager")
+    assert torch.equal(compiled(obs), eager)
+    assert captions and set(policy._ctx_cache) == captions
+
+
 def test_gripper_flip_is_applied_symmetrically(fake_vae):
     cfg = droid_config()
     policy = Flux3Policy(cfg)
@@ -733,6 +834,38 @@ def test_frozen_components_stay_unregistered_eval_and_follow_device_moves(monkey
     policy.to(torch.float64)
     assert vae_module.weight.dtype == torch.float64  # _apply still moves them along
     assert policy.frozen is frozen
+
+
+def test_parts_are_built_on_the_default_device(monkeypatch):
+    # An export builds the policy under `torch.device(<its device>)`; a part made on the CPU would be copied.
+    devices = {}
+
+    def recorder(name):
+        def build(*args, device, **kwargs):
+            devices[name] = torch.device(device)
+
+        return build
+
+    builders = ("build_action_dit", "load_video_vae", "load_text_encoder")
+    for name in builders:
+        monkeypatch.setattr(modeling_flux3, name, recorder(name))
+    builder = SimpleNamespace(dit_params=None, modality="action", dtype_=torch.float32)
+    with torch.device("meta"):
+        Flux3Policy._build_dit(builder, droid_config())
+        Flux3Policy._build_video_vae(builder, droid_config())
+        Flux3Policy._build_text_encoder(builder, droid_config())
+    assert devices == dict.fromkeys(builders, torch.device("meta"))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_checkpoint_loads_into_the_policy_where_it_was_built(fake_vae, tmp_path):
+    policy = Flux3Policy(droid_config())
+    policy.save_pretrained(tmp_path)
+    policy.to("cuda")
+    # As `from_pretrained` calls it: the file mapped on the CPU, the policy moved to its device afterwards.
+    loaded = Flux3Policy._load_as_safetensor(policy, str(tmp_path / "model.safetensors"), "cpu", True)
+    assert loaded.dit.emb_in["action"].weight.device.type == "cuda"
 
 
 def test_compile_model_wraps_the_inference_dit_forward_only(fake_vae, monkeypatch):
@@ -934,6 +1067,15 @@ def test_unsupported_relative_execution_and_rtc_arguments_fail_early(fake_vae):
     for method in (absolute.select_action, absolute.predict_action_chunk):
         with pytest.raises(NotImplementedError, match="RTC inference arguments"):
             method({}, inference_delay=1, prev_chunk_left_over=None)
+
+
+def test_chunk_serving_takes_frame_checkpoints(fake_vae):
+    spec = Flux3Policy(droid_config(n_action_steps=8)).chunk_inference_spec()
+    assert (spec.prediction_steps, spec.execution_steps) == (32, 8)
+    assert spec.current_observation_only
+    for config in (task_config(), single_config(use_relative_actions=True)):
+        with pytest.raises(ValueError, match="FLUX3"):
+            Flux3Policy(config).chunk_inference_spec()
 
 
 def test_lora_update_ema_resume_and_reload(tmp_path, fake_vae):

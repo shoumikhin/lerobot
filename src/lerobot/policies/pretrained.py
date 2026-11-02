@@ -192,10 +192,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         if device is None:
             # PreTrainedConfig.__post_init__ always resolves a device; None here is a programming error.
             raise ValueError(f"{type(config).__name__}.device is unset; cannot load the weights")
+        # Mapped on the CPU, the file is copied into the parameters one tensor at a time, wherever they were
+        # built. Mapped on a GPU, all of it would first be copied there, beside the parameters.
         if os.path.isdir(model_id):
             print("Loading weights from local directory")
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            policy = cls._load_as_safetensor(instance, model_file, device, strict)
+            policy = cls._load_as_safetensor(instance, model_file, "cpu", strict)
         else:
             try:
                 model_file = hf_hub_download(
@@ -209,7 +211,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     token=token,
                     local_files_only=local_files_only,
                 )
-                policy = cls._load_as_safetensor(instance, model_file, device, strict)
+                policy = cls._load_as_safetensor(instance, model_file, "cpu", strict)
             except HfHubHTTPError as e:
                 raise FileNotFoundError(
                     f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"

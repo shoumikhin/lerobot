@@ -39,13 +39,15 @@ import torch.nn as nn
 from lerobot.utils.import_utils import _transformers_available
 
 if TYPE_CHECKING or _transformers_available:
+    from transformers import AttentionInterface, AttentionMaskInterface
     from transformers.activations import ACT2FN
     from transformers.cache_utils import Cache, DynamicCache
-    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask, eager_mask
     from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
         Qwen2_5_VLDecoderLayer,
         Qwen2_5_VLTextModel,
+        eager_attention_forward,
     )
     from transformers.utils.generic import merge_with_config_defaults
     from transformers.utils.output_capturing import capture_outputs
@@ -68,6 +70,30 @@ else:
 
 
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig
+
+# Wall-X's text attention: eager attention, which carries the action-token islands, computed in float32.
+WALL_X_ATTENTION = "wall_x_eager"
+
+
+def float32_eager_attention_forward(
+    module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs
+):
+    """Eager attention in float32, returned in the input dtype.
+
+    Stock eager attention rounds bfloat16 scores before the softmax, which the FlashAttention-2 kernel Wall-X
+    was released with never does; on a bfloat16 policy that moves the actions far from the float32 policy.
+    Autocast is off here, or mixed-precision training would multiply the queries and keys in bfloat16.
+    """
+    with torch.autocast(query.device.type, enabled=False):
+        output, weights = eager_attention_forward(
+            module, query.float(), key.float(), value.float(), attention_mask, scaling, dropout, **kwargs
+        )
+    return output.to(query.dtype), weights.to(query.dtype)
+
+
+if _transformers_available:
+    AttentionInterface.register(WALL_X_ATTENTION, float32_eager_attention_forward)
+    AttentionMaskInterface.register(WALL_X_ATTENTION, eager_mask)
 
 
 @dataclass
@@ -112,7 +138,12 @@ class SparseMoeBlock(nn.Module):
 
         self.dim_inputs = config.dim_inputs
 
-    def forward(self, hidden_states: torch.Tensor, experts_indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        experts_indices: torch.Tensor,
+        experts_counts: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
         """
         Route different hidden_states to corresponding experts for processing.
 
@@ -120,6 +151,9 @@ class SparseMoeBlock(nn.Module):
             hidden_states (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_dim).
             experts_indices (torch.Tensor): Tensor of shape (batch_size, seq_length),
                 indicating the expert index assigned to each token.
+            experts_counts (tuple[int, ...], optional): Number of tokens every sample routes to each
+                expert, when the caller knows it, with experts past the end of the tuple getting none.
+                Routing then uses fixed shapes and no host reads.
 
         Returns:
             output (torch.Tensor): Tensor of shape (batch_size, seq_length, hidden_dim).
@@ -129,9 +163,23 @@ class SparseMoeBlock(nn.Module):
 
         for expert_idx, expert in enumerate(self.experts):
             mask = experts_indices == expert_idx
+            dim_input = self.dim_inputs[expert_idx]
+            if experts_counts is not None:
+                count = experts_counts[expert_idx] if expert_idx < len(experts_counts) else 0
+                if count == 0:
+                    continue
+                # The expert's tokens of each sample, in order: the same rows as hidden_states[mask].
+                positions = torch.arange(seq_length, device=hidden_states.device)
+                index = torch.where(mask, positions, seq_length).topk(count, dim=1, largest=False)
+                index = index.indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+                selected_hidden = hidden_states.gather(1, index).flatten(0, 1)
+                processed_hidden = expert(selected_hidden[:, :dim_input]).view(batch_size, -1, dim_input)
+                output = output.scatter(
+                    1, index, torch.nn.functional.pad(processed_hidden, (0, hidden_dim - dim_input))
+                )
+                continue
             if mask.sum() == 0:
                 continue
-            dim_input = self.dim_inputs[expert_idx]
 
             selected_hidden = hidden_states[mask]
             processed_hidden = expert(selected_hidden[:, :dim_input])
@@ -168,6 +216,7 @@ class Qwen2_5_VLDecoderLayer_with_MoE(Qwen2_5_VLDecoderLayer):  # noqa: N801
         token_types: torch.LongTensor | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_counts: tuple[int, ...] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -193,7 +242,7 @@ class Qwen2_5_VLDecoderLayer_with_MoE(Qwen2_5_VLDecoderLayer):  # noqa: N801
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.mlp is None:  # using moe mlp
             hidden_states = hidden_states.to(self.moe.experts[0].down_proj.weight.dtype)
-            hidden_states = self.moe(hidden_states, token_types)
+            hidden_states = self.moe(hidden_states, token_types, token_counts)
         else:
             hidden_states = hidden_states.to(self.mlp.down_proj.weight.dtype)
             hidden_states = self.mlp(hidden_states)
@@ -219,7 +268,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
         # Transformers selects SDPA automatically when no implementation is
         # requested. Wall-X's action-token islands require an explicit 4D
         # mask, so opt into eager before PreTrainedModel performs that choice.
-        text_config._attn_implementation = "eager"
+        text_config._attn_implementation = WALL_X_ATTENTION
         super().__init__(text_config)
         # Free the parent-allocated dense layers before replacing them (pi_gemma.py precedent).
         del self.layers
@@ -234,7 +283,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
 
     @staticmethod
     def _require_eager_attention(attn_implementation: str | None) -> None:
-        if attn_implementation not in {None, "eager"}:
+        if attn_implementation not in {None, "eager", WALL_X_ATTENTION}:
             raise ValueError(
                 "Wall-X currently supports only attn_implementation='eager'. "
                 "Its bidirectional action-token islands cannot be represented "
@@ -261,6 +310,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
         moe_token_types: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
+        moe_token_counts: tuple[int, ...] | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         self._require_eager_attention(self.config._attn_implementation)
@@ -333,6 +383,7 @@ class Qwen2_5_VLMoEModel(Qwen2_5_VLTextModel):  # noqa: N801
                 token_types=routing_token_types,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                token_counts=moe_token_counts,
                 **kwargs,
             )
 

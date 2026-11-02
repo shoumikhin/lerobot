@@ -31,6 +31,7 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor
 
+from lerobot.policies.utils import is_exporting
 from lerobot.utils.import_utils import _natten_available
 
 from ..utils import resolve_weights
@@ -55,7 +56,7 @@ _PERSISTENT_KERNEL_BACKENDS = ("blackwell-fna", "hopper-fna")
 _natten_backends: dict[int, str] = {}
 
 
-def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
+def _natten_kernel_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
     backend = _natten_backends.get(q.ndim)
     if backend is None:
         backend = os.environ.get(_NATTEN_BACKEND_ENV)
@@ -332,8 +333,7 @@ class RotaryPositionEmbedding3D(nn.Module):
         return torch.cat([-x2, x1], dim=-1)
 
 
-# Target size of the keys one chunk gathers, in elements. A chunk is at least one row of the first axis
-# (a whole frame of a video), so a large frame goes over it.
+# Gathered keys per chunk of query rows, in elements: bounds the memory long videos need.
 _NEIGHBORHOOD_CHUNK_ELEMENTS = 2**28
 
 
@@ -355,22 +355,16 @@ def _window(size: int, kernel: int, causal: bool, device: torch.device) -> tuple
 def _neighbors(x: Tensor, windows: list[Tensor]) -> Tensor:
     """Gather ``(batch, *spatial, heads, dim)`` into ``(batch, *queries, heads, window, dim)``."""
     n = len(windows)
-    batch, *spatial, heads, dim = x.shape
-    # Gather whole rows by a flat (position, head) index, ordered so the window axes merge without a copy.
-    row = torch.arange(heads, device=x.device).view([1] * n + [-1] + [1] * n)
-    stride = heads
-    for axis in reversed(range(n)):
-        shape = [1] * (2 * n + 1)
-        shape[axis], shape[n + 1 + axis] = windows[axis].shape
-        row = row + windows[axis].view(shape) * stride
-        stride *= spatial[axis]
-    return x.reshape(batch, -1, dim)[:, row].flatten(n + 2, 2 * n + 1)
+    for axis, keys in enumerate(windows):
+        x = x.index_select(1 + 2 * axis, keys.flatten()).unflatten(1 + 2 * axis, keys.shape)
+    order = [0, *range(1, 2 * n, 2), 2 * n + 1, *range(2, 2 * n + 1, 2), 2 * n + 2]
+    return x.permute(order).flatten(n + 2, 2 * n + 1)
 
 
 def neighborhood_attention(
     q: Tensor, k: Tensor, v: Tensor, kernel_size: Sequence[int], is_causal: Sequence[bool]
 ) -> Tensor:
-    """NATTEN's neighborhood attention in plain PyTorch, so the VAE runs without NATTEN.
+    """NATTEN's neighborhood attention in plain PyTorch, so the VAE runs without NATTEN and exports.
 
     ``q``, ``k`` and ``v`` are ``(batch, *spatial, heads, head_dim)``. Along every spatial axis each query
     attends to the keys of its window (see ``_window``). Computed in float32, returned in the dtype of ``v``.
@@ -380,29 +374,25 @@ def neighborhood_attention(
     windows = [_window(*axis, q.device) for axis in zip(q.shape[1:-2], kernel_size, is_causal, strict=True)]
     visible = None
     if any(is_causal):
-        # (*spatial, heads, *window) like the logits, of size 1 along the heads and the non-causal axes
         visible = torch.ones((), dtype=torch.bool, device=q.device)
         for axis, (_, seen) in enumerate(windows):
-            if is_causal[axis]:
-                shape = [1] * (2 * n + 1)
-                shape[axis], shape[n + 1 + axis] = seen.shape
-                visible = visible & seen.view(shape)
+            shape = [1] * 2 * n
+            shape[axis], shape[n + axis] = seen.shape
+            visible = visible & seen.view(shape)
+        visible = visible.flatten(n).unsqueeze(-2)  # (*spatial, 1, window), the same for every head
     rows = max(1, _NEIGHBORHOOD_CHUNK_ELEMENTS // (q[:, :1].numel() * math.prod(kernel_size)))
-    out = v.new_empty(v.shape)
+    dtype = v.dtype
+    q, k, v = q.float() * q.shape[-1] ** -0.5, k.float(), v.float()
+    out = []
     with torch.autocast(q.device.type, enabled=False):
         for start in range(0, q.shape[1], rows):
-            # The keys of these rows lie within kernel - 1 rows of them, so only those rows are upcast.
-            first, last = max(0, start - kernel_size[0] + 1), start + rows + kernel_size[0] - 1
-            keys = [w for w, _ in windows]
-            keys[0] = keys[0][start : start + rows] - first
-            query = (q[:, start : start + rows].float() * q.shape[-1] ** -0.5).unsqueeze(-2)
-            logits = (query @ _neighbors(k[:, first:last].float(), keys).transpose(-1, -2)).squeeze(-2)
+            keys = [w[start : start + rows] if axis == 0 else w for axis, (w, _) in enumerate(windows)]
+            query = q[:, start : start + rows].unsqueeze(-2)
+            logits = (query @ _neighbors(k, keys).transpose(-1, -2)).squeeze(-2)
             if visible is not None:
-                mask = visible[start : start + rows] if is_causal[0] else visible
-                logits = logits.unflatten(-1, kernel_size).masked_fill(~mask, float("-inf")).flatten(-n)
-            weights = logits.softmax(-1).unsqueeze(-2)
-            out[:, start : start + rows] = (weights @ _neighbors(v[:, first:last].float(), keys)).squeeze(-2)
-    return out
+                logits = logits.masked_fill(~visible[start : start + rows], float("-inf"))
+            out.append((logits.softmax(-1).unsqueeze(-2) @ _neighbors(v, keys)).squeeze(-2))
+    return torch.cat(out, 1).to(dtype)
 
 
 class Natten3D(nn.Module):
@@ -446,17 +436,12 @@ class Natten3D(nn.Module):
             kernel_size, is_causal = self.window_size[1:], [False, False]
         else:
             kernel_size, is_causal = self.window_size, [self.causal, False, False]
-        # NATTEN's fused kernels need CUDA. On the CPU it uses flex attention, far slower than the plain path.
-        if _natten_available and q.is_cuda:
+        # NATTEN's kernels are fast but no export backend can run them.
+        if _natten_available and not is_exporting():
             na = na2d if t == 1 else na3d
-            out = na(
-                q,
-                k,
-                v,
-                kernel_size=kernel_size,
-                is_causal=is_causal,
-                attention_kwargs=_natten_attention_kwargs(q, k, v),
-            )
+            # CUDA autocast keeps RMSNorm in float32, and NATTEN takes q, k and v in one dtype.
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            out = na(q, k, v, kernel_size=kernel_size, is_causal=is_causal, **_natten_kernel_kwargs(q, k, v))
         else:
             out = neighborhood_attention(q, k, v, kernel_size, is_causal)
         out = out.reshape(b, t, h, w, c)
@@ -1069,16 +1054,9 @@ def load_video_vae(
 
     ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
     distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). On a GPU its attention runs NATTEN's kernels when NATTEN
-    is installed, and otherwise the same neighborhood attention in plain PyTorch.
+    (default filename ``video_vae.safetensors``). Its attention runs NATTEN's kernels when NATTEN is
+    installed, and the same neighborhood attention in plain PyTorch otherwise.
     """
-    # Checked here, not in the attention: the policy moves the VAE to its device later, and a log call inside
-    # the compiled attention blocks would split their graphs.
-    if not _natten_available and torch.cuda.is_available():
-        logger.warning(
-            "NATTEN is not installed, so on a GPU the Video VAE computes its attention in plain PyTorch, which "
-            "is much slower. See docs/source/flux3.mdx to install NATTEN."
-        )
     params = ViTNormInferenceParams(
         use_compile=compile_model,
         compile_decoder=compile_model,

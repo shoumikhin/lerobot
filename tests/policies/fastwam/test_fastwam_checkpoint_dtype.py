@@ -34,6 +34,8 @@ from lerobot.policies.fastwam import modeling_fastwam
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
 from lerobot.policies.fastwam.wan import LiteKVFusion
+from lerobot.policies.fastwam.wan.model import sinusoidal_embedding_1d
+from lerobot.policies.fastwam.wan.modular import FastWAM
 
 DOT_FLAGS = {
     "action_expert_layers": 1,
@@ -113,6 +115,57 @@ def training_batch():
 
 
 @pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
+def test_compiled_action_inference_matches_eager(offline_components, monkeypatch, flags):
+    # compile_action_infer compiles with fullgraph=True, which fails on any size read back from a tensor.
+    # The eager backend checks exactly that, without the cost of Inductor.
+    compile_fn = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: compile_fn(fn, backend="eager", fullgraph=True))
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.float32, compile_action_infer=True, **flags)).eval()
+    batch, noise = training_batch(), torch.randn(1, 8, 3)
+    with torch.no_grad():
+        compiled = policy.predict_action_chunk(batch, noise=noise)
+        policy.config.compile_action_infer = False
+        eager = policy.predict_action_chunk(batch, noise=noise)
+    torch.testing.assert_close(compiled, eager)
+
+
+def test_exported_fasterwam_takes_noise_as_an_input_and_matches_eager(offline_components):
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.float32, **DOT_FLAGS)).eval()
+    batch = training_batch()
+    del batch["action"]
+
+    class Predict(nn.Module):
+        def forward(self, *inputs, noise=None):
+            return policy.predict_action_chunk(dict(zip(batch, inputs, strict=True)), noise=noise)
+
+    model, inputs = Predict(), tuple(batch.values())
+    noise = torch.randn(1, 8, 3)
+    with torch.no_grad():
+        expected = model(*inputs, noise=noise)
+        with pytest.raises(ValueError, match="Pass noise"):
+            torch.export.export(model, inputs)
+        exported = torch.export.export(model, inputs, kwargs={"noise": noise}).module()
+        assert torch.equal(exported(*inputs, noise=noise), expected)
+        assert torch.equal(exported(*inputs, noise=noise), expected)
+        other = torch.randn(1, 8, 3)
+        assert torch.equal(exported(*inputs, noise=other), model(*inputs, noise=other))
+
+
+def test_encode_prompt_zeroes_padding_on_either_side():
+    mask = torch.tensor([[True, True, True, False], [False, True, True, True]])
+    owner = SimpleNamespace(
+        device=torch.device("cpu"),
+        tokenizer=lambda prompt, **kw: (torch.zeros(mask.shape, dtype=torch.long), mask),
+        text_encoder=lambda ids, mask: torch.ones(*mask.shape, 2),
+    )
+    emb, context_mask = FastWAM.encode_prompt(owner, ["right padded", "left padded"])
+    assert torch.equal(emb, mask.unsqueeze(-1).expand(-1, -1, 2).float())
+    assert context_mask.all()
+
+
+@pytest.mark.parametrize("flags", [{}, DOT_FLAGS], ids=["default", "fasterwam"])
 @pytest.mark.parametrize(
     "device,dtype",
     [
@@ -162,6 +215,35 @@ def test_public_dtype_train_infer_and_checkpoint(offline_components, tmp_path, f
     assert torch.isfinite(action).all()
     torch.testing.assert_close(reloaded_action, action, rtol=0, atol=0)
     assert loaded.config.dtype == dtype
+
+
+def test_bfloat16_policy_trains_and_predicts_on_the_cpu_without_autocast(offline_components):
+    # No autocast, as lerobot-export predicts, and CUDA autocast covers no CPU tensor.
+    torch.manual_seed(1234)
+    policy = FastWAMPolicy(tiny_config(dtype=torch.bfloat16))
+    loss, _ = policy(training_batch())
+    assert torch.isfinite(loss)
+    policy.eval()
+    batch = training_batch()
+    del batch["action"]
+    with torch.no_grad():
+        action = policy.predict_action_chunk(batch, noise=torch.randn(1, 8, 3))
+    assert action.shape == (1, 8, 3)
+    assert torch.isfinite(action).all()
+    # The time embedding stays in float32, from the bfloat16 weights cast up, as under CUDA autocast.
+    video = policy.model.video_expert
+    with torch.no_grad():
+        state = video.pre_dit(
+            x=torch.randn(1, 4, 2, 8, 16),
+            timestep=torch.tensor([500.0]),
+            context=torch.randn(1, 4, 8),
+            fuse_vae_embedding_in_latents=True,
+        )
+        # The first latent frame's tokens get timestep 0, the second frame's the given one.
+        position = sinusoidal_embedding_1d(video.freq_dim, torch.tensor([0.0, 500.0])).float()
+        expected = deepcopy(video.time_embedding).float()(position)
+    assert state["t"].dtype == torch.float32
+    torch.testing.assert_close(state["t"][0, [0, -1]], expected)
 
 
 def test_cli_backbone_conversion_loads_weights_and_trains(offline_components, tmp_path, monkeypatch):
