@@ -32,6 +32,7 @@ table.
 
 from __future__ import annotations
 
+import abc
 import logging
 from collections.abc import Iterator
 from copy import copy
@@ -47,10 +48,10 @@ from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Program
 from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
-    BFLOAT16_TOLERANCE,
     BFLOAT16_STEPS_TOLERANCE,
+    BFLOAT16_TOLERANCE,
     FLOAT32_TOLERANCE,
-    ExportRecipe,
+    ChainRecipe,
     Part,
     RunPlan,
     TaskTokenData,
@@ -95,6 +96,8 @@ if TYPE_CHECKING:
     from lerobot.configs import PolicyFeature
     from lerobot.export.configs import ExportConfig
 
+    from ..pi0.configuration_pi0 import PI0Config
+    from ..pi0.modeling_pi0 import PI0Policy, PI0Pytorch
     from .configuration_pi05 import PI05Config
 
 logger = logging.getLogger(__name__)
@@ -283,7 +286,7 @@ class PI05LanguageModelLayers(nn.Module):
     alone. Full attention over the whole prompt is what SDPA expresses, so the layers use it.
     """
 
-    def __init__(self, model: PI05Pytorch, layers: range):
+    def __init__(self, model: PI05Pytorch | PI0Pytorch, layers: range):
         super().__init__()
         language_model = model.paligemma_with_expert.paligemma.model.language_model
         language_model.set_attn_implementation("sdpa")
@@ -406,31 +409,39 @@ class PI05Actions(nn.Module):
         return actions[0].float()
 
 
-class PI05ExportRecipe(ExportRecipe):
-    """pi0.5 as a chain of small programs that runs any task: see this module's documentation.
+class PaliGemmaChainRecipe(ChainRecipe):
+    """A PaliGemma policy with an action expert as a chain of small programs, as pi0 and pi0.5 export.
 
     It builds the policy on the meta device and loads each part's weights when the part is made, so the trace
     holds one part's weights at a time. The test case's actions are the parts run one after another in PyTorch.
     When the whole policy fits in memory, they are also compared with the policy's own `predict_action_chunk`.
+    A subclass makes the `embed` program (`_embed`) and the step (`_step`).
 
     Args:
         cfg (`ExportConfig`):
             The `lerobot-export` configuration.
     """
 
-    # pi0.5 runs ten bfloat16 denoising steps.
+    # The policy runs ten bfloat16 denoising steps by default (`num_inference_steps`).
     bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+    policy_class: type[PI05Policy | PI0Policy]
+    # The modules the step runs.
+    step_modules: tuple[str, ...]
+    # `export_task` always gives one.
+    task: str
+    # The outputs of `embed`, after the prefix's embeddings and padding mask, that the step also reads.
+    step_inputs: tuple[str, ...] = ()
 
     @classmethod
-    def load(cls, cfg: ExportConfig) -> PI05ExportRecipe:
+    def load(cls, cfg: ExportConfig) -> PaliGemmaChainRecipe:
         """The recipe, with no weight loaded yet."""
         return cls(cfg)
 
     def __init__(self, cfg: ExportConfig) -> None:  # noqa: D107
         from transformers.utils import cached_file
 
-        policy_config = cast("PI05Config", cfg.policy)
-        refuse_peft_adapter(policy_config, "pi0.5")
+        policy_config = cast("PI05Config | PI0Config", cfg.policy)
+        refuse_peft_adapter(policy_config, self.policy_name)
         self.cfg = cfg
         self._device = torch.device(cfg.backend.device)
         policy_config.device = cfg.backend.device
@@ -459,7 +470,7 @@ class PI05ExportRecipe(ExportRecipe):
         # The chain against the whole policy is PyTorch against PyTorch, so --tolerance, which allows for the
         # compiler, does not loosen it. Their attention kernels and the order of their sums still differ: in
         # bfloat16 that moved pi0.5's actions by up to 0.03 on random frames and LIBERO's test frame.
-        self._policy_tolerance = (
+        self.policy_tolerance = (
             BFLOAT16_TOLERANCE if policy_config.dtype == torch.bfloat16 else FLOAT32_TOLERANCE
         )
         self._generator = torch.Generator().manual_seed(cfg.seed)
@@ -470,15 +481,195 @@ class PI05ExportRecipe(ExportRecipe):
         self.config.input_features = self._features
         renames = preprocessor_renames(self.preprocessor)
         self._state_name = next(name for name in self._features if renames.get(name, name) == OBS_STATE)
+        self.task = export_task(cfg, self._metadata, self.policy_name)
+        self._frame = random_frame(self._features, self._generator)
+        self._noise = torch.randn(
+            policy_config.chunk_size, policy_config.max_action_dim, generator=self._generator
+        )
+        self._dt = -1.0 / policy_config.num_inference_steps
+        # The schedule of `euler_integrate`.
+        self._timesteps = [1.0 + step * self._dt for step in range(policy_config.num_inference_steps)]
+        self._runs: list[ProgramRun] = []
+        self._constants: dict[str, np.ndarray] = {}
+        self._actions: np.ndarray | None = None
+
+    def parts(self) -> Iterator[Part]:
+        """The chain's parts, each run in PyTorch to make the next part's inputs, one in memory at a time."""
+        config = self._policy_config
+        frame_names = list(self._features)
+        frame = tuple(torch.from_numpy(x).to(self._device) for x in self._frame.values())
+
+        policy = self._load(*EMBED_MODULES)
+        vlm = policy.model.paligemma_with_expert.paligemma.model
+        if config.dtype == torch.bfloat16 and self._device.type == "cuda":
+            # The policy runs its float32 vision tower under bfloat16 autocast on a GPU (`_vision_autocast`).
+            hold_linear_weights_in_bfloat16(vlm.vision_tower)
+            hold_linear_weights_in_bfloat16(vlm.multi_modal_projector)
+        language_model = vlm.language_model
+        embedding = language_model.embed_tokens
+        embed, task_inputs, task_names = self._embed(policy, embedding.weight, frame_names)
+        # The program holds only the rows of the table it reads, so it drops the table.
+        language_model.embed_tokens = LookedUpEmbedding(embedding)
+        del embedding
+        inputs = (*frame, *task_inputs)
+        with torch.no_grad():
+            hidden, prefix_pad_masks, *step_extra = embed(*inputs)
+        names = [*frame_names, *task_names]
+        yield self._part(
+            "embed", embed, inputs, names, ["prefix_embs", "prefix_pad_masks", *self.step_inputs]
+        )
+        del policy, vlm, language_model, embed, inputs, task_inputs
+
+        hidden_name = "prefix_embs"
+        cache: dict[str, Tensor] = {}
+        depth = self._depth()
+        for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PART)):
+            layers = range(first, min(first + LANGUAGE_LAYERS_PER_PART, depth))
+            module = PI05LanguageModelLayers(
+                self._load(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
+            )
+            layer_inputs = (hidden, prefix_pad_masks)
+            with torch.no_grad():
+                outputs = module(*layer_inputs)
+            cache_names = [f"past_{kind}_{i}" for i in layers for kind in ("key", "value")]
+            output_names = cache_names if module.last else [f"language_hidden_{group}", *cache_names]
+            if not module.last:
+                hidden, *outputs = outputs
+            cache.update(zip(cache_names, outputs, strict=True))
+            yield self._part(
+                f"language_model_{group}",
+                module,
+                layer_inputs,
+                [hidden_name, "prefix_pad_masks"],
+                output_names,
+            )
+            del module, layer_inputs, outputs
+            hidden_name = output_names[0]
+
+        step = self._step(self._load(*self.step_modules).model)
+        cache_inputs = (prefix_pad_masks, *step_extra, *cache.values())
+        cache_names = ["prefix_pad_masks", *self.step_inputs, *cache]
+        noise = self._noise.to(self._device)
+        x_t = noise
+        with torch.no_grad():
+            for timestep in self._timesteps:
+                x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
+        step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
+        step_names = [*cache_names, "x", "timestep"]
+        yield Part("step", step, step_inputs, step_names, ["x"])
+        step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
+        step_runs, self._constants = repeated_runs(
+            "step", step_names, ["x"], step_constants, start={"x": NOISE}
+        )
+        self._runs += step_runs
+        del step, step_inputs, cache, cache_inputs, step_extra
+
+        actions = PI05Actions(
+            self.postprocessor,
+            self._steps,
+            cast("dict[str, PolicyFeature]", config.output_features)[ACTION].shape[0],
+        )
+        state = torch.from_numpy(self._frame[self._state_name]).to(self._device)
+        action_inputs: tuple[Tensor, ...] = (x_t, state)
+        action_names = ["x", self._state_name]
+        if actions.mask is None:
+            # A program takes only the inputs it reads.
+            action_inputs, action_names = action_inputs[:1], action_names[:1]
+        with torch.no_grad():
+            self._actions = actions(*action_inputs).cpu().numpy()
+        yield self._part("actions", actions, action_inputs, action_names, [ACTION])
+
+    def test_case(self) -> TestCase:
+        """The random frame and noise, and the actions the parts compute for them in PyTorch."""
+        if self._actions is None:
+            raise RuntimeError("The test case is made by `parts`, which has not run yet.")
+        if not np.isfinite(self._actions).all():
+            raise ValueError(
+                "The chained parts compute actions that are not finite, so they cannot be checked."
+            )
+        width = self._actions.shape[-1]
+        postprocessor, _ = split_absolute_step(self.postprocessor, width)
+        action_scale = measure_action_scale(
+            lambda value: postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
+        )
+        case = TestCase(self._frame, self._noise.numpy(), self._actions, action_scale)
+        self._check_against_policy(case)
+        return case
+
+    def plan(self) -> RunPlan:
+        """The parts in order with the step run once per timestep, and the timesteps."""
+        return RunPlan(runs=self._runs, constants=self._constants)
+
+    @abc.abstractmethod
+    def _embed(
+        self, policy: PI05Policy | PI0Policy, table: Tensor, frame_names: list[str]
+    ) -> tuple[nn.Module, tuple[Tensor, ...], list[str]]:
+        """The `embed` program, built from `policy` before the program drops the embedding `table`, and the
+        inputs, with their names, it takes after the frame."""
+
+    @abc.abstractmethod
+    def _step(self, model: PI05Pytorch | PI0Pytorch) -> nn.Module:
+        """The denoising step, from the model with only the step's weights loaded."""
+
+    def _depth(self) -> int:
+        """How many layers the language model has."""
+        return modeling_pi05.get_gemma_config(self._policy_config.paligemma_variant).depth
+
+    def _load(self, *modules: str) -> PI05Policy | PI0Policy:
+        """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
+        return load_checkpoint_modules(
+            self.policy_class, str(self._model_file), self._policy_config, list(modules)
+        )
+
+    def _policy_actions(self, case: TestCase) -> np.ndarray | None:
+        """The whole policy's actions for the test case, when the policy fits in memory."""
+        if not whole_policy_fits(self._model_file, self._device, self.policy_name, WHOLE_POLICY_PEAK):
+            return None
+        with torch.device(self._device):
+            policy = self.policy_class.from_pretrained(
+                str(self._policy_config.pretrained_path),
+                config=self._policy_config,
+                revision=self._policy_config.pretrained_revision,
+            ).eval()
+        self.preprocessor.reset()
+        self.postprocessor.reset()
+        observation = prepare_observation_for_inference(dict(case.frame), self._device, self.task)
+        with torch.no_grad():
+            batch = self.preprocessor(observation)
+            noise = torch.from_numpy(case.noise).to(self._device)[None]
+            predicted = policy.predict_action_chunk(batch, noise=noise)[:, : self._steps]
+            expected = self.postprocessor(predicted)[0].float().cpu().numpy()
+        del policy
+        return expected
+
+
+class PI05ExportRecipe(PaliGemmaChainRecipe):
+    """pi0.5 as a chain of small programs that runs any task: see this module's documentation.
+
+    Args:
+        cfg (`ExportConfig`):
+            The `lerobot-export` configuration.
+    """
+
+    policy_class = PI05Policy
+    policy_name = "pi0.5"
+    step_modules = STEP_MODULES
+    text_steps = (Pi05PrepareStateTokenizerProcessorStep, TokenizerProcessorStep)
+
+    def __init__(self, cfg: ExportConfig) -> None:  # noqa: D107
+        from transformers.utils import cached_file
+
+        super().__init__(cfg)
         self._state_dim = frame_shapes(self._features)[self._state_name][0]
-        exported = self.task = export_task(cfg, self._metadata, "pi0.5")
         # A dataset without episodes has no tasks.
         tasks = None if self._metadata is None else self._metadata.tasks
         dataset_tasks = [] if tasks is None else [str(t) for t in tasks.index]
-        known_tasks = list(dict.fromkeys([exported, *dataset_tasks]))
+        known_tasks = list(dict.fromkeys([self.task, *dataset_tasks]))
         # The policy's processor makes a prompt for an empty dataset task too, so only the exported one counts.
-        if not clean(TASK_PROMPT_OPS[:-1], exported).strip():
-            raise ValueError(f"The task {exported!r} is empty once cleaned, so pi0.5's prompt holds no task.")
+        if not clean(TASK_PROMPT_OPS[:-1], self.task).strip():
+            raise ValueError(
+                f"The task {self.task!r} is empty once cleaned, so pi0.5's prompt holds no task."
+            )
 
         self._tokenizer_step = next(
             s for s in self.preprocessor.steps if isinstance(s, TokenizerProcessorStep)
@@ -506,13 +697,13 @@ class PI05ExportRecipe(ExportRecipe):
         )
         if not 0 < self._max_tokens <= window:
             raise ValueError(f"The task prompt must fit in the policy's prompt: at most {window} tokens.")
-        self._task_ids = self._known_tasks[exported]
+        self._task_ids = self._known_tasks[self.task]
         if len(self._task_ids) > self._max_tokens:
             limit = (
                 "of --max_task_tokens" if cfg.max_task_tokens is not None else "the policy's prompt leaves"
             )
             raise ValueError(
-                f"The task {exported!r} is {len(self._task_ids)} tokens long, more than the "
+                f"The task {self.task!r} is {len(self._task_ids)} tokens long, more than the "
                 f"{self._max_tokens} {limit}."
             )
         too_long = [task for task, task_ids in self._known_tasks.items() if len(task_ids) > self._max_tokens]
@@ -525,123 +716,6 @@ class PI05ExportRecipe(ExportRecipe):
             for task in too_long:
                 del self._known_tasks[task]
 
-        self._frame = random_frame(self._features, self._generator)
-        self._noise = torch.randn(
-            policy_config.chunk_size, policy_config.max_action_dim, generator=self._generator
-        )
-        self._dt = -1.0 / policy_config.num_inference_steps
-        # The schedule of `euler_integrate`.
-        self._timesteps = [1.0 + step * self._dt for step in range(policy_config.num_inference_steps)]
-        self._runs: list[ProgramRun] = []
-        self._constants: dict[str, np.ndarray] = {}
-        self._actions: np.ndarray | None = None
-
-    def parts(self) -> Iterator[Part]:
-        """The chain's parts, each run in PyTorch to make the next part's inputs, one in memory at a time."""
-        config = self._policy_config
-        frame_names = list(self._features)
-        frame = tuple(torch.from_numpy(x).to(self._device) for x in self._frame.values())
-
-        policy = self._load(*EMBED_MODULES)
-        vlm = policy.model.paligemma_with_expert.paligemma.model
-        if config.dtype == torch.bfloat16 and self._device.type == "cuda":
-            # The policy runs its float32 vision tower under bfloat16 autocast on a GPU (`_vision_autocast`).
-            _hold_linear_weights_in_bfloat16(vlm.vision_tower)
-            _hold_linear_weights_in_bfloat16(vlm.multi_modal_projector)
-        language_model = vlm.language_model
-        embedding = language_model.embed_tokens
-        prompt = StatePrompt(
-            self._pieces,
-            self._end,
-            self._tokenizer_step.input_tokenizer.pad_token_id,
-            embedding.weight,
-            self._state_dim,
-            self._max_tokens,
-        )
-        task_inputs = self._task_inputs(self._task_ids, embedding.weight)
-        # The bundle looks the task's rows up in the full table, so the program drops it.
-        language_model.embed_tokens = LookedUpEmbedding(embedding)
-        del embedding
-        embed = PI05Embed(policy, self._tensor_preprocessor(), prompt, frame_names, self._visual)
-        self._check_prompt(embed)
-        inputs = (*frame, *task_inputs)
-        with torch.no_grad():
-            hidden, prefix_pad_masks = embed(*inputs)
-        names = [*frame_names, TASK_EMBEDDINGS, TASK_LENGTH]
-        yield self._part("embed", embed, inputs, names, ["prefix_embs", "prefix_pad_masks"])
-        del policy, vlm, language_model, embed, prompt, inputs
-
-        hidden_name = "prefix_embs"
-        cache: dict[str, Tensor] = {}
-        depth = modeling_pi05.get_gemma_config(config.paligemma_variant).depth
-        for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PART)):
-            layers = range(first, min(first + LANGUAGE_LAYERS_PER_PART, depth))
-            module = PI05LanguageModelLayers(
-                self._load(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
-            )
-            inputs = (hidden, prefix_pad_masks)
-            with torch.no_grad():
-                outputs = module(*inputs)
-            cache_names = [f"past_{kind}_{i}" for i in layers for kind in ("key", "value")]
-            output_names = cache_names if module.last else [f"language_hidden_{group}", *cache_names]
-            if not module.last:
-                hidden, *outputs = outputs
-            cache.update(zip(cache_names, outputs, strict=True))
-            yield self._part(
-                f"language_model_{group}", module, inputs, [hidden_name, "prefix_pad_masks"], output_names
-            )
-            del module, inputs, outputs
-            hidden_name = output_names[0]
-
-        step = PI05Step(self._load(*STEP_MODULES).model, self._timesteps, self._dt)
-        cache_inputs = (prefix_pad_masks, *cache.values())
-        cache_names = ["prefix_pad_masks", *cache]
-        noise = self._noise.to(self._device)
-        x_t = noise
-        with torch.no_grad():
-            for timestep in self._timesteps:
-                x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
-        step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
-        step_names = [*cache_names, "x", "timestep"]
-        yield Part("step", step, step_inputs, step_names, ["x"])
-        step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
-        step_runs, self._constants = repeated_runs(
-            "step", step_names, ["x"], step_constants, start={"x": NOISE}
-        )
-        self._runs += step_runs
-        del step, step_inputs, cache, cache_inputs
-
-        actions = PI05Actions(
-            self.postprocessor,
-            self._steps,
-            cast("dict[str, PolicyFeature]", config.output_features)[ACTION].shape[0],
-        )
-        state = torch.from_numpy(self._frame[self._state_name]).to(self._device)
-        inputs, names = ((x_t, state), ["x", self._state_name])
-        if actions.mask is None:
-            # A program takes only the inputs it reads.
-            inputs, names = inputs[:1], names[:1]
-        with torch.no_grad():
-            self._actions = actions(*inputs).cpu().numpy()
-        yield self._part("actions", actions, inputs, names, [ACTION])
-
-    def test_case(self) -> TestCase:
-        """The random frame and noise, and the actions the parts compute for them in PyTorch."""
-        if self._actions is None:
-            raise RuntimeError("The test case is made by `parts`, which has not run yet.")
-        if not np.isfinite(self._actions).all():
-            raise ValueError(
-                "The chained parts compute actions that are not finite, so they cannot be checked."
-            )
-        width = self._actions.shape[-1]
-        postprocessor, _ = split_absolute_step(self.postprocessor, width)
-        action_scale = measure_action_scale(
-            lambda value: postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
-        )
-        case = TestCase(self._frame, self._noise.numpy(), self._actions, action_scale)
-        self._check_against_policy(case)
-        return case
-
     def plan(self) -> RunPlan:
         """The parts in order with the step run once per timestep, the timesteps, and the task's tokens."""
         # The bundle writes the table from the CPU, so it is read there, without a copy on the device.
@@ -650,35 +724,27 @@ class PI05ExportRecipe(ExportRecipe):
         policy = load_checkpoint_modules(PI05Policy, str(self._model_file), config, [EMBED_TOKENS])
         table = policy.model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight.detach()
         del policy
-        return RunPlan(
-            runs=self._runs,
-            constants=self._constants,
+        return replace(
+            super().plan(),
             task_tokens=TaskTokenData(
                 TASK_PROMPT_OPS, self._tokenizer_file, table, self._known_tasks, self._max_tokens
             ),
         )
 
-    def _part(
-        self,
-        name: str,
-        module: nn.Module,
-        inputs: tuple[Tensor, ...],
-        input_names: list[str],
-        output_names: list[str],
-    ) -> Part:
-        self._runs.append(ProgramRun(name, name, input_names, output_names))
-        return Part(name, module, inputs, input_names, output_names)
-
-    def _load(self, *modules: str) -> PI05Policy:
-        """The policy with only `modules`' weights read from the checkpoint; every other module is None."""
-        return load_checkpoint_modules(PI05Policy, str(self._model_file), self._policy_config, list(modules))
-
-    def _tensor_preprocessor(self) -> PolicyProcessorPipeline:
-        """The preprocessor without the steps that make the prompt text and tokenize it, which StatePrompt does."""
-        text_steps = (Pi05PrepareStateTokenizerProcessorStep, TokenizerProcessorStep)
-        return replace(
-            self.preprocessor, steps=[s for s in self.preprocessor.steps if not isinstance(s, text_steps)]
+    def _embed(
+        self, policy: PI05Policy | PI0Policy, table: Tensor, frame_names: list[str]
+    ) -> tuple[nn.Module, tuple[Tensor, ...], list[str]]:
+        """The frame and the task's rows in; the bundle looks the task's rows up in the full table."""
+        pad_id = self._tokenizer_step.input_tokenizer.pad_token_id
+        prompt = StatePrompt(self._pieces, self._end, pad_id, table, self._state_dim, self._max_tokens)
+        embed = PI05Embed(
+            cast(PI05Policy, policy), self._tensor_preprocessor(), prompt, frame_names, self._visual
         )
+        self._check_prompt(embed)
+        return embed, self._task_inputs(self._task_ids, table), [TASK_EMBEDDINGS, TASK_LENGTH]
+
+    def _step(self, model: PI05Pytorch | PI0Pytorch) -> nn.Module:
+        return PI05Step(cast(PI05Pytorch, model), self._timesteps, self._dt)
 
     def _task_inputs(self, ids: list[int], table: Tensor) -> tuple[Tensor, Tensor]:
         """What the bundle gives the programs for a task: its prompt's embedding rows, padded, and their count."""
@@ -746,40 +812,8 @@ class PI05ExportRecipe(ExportRecipe):
                 )
         self.preprocessor.reset()
 
-    def _check_against_policy(self, case: TestCase) -> None:
-        """Compare the test case with the whole policy's `predict_action_chunk`, when the policy fits in memory."""
-        if not whole_policy_fits(self._model_file, self._device, "pi0.5", WHOLE_POLICY_PEAK):
-            return
-        with torch.device(self._device):
-            policy = PI05Policy.from_pretrained(
-                str(self._policy_config.pretrained_path),
-                config=self._policy_config,
-                revision=self._policy_config.pretrained_revision,
-            ).eval()
-        self.preprocessor.reset()
-        self.postprocessor.reset()
-        observation = prepare_observation_for_inference(dict(case.frame), self._device, self.task)
-        with torch.no_grad():
-            batch = self.preprocessor(observation)
-            noise = torch.from_numpy(case.noise).to(self._device)[None]
-            predicted = policy.predict_action_chunk(batch, noise=noise)[:, : self._steps]
-            expected = self.postprocessor(predicted)[0].float().cpu().numpy()
-        del policy
-        error = float((np.abs(case.actions - expected) / case.action_scale).max())
-        logger.info(
-            "Test case against the whole policy: largest difference %.2e (tolerance %g)",
-            error,
-            self._policy_tolerance,
-        )
-        if not error <= self._policy_tolerance:
-            raise ValueError(
-                f"The chained parts compute other actions than pi0.5's predict_action_chunk ({error:.2e} > "
-                f"{self._policy_tolerance} in normalized units), so they do not export this checkpoint "
-                "correctly."
-            )
 
-
-def _hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
+def hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
     """Store the linear layers of `module`, which runs them only under bfloat16 autocast, in bfloat16.
 
     Autocast casts a float32 linear layer's weight to bfloat16 on every call, so this is the same arithmetic

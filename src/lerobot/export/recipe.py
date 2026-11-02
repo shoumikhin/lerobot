@@ -647,10 +647,14 @@ class ChainRecipe(ExportRecipe):
         - **policy_name** (`str`) -- The policy's name in messages.
         - **text_steps** (`tuple[type, ...]`) -- The preprocessor's steps that write the prompt and tokenize it,
           which the programs do not run, for a recipe that uses `_tensor_preprocessor`.
+        - **policy_tolerance** (`float | None`) -- The largest allowed difference from `_policy_actions`, in
+          normalized action units, for a recipe that holds the chain closer to the policy than `tolerance`,
+          which allows for the compiler. `None` uses `tolerance`.
     """
 
     policy_name: str
     text_steps: tuple[type, ...]
+    policy_tolerance: float | None = None
     _runs: list[ProgramRun]
 
     @abc.abstractmethod
@@ -684,16 +688,15 @@ class ChainRecipe(ExportRecipe):
         expected = self._policy_actions(case)
         if expected is None:
             return
+        tolerance = self.tolerance if self.policy_tolerance is None else self.policy_tolerance
         error = float((np.abs(case.actions - expected) / case.action_scale).max())
         logger.info(
-            "Test case against the whole policy: largest difference %.2e (tolerance %g)",
-            error,
-            self.tolerance,
+            "Test case against the whole policy: largest difference %.2e (tolerance %g)", error, tolerance
         )
-        if not error <= self.tolerance:
+        if not error <= tolerance:
             raise ValueError(
                 f"The chained parts compute other actions than {self.policy_name}'s predict_action_chunk "
-                f"({error:.2e} > {self.tolerance} in normalized units), so they do not export this checkpoint "
+                f"({error:.2e} > {tolerance} in normalized units), so they do not export this checkpoint "
                 "correctly."
             )
 

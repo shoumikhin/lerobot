@@ -137,6 +137,10 @@ def test_recipe_refuses_a_task_with_no_text(recipe_config, task):
         export_pi05.PI05ExportRecipe(recipe_config)
 
 
+def test_recipe_keeps_its_configuration(recipe_config):
+    assert export_pi05.PI05ExportRecipe(recipe_config).cfg is recipe_config
+
+
 @pytest.mark.dataset
 def test_recipe_exports_the_given_task_beside_empty_or_no_dataset_tasks(recipe_config, tmp_path, monkeypatch):
     from lerobot.datasets import LeRobotDatasetMetadata
