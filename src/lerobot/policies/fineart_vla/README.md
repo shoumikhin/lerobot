@@ -1,1 +1,0 @@
-../../../../docs/source/policy_fineart_vla_README.md
