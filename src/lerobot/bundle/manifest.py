@@ -149,6 +149,13 @@ class BundleManifest:
             The compiled programs, by name.
         runs (`list[ProgramRun]`):
             The runs of the programs, in order.
+        first_runs (`list[list[ProgramRun]]`, *optional*):
+            For a policy whose first chunks after a reset compute differently, the runs of each of them, one
+            list per chunk. The chunks after them run `runs`.
+        carry (`list[str]`, *optional*):
+            The values the runs of a chunk write for the runs of later chunks, such as a policy's cache of
+            past frames. The engine keeps the latest value of each from one chunk to the next, and drops them
+            at a reset.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
         task_tokens (`TaskTokens`, *optional*):
@@ -181,7 +188,9 @@ class BundleManifest:
         test_case (`str`, *optional*, defaults to `"test.safetensors"`):
             The test case file: a frame, the noise, and the expected actions under `action`. With `history`,
             each frame value holds the frames of several control ticks, oldest first, and the actions are those
-            computed at the last one.
+            computed at the last one. A bundle with `first_runs` or `carry` plays several chunks from a reset
+            instead: each frame value holds the frames of every tick, `noise` the noise of each chunk, both
+            stacked on a new first axis, and `action` the action played at each tick.
     """
 
     format_version: int = FORMAT_VERSION
@@ -190,6 +199,8 @@ class BundleManifest:
     runtime_imports: list[str] = field(default_factory=list)
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
+    carry: list[str] = field(default_factory=list)
     constants: str | None = None
     task_tokens: TaskTokens | None = None
     noise_shape: list[int] | None = None
@@ -210,15 +221,21 @@ class BundleManifest:
             raise ValueError(f"The action scale must hold finite numbers above 0, not {self.action_scale}.")
         if self.action_names is not None and len(self.action_names) != len(self.action_scale):
             raise ValueError("The manifest names a different number of actions than it scales.")
-        if not self.runs:
-            raise ValueError("The manifest lists no run.")
+        if not self.runs or not all(self.first_runs):
+            raise ValueError("The manifest lists no run for a chunk.")
         if not all(type(n) is int and n > 0 for n in self.history.values()):
             raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
-        names = [run.name for run in self.runs]
-        if len(set(names)) != len(names):
-            raise ValueError(f"The manifest names a run twice: {names}.")
-        if unknown := sorted({run.program for run in self.runs} - set(self.programs)):
-            raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+        for runs in (*self.first_runs, self.runs):
+            names = [run.name for run in runs]
+            if len(set(names)) != len(names):
+                raise ValueError(f"The manifest names a run of one chunk twice: {names}.")
+            if unknown := sorted({run.program for run in runs} - set(self.programs)):
+                raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+
+    @property
+    def stateful(self) -> bool:
+        """Whether a chunk depends on the chunks before it since a reset, so the test case plays several."""
+        return bool(self.first_runs or self.carry)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleManifest:
@@ -236,6 +253,7 @@ class BundleManifest:
             )
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
+        first_runs = data.get("first_runs") or []
         target = data.get("target")
         task_tokens = data.get("task_tokens")
         # A key added later can change how the programs run, so a reader that does not know it stops.
@@ -244,7 +262,10 @@ class BundleManifest:
             + sorted(
                 {key for files in programs.values() for key in files} - {f.name for f in fields(ProgramFiles)}
             )
-            + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
+            + sorted(
+                {key for run in [*runs, *(run for chunk in first_runs for run in chunk)] for key in run}
+                - {f.name for f in fields(ProgramRun)}
+            )
             + sorted(set(target or {}) - {f.name for f in fields(Target)})
             + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokens)})
             + sorted({op[0] for op in (task_tokens or {}).get("prompt_ops", [])} - PROMPT_OPS)
@@ -258,6 +279,7 @@ class BundleManifest:
                 **data,
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
+                "first_runs": [[ProgramRun(**run) for run in chunk] for chunk in first_runs],
                 "target": None if target is None else Target(**target),
                 "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
             }

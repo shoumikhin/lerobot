@@ -104,11 +104,14 @@ class TestCase:
         frame (`dict[str, np.ndarray]`):
             The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
             `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
-            actions are those computed at the last one.
+            actions are those computed at the last one. For a recipe whose plan has `first_runs` or `carry`,
+            the frames of every tick of several chunks from a reset, stacked the same way.
         noise (`np.ndarray`, *optional*):
-            The starting noise, for a policy that takes one.
+            The starting noise, for a policy that takes one. With `first_runs` or `carry`, the noise of each
+            chunk, stacked on a new first axis.
         actions (`np.ndarray`):
-            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`.
+            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`. With
+            `first_runs` or `carry`, the action played at each tick.
         action_scale (`np.ndarray`):
             For each action component, the robot units of one step of the policy's normalized actions.
     """
@@ -154,6 +157,12 @@ class RunPlan:
             The runs in order, each naming the part it runs as its program. A part may run several times, for
             example a denoising step. `None` runs each part once, in the order it was yielded, with its own
             names.
+        first_runs (`list[list[ProgramRun]]`):
+            The runs of each of the first chunks after a reset, for a policy whose first chunks compute
+            differently (see `BundleManifest.first_runs`).
+        carry (`list[str]`):
+            The values the runs of a chunk write for later chunks, such as a policy's cache of past frames
+            (see `BundleManifest.carry`).
         constants (`dict[str, np.ndarray]`):
             Named arrays the runs can read, such as each step's timestep.
         task_tokens (`TaskTokenData`, *optional*):
@@ -165,6 +174,8 @@ class RunPlan:
     """
 
     runs: list[ProgramRun] | None = None
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
+    carry: list[str] = field(default_factory=list)
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)

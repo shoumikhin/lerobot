@@ -346,7 +346,7 @@ def test_engine_refuses_a_program_that_reads_what_nothing_gives(tmp_path):
 
 def test_engine_refuses_a_live_chunk_of_the_wrong_width(tmp_path, monkeypatch):
     engine = BundleEngine(make_bundle(tmp_path / "bundle", Chunk(), FRAME))
-    program = engine._runs[-1][1]
+    program = engine._chunk_runs[-1][-1][1]
     monkeypatch.setattr(program, "to_numpy", lambda value: np.ones((3, 2), np.float32))
     with pytest.raises(RuntimeError, match=r"shaped \(3, 2\), not \[execution_steps, 3\]"):
         engine.get_action(FRAME)

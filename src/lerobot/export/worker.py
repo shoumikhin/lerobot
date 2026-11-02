@@ -112,13 +112,19 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         plan = recipe.plan()
         test_case = recipe.test_case()
         runs = runs if plan.runs is None else plan.runs
-        if test_case.noise is not None and cfg.backend.device == "cuda":
+        first_runs = plan.first_runs
+        noise_shape = None
+        if test_case.noise is not None:
+            # A stateful test case holds the noise of each of its chunks.
+            noise_shape = test_case.noise.shape[1:] if plan.first_runs or plan.carry else test_case.noise.shape
+        if noise_shape is not None and cfg.backend.device == "cuda":
             # Drawn where the programs read it, so a chunk uploads only the robot's frame.
-            noise = torch.from_numpy(test_case.noise)
-            draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
+            draw = _DrawNoise(tuple(noise_shape), torch.from_numpy(test_case.noise).dtype, cfg.backend.device)
             torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
             programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
-            runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
+            noise_run = ProgramRun(NOISE, NOISE, [], [NOISE])
+            runs = [noise_run, *runs]
+            first_runs = [[noise_run, *chunk] for chunk in first_runs]
         task_tokens = plan.task_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
@@ -126,13 +132,15 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runtime_imports=list(cfg.backend.runtime_imports),
             programs=programs,
             runs=runs,
+            first_runs=first_runs,
+            carry=plan.carry,
             constants=CONSTANTS if plan.constants else None,
             task_tokens=None
             if task_tokens is None
             else TaskTokens(
                 task_tokens.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, task_tokens.max_tokens
             ),
-            noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
+            noise_shape=None if noise_shape is None else list(noise_shape),
             history=plan.history,
             task=recipe.task,
             action_names=getattr(recipe.config, "action_feature_names", None),
