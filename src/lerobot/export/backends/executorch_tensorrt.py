@@ -49,6 +49,10 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         workspace_size (`int`, *optional*):
             The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine, for
             example to fit a build into a small board. `None` lets TensorRT decide.
+        deduplicate_weights (`bool`, *optional*, defaults to `True`):
+            Keep one host copy of each weight, and of its transpose, instead of one per layer that reads it
+            (pytorch/TensorRT#4965). `False` gives each layer its own copy, for a policy whose engines come out
+            wrong with shared weights.
     """
 
     device = "cuda"
@@ -63,6 +67,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     workspace_size: int | None = None
     """The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine. `None` lets
     TensorRT decide."""
+    deduplicate_weights: bool = True
+    """Keep one host copy of each weight, and of its transpose, instead of one per layer that reads it.
+    `False` gives each layer its own copy, for a policy whose engines come out wrong with shared weights."""
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
@@ -93,10 +100,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
         }
-        # One host copy of each weight, and of its transpose, instead of one per layer that reads it
-        # (pytorch/TensorRT#4965). An older Torch-TensorRT would ignore the setting without a word.
+        # An older Torch-TensorRT would ignore the setting without a word.
         if "deduplicate_weights" in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
-            options["deduplicate_weights"] = True
+            options["deduplicate_weights"] = self.deduplicate_weights
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
         args, _ = program.example_inputs

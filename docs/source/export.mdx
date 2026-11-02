@@ -131,24 +131,25 @@ Then the robot moves, as with any policy. Every 5 seconds it logs the loop rate,
 
 ### Options
 
-| Flag                               | What it does                                                                                                                        |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                            |
-| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                     |
-| `--backend.type`                   | The compiler, from the table above.                                                                                                 |
-| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                |
-| `--task`                           | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                               |
-| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).               |
-| `--dataset.root`                   | A local folder that holds the dataset. Defaults to LeRobot's cache, as for training.                                                |
-| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                    |
-| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                       |
-| `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                           |
-| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                    |
-| `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                     |
-| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine). |
-| `--backend.compute_precision`      | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`, which needs a larger `--tolerance`.      |
-| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                             |
-| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.               |
+| Flag                               | What it does                                                                                                                                                                                               |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                                                                                                   |
+| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                                                                                            |
+| `--backend.type`                   | The compiler, from the table above.                                                                                                                                                                        |
+| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                                                                                       |
+| `--task`                           | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                                                                                      |
+| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                                                                                      |
+| `--dataset.root`                   | A local folder that holds the dataset. Defaults to LeRobot's cache, as for training.                                                                                                                       |
+| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                                                                                           |
+| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                                                              |
+| `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                                                                                                  |
+| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                                                           |
+| `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                                                                                            |
+| `--backend.deduplicate_weights`    | TensorRT only: `true` (the default) keeps one host copy of each shared weight while TensorRT builds; `false` gives each layer its own copy, for a policy whose engines come out wrong with shared weights. |
+| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                                                                        |
+| `--backend.compute_precision`      | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`, which needs a larger `--tolerance`.                                                                             |
+| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                                                                                                    |
+| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.                                                                                      |
 
 `lerobot-export --backend.type=<backend> --help` lists the options of a backend. The other `--dataset.*` options it lists are those of training, and the export does not use them.
 
