@@ -69,7 +69,7 @@ source .venv/bin/activate
 
 ### Install `ffmpeg` (for video decoding)
 
-LeRobot uses [TorchCodec](https://github.com/meta-pytorch/torchcodec) for video decoding by default, which requires `ffmpeg`. TorchCodec loads the `ffmpeg` shared libraries, so having the `ffmpeg` command on the path does not mean those libraries are present. Where they are missing, TorchCodec installs normally and then fails to import, naming the library it looked for in a `cannot open shared object file` error. The name it reports belongs to the first `ffmpeg` version it tries, which is older than the one you probably want, so read it as a missing-library error rather than a request for that version.
+LeRobot uses [TorchCodec](https://github.com/meta-pytorch/torchcodec) for video decoding by default, which requires `ffmpeg`. TorchCodec loads the `ffmpeg` shared libraries, so having the `ffmpeg` command on the path does not mean those libraries are present. Where they are missing, TorchCodec installs normally and then fails to import, naming the library it looked for in a `cannot open shared object file` error. It tries each supported `ffmpeg` major version in turn, newest first, and the error lists every attempt, so read it as a missing-library error rather than a request for one particular version.
 
 > [!NOTE]
 > **Platform support:** TorchCodec is **not available** on macOS Intel (x86_64), Linux armv7l, or Windows with PyTorch < 2.8. Ordinary dataset loading falls back to `pyav` on these platforms, so you do not need a separate `ffmpeg` installation for that fallback. Linux aarch64/arm64 wheels are available, but their CUDA requirements differ from x86_64; see [PyTorch CUDA variant](#pytorch-cuda-variant-linux-only).
@@ -178,7 +178,7 @@ LeRobot provides **feature-scoped extras** that map to common workflows. If you 
 | Extra      | What it adds                                | Typical use case                    |
 | ---------- | ------------------------------------------- | ----------------------------------- |
 | `dataset`  | `datasets`, `av`, `torchcodec`, `jsonlines` | Loading & creating datasets         |
-| `training` | `dataset` + `accelerate`, `wandb`           | Training policies                   |
+| `training` | `dataset` + `accelerate`, `trackio`         | Training policies                   |
 | `hardware` | `pynput`, `pyserial`, `deepdiff`            | Connecting to real robots           |
 | `viz`      | `rerun-sdk`, `foxglove-sdk`                 | Visualization during recording/eval |
 
@@ -211,7 +211,7 @@ _Multiple extras can be combined (e.g., `.[core_scripts,pi,pusht]`). For a full 
 
 ### PyTorch CUDA variant (Linux only)
 
-On Linux, the install path determines which CUDA wheel you get. macOS and Windows installs use the PyPI default (MPS / CPU / CUDA-Windows wheel respectively) and can skip this section.
+On Linux, the install path determines which CUDA wheel you get. macOS and Windows installs use the PyPI default (MPS on macOS, CPU on Windows) and can skip this section.
 
 <!-- prettier-ignore-start -->
 
@@ -229,14 +229,14 @@ On Linux, the install path determines which CUDA wheel you get. macOS and Window
 
 A cubin also runs on a GPU with the same major version and an equal-or-higher minor version. So on x86_64 the list covers Turing through Blackwell and needs no action: for example, an L4 (`sm_89`) uses the `sm_86` cubin. On aarch64 there is no `sm_75` or `sm_86`, but the `sm_80` cubin covers an A10 (`sm_86`), an L4 (`sm_89`) and a Jetson Orin (`sm_87`). One case is not covered: a T4 (`sm_75`) has no `sm_7x` cubin in any aarch64 wheel, on PyPI or on either CUDA 12 index, so it needs a torch built for the device.
 
-On a driver older than 580, pin a CUDA 12 index in your own checkout. Both CUDA 12 variants have driver floor **525.60.13** and differ in which GPUs they carry:
+On a driver older than 580, or on a GPU older than Turing (`sm_50` to `sm_70`, which no default wheel carries), pin a CUDA 12 index in your own checkout. Both CUDA 12 variants have driver floor **525.60.13** and differ in which GPUs they carry:
 
-| index   | x86_64 architectures                                                                                     | aarch64 architectures                                    |
-| ------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `cu129` | Turing → Blackwell (`sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`, `sm_100`, `sm_103`, `sm_120`, `sm_121`) | `sm_80`, `sm_90`, `sm_100`, `sm_103`, `sm_120`, `sm_121` |
-| `cu126` | Maxwell → Hopper (`sm_50`, `sm_60`, `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`)                | `sm_80`, `sm_90`                                         |
+| index   | x86_64 architectures                                                             | aarch64 architectures                |
+| ------- | -------------------------------------------------------------------------------- | ------------------------------------ |
+| `cu129` | Turing → Blackwell (`sm_75`, `sm_80`, `sm_86`, `sm_90`, `sm_100`, `sm_120`)      | `sm_80`, `sm_90`, `sm_100`, `sm_120` |
+| `cu126` | Maxwell → Hopper (`sm_50`, `sm_60`, `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_90`) | `sm_80`, `sm_90`                     |
 
-Prefer `cu126`. It publishes `torch` up to 2.14.1 (torch 2.15 has no CUDA 12 build) and a `torchcodec` that needs nothing beyond what its own `torch` supplies, so all three packages can come from one index. Choose `cu129` only if you need a GPU that `cu129` covers and `cu126` does not, and see the note below before you do.
+Prefer `cu126`. It publishes `torch` up to 2.14.1 (torch 2.15 has no CUDA 12 build) and a `torchcodec` that needs nothing beyond what its own `torch` supplies, so all three packages can come from one index. Choose `cu129` only if you need a GPU that `cu129` covers and `cu126` does not. It stops at torch 2.13, one release lower than `cu126`, so see the note below before you do.
 
 ```toml
 # pyproject.toml, in your own checkout: replace the existing [tool.uv.sources] table
@@ -251,9 +251,9 @@ torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
 torchcodec = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
 ```
 
-On **x86_64** with `cu129`, redirect `torch` and `torchvision` but leave `torchcodec` on PyPI. That index jumps from 0.11.1 to 0.15.0 with nothing in between, so a redirect lands on 0.11.1, which was built for torch 2.11 and needs an NVIDIA Performance Primitives library (`libnppicc`) that neither the lock nor these commands install. PyPI TorchCodec 0.13.0 on x86_64 has no CUDA library dependency.
+On **x86_64** with `cu129`, redirect `torch` and `torchvision` but leave `torchcodec` on PyPI. That index's `torchcodec` jumps from 0.11.1 to 0.15.0 with nothing in between, so a redirect lands on 0.11.1, which was built for torch 2.11 and needs an NVIDIA Performance Primitives library (`libnppicc`) that neither the lock nor this mapping installs. PyPI TorchCodec 0.13.0 on x86_64 has no CUDA library dependency.
 
-This advice does **not** apply to **aarch64**: PyPI TorchCodec 0.13.0 requires `libcudart.so.13` and `libnvrtc.so.13`, which a CUDA 12 torch does not supply. Prefer the `cu126` mapping above for all three packages when it supports your GPU. Ordinary and streaming dataset loading can fall back to `pyav` if TorchCodec cannot load, but RGB video in Lance datasets requires a working TorchCodec installation.
+This advice does **not** apply to **aarch64**: PyPI TorchCodec 0.13.0 requires `libcudart.so.13` and `libnvrtc.so.13`, which a CUDA 12 torch does not supply. Prefer the `cu126` mapping above for all three packages when it supports your GPU. Ordinary and streaming dataset loading can fall back to `pyav` if TorchCodec cannot load, but any video in Lance datasets, RGB or depth, requires a working TorchCodec installation.
 
 `uv sync` has no `--torch-backend` flag, and it reinstalls exactly what `uv.lock` pins, so a one-off `uv pip install --force-reinstall` is reverted by the next sync. The index has to be declared in the project for the choice to stick.
 
@@ -333,11 +333,30 @@ pip install -e ".[feetech]" # or "[dynamixel]" for example
 
 ### Experiment Tracking
 
-Weights and Biases is included in the `training` extra. To use [Weights and Biases](https://docs.wandb.ai/quickstart) for experiment tracking, log in with:
+[Trackio](https://huggingface.co/docs/trackio) is included in the `training` extra. Local runs need no account or login: they are stored in a local SQLite database under `~/.cache/huggingface/trackio`. Open the dashboard with:
 
 ```bash
-wandb login
+trackio show --project lerobot
 ```
+
+To sync runs to a Hugging Face Space (created if missing), run `hf auth login` and pass `--trackio.space_id=<user>/<space>`. Remote jobs (`--job.target`) with tracking enabled require `space_id`, because the pod's local database is lost when the job ends.
+
+Space privacy defaults to `None`: new Spaces are public unless the organization's default is private. Pass `--trackio.private=true` to create a private Space.
+
+Each run records the command that launched it and its console output (prints, logs, tracebacks), both shown on the run's page in the dashboard. On a Space they are as visible as the Space itself; pass `--trackio.capture_console=false` to keep the console output out of the run.
+
+#### Migrating from Weights & Biases
+
+| W&B setting                     | Trackio setting                                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `--wandb.enable=true`           | `--trackio.enable=true`                                                                          |
+| `--wandb.project=<project>`     | `--trackio.project=<project>`                                                                    |
+| `--wandb.disable_artifact=true` | Already the default; use `--trackio.disable_artifact=false` to opt in                            |
+| `--wandb.entity=<team>`         | Choose `--trackio.space_id=<user-or-org>/<space>` for hosted logging                             |
+| `--wandb.run_id=<id>`           | Use `--trackio.run_name=<name>` for an existing **Trackio** run                                  |
+| `--wandb.mode=offline`          | Omit `space_id` for local logging; also unset `TRACKIO_SPACE_ID` and `TRACKIO_SERVER_URL` if set |
+| `--wandb.mode=disabled`         | `--trackio.enable=false`                                                                         |
+| `--wandb.console=off`           | `--trackio.capture_console=false`                                                                |
 
 ## Next steps
 

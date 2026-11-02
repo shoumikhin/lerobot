@@ -21,41 +21,27 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
+from .executorch import EXECUTORCH, ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
-    from ..recipe import Part
+    from torch.export import ExportedProgram
 
 
 @ExportBackendConfig.register_subclass("executorch_openvino")
 @dataclass
-class ExecuTorchOpenVINOConfig(ExportBackendConfig):
-    """ExecuTorch programs whose work runs through OpenVINO, Intel's compiler, on the CPU.
+class ExecuTorchOpenVINOConfig(ExecuTorchConfig):
+    """ExecuTorch programs whose work runs through OpenVINO, Intel's compiler, on the CPU."""
 
-    Needs an ExecuTorch build with its OpenVINO backend, and `pip install openvino nncf`.
-    """
-
-    runtime = "executorch"
-    file_suffix = ".pte"
     device = "cpu"
+    packages = (EXECUTORCH, "openvino", "nncf")
+    # ExecuTorch's OpenVINO backend loads the OpenVINO runtime that this package installs.
+    runtime_imports = ("openvino",)
+    runtime_modules = ("executorch", "openvino")
 
-    def compile(self, part: Part, path: Path) -> None:
-        """Lower `part` to OpenVINO and save it as an ExecuTorch program."""
-        import torch
+    def compile(self, program: ExportedProgram, path: Path) -> None:
+        """Lower `program` to OpenVINO and save it as an ExecuTorch program."""
+        from executorch.backends.openvino.partitioner import OpenvinoPartitioner
+        from executorch.exir.backend.compile_spec_schema import CompileSpec
 
-        try:
-            from executorch.backends.openvino.partitioner import OpenvinoPartitioner
-            from executorch.exir import ExecutorchBackendConfig, to_edge_transform_and_lower
-            from executorch.exir.backend.compile_spec_schema import CompileSpec
-        except ImportError as error:
-            raise ImportError(
-                "The executorch_openvino backend needs ExecuTorch built with its OpenVINO backend, "
-                "and pip install openvino nncf"
-            ) from error
-
-        with torch.no_grad():
-            program = torch.export.export(part.module, part.example_inputs)
-        partitioner = OpenvinoPartitioner([CompileSpec("device", b"CPU")])
-        edge = to_edge_transform_and_lower(program, partitioner=[partitioner])
-        # ExecuTorch's OpenVINO backend frees a separate delegate segment while OpenVINO still reads it, so a
-        # program loaded from a file crashes unless the segment stays inside the program.
-        path.write_bytes(edge.to_executorch(ExecutorchBackendConfig(extract_delegate_segments=False)).buffer)
+        edge = lower(program, OpenvinoPartitioner([CompileSpec("device", b"CPU")]))
+        path.write_bytes(edge.to_executorch().buffer)

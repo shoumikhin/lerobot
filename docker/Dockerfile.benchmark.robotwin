@@ -60,11 +60,11 @@ RUN uv pip install --no-cache \
 
 # pytorch3d has no universal wheel; must be built from source (~10 min, cached).
 # Its setup.py hardcodes -std=c++17 in extra_compile_args, and torch only supplies its own
-# -std when the caller passed none, so pytorch3d's flag wins. The torch this image installs
-# needs C++20 in its headers, so the extension fails to compile before CuRobo is reached.
+# -std when the caller passed none, so pytorch3d's flag wins. From torch 2.14 the torch in the
+# base image needs C++20 in its headers, so the extension fails to compile before CuRobo is reached.
 # extra_compile_args is appended after any CXXFLAGS, so an environment variable cannot win;
 # clone and rewrite the one flag instead, then assert the rewrite landed on both lines.
-ARG PYTORCH3D_REF=stable
+ARG PYTORCH3D_REF=V0.7.8
 RUN git clone --branch ${PYTORCH3D_REF} --depth 1 \
         https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d \
     && sed -i 's/"-std=c++17"/"-std=c++20"/g' /tmp/pytorch3d/setup.py \
@@ -75,12 +75,13 @@ RUN git clone --branch ${PYTORCH3D_REF} --depth 1 \
 # CuRobo — NVlabs motion generator; TORCH_CUDA_ARCH_LIST must be set or the
 # build aborts on an empty arch list. RoboTwin's own installer pins v0.7.8,
 # which still exposes the v1 API (`curobo.types.math`) that RoboTwin imports.
-# 7.0 is not in the list: CUDA 13 rejects compute_70 outright, and the torch wheels this
-# image installs carry no sm_70 cubins either way (only cu126 builds still ship Volta).
+# 7.0 is not in the list: CUDA 13 rejects compute_70 outright, and the torch wheels in the
+# base image carry no sm_70 cubins either way (only cu126 builds still ship Volta).
 # The awk step guards CuRobo's own scalar `lerp` declaration. From torch 2.12, cpp_extension
-# compiles .cu sources at -std=c++20, and nvcc preincludes cmath, so std::lerp is already
-# declared and CuRobo's global float lerp becomes a conflicting redeclaration. All eight of its
-# .cu files include this header, so the build stops. Only the float overload collides; the
+# compiles .cu sources at -std=c++20, where the standard math.h brings std::lerp into the
+# global namespace with a using-declaration. CuRobo's global float lerp has the same
+# signature, so the two collide. All eight of its .cu files include this header, so the
+# build stops. Only the float overload collides; the
 # float2/float3/float4 ones take different parameter types, so they never clash and stay
 # unguarded. The check afterwards asserts the guard opened once, closed once, and closed before
 # the float2 overload, so a header whose brace stops matching cannot silently swallow it.

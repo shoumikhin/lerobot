@@ -24,25 +24,9 @@ outputs are staged per-episode before a final parquet rewrite:
 - :mod:`.modules.general_vqa` (the ``vqa`` module) — event-style VQA pairs
 """
 
-from typing import TYPE_CHECKING
-
-from lerobot.utils.import_utils import lazy_exports
-
 from .config import AnnotationPipelineConfig
-
-# These import lerobot.datasets, so each is imported the first time it is used.
-if TYPE_CHECKING:
-    from .validator import StagingValidator, ValidationReport
-    from .writer import LanguageColumnsWriter
-else:
-    __getattr__, __dir__ = lazy_exports(
-        __name__,
-        {
-            "StagingValidator": ".validator.StagingValidator",
-            "ValidationReport": ".validator.ValidationReport",
-            "LanguageColumnsWriter": ".writer.LanguageColumnsWriter",
-        },
-    )
+from .validator import StagingValidator, ValidationReport
+from .writer import LanguageColumnsWriter
 
 __all__ = [
     "AnnotationPipelineConfig",

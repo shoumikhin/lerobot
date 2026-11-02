@@ -27,7 +27,6 @@ from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Event
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -46,14 +45,12 @@ from lerobot.inference import (
     supports_rtc_inference,
     validate_local_chunk_policy,
 )
-from lerobot.inference.export import ExportInferenceEngine
 from lerobot.policies import (
     PreTrainedPolicy,
-    get_policy_class,
     make_pre_post_processors,
     validate_trained_rtc_horizon,
 )
-from lerobot.policies.factory import has_peft_adapter_config
+from lerobot.policies.factory import load_pretrained_policy
 from lerobot.processor import (
     PolicyProcessorPipeline,
     RenderRuntimeMessagesStep,
@@ -67,19 +64,13 @@ from lerobot.processor import (
 from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
 from lerobot.robots import Robot, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
-from lerobot.utils.constants import OBS_STATE, OBS_STR
+from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
-from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.utils.robot_utils import align_to_checkpoint_order, policy_features
 
 from .configs import RolloutConfig
 from .planner import PlannerConfig, VlmPlanner, training_vocabulary
 from .robot_wrapper import ThreadSafeRobot
-
-if TYPE_CHECKING or _peft_available:
-    from peft import PeftConfig, PeftModel
-else:
-    PeftConfig = None
-    PeftModel = None
 
 logger = logging.getLogger(__name__)
 
@@ -127,40 +118,6 @@ def _validate_trained_rtc_rollout_config(policy_config, inference_config: RTCInf
             f"--inference.queue_threshold ({inference_config.queue_threshold}) must be at least the "
             f"checkpoint's rtc_training_max_delay ({training_max_delay})."
         )
-
-
-def _align_to_checkpoint_order(
-    features: dict[str, type | tuple], policy_action_names: list[str] | None, *, what: str
-) -> dict[str, type | tuple]:
-    """Order ``features`` so its motor entries follow the checkpoint's joint order.
-
-    One rule for both sides: the policy emits and consumes tensors in the order it was
-    trained on, so whichever dict is about to be flattened into a tensor has to match it.
-    Only the scalar motor entries take part; anything else (camera shapes, on the state
-    side) keeps its relative order at the end.
-
-    A set mismatch is left alone rather than forced: extra ``.vel`` channels or an
-    uncommanded base mean the two describe different things, and the robot's own order is
-    the only meaningful one. ``what`` names the side being aligned, so the warning says
-    which of the two reordered.
-    """
-    if not policy_action_names:
-        return features
-
-    motor_names = [name for name, feature in features.items() if not isinstance(feature, tuple)]
-    if set(motor_names) != set(policy_action_names) or motor_names == policy_action_names:
-        return features
-
-    logger.warning(
-        "Robot %s order %s differs from checkpoint joint order %s; reordering %s",
-        what,
-        motor_names,
-        policy_action_names,
-        what,
-    )
-    reordered = {name: features[name] for name in policy_action_names}
-    reordered.update({name: feature for name, feature in features.items() if name not in reordered})
-    return reordered
 
 
 def _assert_state_matches_action_order(dataset_features: dict, ordered_action_keys: list[str]) -> None:
@@ -224,8 +181,7 @@ class PolicyContext:
     """Inference engine and optional local policy resources.
 
     Remote inference leaves ``policy``, ``preprocessor`` and ``postprocessor``
-    as ``None``: those resources live on the server. An exported policy leaves them
-    ``None`` too: its compiled programs hold them. Strategies use ``inference``
+    as ``None``: those resources live on the server. Strategies use ``inference``
     for policy work and ``ProcessorContext`` for robot-side processing.
     """
 
@@ -273,38 +229,6 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 
 
-def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
-    """Load policy weights, keeping adapter and base-model revisions independent."""
-    pretrained_path = policy_config.pretrained_path
-    if pretrained_path is None:
-        raise ValueError("--policy.path is required for rollout")
-    pretrained_revision = policy_config.pretrained_revision
-    policy_class = get_policy_class(policy_config.type)
-
-    # A `use_peft=True` config can still point at a base model (see `has_peft_adapter_config`).
-    if not (policy_config.use_peft and has_peft_adapter_config(pretrained_path, pretrained_revision)):
-        return policy_class.from_pretrained(
-            pretrained_path,
-            config=policy_config,
-            revision=pretrained_revision,
-        )
-
-    require_package("peft", extra="peft")
-
-    peft_config = PeftConfig.from_pretrained(pretrained_path, revision=pretrained_revision)
-    policy = policy_class.from_pretrained(
-        pretrained_name_or_path=peft_config.base_model_name_or_path,
-        config=policy_config,
-        revision=peft_config.revision,
-    )
-    return PeftModel.from_pretrained(
-        policy,
-        pretrained_path,
-        config=peft_config,
-        revision=pretrained_revision,
-    )
-
-
 def _resolve_robot_processors(
     teleop_action: RobotProcessorPipeline | None,
     robot_action: RobotProcessorPipeline | None,
@@ -328,25 +252,32 @@ def _disconnect_setup_hardware(robot: Robot, teleop: Teleoperator | None) -> Non
             logger.exception("Could not close %s after rollout setup failed", name)
 
 
-def _connect_rollout_hardware(cfg: RolloutConfig, *, require_hold: bool = False) -> HardwareContext:
-    """Connect devices and capture the initial pose after policy/descriptor validation."""
+def _prepare_rollout_devices(
+    cfg: RolloutConfig, *, require_hold: bool = False
+) -> tuple[ThreadSafeRobot, Teleoperator | None]:
+    """Construct rollout devices without opening their hardware resources."""
     if cfg.robot is None:
         raise ValueError("--robot.type is required for rollout")
     robot = make_robot_from_config(cfg.robot)
     wrapper = ThreadSafeRobot(robot)
-    teleop = None
+    if require_hold:
+        wrapper.configure_position_hold()
+    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+    return wrapper, teleop
+
+
+def _connect_rollout_hardware(wrapper: ThreadSafeRobot, teleop: Teleoperator | None) -> HardwareContext:
+    """Connect prepared devices and capture the robot's initial position."""
+    robot = wrapper.inner
     try:
-        if require_hold:
-            wrapper.configure_position_hold()
-        logger.info("Connecting robot (%s)...", cfg.robot.type)
+        logger.info("Connecting robot (%s)...", wrapper.robot_type)
         robot.connect()
         logger.info("Robot connected: %s", robot.name)
         initial_obs = wrapper.get_observation()
         initial_position = {key: value for key, value in initial_obs.items() if key.endswith(".pos")}
         logger.info("Captured initial robot position (%d keys)", len(initial_position))
-        if cfg.teleop is not None:
-            logger.info("Connecting teleoperator (%s)...", cfg.teleop.type)
-            teleop = make_teleoperator_from_config(cfg.teleop)
+        if teleop is not None:
+            logger.info("Connecting teleoperator (%s)...", teleop.name)
             teleop.connect()
             logger.info("Teleoperator connected")
         return HardwareContext(wrapper, teleop, initial_position)
@@ -433,39 +364,6 @@ def _build_rollout_dataset(cfg: RolloutConfig, robot: Robot, dataset_features: d
     return dataset
 
 
-def _local_rollout_features(
-    cfg: RolloutConfig, robot: Robot, processors: ProcessorContext, policy_action_names: list[str] | None
-) -> tuple[dict, dict, list[str]]:
-    """The dataset features, the hardware observation features and the action dispatch order.
-
-    Motor entries follow the checkpoint's joint order when it records one.
-    """
-    # Retain position and base-velocity channels for mobile manipulators, plus cameras.
-    observation_features_hw: dict[str, type | tuple] = {
-        k: v
-        for k, v in robot.observation_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
-    }
-    checkpoint_order = list(policy_action_names) if policy_action_names else None
-    observation_features_hw = _align_to_checkpoint_order(
-        observation_features_hw, checkpoint_order, what="state"
-    )
-    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
-    action_features_hw = _align_to_checkpoint_order(action_features_hw, checkpoint_order, what="action")
-
-    dataset_features = _aggregate_rollout_features(
-        processors,
-        action_features_hw,
-        observation_features_hw,
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
-    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-    # ``action_features_hw`` is already in checkpoint order, so it *is* the dispatch order.
-    ordered_action_keys = list(action_features_hw)
-    _assert_state_matches_action_order(dataset_features, ordered_action_keys)
-    return dataset_features, hw_features, ordered_action_keys
-
-
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -483,10 +381,6 @@ def build_rollout_context(
         return build_remote_rollout_context(
             cfg, shutdown_event, teleop_action_processor, robot_action_processor, robot_observation_processor
         )
-    if cfg.export is not None:
-        return build_export_rollout_context(
-            cfg, shutdown_event, teleop_action_processor, robot_action_processor, robot_observation_processor
-        )
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
@@ -502,6 +396,9 @@ def build_rollout_context(
 
     if hasattr(policy_config, "compile_model"):
         policy_config.compile_model = cfg.use_torch_compile
+    if cfg.tf32 is not None:
+        torch.backends.cuda.matmul.allow_tf32 = cfg.tf32
+        torch.backends.cudnn.allow_tf32 = cfg.tf32
 
     if policy_config.type == "vqbet" and cfg.device == "mps":
         raise NotImplementedError(
@@ -509,7 +406,7 @@ def build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
-    policy = _load_pretrained_policy(policy_config)
+    policy = load_pretrained_policy(policy_config)
 
     if is_rtc:
         validate_local_chunk_policy(policy)
@@ -546,14 +443,27 @@ def build_rollout_context(
     processors = _resolve_robot_processors(
         teleop_action_processor, robot_action_processor, robot_observation_processor
     )
-    hardware = _connect_rollout_hardware(cfg)
-    robot_wrapper = hardware.robot_wrapper
+    robot_wrapper, teleop = _prepare_rollout_devices(cfg)
     robot = robot_wrapper.inner
+    dataset: LeRobotDataset | None = None
+    hardware: HardwareContext | None = None
 
     try:
-        dataset_features, hw_features, ordered_action_keys = _local_rollout_features(
-            cfg, robot, processors, getattr(policy_config, "action_feature_names", None)
+        policy_action_names = getattr(policy_config, "action_feature_names", None)
+        observation_features_hw, action_features_hw = policy_features(
+            robot, list(policy_action_names) if policy_action_names else None
         )
+
+        dataset_features = _aggregate_rollout_features(
+            processors,
+            action_features_hw,
+            observation_features_hw,
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
+        hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+        # ``action_features_hw`` is already in checkpoint order, so it *is* the dispatch order.
+        ordered_action_keys = list(action_features_hw)
+        _assert_state_matches_action_order(dataset_features, ordered_action_keys)
 
         # Validate visual features if no rename_map is active
         rename_map = cfg.rename_map
@@ -623,6 +533,9 @@ def build_rollout_context(
         )
         _attach_planner(cfg, inference_strategy, robot_wrapper, preprocessor, policy_config)
 
+        # Keep hardware closed while loading resources that may block robot control threads.
+        hardware = _connect_rollout_hardware(robot_wrapper, teleop)
+
         logger.info("Rollout context assembled successfully")
         return RolloutContext(
             runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
@@ -642,7 +555,13 @@ def build_rollout_context(
             ),
         )
     except BaseException:
-        _disconnect_setup_hardware(robot, hardware.teleop)
+        if hardware is not None:
+            _disconnect_setup_hardware(robot, hardware.teleop)
+        if dataset is not None:
+            try:
+                dataset.finalize()
+            except Exception:
+                logger.exception("Could not close dataset after rollout setup failed")
         raise
 
 
@@ -709,57 +628,6 @@ def _attach_planner(
     engine.external_history = deque(maxlen=planner_cfg.history)
 
 
-def build_export_rollout_context(
-    cfg: RolloutConfig,
-    shutdown_event: Event,
-    teleop_action_processor: RobotProcessorPipeline | None = None,
-    robot_action_processor: RobotProcessorPipeline | None = None,
-    robot_observation_processor: RobotProcessorPipeline | None = None,
-) -> RolloutContext:
-    """Run a bundle written by ``lerobot-export`` instead of a local PyTorch policy.
-
-    The engine loads the compiled programs and replays the bundle's test case before the robot
-    connects, so a bundle that does not reproduce its actions never moves the robot.
-    """
-    bundle = cfg.export
-    if bundle is None:
-        raise ValueError("Export rollout requires --policy.path to be a bundle written by lerobot-export")
-    logger.info("Loading exported policy from '%s'...", bundle.path)
-    engine = ExportInferenceEngine(
-        bundle, task=cfg.dataset.single_task if cfg.dataset else cfg.task, rename_map=cfg.rename_map
-    )
-    processors = _resolve_robot_processors(
-        teleop_action_processor, robot_action_processor, robot_observation_processor
-    )
-    hardware = _connect_rollout_hardware(cfg)
-    robot = hardware.robot_wrapper.inner
-    try:
-        dataset_features, hw_features, ordered_action_keys = _local_rollout_features(
-            cfg, robot, processors, bundle.action_feature_names
-        )
-        engine.check_robot(
-            {
-                cfg.rename_map.get(name, name): tuple(feature["shape"])
-                for name, feature in dataset_features.items()
-                if name.startswith(f"{OBS_STR}.")
-            },
-            ordered_action_keys,
-        )
-        dataset = _build_rollout_dataset(cfg, robot, dataset_features)
-        _attach_planner(cfg, engine, hardware.robot_wrapper)
-        logger.info("Rollout context assembled successfully")
-        return RolloutContext(
-            runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
-            hardware=hardware,
-            policy=PolicyContext(None, None, None, engine),
-            processors=processors,
-            data=DatasetContext(dataset, dataset_features, hw_features, ordered_action_keys),
-        )
-    except BaseException:
-        _disconnect_setup_hardware(robot, hardware.teleop)
-        raise
-
-
 def build_remote_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -792,8 +660,8 @@ def build_remote_rollout_context(
         processors = _resolve_robot_processors(
             teleop_action_processor, robot_action_processor, robot_observation_processor
         )
-        hardware = _connect_rollout_hardware(cfg, require_hold=True)
-        wrapper = hardware.robot_wrapper
+        wrapper, teleop = _prepare_rollout_devices(cfg, require_hold=True)
+        hardware = _connect_rollout_hardware(wrapper, teleop)
         robot = wrapper.inner
 
         observation_hw: dict[str, type | tuple] = {
@@ -802,12 +670,12 @@ def build_remote_rollout_context(
             if isinstance(value, tuple) or value is float
         }
         expected_state = next((feature for feature in expected if feature.name == "observation.state"), None)
-        observation_hw = _align_to_checkpoint_order(
+        observation_hw = align_to_checkpoint_order(
             observation_hw,
             list(expected_state.names) if expected_state and expected_state.names else None,
             what="state",
         )
-        action_hw = _align_to_checkpoint_order(robot.action_features, list(action.names), what="action")
+        action_hw = align_to_checkpoint_order(robot.action_features, list(action.names), what="action")
         if list(action_hw) != list(action.names):
             raise ValueError("Robot action component names differ from the deployment contract")
         features = _aggregate_rollout_features(

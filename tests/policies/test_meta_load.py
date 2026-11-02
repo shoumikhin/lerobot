@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn.modules import module as torch_module
 
-from lerobot.policies.pretrained import _load_state_dict_into_meta_model, _parameters_on_meta
+from lerobot.policies.common.meta_load import load_state_dict_into_meta_model, parameters_on_meta
 from tests.utils import require_cuda
 
 
@@ -76,14 +76,14 @@ def checkpoint():
 
 
 def load_on_meta(state_dict):
-    with _parameters_on_meta():
+    with parameters_on_meta():
         model = Toy()
-    _load_state_dict_into_meta_model(model, state_dict.items(), "cpu")
+    load_state_dict_into_meta_model(model, state_dict.items(), "cpu")
     return model
 
 
 def test_only_parameters_go_to_meta():
-    with _parameters_on_meta():
+    with parameters_on_meta():
         model = Toy()
     assert all(param.is_meta for param in model.parameters())
     assert not model.fixed.requires_grad
@@ -93,7 +93,7 @@ def test_only_parameters_go_to_meta():
 
 def test_other_threads_build_real_parameters():
     built = []
-    with _parameters_on_meta():
+    with parameters_on_meta():
         worker = threading.Thread(target=lambda: built.append(nn.Linear(2, 2)))
         worker.start()
         worker.join()
@@ -102,7 +102,7 @@ def test_other_threads_build_real_parameters():
 
 def test_hook_registry_never_changes():
     hooks = dict(torch_module._global_parameter_registration_hooks)
-    with _parameters_on_meta(), _parameters_on_meta():
+    with parameters_on_meta(), parameters_on_meta():
         Toy()
         assert torch_module._global_parameter_registration_hooks == hooks
     assert torch_module._global_parameter_registration_hooks == hooks
@@ -113,13 +113,13 @@ def test_concurrent_blocks_do_not_interfere():
     built = []
 
     def first():
-        with _parameters_on_meta():
+        with parameters_on_meta():
             both_inside.wait()
             built.append(Toy())
         first_left.set()
 
     def second():
-        with _parameters_on_meta():
+        with parameters_on_meta():
             both_inside.wait()
             first_left.wait()
             built.append(Toy())
@@ -133,20 +133,20 @@ def test_concurrent_blocks_do_not_interfere():
 
 
 def test_shared_parameter_stays_shared():
-    with _parameters_on_meta():
+    with parameters_on_meta():
         model = Shared()
         model.c = nn.Module()
         model.c.weight = model.a.weight
     assert model.a.weight is model.b.weight is model.c.weight
     with pytest.raises(ValueError, match="shares parameters"):
-        _load_state_dict_into_meta_model(model, {"a.weight": torch.ones(4)}.items(), "cpu")
+        load_state_dict_into_meta_model(model, {"a.weight": torch.ones(4)}.items(), "cpu")
 
 
 def test_buffer_computed_from_a_parameter_raises():
-    with _parameters_on_meta():
+    with parameters_on_meta():
         model = Derived()
     with pytest.raises(RuntimeError, match=r"computed these buffers from parameters.*doubled"):
-        _load_state_dict_into_meta_model(model, {"weight": torch.ones(4)}.items(), "cpu")
+        load_state_dict_into_meta_model(model, {"weight": torch.ones(4)}.items(), "cpu")
 
 
 def test_matches_regular_load(checkpoint):
@@ -159,9 +159,9 @@ def test_matches_regular_load(checkpoint):
 
 @require_cuda
 def test_tensors_move_to_the_device_as_they_load(checkpoint):
-    with _parameters_on_meta():
+    with parameters_on_meta():
         model = Toy()
-    _load_state_dict_into_meta_model(model, checkpoint.items(), "cuda")
+    load_state_dict_into_meta_model(model, checkpoint.items(), "cuda")
     for name, tensor in model.state_dict().items():
         assert tensor.is_cuda and torch.equal(tensor.cpu(), checkpoint[name].to(tensor.dtype)), name
 

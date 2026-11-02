@@ -17,10 +17,12 @@
 import functools
 import re
 import traceback
+from collections.abc import Iterator
 from pathlib import Path
 
 import draccus.wrappers.docstring as _draccus_docstring
 import pytest
+import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.utils.import_utils import is_package_available
@@ -49,6 +51,22 @@ if is_package_available("datasets"):
     ]
 
 
+@pytest.fixture
+def restore_torch_backend_flags() -> Iterator[None]:
+    """Restore training's global backend settings without monkeypatching dynamic attributes."""
+    benchmark = torch.backends.cudnn.benchmark
+    deterministic = torch.backends.cudnn.deterministic
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 # Marks selecting the tests of each Fast Tests tier (`-m dataset`, see .github/workflows/fast_tests.yml);
 # every other test is marked `base`. Marks only select tests: skipping when an extra is missing is still
 # done by `pytest.importorskip` and friends.
@@ -70,12 +88,27 @@ def _needs_gpu(item) -> bool:
     return any(NEEDS_GPU_REASON.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif"))
 
 
+# No CI job installs ExecuTorch yet, so the tests that run it skip there; `-m executorch` selects them for a job that
+# installs it. The mark is added to tests skipped without ExecuTorch; a test that skips at run time marks itself.
+NEEDS_EXECUTORCH_REASON = re.compile(r"executorch", re.IGNORECASE)
+
+
+def _needs_executorch(item) -> bool:
+    return any(
+        NEEDS_EXECUTORCH_REASON.search(mark.kwargs.get("reason", "")) for mark in item.iter_markers("skipif")
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "base: Fast Tests base tier (added to tests without a tier mark)")
     for mark in TIER_MARKS:
         config.addinivalue_line("markers", f"{mark}: Fast Tests tier that installs the `{mark}` extra")
     config.addinivalue_line(
         "markers", "gpu: run by the GPU Tests job (added to policy tests and `require_cuda` tests)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "executorch: needs ExecuTorch, which no CI job installs yet (added to tests skipped without it)",
     )
 
 
@@ -86,6 +119,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.base)
         if _needs_gpu(item):
             item.add_marker(pytest.mark.gpu)
+        if _needs_executorch(item):
+            item.add_marker(pytest.mark.executorch)
 
 
 @pytest.hookimpl(hookwrapper=True)

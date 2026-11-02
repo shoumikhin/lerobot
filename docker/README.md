@@ -31,7 +31,7 @@ A lightweight image based on `python:3.12-slim`. Includes all Python dependencie
 
 ### `Dockerfile.internal` (GPU)
 
-A CUDA-enabled image based on `nvidia/cuda`. This is the image for training — mostly used for internal interactions with the GPU cluster. It uses CUDA 13 builds of PyTorch, so the host needs an NVIDIA driver of 580 or newer.
+A CUDA-enabled image based on `nvidia/cuda`. This is the image for training — mostly used for internal interactions with the GPU cluster. It uses CUDA 13 builds of PyTorch, so the host needs an NVIDIA driver of 580.65 or newer.
 
 ### `Dockerfile.rocm` (AMD GPU)
 

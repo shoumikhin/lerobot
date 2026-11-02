@@ -17,11 +17,13 @@ import importlib
 import importlib.metadata
 import importlib.util
 import logging
-import sys
-from collections.abc import Callable
+import pkgutil
+from collections.abc import Iterable, Sequence
+from pkgutil import ModuleInfo
+from types import ModuleType
 from typing import Any, Literal, overload
 
-from draccus.choice_types import ChoiceRegistry, ChoiceRegistryBase
+from draccus.choice_types import ChoiceRegistry
 
 
 @overload
@@ -135,6 +137,7 @@ _lancedb_available = is_package_available("lancedb")
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
 _accelerate_available = is_package_available("accelerate")
+_trackio_available = is_package_available("trackio")
 _scipy_available = is_package_available("scipy")
 _diffusers_available = is_package_available("diffusers")
 _natten_available = is_package_available("natten")
@@ -177,75 +180,6 @@ _pygame_available = is_package_available("pygame")
 _qwen_vl_utils_available = is_package_available("qwen-vl-utils", import_name="qwen_vl_utils")
 _grpc_available = is_package_available("grpcio", import_name="grpc")
 _wallx_deps_available = _transformers_available and _peft_available and _qwen_vl_utils_available
-
-
-def lazy_exports(
-    module_name: str, exports: dict[str, str]
-) -> tuple[Callable[[str], Any], Callable[[], list[str]]]:
-    """Return a module `__getattr__` and `__dir__` (PEP 562) that import each name in `exports` on first use.
-
-    `exports` maps each name to the object it stands for, written `<module>.<attribute>` with the module
-    absolute or relative to the calling package. Import the same names under `if TYPE_CHECKING:` and assign
-    these in its `else:` branch, so type checkers read the real imports and still report names that do not
-    exist. The names never become module globals, so the module's own code imports them where it uses them,
-    and `typing.get_type_hints` cannot resolve an annotation that uses them.
-    """
-    module = sys.modules[module_name]
-
-    def module_getattr(name: str) -> Any:
-        if name not in exports:
-            raise AttributeError(f"module {module_name!r} has no attribute {name!r}")
-        module_path, _, attribute = exports[name].rpartition(".")
-        try:
-            return getattr(importlib.import_module(module_path, module.__package__), attribute)
-        except AttributeError as e:
-            # From a module __getattr__, Python reads AttributeError as a missing name and drops the cause.
-            raise ImportError(f"cannot import name {name!r} from {module_name!r}: {e}") from e
-
-    def module_dir() -> list[str]:
-        return sorted({*vars(module), *exports})
-
-    return module_getattr, module_dir
-
-
-class ChoicesFromPolicies(ChoiceRegistryBase):
-    """Base for a draccus registry that policy packages add choices to, like the optimizers and schedulers.
-
-    Policies are imported on demand, so a name that is not registered yet imports every policy before the
-    lookup fails. It is not a `draccus.ChoiceRegistry` itself, since the registries that use it would then
-    share one set of choices.
-    """
-
-    # The names policy packages register, each with the package that owns it, so a plugin cannot take one
-    # before that package is imported.
-    POLICY_CHOICES = {
-        "molmoact2_adamw": "molmoact2",
-        "molmoact2_cosine_with_warmup": "molmoact2",
-        "lawam_cosine_with_min_lr": "lawam",
-    }
-
-    @classmethod
-    def register_subclass(cls, name: str, choice_type: Any = None) -> Any:
-        owner = cls.POLICY_CHOICES.get(name)
-        if (
-            choice_type is not None
-            and owner
-            and not choice_type.__module__.startswith(f"lerobot.policies.{owner}.")
-        ):
-            raise ValueError(f"'{name}' is reserved for the {owner} policy.")
-        return super().register_subclass(name, choice_type)
-
-    @classmethod
-    def get_choice_class(cls, name: str) -> Any:
-        if name not in cls.get_known_choices():
-            cls.load_all_choices()
-        return super().get_choice_class(name)
-
-    @classmethod
-    def load_all_choices(cls) -> None:
-        from lerobot.configs.policies import PreTrainedConfig
-
-        PreTrainedConfig.load_all_choices()
 
 
 def make_device_from_device_class(config: ChoiceRegistry) -> Any:
@@ -313,23 +247,20 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     )
 
 
-def register_third_party_plugins() -> None:
+PLUGIN_KINDS = ("robot", "camera", "teleoperator", "policy", "env", "strategy")
+"""The kinds of third-party plugins `register_third_party_plugins` imports by default."""
+
+
+def register_third_party_plugins(kinds: Sequence[str] = PLUGIN_KINDS) -> None:
     """
     Discover and import third-party LeRobot plugins so they can register themselves.
 
     This function uses `importlib.metadata` to find packages installed in the environment
-    (including editable installs) starting with 'lerobot_robot_', 'lerobot_camera_',
-    'lerobot_teleoperator_', 'lerobot_policy_', 'lerobot_env_' or 'lerobot_strategy_' and
-    imports them.
+    (including editable installs) named `lerobot_<kind>_...` for each of `kinds`, such as
+    `lerobot_robot_` or `lerobot_policy_`, and imports them. A command that must not load
+    some plugins, such as policy plugins that import PyTorch, passes only the kinds it needs.
     """
-    prefixes = (
-        "lerobot_robot_",
-        "lerobot_camera_",
-        "lerobot_teleoperator_",
-        "lerobot_policy_",
-        "lerobot_env_",
-        "lerobot_strategy_",
-    )
+    prefixes = tuple(f"lerobot_{kind}_" for kind in kinds)
     imported: list[str] = []
     failed: list[str] = []
 
@@ -350,3 +281,111 @@ def register_third_party_plugins() -> None:
             attempt_import(dist_name)
 
     logging.debug("Third-party plugin import summary: imported=%s failed=%s", imported, failed)
+
+
+PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
+
+
+def parse_plugin_args(plugin_arg_suffix: str, args: Sequence[str]) -> dict[str, str]:
+    """Parse plugin-related arguments from command-line arguments.
+
+    This function extracts arguments from command-line arguments that match a specified suffix pattern.
+    It accepts arguments in the formats '--key=value' and '--key value' and returns them as a dictionary.
+
+    Args:
+        plugin_arg_suffix (str): The suffix to identify plugin-related arguments.
+        cli_args (Sequence[str]): A sequence of command-line arguments to parse.
+
+    Returns:
+        dict: A dictionary containing the parsed plugin arguments where:
+            - Keys are the argument names (with '--' prefix removed if present)
+            - Values are the corresponding argument values
+
+    Example:
+        >>> args = ["--env.discover_packages_path=my_package", "--other_arg=value"]
+        >>> parse_plugin_args("discover_packages_path", args)
+        {'env.discover_packages_path': 'my_package'}
+    """
+    plugin_args = {}
+    for index, arg in enumerate(args):
+        if not arg.startswith("--"):
+            continue
+
+        key, separator, value = arg[2:].partition("=")
+        if plugin_arg_suffix not in key:
+            continue
+        if not separator:
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                continue
+            value = args[index + 1]
+        plugin_args[key] = value
+    return plugin_args
+
+
+class PluginLoadError(Exception):
+    """Raised when a plugin fails to load."""
+
+
+def load_plugin(plugin_path: str) -> None:
+    """Load and initialize a plugin from a given Python package path.
+
+    This function attempts to load a plugin by importing its package and any submodules.
+    Plugin registration is expected to happen during package initialization, i.e. when
+    the package is imported the gym environment should be registered and the config classes
+    registered with their parents using the `register_subclass` decorator.
+
+    Args:
+        plugin_path (str): The Python package path to the plugin (e.g. "mypackage.plugins.myplugin")
+
+    Raises:
+        PluginLoadError: If the plugin cannot be loaded due to import errors or if the package path is invalid.
+
+    Examples:
+        >>> load_plugin("external_plugin.core")  # Loads plugin from external package
+
+    Notes:
+        - The plugin package should handle its own registration during import
+        - All submodules in the plugin package will be imported
+        - Implementation follows the plugin discovery pattern from Python packaging guidelines
+
+    See Also:
+        https://packaging.python.org/en/latest/guides/creating-and-discovering-plugins/
+    """
+    try:
+        package_module = importlib.import_module(plugin_path, __package__)
+    except (ImportError, ModuleNotFoundError) as e:
+        raise PluginLoadError(
+            f"Failed to load plugin '{plugin_path}'. Verify the path and installation: {str(e)}"
+        ) from e
+
+    def iter_namespace(ns_pkg: ModuleType) -> Iterable[ModuleInfo]:
+        return pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + ".")
+
+    try:
+        for _finder, pkg_name, _ispkg in iter_namespace(package_module):
+            importlib.import_module(pkg_name)
+    except ImportError as e:
+        raise PluginLoadError(
+            f"Failed to load plugin '{plugin_path}'. Verify the path and installation: {str(e)}"
+        ) from e
+
+
+def filter_arg(field_to_filter: str, args: Sequence[str] | None = None) -> list[str]:
+    if args is None:
+        return []
+    option = f"--{field_to_filter}"
+    filtered_args = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == option:
+            index += 1
+            if index < len(args) and not args[index].startswith("--"):
+                index += 1
+            continue
+        if arg.startswith(f"{option}="):
+            index += 1
+            continue
+        filtered_args.append(arg)
+        index += 1
+    return filtered_args

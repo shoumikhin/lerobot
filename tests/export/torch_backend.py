@@ -17,66 +17,108 @@ programs, run in PyTorch. A bundle names this module in `runtime_imports`, which
 compiler's own module registers its kernels with a real runtime.
 """
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from huggingface_hub.constants import CONFIG_NAME
 from safetensors.numpy import save_file
 from torch import Tensor, nn
 
+from lerobot.bundle.manifest import NOISE, TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.export.configs import ExportBackendConfig
-from lerobot.export.recipe import Part
-from lerobot.inference.export import MANIFEST, RUNTIMES, ExportBundle, ExportManifest, ProgramSpec
-from lerobot.inference.export.bundle import TEST_CASE
 from lerobot.utils.constants import ACTION
 
 
 class TorchProgram:
-    """Runs a saved `torch.export` program."""
+    """Runs a saved `torch.export` program. A data file, when given, must exist."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, data: Path | None = None):
+        if data is not None and not data.is_file():
+            raise FileNotFoundError(data)
         self._module = torch.export.load(path).module()
 
     def __call__(self, *inputs: Any) -> tuple[Tensor, ...]:
-        outputs = self._module(*(torch.as_tensor(x) for x in inputs))
+        with torch.no_grad():
+            outputs = self._module(*(torch.as_tensor(x) for x in inputs))
         return outputs if isinstance(outputs, tuple) else (outputs,)
 
     def to_numpy(self, value: Tensor) -> np.ndarray:
         return value.numpy()
 
+    def place(self, index: int, value: np.ndarray) -> Tensor:
+        return torch.as_tensor(value)
 
-RUNTIMES["torch_test"] = TorchProgram
+
+register_runtime("torch_test", Runtime(TorchProgram))
+
+
+def record_places(monkeypatch) -> list[tuple[int, ...]]:
+    """From now on, record the shape of each value the runtime copies to where a program reads it."""
+    shapes: list[tuple[int, ...]] = []
+    place = TorchProgram.place
+    monkeypatch.setattr(
+        TorchProgram,
+        "place",
+        lambda self, index, value: shapes.append(value.shape) or place(self, index, value),
+    )
+    return shapes
 
 
 def make_bundle(
     folder: Path,
     module: nn.Module,
     frame: dict[str, np.ndarray],
+    *,
+    noise_shape: tuple[int, ...] | None = None,
     task: str | None = None,
+    action_names: list[str] | None = None,
+    data: str | None = None,
     expected_offset: float = 0.0,
-) -> ExportBundle:
-    """Write a one-program bundle of `module`, whose test case expects its actions plus `expected_offset`."""
+    history: dict[str, int] | None = None,
+) -> Bundle:
+    """Write a one-program bundle of `module`, whose test case expects its actions plus `expected_offset`.
+
+    With `noise_shape`, the program takes a starting noise after the frame. With `data`, the program names
+    a data file of that name, written beside it. With `history`, each value of `frame` holds the frames of
+    several ticks, and the program takes the last frames of the keys `history` names, as the policies' queues
+    keep them: the first frame repeated until the queue is full.
+    """
     folder.mkdir(parents=True)
-    inputs = tuple(torch.from_numpy(x) for x in frame.values())
+    case = dict(frame)
+    values = {}
+    for name, value in frame.items():
+        if size := (history or {}).get(name):
+            value = np.stack([value[0]] * max(size - len(value), 0) + list(value[-size:]))
+        elif history:
+            value = value[-1]
+        values[name] = value
+    if noise_shape is not None:
+        case[NOISE] = values[NOISE] = np.random.default_rng(0).standard_normal(noise_shape).astype(np.float32)
+    inputs = tuple(torch.from_numpy(x) for x in values.values())
     torch.export.save(torch.export.export(module, inputs), folder / "model.pt2")
+    if data is not None:
+        (folder / data).write_bytes(b"")
     with torch.no_grad():
         actions = module(*inputs).numpy() + expected_offset
-    save_file({**frame, ACTION: actions}, folder / TEST_CASE)
-    (folder / CONFIG_NAME).write_text(json.dumps({"type": "act"}))
-    manifest = ExportManifest(
+    save_file({**case, ACTION: actions}, folder / TEST_CASE)
+    manifest = BundleManifest(
         backend="torch_test",
         runtime="torch_test",
         runtime_imports=["tests.export.torch_backend"],
-        programs=[ProgramSpec("model", "model.pt2", list(frame), [ACTION])],
+        programs={"model": ProgramFiles("model.pt2", data)},
+        runs=[ProgramRun("model", "model", list(case), [ACTION])],
+        noise_shape=None if noise_shape is None else list(noise_shape),
+        history=history or {},
         task=task,
+        action_names=action_names,
+        action_scale=[1.0] * actions.shape[-1],
         tolerance=1e-4,
     )
-    (folder / MANIFEST).write_text(json.dumps(manifest.to_dict()))
-    return ExportBundle.read(folder)
+    Bundle(folder, manifest).write()
+    return Bundle.read(folder)
 
 
 class _Offset(nn.Module):
@@ -101,6 +143,8 @@ class TorchTestBackend(ExportBackendConfig):
 
     offset: float = 0.0
 
-    def compile(self, part: Part, path: Path) -> None:
-        module = _Offset(part.module, self.offset) if self.offset else part.module
-        torch.export.save(torch.export.export(module, part.example_inputs), path)
+    def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+        if self.offset:
+            args, _ = program.example_inputs
+            program = torch.export.export(_Offset(program.module(), self.offset), args)
+        torch.export.save(program, path)

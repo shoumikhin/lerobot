@@ -94,22 +94,25 @@ bash script/_install.sh
 bash script/_download_assets.sh
 ```
 
-The install script handles the Python dependencies, including SAPIEN, CuRobo, mplib and pytorch3d. On PyTorch 2.12 and newer its CuRobo and pytorch3d builds fail, so install those two manually as shown below.
+The install script handles the Python dependencies, including SAPIEN, CuRobo, mplib and pytorch3d. Its CuRobo build fails on PyTorch 2.12 and newer, and its pytorch3d build on PyTorch 2.14 and newer, so build those two with the steps below.
 
 <Tip warning={true}>
-If the automated install fails, install manually.
+With PyTorch 2.12 or newer, which a default install gets, the automated install fails, so install manually.
 
-On PyTorch 2.12 and newer, CUDA sources are compiled as C++20, and two of the packages below do not build under it without a small edit. Both edits have to happen before the build that needs them, so the steps are ordered here to do that.
+Two of the packages below need a small edit to build, for different reasons. From PyTorch 2.12, CUDA sources are compiled as C++20, and CuRobo's own `lerp` then clashes with the standard one. From PyTorch 2.14, the PyTorch headers need C++20, but PyTorch3D pins C++17 for its own extension. Both edits have to happen before the build that needs them, so the steps are ordered here to do that.
 
 ```bash
 pip install -r requirements.txt
 
 # PyTorch3D pins C++17 for its own extension, and that pin wins over what PyTorch asks for.
-git clone --branch stable --depth 1 https://github.com/facebookresearch/pytorch3d.git
+# V0.7.8 is the release the `stable` tag points to; the edit below expects its setup.py.
+git clone --branch V0.7.8 --depth 1 https://github.com/facebookresearch/pytorch3d.git
 sed -i 's/"-std=c++17"/"-std=c++20"/g' pytorch3d/setup.py
-pip install ./pytorch3d --no-build-isolation
+# The CUDA 13 nvcc makes kernel templates private to their source file, which breaks V0.7.8's link.
+NVCC_FLAGS="-static-global-template-stub=false" pip install ./pytorch3d --no-build-isolation
 
-cd envs && git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git && cd curobo
+# The install script may have cloned an unpatched CuRobo already.
+cd envs && rm -rf curobo && git clone --branch v0.7.8 --depth 1 https://github.com/NVlabs/curobo.git && cd curobo
 # CuRobo declares its own `lerp` for plain floats, which now clashes with the standard library
 # one. Guard only that overload; the float2, float3 and float4 ones take different argument
 # types, so they do not clash and must stay.

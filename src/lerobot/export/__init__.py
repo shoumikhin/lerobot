@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile a trained policy ahead of time into a bundle that `lerobot-rollout` runs without PyTorch.
+"""Compile a trained policy ahead of time into a bundle that `lerobot-rollout` runs instead of the policy.
 
 A recipe turns the policy into parts, a backend compiles each part into a program file, and the bundle
-holds the files with a manifest and a test case. The run side lives in [`lerobot.inference.export`].
+holds the files with a manifest and a test case. The run side lives in [`lerobot.bundle`].
 """

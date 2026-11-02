@@ -35,6 +35,11 @@ Inference backends
     --inference.type=rtc       Real-Time Chunking for slow VLA models
     --inference.type=remote    Policy served by lerobot-policy-server (see remote inference docs)
 
+Compiled bundles
+----------------
+    --bundle.path=<folder>     Run a bundle written by ``lerobot-export`` without PyTorch,
+                               base strategy only (see ``lerobot.bundle.rollout``)
+
 Usage examples
 --------------
 ::
@@ -190,8 +195,13 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
-from lerobot.rollout import InteractiveSession, LinkedEvent, RolloutConfig
-from lerobot.rollout.status_line import StatusLine
+from lerobot.rollout import (
+    InteractiveSession,
+    LinkedEvent,
+    RolloutConfig,
+    build_rollout_context,
+    create_strategy,
+)
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -219,9 +229,6 @@ logger = logging.getLogger(__name__)
 @parser.wrap()
 def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
-    # The rollout runtime imports torch and the dataset stack, so it loads after the arguments are parsed.
-    from lerobot.rollout import build_rollout_context, create_strategy
-
     init_logging(console_level=cfg.inference.log_level)
 
     if cfg.display_data:
@@ -263,9 +270,7 @@ def rollout(cfg: RolloutConfig):
             session.run()
         else:
             logger.info("Rollout setup complete, starting rollout...")
-            tick_hz = cfg.fps * cfg.interpolation_multiplier
-            with StatusLine(ctx.hardware.robot_wrapper, ctx.policy.inference, tick_hz, cfg.device):
-                strategy.run(ctx)
+            strategy.run(ctx)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:

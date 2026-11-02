@@ -65,13 +65,13 @@ dependencies = [
     "torchvision>=0.22.0,<0.27.0; sys_platform == 'darwin'",
     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
     "opencv-python-headless>=4.9.0,<4.14.0",
-    "Pillow>=10.0.0,<13.0.0",
+    "Pillow>=10.0.0,<14.0.0",
     "einops>=0.8.0,<0.9.0",
 
     # Config & Hub
     "draccus>=0.11.6,<0.12.0",
     "huggingface-hub>=1.6.0,<2.0.0",
-    "filelock>=3.12.0,<4.0.0",
+    "filelock>=4.2.1,<5.0.0",
     "fsspec>=2023.5.0,<2027.0.0",
     "httpx>=0.27.0,<1.0.0",
     "requests>=2.32.0,<3.0.0",
@@ -86,7 +86,7 @@ dependencies = [
     "safetensors>=0.4.3,<1.0.0",
 
     # Lightweight utilities
-    "packaging>=24.2,<26.0",
+    "packaging>=24.2,<27.0",
     "termcolor>=2.4.0,<4.0.0",
     "tqdm>=4.66.0,<5.0.0",
 
@@ -120,7 +120,11 @@ dataset = [
     #   - macOS x86_64 (Intel) and linux armv7l: no wheels in any released version -> fall through to the PyAV decoder.
     # Each platform gets its own line so the resolver picks the minimum version that has a wheel for it.
     #
-    # The <0.14 cap avoids CUDA 13-linked PyPI TorchCodec wheels on Linux x86_64.
+    # On Linux x86_64, uv installs of this project take TorchCodec from the CPU-only index in
+    # [tool.uv.sources], so there the <0.14 cap does not decide CUDA linkage. It does wherever
+    # TorchCodec comes from PyPI, such as a pip install or the x86_64 cu129 recipe in the
+    # installation guide: PyPI 0.13 links no CUDA library, while 0.14 and newer link CUDA 13
+    # (so did 0.11.0, which the range still allows).
     # It is not a CUDA 12 guarantee on aarch64: PyPI 0.13 already needs CUDA 13 there.
     # TorchCodec does not declare a torch dependency, so CUDA 12 installs must follow
     # the platform-specific package pairing in the installation guide.
@@ -135,7 +139,8 @@ dataset = [
 ]
 training = [
     "lerobot[dataset]",
-    "wandb>=0.24.0,<0.28.0",
+    "trackio[gpu]>=0.44.0,<1.0.0; sys_platform != 'darwin'",
+    "trackio[apple-gpu]>=0.44.0,<1.0.0; sys_platform == 'darwin'",
     "lerobot[accelerate-dep]",
 ]
 hardware = [
@@ -255,12 +260,13 @@ robometer = ["lerobot[transformers-dep]", "lerobot[qwen-vl-utils-dep]", "lerobot
 topreward = ["lerobot[transformers-dep]"]
 xvla = ["lerobot[transformers-dep]"]
 eo1 = ["lerobot[transformers-dep]", "lerobot[qwen-vl-utils-dep]"]
+longwam = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[sentencepiece-dep]"]
 fastwam = [
     "lerobot[transformers-dep]",
     "lerobot[diffusers-dep]",
 ]
 # flux3 (FLUX 3 Action): Qwen3-VL text encoder via transformers. The video
-# VAE additionally needs NATTEN (`natten`, torch-matched wheel, not on PyPI for every platform): see
+# VAE runs faster with NATTEN (`natten`, torch-matched wheel, not on PyPI for every platform): see
 # docs/source/flux3.mdx.
 flux3 = [
     "lerobot[transformers-dep]",
@@ -290,8 +296,8 @@ lawam = [
 remote = ["eclipse-zenoh>=1.9.0,<1.11.0", "msgpack>=1.1.0,<2.0.0"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
 # NOTE: `export` (ExecuTorch, to run a bundle written by lerobot-export) is not an extra yet. It needs
-# `executorch>=1.6.0,<1.7.0; sys_platform == 'linux'`, which is not on PyPI yet, so the lock cannot resolve
-# it. Torch-TensorRT stays out of it even then: it pins one torch minor version, which uv's single lock
+# `executorch>=1.6.0,<1.7.0; sys_platform == 'linux'`, which needs torchao 0.19; neither is on PyPI yet, so
+# the lock cannot resolve it. Torch-TensorRT stays out of it even then: it pins one torch minor version, which uv's single lock
 # would impose on every extra, as vllm would (see `annotations`).
 
 # Annotation pipeline (lerobot-annotate). The only backend is ``openai``,
@@ -371,6 +377,7 @@ all = [
     "lerobot[molmoact2]",
     "lerobot[smolvla]",
     "lerobot[fastwam]",
+    "lerobot[longwam]",
     "lerobot[flux3]",
     "lerobot[groot]",
     "lerobot[xvla]",
@@ -411,12 +418,13 @@ lerobot-train="lerobot.scripts.lerobot_train:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"
 lerobot-info="lerobot.scripts.lerobot_info:main"
+lerobot-check-bundle="lerobot.scripts.lerobot_check_bundle:main"
 lerobot-find-joint-limits="lerobot.scripts.lerobot_find_joint_limits:main"
 lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
-lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-rollout="lerobot.scripts.lerobot_rollout_entry:main"
 lerobot-export="lerobot.scripts.lerobot_export:main"
 lerobot-policy-server="lerobot.scripts.lerobot_policy_server:main"
 
@@ -540,7 +548,7 @@ exclude_dirs = [
 skips = ["B101", "B311", "B404", "B603", "B615"]
 
 [tool.typos]
-default.extend-words = { trak = "trak", nd = "nd" }
+default.extend-words = { trak = "trak", nd = "nd", ptd = "ptd" }
 default.extend-ignore-re = [
     "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",                      # spellchecker:disable-line
     "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on", # spellchecker:<on|off>
@@ -559,6 +567,8 @@ default.extend-ignore-identifiers-re = [
     "OT_VALUE",
     "VanderBilt",
     "seperated_timestep",
+    # Diffusers VAE configuration spelling.
+    "temperal_downsample",
     "nd",  # einsum output axes "...nd" in the vendored FLUX 3 Action transformer
     "EmbedND",
 ]

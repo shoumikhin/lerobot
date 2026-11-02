@@ -22,7 +22,7 @@ import torch
 from safetensors.torch import save_file
 from transformers import PaliGemmaConfig
 
-from lerobot.policies.common import openpi_checkpoint
+from lerobot.policies.common import meta_load
 
 EMBED_TOKENS = "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
 
@@ -88,7 +88,7 @@ def save_checkpoint(policy_cls, config, path, renames=None, edit=None):
 def load(policy_cls, path, config, monkeypatch, regular=False, **kwargs):
     """Load `path` and return the policy and whether it is the one built with parameters on meta."""
     built_on_meta = []
-    load_into_meta = openpi_checkpoint._load_state_dict_into_meta_model
+    load_into_meta = meta_load.load_state_dict_into_meta_model
 
     def check_meta(model, state_dict, device):
         if all(param.is_meta for param in model.parameters()):
@@ -99,7 +99,7 @@ def load(policy_cls, path, config, monkeypatch, regular=False, **kwargs):
         load_into_meta(model, state_dict, device)
 
     with monkeypatch.context() as patch:
-        patch.setattr(openpi_checkpoint, "_load_state_dict_into_meta_model", check_meta)
+        patch.setattr(meta_load, "load_state_dict_into_meta_model", check_meta)
         if regular:
             # `from_pretrained` looks the fast path up in the module that defines it.
             module = sys.modules[policy_cls.from_pretrained.__module__]

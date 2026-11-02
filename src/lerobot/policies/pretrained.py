@@ -18,10 +18,7 @@ import builtins
 import dataclasses
 import logging
 import os
-import threading
 import warnings
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, TypeVar, Unpack
 
@@ -30,10 +27,9 @@ from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor, nn
-from torch.nn.modules.module import register_module_parameter_registration_hook
-from torch.utils.weak import WeakIdKeyDictionary
 
 from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.lerobot_types import PolicyOutput
 from lerobot.optim.optimizers import OptimizerParams
 from lerobot.utils.constants import ACTION
 from lerobot.utils.device_utils import resolve_safetensors_device
@@ -73,76 +69,6 @@ class RTCActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
-_meta_init = threading.local()
-
-
-def _parameter_to_meta(module: nn.Module, name: str, param: nn.Parameter) -> nn.Parameter | None:
-    replacements = getattr(_meta_init, "replacements", None)
-    if replacements is None or param.is_meta:
-        return None
-    if param not in replacements:
-        replacements[param] = nn.Parameter(param.to("meta"), requires_grad=param.requires_grad)
-    return replacements[param]
-
-
-# Registered once, so that entering and leaving `_parameters_on_meta` never changes PyTorch's
-# process-wide hook registry while another thread iterates it to register a parameter.
-register_module_parameter_registration_hook(_parameter_to_meta)
-
-
-@contextmanager
-def _parameters_on_meta() -> Iterator[None]:
-    """Create the parameters of modules built inside this block on the meta device.
-
-    A meta tensor has a shape and a dtype but no memory. Modules like `nn.Linear` register a parameter
-    before they initialize it, so building them here skips allocating and randomly initializing weights
-    that a checkpoint will replace; `nn.Parameter(torch.randn(n))` is still drawn before it moves. Buffers
-    and plain tensors are still computed, so values built from the config (rotary tables, masks) stay
-    correct, but one computed from a parameter ends up on meta. Only the thread that entered the block is
-    affected, and a parameter registered in two modules stays shared.
-    """
-    previous = getattr(_meta_init, "replacements", None)
-    _meta_init.replacements = WeakIdKeyDictionary() if previous is None else previous
-    try:
-        yield
-    finally:
-        _meta_init.replacements = previous
-
-
-def _shares_parameters(model: nn.Module) -> bool:
-    return len(list(model.parameters())) != len(list(model.named_parameters(remove_duplicate=False)))
-
-
-def _load_state_dict_into_meta_model(
-    model: nn.Module, state_dict: Iterable[tuple[str, Tensor]], device: str | None
-) -> None:
-    """Load a complete checkpoint into a model built under `_parameters_on_meta`.
-
-    `state_dict` can be a lazy iterator and must have exactly the model's keys. Each tensor is copied
-    on the CPU into the dtype the constructor gave the matching parameter or buffer, then moved to
-    `device`, so the constructor's precision choices are kept and only one checkpoint tensor is held
-    at a time. Raises if the model shares a parameter between modules, because `assign=True` would
-    give each name its own tensor, and if a buffer computed from a parameter is left on the meta device.
-    """
-    if _shares_parameters(model):
-        raise ValueError(f"{type(model).__name__} shares parameters between modules, which is not supported")
-    targets = model.state_dict(keep_vars=True)
-    tensors = {}
-    for name, tensor in state_dict:
-        target = targets.get(name)
-        # A device copy straight from a memory-mapped file can keep every page it read as private memory
-        # until the file closes (measured on Jetson), a second copy of the weights; a CPU copy does not.
-        tensors[name] = tensor if target is None else tensor.to(dtype=target.dtype, copy=True).to(device)
-    model.load_state_dict(tensors, strict=True, assign=True)
-
-    on_meta = [name for name, buffer in model.named_buffers(remove_duplicate=False) if buffer.is_meta]
-    if on_meta:
-        raise RuntimeError(
-            f"{type(model).__name__} computed these buffers from parameters, so no checkpoint can fill them: "
-            f"{on_meta}"
-        )
-
-
 class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     """
     Base class for policy models.
@@ -151,7 +77,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     config_class: ClassVar[type[PreTrainedConfig]]
     name: ClassVar[str]
 
-    # --- declarative parallelism/acceleration surface ----------------------------------------
+    # declarative parallelism/acceleration surface
     # Module CLASS names forming the FSDP2 wrap units (and, once wired, the activation-
     # checkpointing units). Resolved onto the accelerate plugin right before
     # `accelerator.prepare()` by `lerobot.distributed.set_fsdp_wrap_modules`; sharded training
@@ -266,10 +192,12 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         if device is None:
             # PreTrainedConfig.__post_init__ always resolves a device; None here is a programming error.
             raise ValueError(f"{type(config).__name__}.device is unset; cannot load the weights")
+        # Mapped on the CPU, the file is copied into the parameters one tensor at a time, wherever they were
+        # built. Mapped on a GPU, all of it would first be copied there, beside the parameters.
         if os.path.isdir(model_id):
             print("Loading weights from local directory")
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            policy = cls._load_as_safetensor(instance, model_file, device, strict)
+            policy = cls._load_as_safetensor(instance, model_file, "cpu", strict)
         else:
             try:
                 model_file = hf_hub_download(
@@ -283,7 +211,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     token=token,
                     local_files_only=local_files_only,
                 )
-                policy = cls._load_as_safetensor(instance, model_file, device, strict)
+                policy = cls._load_as_safetensor(instance, model_file, "cpu", strict)
             except HfHubHTTPError as e:
                 raise FileNotFoundError(
                     f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
@@ -461,7 +389,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor | PolicyOutput:
         """Returns the action chunk (for action chunking policies) for a given observation, potentially in batch mode.
 
         Child classes using action chunking should use this method within `select_action` to form the action chunk
@@ -469,15 +399,34 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
         A policy that supports a `noise` keyword starts its sampling from that tensor, shaped as the policy would
         draw it. When `noise` is None, the policy draws it as usual.
+
+        May return a `PolicyOutput` carrying the chunk and its prediction, as for `select_action`.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+    def select_action(
+        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor | PolicyOutput:
         """Return one action to run in the environment (potentially in batch mode).
 
         When the model uses a history of observations, or outputs a sequence of actions, this method deals
         with caching.
+
+        Returns a bare action tensor, or a `PolicyOutput`: a batch, keyed like the input batch, holding
+        the action under ``"action"`` and what the policy expects or believes besides it under
+        ``"prediction"`` (a `PolicyPrediction`). The prediction is batched like the action, one value
+        per environment, and each entry is keyed by what it refers to: predicted frames by the
+        observation key they predict, language by annotation style ("subtask", "plan", "memory"),
+        boxes (annotation VQA schema) by the camera they are drawn on. Callers normalize the two
+        return types with `lerobot.processor.policy_output_to_transition`; `--display_data` shows
+        the prediction of the first environment.
+
+        A prediction holds values for this step: one spanning a chunk (e.g. an imagined clip) is
+        returned piece by piece, with the action each piece belongs to. Each entry stays displayed
+        until it is returned again. Predicting is opt-in through a config field of the policy's
+        choosing, and must not change the actions; text that should steer the policy goes
+        through `generate_text`.
         """
         raise NotImplementedError
 

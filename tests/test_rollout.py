@@ -17,17 +17,13 @@
 from __future__ import annotations
 
 import dataclasses
-import io
 import logging
-import os
 import sys
 import threading
-import time
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -36,7 +32,13 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 # Hoisted rather than re-imported inside each test: the module-scoped `importorskip`
 # above already guards everything below it.
+from lerobot.inference import SyncInferenceEngine, sync  # noqa: E402
+from lerobot.processor import transition_to_prediction  # noqa: E402
+from lerobot.rollout import BaseStrategyConfig  # noqa: E402
+from lerobot.rollout.strategies import BaseStrategy  # noqa: E402
+from lerobot.utils import rollout_status as status  # noqa: E402
 from lerobot.utils.cycle_timer import CycleTimer  # noqa: E402
+from tests.interactive_helpers import _FakeEngine, _loop_ctx  # noqa: E402
 
 pytestmark = pytest.mark.dataset
 
@@ -280,7 +282,7 @@ def test_build_rollout_context_uses_resolved_device(
     # Emulate a checkpoint saved on a different host without needing that device locally.
     policy_config.device = checkpoint_device
     robot_config = MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
-    cfg = RolloutConfig(robot=robot_config, policy=policy_config, device=runtime_device)
+    cfg = RolloutConfig(robot=robot_config, policy=policy_config, device=runtime_device, tf32=None)
     robot = MockRobot(robot_config)
     policy = torch.nn.Linear(3, 3)
 
@@ -300,7 +302,7 @@ def test_build_rollout_context_uses_resolved_device(
         )
         return processor, PolicyProcessorPipeline(steps=[])
 
-    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", load_policy)
+    monkeypatch.setattr(rollout_context, "load_pretrained_policy", load_policy)
     monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
     monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
 
@@ -316,9 +318,10 @@ def test_build_rollout_context_uses_resolved_device(
             robot.disconnect()
 
 
-@pytest.mark.parametrize("failure_stage", ["observation", "processors", "engine"])
-def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
+@pytest.mark.parametrize("failure_stage", ["engine", "observation"])
+def test_local_setup_failure_releases_hardware_and_dataset(monkeypatch, tmp_path, failure_stage):
     import lerobot.rollout.context as rollout_context
+    from lerobot.configs.dataset import DatasetRecordConfig
     from lerobot.policies import ACTConfig
     from lerobot.processor import PolicyProcessorPipeline
     from lerobot.rollout import RolloutConfig
@@ -328,221 +331,36 @@ def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
         robot=MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0]),
         policy=ACTConfig(device="cpu", pretrained_path=Path("unused-checkpoint")),
         device="cpu",
+        tf32=None,
     )
+    cfg.dataset = DatasetRecordConfig(repo_id="user/rollout_test", single_task="task", root=tmp_path)
     robot = MockRobot(cfg.robot)
+    dataset = MagicMock(num_episodes=0, repo_id="user/rollout_test")
+    dataset.meta.stats = {}
     failure = RuntimeError("setup failed")
-    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
-    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+
+    def make_engine(*args, **kwargs):
+        assert not robot.is_connected, "the robot connects after the engine is constructed"
+        if failure_stage == "engine":
+            raise failure
+        return MagicMock()
+
     if failure_stage == "observation":
         monkeypatch.setattr(robot, "get_observation", MagicMock(side_effect=failure))
-    elif failure_stage == "processors":
-        monkeypatch.setattr(rollout_context, "make_pre_post_processors", MagicMock(side_effect=failure))
-    else:
-        monkeypatch.setattr(
-            rollout_context,
-            "make_pre_post_processors",
-            lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
-        )
-
-        def fail_engine(*args, **kwargs):
-            assert robot.is_connected, "the engine is constructed after hardware is connected"
-            raise failure
-
-        monkeypatch.setattr(rollout_context, "create_inference_engine", fail_engine)
+    monkeypatch.setattr(rollout_context, "load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "LeRobotDataset", MagicMock(create=MagicMock(return_value=dataset)))
+    monkeypatch.setattr(
+        rollout_context,
+        "make_pre_post_processors",
+        lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
+    )
+    monkeypatch.setattr(rollout_context, "create_inference_engine", make_engine)
     with pytest.raises(RuntimeError) as raised:
         rollout_context.build_rollout_context(cfg, threading.Event())
     assert raised.value is failure
     assert not robot.is_connected
-
-
-class _TwoActions(torch.nn.Module):
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return torch.stack([state, -state])
-
-
-def _export_rollout_config(monkeypatch, tmp_path, *args: str, n_motors: int = 3, **kwargs):
-    import numpy as np
-
-    from lerobot.rollout import RolloutConfig
-    from lerobot.utils.constants import OBS_STATE
-    from tests.export.torch_backend import make_bundle
-    from tests.mocks.mock_robot import MockRobotConfig
-
-    bundle = make_bundle(tmp_path / "bundle", _TwoActions(), {OBS_STATE: np.zeros(3, np.float32)})
-    monkeypatch.setattr(sys, "argv", ["lerobot-rollout", f"--policy.path={bundle.path}", *args])
-    robot = MockRobotConfig(n_motors=n_motors, random_values=False, static_values=[0.0] * n_motors)
-    return RolloutConfig(robot=robot, **kwargs)
-
-
-def test_rollout_config_reads_an_export_bundle(monkeypatch, tmp_path):
-    cfg = _export_rollout_config(monkeypatch, tmp_path)
-    assert cfg.export is not None and cfg.export.path == tmp_path / "bundle"
-    assert cfg.policy is None and cfg.device is None
-
-
-@pytest.mark.parametrize(
-    ("args", "kwargs"),
-    [
-        (["--policy.n_action_steps=1"], {}),
-        ([], {"use_torch_compile": True}),
-        ([], {"device": "cpu"}),
-    ],
-)
-def test_rollout_config_refuses_settings_an_export_bundle_cannot_follow(monkeypatch, tmp_path, args, kwargs):
-    with pytest.raises(ValueError, match="runs as it was compiled"):
-        _export_rollout_config(monkeypatch, tmp_path, *args, **kwargs)
-
-
-def test_rollout_config_refuses_rtc_for_an_export_bundle(monkeypatch, tmp_path):
-    from lerobot.inference import RTCInferenceConfig
-
-    with pytest.raises(ValueError, match="runs as it was compiled"):
-        _export_rollout_config(monkeypatch, tmp_path, inference=RTCInferenceConfig())
-
-
-def test_build_rollout_context_runs_an_export_bundle_before_connecting(monkeypatch, tmp_path):
-    import lerobot.rollout.context as rollout_context
-    from lerobot.inference.export import ExportInferenceEngine
-    from tests.mocks.mock_robot import MockRobot
-
-    cfg = _export_rollout_config(monkeypatch, tmp_path)
-    robot = MockRobot(cfg.robot)
-    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
-
-    def make_engine(*args, **kwargs):
-        assert not robot.is_connected
-        return ExportInferenceEngine(*args, **kwargs)
-
-    monkeypatch.setattr(rollout_context, "ExportInferenceEngine", make_engine)
-    try:
-        ctx = rollout_context.build_rollout_context(cfg, threading.Event())
-        assert isinstance(ctx.policy.inference, ExportInferenceEngine)
-        assert ctx.policy.policy is None and ctx.policy.preprocessor is None
-        assert ctx.data.ordered_action_keys == ["motor_1.pos", "motor_2.pos", "motor_3.pos"]
-    finally:
-        if robot.is_connected:
-            robot.disconnect()
-
-
-def test_build_rollout_context_refuses_a_robot_an_export_bundle_does_not_fit(monkeypatch, tmp_path):
-    import lerobot.rollout.context as rollout_context
-    from tests.mocks.mock_robot import MockRobot
-
-    cfg = _export_rollout_config(monkeypatch, tmp_path, n_motors=4)
-    robot = MockRobot(cfg.robot)
-    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
-    with pytest.raises(ValueError, match="does not match the exported policy"):
-        rollout_context.build_rollout_context(cfg, threading.Event())
-    assert not robot.is_connected
-
-
-def test_load_pretrained_policy_passes_revision(monkeypatch):
-    import lerobot.rollout.context as rollout_context
-
-    policy_config = SimpleNamespace(
-        type="mock",
-        use_peft=False,
-        pretrained_path="user/policy",
-        pretrained_revision="policy-sha",
-    )
-    policy_class = MagicMock()
-    loaded_policy = MagicMock()
-    policy_class.from_pretrained.return_value = loaded_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
-
-    policy = rollout_context._load_pretrained_policy(policy_config)
-
-    assert policy is loaded_policy
-    policy_class.from_pretrained.assert_called_once_with(
-        "user/policy",
-        config=policy_config,
-        revision="policy-sha",
-    )
-
-
-def test_load_pretrained_policy_use_peft_on_base_model_loads_base(monkeypatch):
-    # A `use_peft=True` config pointing at a base model (no adapter_config.json) loads it normally.
-    import lerobot.rollout.context as rollout_context
-
-    policy_config = SimpleNamespace(
-        type="mock",
-        use_peft=True,
-        pretrained_path="user/base-policy",
-        pretrained_revision="base-sha",
-    )
-    policy_class = MagicMock()
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
-    monkeypatch.setattr(rollout_context, "has_peft_adapter_config", lambda *args: False)
-
-    policy = rollout_context._load_pretrained_policy(policy_config)
-
-    assert policy is policy_class.from_pretrained.return_value
-    policy_class.from_pretrained.assert_called_once_with(
-        "user/base-policy",
-        config=policy_config,
-        revision="base-sha",
-    )
-
-
-def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(monkeypatch):
-    import lerobot.rollout.context as rollout_context
-
-    policy_config = SimpleNamespace(
-        type="mock",
-        use_peft=True,
-        pretrained_path="user/adapter",
-        pretrained_revision="adapter-sha",
-    )
-    policy_class = MagicMock()
-    base_policy = MagicMock()
-    policy_class.from_pretrained.return_value = base_policy
-    monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
-    # "user/adapter" is a fake repo id: pin the adapter check instead of reaching the Hub.
-    monkeypatch.setattr(rollout_context, "has_peft_adapter_config", lambda *args: True)
-
-    peft_config = SimpleNamespace(
-        base_model_name_or_path="user/base-policy",
-        revision="base-sha",
-    )
-    peft_config_from_pretrained = MagicMock(return_value=peft_config)
-    adapted_policy = MagicMock()
-    peft_model_from_pretrained = MagicMock(return_value=adapted_policy)
-    require_package = MagicMock()
-    monkeypatch.setattr(rollout_context, "require_package", require_package)
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftConfig",
-        SimpleNamespace(from_pretrained=peft_config_from_pretrained),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        rollout_context,
-        "PeftModel",
-        SimpleNamespace(from_pretrained=peft_model_from_pretrained),
-        raising=False,
-    )
-
-    policy = rollout_context._load_pretrained_policy(policy_config)
-
-    assert policy is adapted_policy
-    require_package.assert_called_once_with("peft", extra="peft")
-    peft_config_from_pretrained.assert_called_once_with("user/adapter", revision="adapter-sha")
-    policy_class.from_pretrained.assert_called_once_with(
-        pretrained_name_or_path="user/base-policy",
-        config=policy_config,
-        revision="base-sha",
-    )
-    peft_model_from_pretrained.assert_called_once_with(
-        base_policy,
-        "user/adapter",
-        config=peft_config,
-        revision="adapter-sha",
-    )
-
-
-# ---------------------------------------------------------------------------
-# RolloutRingBuffer
-# ---------------------------------------------------------------------------
+    dataset.finalize.assert_called_once()
 
 
 def test_ring_buffer_append_and_eviction():
@@ -728,7 +546,11 @@ def test_setup_defaults_to_starting_the_engine():
 
     engine = MagicMock()
     ctx = SimpleNamespace(
-        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=2)),
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                interpolation_multiplier=2, interactive=False, status_interval_s=5, device="cpu"
+            )
+        ),
         policy=SimpleNamespace(inference=engine),
     )
     strategy = MinimalStrategy(BaseStrategyConfig())
@@ -788,8 +610,8 @@ def test_create_inference_engine_remote_explains_session_construction():
 
 
 def test_align_to_checkpoint_order_reorders_motors_and_preserves_cameras(caplog):
-    from lerobot.rollout.context import _align_to_checkpoint_order
     from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
+    from lerobot.utils.robot_utils import align_to_checkpoint_order
 
     features = {
         "wrist_camera": (480, 640, 3),
@@ -797,7 +619,7 @@ def test_align_to_checkpoint_order_reorders_motors_and_preserves_cameras(caplog)
         "joint_a.pos": float,
     }
 
-    aligned = _align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="state")
+    aligned = align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="state")
 
     assert list(aligned) == ["joint_a.pos", "joint_b.pos", "wrist_camera"]
     assert aligned["wrist_camera"] == (480, 640, 3)
@@ -814,11 +636,11 @@ def test_align_to_checkpoint_order_reorders_motors_and_preserves_cameras(caplog)
 
 def test_align_to_checkpoint_order_aligns_the_action_side_by_the_same_rule(caplog):
     """One primitive serves both sides; the action dict simply has no camera entries."""
-    from lerobot.rollout.context import _align_to_checkpoint_order
+    from lerobot.utils.robot_utils import align_to_checkpoint_order
 
     features = {"joint_b.pos": float, "joint_a.pos": float}
 
-    aligned = _align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="action")
+    aligned = align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="action")
 
     assert list(aligned) == ["joint_a.pos", "joint_b.pos"]
     assert "reordering action" in caplog.text
@@ -836,7 +658,7 @@ def test_align_to_checkpoint_order_aligns_the_action_side_by_the_same_rule(caplo
 )
 def test_align_to_checkpoint_order_is_noop_without_an_exact_name_match(policy_action_names, what):
     """A set mismatch means the two describe different things: keep the robot's own order."""
-    from lerobot.rollout.context import _align_to_checkpoint_order
+    from lerobot.utils.robot_utils import align_to_checkpoint_order
 
     features = {
         "joint_b.pos": float,
@@ -844,7 +666,7 @@ def test_align_to_checkpoint_order_is_noop_without_an_exact_name_match(policy_ac
         "wrist_camera": (480, 640, 3),
     }
 
-    aligned = _align_to_checkpoint_order(features, policy_action_names, what=what)
+    aligned = align_to_checkpoint_order(features, policy_action_names, what=what)
 
     assert aligned is features
     assert list(aligned) == ["joint_b.pos", "joint_a.pos", "wrist_camera"]
@@ -1631,245 +1453,174 @@ def test_sync_engine_without_a_relative_step_binds_nothing():
     _build_sync_engine(policy, MagicMock(steps=[]), MagicMock())  # must not raise
 
 
-@pytest.mark.parametrize("multiplier", [1, 3])
-def test_send_next_action_sends_the_same_values_for_numpy_actions(multiplier):
-    """An engine may return NumPy actions; the robot then gets what tensors would give it."""
-    import numpy as np
+# ---------------------------------------------------------------------------
+# Policy side outputs
+# ---------------------------------------------------------------------------
 
+
+def test_sync_engine_returns_the_prediction_with_the_action():
+    from lerobot.inference import SyncInferenceEngine
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.utils.constants import ACTION, PREDICTION
+
+    returned = {"subtask": None}
+    policy = MagicMock()
+    policy.config.use_amp = False
+
+    def select_action(_obs):
+        action = torch.zeros(1, 2)
+        if returned["subtask"] is None:
+            return action
+        return {ACTION: action, PREDICTION: {"language": {"subtask": [returned["subtask"]]}}}
+
+    policy.select_action.side_effect = select_action
+    postprocessor = MagicMock(side_effect=lambda action: action + 1)
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=MagicMock(side_effect=lambda obs: obs),
+        postprocessor=postprocessor,
+        dataset_features={},
+        ordered_action_keys=[],
+        task="test",
+        device="cpu",
+        robot_type="mock",
+    )
+
+    # No prediction: a bare action, as before.
+    torch.testing.assert_close(engine.get_action({}), torch.ones(2))
+
+    # With a prediction: a transition carrying the postprocessed action and the prediction.
+    returned["subtask"] = "reach"
+    step = engine.get_action({})
+    assert isinstance(postprocessor.call_args.args[0], torch.Tensor)  # only the action is postprocessed
+    torch.testing.assert_close(step[TransitionKey.ACTION], torch.ones(2))
+    assert transition_to_prediction(step) == {"language": {"subtask": ["reach"]}}
+
+
+class _Identity:
+    """A processor pipeline stand-in with no steps."""
+
+    steps = ()
+
+    def __call__(self, data):
+        return data
+
+    def reset(self):
+        pass
+
+
+def test_send_next_action_returns_the_step_with_the_prediction():
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.processor import create_transition
     from lerobot.rollout.strategies.core import send_next_action
     from lerobot.utils.action_interpolator import ActionInterpolator
 
-    chunk = [[0.1, -2.5, 3.0], [1.7, 0.3, -0.9]]
+    ctx, _ = _make_loop_ctx(fps=30.0, multiplier=2, num_ticks=10)
+    engine = ctx.policy.inference
+    engine.get_action.side_effect = [
+        create_transition(action=torch.tensor([1.0]), prediction={"language": {"subtask": ["reach"]}}),
+        torch.tensor([2.0]),
+    ]
+    interpolator = ActionInterpolator(multiplier=2)
 
-    def run(convert):
-        actions = iter([convert(a) for a in chunk])
-        sent = []
-        ctx = SimpleNamespace(
-            policy=SimpleNamespace(
-                inference=SimpleNamespace(
-                    get_action=lambda obs_frame: next(actions, None),
-                    dispatch_allowed=lambda: True,
-                    record_dispatch=lambda: None,
-                )
-            ),
-            data=SimpleNamespace(dataset_features={}, ordered_action_keys=["x", "y", "z"]),
-            processors=SimpleNamespace(robot_action_processor=lambda pair: pair[0]),
-            hardware=SimpleNamespace(
-                robot_wrapper=SimpleNamespace(send_action=sent.append, supports_hold=False)
-            ),
-        )
-        interpolator = ActionInterpolator(multiplier=multiplier)
-        for _ in range(len(chunk) * multiplier):
-            send_next_action({}, {}, ctx, interpolator)
-        return sent
+    first = send_next_action({"m.pos": 0.0}, {"m.pos": 0.0}, ctx, interpolator)
+    assert first[TransitionKey.ACTION] == {"m.pos": 1.0}
+    assert transition_to_prediction(first) == {"language": {"subtask": ["reach"]}}
 
-    expected = run(torch.tensor)
-    assert len(expected) == 1 + multiplier
-    assert run(lambda a: np.array(a, dtype=np.float32)) == expected
+    # The next policy step returned a bare action, and the interpolated tick in between
+    # pulled nothing from the engine: neither carries a prediction.
+    for _ in range(2):
+        step = send_next_action({"m.pos": 0.0}, {"m.pos": 0.0}, ctx, interpolator)
+        assert transition_to_prediction(step) == {}
 
 
-# ---------------------------------------------------------------------------
-# Live status line
-# ---------------------------------------------------------------------------
+def test_log_telemetry_passes_the_step_only_with_display_data(monkeypatch):
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.processor import create_transition
+    from lerobot.rollout.strategies import core
+
+    logged = []
+    monkeypatch.setattr(core, "log_visualization_data", lambda *a, **k: logged.append(k))
+    step = create_transition(action={"m.pos": 1.0}, prediction={"language": {"subtask": ["reach"]}})
+    cfg = SimpleNamespace(display_data=False, display_mode="rerun", display_compressed_images=False)
+    runtime = SimpleNamespace(cfg=cfg)
+
+    core.RolloutStrategy._log_telemetry({"x": 1.0}, step, runtime)
+    assert logged == []
+
+    cfg.display_data = True
+    core.RolloutStrategy._log_telemetry({"x": 1.0}, step, runtime)
+    assert logged[-1]["action"] == step[TransitionKey.ACTION]
+    assert logged[-1]["policy_step"] is step  # passed as is; the viewer extracts what to show
 
 
-def test_sync_engine_times_only_the_ticks_that_run_inference():
-    """``inference_times`` gets one entry per computed chunk, not one per served action."""
-    n = 4
-    chunk_rel = torch.zeros(n, _REL_ACTION_DIM)
-    pre, post, _ = _relative_pre_post()
-    policy = _fake_relative_policy(chunk_rel, n_action_steps=n)
-    engine = _build_sync_engine(policy, pre, post)
-
-    for _ in range(2 * n):
-        engine.get_action(_obs_frame([1.0, 2.0, 3.0, 4.0]))
-
-    assert policy._predict_state["predict_calls"] == 2
-    assert len(engine.inference_times) == 2
+@pytest.fixture
+def probes(monkeypatch, clock):
+    monkeypatch.setattr(status, "time", SimpleNamespace(monotonic=clock.perf_counter))
+    rss = Mock(side_effect=[2 * 1024**3, None])
+    gpu = Mock(side_effect=[(5 * 1024**3, 80 * 1024**3), None])
+    monkeypatch.setattr(status, "_process_rss_bytes", rss)
+    monkeypatch.setattr(status, "_gpu_memory_bytes", gpu)
+    return rss, gpu
 
 
-class _FakeTerminal(io.StringIO):
-    def isatty(self):
-        return True
+def test_periodic_logs_use_interval_metrics_and_omit_unavailable_measurements(probes, clock, caplog):
+    engine = _FakeEngine()
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy.setup(_loop_ctx(engine, interactive=False, status_interval_s=1, device="cuda:1"))
+    timer = CycleTimer(4)
+    with caplog.at_level(logging.INFO, logger=status.logger.name):
+        for tick in range(9):
+            strategy._tick(timer)
+            if tick == 0:
+                timer.note_starved_tick()
+                engine.latency.record(0.04, 0.1)
+                engine.latency.record(0.02, 0.2)
+            if tick < 4:
+                probes[0].assert_not_called()
+                probes[1].assert_not_called()
+            timer.wait()
+    lines = [r.message for r in caplog.records if r.name == status.logger.name]
+    assert lines == [
+        "Rollout: loop 4.0/4 Hz · over budget 0/3 · starved 1 · infer 30.0 ms (worst 40.0) "
+        "· process 2.00 GiB · GPU 5.00/80.0 GiB",
+        "Rollout: loop 4.0/4 Hz · over budget 0/4 · starved 0",
+    ]
+    assert probes[0].call_count == probes[1].call_count == 2
+    probes[1].assert_called_with("cuda:1")
+    assert timer.snapshot().starved_ticks == 1
 
 
-def test_thread_safe_robot_records_when_each_observation_is_read():
-    from lerobot.rollout.robot_wrapper import ThreadSafeRobot
-    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
-
-    robot = MockRobot(MockRobotConfig(n_motors=3))
-    robot.connect()
-    wrapper = ThreadSafeRobot(robot)
-    for _ in range(3):
-        wrapper.get_observation()
-    robot.disconnect()
-
-    times = list(wrapper.observation_times)
-    assert len(times) == 3
-    assert times == sorted(times)
-
-
-def test_status_line_redraws_in_place_and_steps_aside_for_log_records():
-    from lerobot.rollout.status_line import StatusLine
-
-    robot = SimpleNamespace(observation_times=deque())
-    engine = SimpleNamespace(
-        inference_times=deque([(time.perf_counter(), 0.020), (time.perf_counter(), 0.030)])
-    )
-    terminal = _FakeTerminal()
-    handler = logging.StreamHandler(terminal)
-    root = logging.getLogger()
-    root.addHandler(handler)
-    try:
-        with (
-            patch("lerobot.rollout.status_line.REFRESH_S", 0.01),
-            StatusLine(robot, engine, 30, stream=terminal),
-        ):
-            for _ in range(3):
-                robot.observation_times.append(time.perf_counter())
-                time.sleep(0.02)
-            logging.getLogger("test").warning("a log record")
-            time.sleep(0.05)
-        assert handler.stream is terminal
-    finally:
-        root.removeHandler(handler)
-
-    output = terminal.getvalue()
-    assert "\r\033[2Kloop " in output
-    assert "infer  25.0 ms (worst  30.0)" in output
-    assert "\r\033[2Ka log record\n" in output
-    assert output.endswith("\n")
+@pytest.mark.parametrize("interactive, interval", [(False, 0), (True, 5)])
+def test_disabled_and_interactive_skip_measurements(probes, clock, caplog, interactive, interval):
+    engine = _FakeEngine()
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy.setup(_loop_ctx(engine, interactive=interactive, status_interval_s=interval))
+    timer = CycleTimer(1)
+    with caplog.at_level(logging.INFO):
+        strategy._tick(timer)
+        timer.wait()
+        clock.advance(20)
+        strategy._tick(timer)
+    probes[0].assert_not_called()
+    probes[1].assert_not_called()
+    assert engine.latency.interval_s == 0
+    assert not any(r.message.startswith("Rollout:") for r in caplog.records)
 
 
-def test_status_line_fits_the_terminal_width():
-    """A wrapped line would leave a row behind on every redraw, since clearing only reaches the last row."""
-    from lerobot.rollout.status_line import StatusLine
+def test_sync_latency_excludes_precomputed_actions(monkeypatch, clock):
+    monkeypatch.setattr(sync, "time", SimpleNamespace(monotonic=clock.perf_counter))
+    policy = Mock()
+    policy.count_queued_actions.return_value = 0
 
-    terminal = _FakeTerminal()
-    engine = SimpleNamespace(inference_times=deque([(time.perf_counter(), 0.020)]))
-    with (
-        patch("lerobot.rollout.status_line.REFRESH_S", 0.01),
-        patch(
-            "lerobot.rollout.status_line.shutil.get_terminal_size", return_value=os.terminal_size((20, 24))
-        ),
-        StatusLine(SimpleNamespace(observation_times=deque()), engine, 30, stream=terminal),
-    ):
-        time.sleep(0.05)
-    lines = [line for line in terminal.getvalue().split("\r\033[2K") if line.strip()]
-    assert lines
-    assert all(len(line.rstrip("\n")) <= 19 for line in lines)
+    def select(_obs):
+        clock.advance(0.02)
+        return torch.zeros(1, 2)
 
-
-def test_status_line_hides_inference_times_that_are_too_old():
-    """A policy that stopped running must not keep showing its last healthy time."""
-    from lerobot.rollout.status_line import INFERENCE_WINDOW_S, StatusLine
-
-    now = time.perf_counter()
-    engine = SimpleNamespace(inference_times=deque([(now - INFERENCE_WINDOW_S - 1, 0.5), (now, 0.02)]))
-    line = StatusLine(SimpleNamespace(observation_times=deque()), engine, 30, stream=io.StringIO())
-    assert "infer  20.0 ms (worst  20.0)" in line._format()
-
-    engine.inference_times.popleft()
-    engine.inference_times[0] = (now - INFERENCE_WINDOW_S - 1, 0.02)
-    assert "infer" not in line._format()
-
-
-def test_status_line_measures_the_stream_it_draws_on():
-    """With stdout redirected, the width must still come from the terminal the line is drawn on."""
-    import fcntl
-    import pty
-    import struct
-    import termios
-
-    from lerobot.rollout.status_line import StatusLine
-
-    leader, follower = pty.openpty()
-    fcntl.ioctl(follower, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 30, 0, 0))
-    with (
-        os.fdopen(follower, "w", closefd=True) as terminal,
-        patch("lerobot.rollout.status_line.REFRESH_S", 0.01),
-        patch(
-            "lerobot.rollout.status_line.shutil.get_terminal_size", return_value=os.terminal_size((200, 24))
-        ),
-        StatusLine(
-            SimpleNamespace(observation_times=deque()),
-            SimpleNamespace(inference_times=deque([(time.perf_counter(), 0.02)])),
-            30,
-            stream=terminal,
-        ),
-    ):
-        time.sleep(0.05)
-        # Read before the terminal closes: on macOS, closing it drops what was not read yet.
-        os.set_blocking(leader, False)
-        output = os.read(leader, 65536).decode()
-    os.close(leader)
-    lines = [line for line in output.split("\r\033[2K") if line.strip()]
-    assert lines
-    assert all(len(line.rstrip("\r\n")) <= 29 for line in lines)
-
-
-def test_status_line_stays_silent_off_a_terminal():
-    from lerobot.rollout.status_line import StatusLine
-
-    stream = io.StringIO()
-    robot = SimpleNamespace(observation_times=deque([0.0, 1.0]))
-    with (
-        patch("lerobot.rollout.status_line.REFRESH_S", 0.01),
-        StatusLine(
-            robot, SimpleNamespace(inference_times=deque([(time.perf_counter(), 0.1)])), 30, stream=stream
-        ),
-    ):
-        time.sleep(0.05)
-    assert stream.getvalue() == ""
-
-
-def _log_while_a_signal_arrives() -> None:
-    """In a child process: a signal whose handler logs, as Ctrl-C's does, lands inside a status-line write."""
-    import signal
-
-    from lerobot.rollout.status_line import StatusLine
-
-    class SlowTerminal(_FakeTerminal):
-        def write(self, text):
-            time.sleep(0.2)
-            return super().write(text)
-
-    terminal = SlowTerminal()
-    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(terminal)], force=True)
-    signal.signal(signal.SIGALRM, lambda *_: logging.info("Shutdown signal received"))
-    with StatusLine(
-        SimpleNamespace(observation_times=deque()),
-        SimpleNamespace(inference_times=deque()),
-        30,
-        stream=terminal,
-    ):
-        signal.setitimer(signal.ITIMER_REAL, 0.1)
-        logging.info("a log record")
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="SIGALRM is POSIX only")
-def test_status_line_survives_a_signal_that_logs_during_a_write():
-    import multiprocessing
-
-    child = multiprocessing.get_context("fork").Process(target=_log_while_a_signal_arrives)
-    child.start()
-    child.join(10)
-    hung = child.is_alive()
-    if hung:
-        child.kill()
-        child.join()
-    assert not hung, "a signal handler that logs deadlocked the status line"
-    assert child.exitcode == 0
-
-
-def test_status_line_rate_counts_only_the_last_second():
-    """A loop that stopped reading the robot shows 0 Hz, not the rate it last had."""
-    from lerobot.rollout.status_line import StatusLine
-
-    now = time.perf_counter()
-    running = SimpleNamespace(observation_times=deque(now - i / 30 for i in range(60)))
-    stalled = SimpleNamespace(observation_times=deque(now - 5 - i / 30 for i in range(60)))
-    engine = SimpleNamespace(inference_times=deque())
-
-    assert StatusLine(running, engine, 30, stream=io.StringIO())._format().startswith("loop  30/30 Hz")
-    assert StatusLine(stalled, engine, 30, stream=io.StringIO())._format().startswith("loop   0/30 Hz")
+    policy.select_action.side_effect = select
+    engine = SyncInferenceEngine(policy, lambda x: x, lambda x: x, {}, [], "test", "cpu", "mock")
+    engine.latency.configure(1)
+    engine.get_action({})
+    policy.count_queued_actions.return_value = 3
+    engine.get_action({})
+    assert engine.latency.recent(clock.now) == pytest.approx([0.02])

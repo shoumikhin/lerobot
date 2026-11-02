@@ -21,18 +21,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
+from .executorch import EXECUTORCH, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
 
 if TYPE_CHECKING:
-    from ..recipe import Part
+    from torch.export import ExportedProgram
+
+
+def tensorrt_takes_the_plugin_setting() -> bool:
+    """Whether the installed Torch-TensorRT has `fallback_pytorch_plugin_ops` (pytorch/TensorRT#4953)."""
+    import inspect
+
+    import torch_tensorrt
+
+    return "fallback_pytorch_plugin_ops" in inspect.signature(torch_tensorrt.dynamo.compile).parameters
 
 
 @ExportBackendConfig.register_subclass("executorch_tensorrt")
 @dataclass
-class ExecuTorchTensorRTConfig(ExportBackendConfig):
+class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     """ExecuTorch programs whose work runs on the GPU through TensorRT, NVIDIA's compiler.
 
-    A TensorRT engine runs only on the GPU model that built it, so export on the kind of board that will run
-    the policy. Needs `pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"`.
+    An operator TensorRT does not take runs on the GPU too, compiled by ExecuTorch's CUDA backend, which needs
+    the CUDA compiler (`nvcc`) at export. A TensorRT engine runs only on the GPU model that built it, so export
+    on the kind of board that will run the policy.
 
     Args:
         workspace_size (`int`, *optional*):
@@ -40,43 +51,52 @@ class ExecuTorchTensorRTConfig(ExportBackendConfig):
             example to fit a build into a small board. `None` lets TensorRT decide.
     """
 
-    runtime = "executorch"
-    file_suffix = ".pte"
     device = "cuda"
     # Registers the TensorRT backend with the ExecuTorch runtime.
     runtime_imports = ("torch_tensorrt_executorch_runtime",)
+    # A bundle runs its TensorRT engines one after another, so they can share one scratch buffer for
+    # activations instead of holding one each.
+    runtime_options = {"TensorRTBackend": {"use_shared_activation_scratch": True}}
+    runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
+    packages = (EXECUTORCH, "torch-tensorrt[executorch]>=2.15,<2.16")
 
     workspace_size: int | None = None
 
-    def compile(self, part: Part, path: Path) -> None:
-        """Compile `part` with Torch-TensorRT and save it as an ExecuTorch program."""
-        import torch
+    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
+        """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
 
-        try:
-            import torch_tensorrt
-            from executorch.exir import ExecutorchBackendConfig
-            from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
-            from executorch.exir.passes.propagate_device_pass import PropagateDeviceConfig
-        except ImportError as error:
+        Returns the weights file of the CUDA backend's part, if it has one.
+        """
+        import inspect
+
+        import torch_tensorrt
+
+        if not tensorrt_takes_the_plugin_setting():
             raise ImportError(
-                "The executorch_tensorrt backend needs ExecuTorch and Torch-TensorRT: "
-                'pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16"'
-            ) from error
-
-        with torch.no_grad():
-            program = torch.export.export(part.module, part.example_inputs)
+                f"Torch-TensorRT {torch_tensorrt.__version__} lacks fallback_pytorch_plugin_ops, a "
+                "compile setting that ExecuTorch programs need (pytorch/TensorRT#4953)."
+            )
         options = {
             "min_block_size": 1,
+            # ExecuTorch programs run without libtorch, so a TensorRT plugin that needs it could never run.
+            "fallback_pytorch_plugin_ops": True,
             # Flow-matching time embeddings are computed in float64, which TensorRT does not support.
             "truncate_double": True,
-            # On a Jetson the CPU and GPU share memory, and CPU memory can swap during the build while GPU
-            # memory cannot.
+            # The part's PyTorch weights wait in host memory while TensorRT builds; on an 8 GB Jetson this
+            # leaves about 600 MiB more free at the peak of the largest build.
             "offload_module_to_cpu": True,
+            # Float32 math stays float32, as in PyTorch. TensorRT's default TF32 moved ACT's actions by up to
+            # 5e-3 of their spread, a thousand times the float32 rounding.
+            "disable_tf32": True,
         }
+        # One host copy of each weight, and of its transpose, instead of one per layer that reads it
+        # (pytorch/TensorRT#4965). An older Torch-TensorRT would ignore the setting without a word.
+        if "deduplicate_weights" in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+            options["deduplicate_weights"] = True
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
-        engine = torch_tensorrt.dynamo.compile(program, arg_inputs=part.example_inputs, **options)
-        del program
+        args, _ = program.example_inputs
+        engine = torch_tensorrt.dynamo.compile(program, arg_inputs=args, **options)
         torch_tensorrt.save(
             engine,
             str(path),
@@ -84,12 +104,9 @@ class ExecuTorchTensorRTConfig(ExportBackendConfig):
             # Tracing the compiled module again would drop the engines it holds.
             retrace=False,
             use_cuda_graphs=True,
-            backend_config=ExecutorchBackendConfig(
-                # Inputs and outputs stay in GPU memory, so a program reads an earlier one's outputs in place.
-                propagate_device_config=PropagateDeviceConfig(
-                    skip_h2d_for_method_inputs=True, skip_d2h_for_method_outputs=True
-                ),
-                enable_non_cpu_memory_planning=True,
-                memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False, alloc_graph_output=False),
-            ),
+            # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
+            partitioners=[cuda_partitioner(path.stem)],
+            backend_config=gpu_memory_config(),
         )
+        data = path.with_suffix(".ptd")
+        return data if data.exists() else None
