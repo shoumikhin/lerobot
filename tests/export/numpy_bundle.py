@@ -20,10 +20,11 @@ runtime. A bundle names this module in its `runtime_imports`, which registers th
 
 import json
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
+from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.manifest import (
     DECODED_ACTIONS,
@@ -42,7 +43,7 @@ from lerobot.bundle.manifest import (
 )
 from lerobot.bundle.runtime import Runtime, register_runtime
 from lerobot.robots import RobotConfig
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
 
 RUNTIME = "numpy"
@@ -154,6 +155,8 @@ class RecordingRobotConfig(MockRobotConfig):
     # A JSON-lines file of what happens to the robot: connect, each action sent, disconnect.
     log: str = ""
     random_values: bool = False
+    # A bundle's test case: the robot has a camera for each of its images, which shows its last frame.
+    frames: str = ""
 
 
 class RecordingRobot(MockRobot):
@@ -161,6 +164,26 @@ class RecordingRobot(MockRobot):
 
     config_class = RecordingRobotConfig
     name = "recording_robot"
+
+    @cached_property
+    def _images(self) -> dict[str, np.ndarray]:
+        if not self.config.frames:
+            return {}
+        prefix = f"{OBS_IMAGES}."
+        images = {
+            k.removeprefix(prefix): v
+            for k, v in load_file(self.config.frames).items()
+            if k.startswith(prefix)
+        }
+        # A test case of several control ticks holds an image per tick (see `BundleManifest.test_case`).
+        return {name: image if image.ndim == 3 else image[-1] for name, image in images.items()}
+
+    @property
+    def _cameras_ft(self) -> dict[str, tuple]:
+        return {name: image.shape for name, image in self._images.items()}
+
+    def get_observation(self):
+        return {**super().get_observation(), **self._images}
 
     def _log(self, event: str, value: object = None) -> None:
         with open(self.config.log, "a") as log:
