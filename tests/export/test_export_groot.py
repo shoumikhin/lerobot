@@ -132,7 +132,7 @@ def write_backbone(path):
     ).save_pretrained(path)
 
 
-def save_checkpoint(path, mode: str):
+def save_checkpoint(path, mode: str, **overrides):
     """A fine-tuned GR00T: 7 Qwen3 layers (two language parts), 9 diffusion blocks (two step parts)."""
     geometry, cameras = MODES[mode]
     backbone = path / "backbone"
@@ -178,6 +178,7 @@ def save_checkpoint(path, mode: str):
         max_state_dim=8,
         max_action_dim=6,
         use_bf16=False,
+        **overrides,
     )
     torch.manual_seed(0)
     policy = GrootPolicy(config)
@@ -285,7 +286,8 @@ def test_export_takes_the_state_under_the_name_the_saved_preprocessor_renames(tm
     from lerobot.processor import RenameObservationsProcessorStep
 
     joints = "observation.joints"
-    checkpoint = save_checkpoint(tmp_path, "torchvision")
+    # With relative actions, the actions part reads the state too.
+    checkpoint = save_checkpoint(tmp_path, "torchvision", use_relative_actions=True)
     config = GrootConfig.from_pretrained(checkpoint)
     preprocessor, _ = make_pre_post_processors(config, checkpoint)
     preprocessor.steps.insert(0, RenameObservationsProcessorStep(rename_map={joints: OBS_STATE}))
@@ -314,8 +316,9 @@ def test_export_takes_the_state_under_the_name_the_saved_preprocessor_renames(tm
             "--tolerance=1e-4",
         ]
     )
-    vision = Bundle.read(bundle).manifest.runs[0]
-    assert joints in vision.inputs and OBS_STATE not in vision.inputs
+    runs = Bundle.read(bundle).manifest.runs
+    assert [run.name for run in runs if joints in run.inputs] == ["vision", "actions"]
+    assert not any(OBS_STATE in run.inputs for run in runs)
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
