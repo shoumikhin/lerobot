@@ -32,7 +32,6 @@ and held as constants, as are the timestep tables of the denoising steps.
 
 from __future__ import annotations
 
-import dataclasses
 import gc
 import logging
 import os
@@ -65,12 +64,13 @@ from lerobot.export.recipe import (
     measure_action_scale,
     preprocessor_renames,
     random_frame,
+    refuse_peft_adapter,
+    split_absolute_step,
     to_policy_input,
     whole_policy_fits,
 )
 from lerobot.policies import prepare_observation_for_inference
 from lerobot.processor import (
-    AbsoluteActionsProcessorStep,
     DeviceProcessorStep,
     PolicyProcessorPipeline,
     policy_output_to_transition,
@@ -117,6 +117,9 @@ EDGE_CASE_TASKS = ("", "!!!", "Pick UP the Red cube, then STOP.", "put_the  bowl
 # pixel by up to one level, and torchvision's 8-bit CPU kernel, which also rounds between its two passes, by up
 # to two on noise; its GPU path converts to float32 and rounds once, as the program does.
 PIXEL_TOLERANCE = 2.0
+# The most pixels of line images handed to the processor's transform at once. All the lines of a 1080x1920
+# camera at once would take 23 GiB.
+LINE_BATCH_PIXELS = 2**24
 
 
 class GrootExportRecipe(ExportRecipe):
@@ -140,6 +143,7 @@ class GrootExportRecipe(ExportRecipe):
     def __init__(self, cfg: ExportConfig) -> None:  # noqa: D107
         self.cfg = cfg
         config = cast(GrootConfig, copy(cfg.policy))
+        refuse_peft_adapter(config, "GR00T")
         config.device = cfg.backend.device
         self._policy_config = config
         self._device = torch.device(cfg.backend.device)
@@ -209,7 +213,7 @@ class GrootExportRecipe(ExportRecipe):
         _free_memory()
 
         table = self._embedding_table()
-        head_embeds = table[self._prompt["head_ids"]].float().to(device)[None]
+        head_embeds = table[self._prompt["head_ids"]].to(device, self._policy_config.dtype)[None]
         task_embeddings, task_length = self._task_rows(table, self._task)
         del table
         depth, hidden_name = self._model_config.select_layer, "image_embeds"
@@ -286,6 +290,7 @@ class GrootExportRecipe(ExportRecipe):
                     stop,
                     use_bf16,
                     1.0 / len(self._timesteps),
+                    self._policy_config.dtype,
                 ).eval()
                 if first == 0 and not self._step_tables:
                     self._step_tables = module.time_tables(self._timesteps, use_bf16)
@@ -333,8 +338,8 @@ class GrootExportRecipe(ExportRecipe):
 
         module = self._chunk_actions
         inputs, names = (
-            (actions, torch.from_numpy(self._frame[OBS_STATE]).to(device)),
-            [x_names[-1], OBS_STATE],
+            (actions, torch.from_numpy(self._frame[self._images.state_name]).to(device)),
+            [x_names[-1], self._images.state_name],
         )
         if not module.reads_state:
             # A program takes only the inputs it reads.
@@ -548,14 +553,21 @@ class GrootExportRecipe(ExportRecipe):
         return [] if self._metadata is None else [str(task) for task in self._metadata.tasks.index]
 
     def _action_scale(self) -> np.ndarray:
-        """Robot units per normalized unit for each action, measured on the actions part."""
+        """Robot units per normalized unit for each action, measured on the actions part.
+
+        The actions of a relative end-effector rotation are components of unit vectors, so their scale is 1: the
+        constant actions that measure the others are not a rotation.
+        """
         width = self._model_config.max_action_dim
-        state = torch.from_numpy(self._frame[OBS_STATE]).to(self._device)
-        return measure_action_scale(
+        state = torch.from_numpy(self._frame[self._images.state_name]).to(self._device)
+        scale = measure_action_scale(
             lambda value: self._chunk_actions(
                 torch.full((self._steps, width), value, device=self._device), state
             )[0]
         )
+        if isinstance(self._chunk_actions, _N17ChunkActions):
+            scale[[i for i in self._chunk_actions.decode.rotations if i < len(scale)]] = 1
+        return scale
 
     def _check_n17_decode(self, actions: Tensor) -> None:
         """`N17ActionDecode` must decode the test chunk as `GrootN17ActionDecodeStep` does."""
@@ -573,7 +585,7 @@ class GrootExportRecipe(ExportRecipe):
 
     def _check_against_policy(self, case: TestCase) -> None:
         """Compare the chained parts with the policy's own `predict_action_chunk`, when the policy fits."""
-        if not whole_policy_fits(self._model_file(), self._device, self.cfg.skip_policy_check):
+        if not whole_policy_fits(self._model_file(), self._device, "GR00T"):
             return
         policy, preprocessor, postprocessor = load_policy(self.cfg)
         policy.to(self._device)
@@ -642,7 +654,8 @@ class _ImagesAndState(nn.Module):
             raise ValueError("The frame has no camera the policy reads.")
         renames = preprocessor_renames(self.preprocessor)
         robot_names = {renames.get(name, name): name for name in frame}
-        self.frame_names = [n for n in frame if renames.get(n, n) in self.cameras or n == OBS_STATE]
+        self.state_name = robot_names[OBS_STATE]
+        self.frame_names = [n for n in frame if renames.get(n, n) in self.cameras or n == self.state_name]
         grids = batch["image_grid_thw"].tolist()
         if len(grids) != len(self.cameras) or any(g != grids[0] for g in grids) or grids[0][0] != 1:
             raise ValueError("GR00T export needs one image grid, the same for every camera.")
@@ -673,7 +686,7 @@ class _ImagesAndState(nn.Module):
         scale = 1 / ip.rescale_factor if self.rescale else 1
         self.register_buffer("image_mean", (torch.tensor(ip.image_mean) * scale)[None, :, None, None])
         self.register_buffer("image_std", (torch.tensor(ip.image_std) * scale)[None, :, None, None])
-        dim = frame[OBS_STATE].size
+        dim = frame[self.state_name].size
         if dim > pack.max_state_dim:
             raise ValueError("The frame's state exceeds the checkpoint's state width.")
         self.max_state_dim = pack.max_state_dim
@@ -805,12 +818,21 @@ def _separable_map(transform, shape: tuple[int, int]) -> tuple[Tensor, Tensor]:
     height, width = shape
     ones = transform(np.ones((1, height, width), np.float32))[0].astype(np.float64)
     i0, j0 = np.unravel_index(np.argmax(np.abs(ones)), ones.shape)
-    row_lines: np.ndarray = np.zeros((height, height, width), np.float32)
-    row_lines[np.arange(height), np.arange(height), :] = 1
-    column_lines: np.ndarray = np.zeros((width, height, width), np.float32)
-    column_lines[np.arange(width), :, np.arange(width)] = 1
-    rows = transform(row_lines)[:, :, j0].astype(np.float64).T
-    columns = transform(column_lines)[:, i0, :].astype(np.float64).T / ones[i0, j0]
+    batch = max(1, LINE_BATCH_PIXELS // (height * width))
+    row_responses: list[np.ndarray] = []
+    column_responses: list[np.ndarray] = []
+    for first in range(0, height, batch):
+        index = np.arange(first, min(first + batch, height))
+        lines: np.ndarray = np.zeros((len(index), height, width), np.float32)
+        lines[np.arange(len(index)), index, :] = 1
+        row_responses.append(transform(lines)[:, :, j0])
+    for first in range(0, width, batch):
+        index = np.arange(first, min(first + batch, width))
+        lines = np.zeros((len(index), height, width), np.float32)
+        lines[np.arange(len(index)), :, index] = 1
+        column_responses.append(transform(lines)[:, i0, :])
+    rows = np.concatenate(row_responses).astype(np.float64).T
+    columns = np.concatenate(column_responses).astype(np.float64).T / ones[i0, j0]
     return torch.from_numpy(rows).float(), torch.from_numpy(columns).float()
 
 
@@ -967,13 +989,15 @@ class GrootLanguageModel(nn.Module):
             if self.start == 0:
                 task_embeddings, *rest = inputs
                 inputs = tuple(rest)
-                text = torch.cat((self.head_embeds, task_embeddings[None]), dim=1)
+                # The prompt's rows in the dtype of the policy's token embeddings, as its own lookup gives them.
+                text = torch.cat((self.head_embeds, task_embeddings[None].to(self.head_embeds.dtype)), dim=1)
                 hidden = _place_image_features(text, hidden.to(text.dtype), self.image_mask, self.image_rows)
             mask = self.causal_mask.to(hidden.dtype)
+            rotary = (self.rotary_cos.to(hidden.dtype), self.rotary_sin.to(hidden.dtype))
             for index, layer in enumerate(self.layers, self.start):
                 hidden = layer(
                     hidden,
-                    position_embeddings=(self.rotary_cos, self.rotary_sin),
+                    position_embeddings=rotary,
                     attention_mask=mask,
                     past_key_values=None,
                 )
@@ -1098,7 +1122,14 @@ class GrootStep(nn.Module):
     """
 
     def __init__(
-        self, action_head: nn.Module, prompt: dict[str, Any], start: int, stop: int, use_bf16: bool, dt: float
+        self,
+        action_head: nn.Module,
+        prompt: dict[str, Any],
+        start: int,
+        stop: int,
+        use_bf16: bool,
+        dt: float,
+        dtype: torch.dtype,
     ):
         super().__init__()
         model = action_head.model
@@ -1117,6 +1148,7 @@ class GrootStep(nn.Module):
             # GrootKeysValues holds these projections; the step only reads what they compute.
             del attn.to_k, attn.to_v
         self.use_bf16 = use_bf16
+        self.dtype = dtype
         self.horizon = action_head.action_horizon
         self.head = prompt["head"]
         device = prompt["embodiment_id"].device
@@ -1157,7 +1189,9 @@ class GrootStep(nn.Module):
         with torch.autocast(task_length.device.type, torch.bfloat16, enabled=self.use_bf16):
             if self.start == 0:
                 state_features, x_t, time_encoding, temb = rest
-                hidden = self.action_encoder.encode(x_t[None], time_encoding, self.embodiment_id)
+                hidden = self.action_encoder.encode(
+                    x_t[None].to(self.dtype), time_encoding, self.embodiment_id
+                )
                 if self.position_embedding is not None:
                     positions = torch.arange(hidden.shape[1], device=hidden.device)
                     hidden = hidden + self.position_embedding(positions)[None]
@@ -1166,7 +1200,7 @@ class GrootStep(nn.Module):
                 hidden, temb, x_t = rest
             else:
                 hidden, temb = rest
-            hidden = hidden.contiguous()
+            hidden, temb = hidden.contiguous(), temb.to(self.dtype)
             for index in range(self.start, self.stop):
                 mask = self.model.block_encoder_mask(index, self.image_mask, prompt)
                 hidden = self.model.run_block(index, hidden, given.get(index), temb, mask)
@@ -1212,6 +1246,8 @@ class N17ActionDecode(nn.Module):
         self.env_action_dim = decode.env_action_dim
         self.groups: list[tuple[str, int, int]] = []
         self.relative: list[tuple[str, str, str]] = []
+        # The decoded actions that are the rotation of a relative end-effector pose.
+        self.rotations: list[int] = []
         start = 0
         for index, key in enumerate(keys):
             entry = raw_stats.get("action", {}).get(key) if isinstance(key, str) else None
@@ -1238,6 +1274,9 @@ class N17ActionDecode(nn.Module):
                 if kind[0] != "non_eef" and kind != ("eef", "xyz+rot6d"):
                     raise ValueError(f"Unsupported relative N1.7 action config for {key!r}: {config}")
                 self.relative.append((key, config.get("state_key") or key, kind[0]))
+                if kind[0] == "eef":
+                    # The group's actions end at `start`, and its rotation follows its xyz.
+                    self.rotations += range(start - dim + 3, start)
         self.state_groups: dict[str, tuple[int, int]] = {}
         state_start = 0
         for key in (pack.modality_config or {}).get("state", {}).get("modality_keys", []):
@@ -1296,34 +1335,16 @@ class _ChunkActions(nn.Module):
     def __init__(self, execution_steps: int, action_dim: int, postprocessor: PolicyProcessorPipeline):
         super().__init__()
         self.execution_steps, self.action_dim = execution_steps, action_dim
-        postprocessor_steps = list(postprocessor.steps)
-        index = next(
-            (
-                i
-                for i, s in enumerate(postprocessor_steps)
-                if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled
-            ),
-            None,
-        )
-        self.absolute_step: Any = None if index is None else postprocessor_steps[index]
-        if index is not None:
-            if not all(isinstance(s, DeviceProcessorStep) for s in postprocessor_steps[index + 1 :]):
-                raise ValueError(
-                    "The relative-to-absolute action step must be the postprocessor's last step."
-                )
-            postprocessor = dataclasses.replace(postprocessor, steps=postprocessor_steps[:index])
-        self.postprocessor = postprocessor
+        self.postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
 
     @property
     def reads_state(self) -> bool:
-        return self.absolute_step is not None
+        return self.mask is not None
 
     def forward(self, actions: Tensor, state: Tensor | None = None) -> Tensor:
         actions = self.postprocessor(actions[None, : self.execution_steps, : self.action_dim])
-        if self.absolute_step is not None:
-            # The relative step has no public mask accessor; LeRobot's own RTC and stats code call this one too.
-            mask = self.absolute_step.relative_step._build_mask(actions.shape[-1])
-            actions = to_absolute_actions(actions, cast(Tensor, state)[None], mask)
+        if self.mask is not None:
+            actions = to_absolute_actions(actions, cast(Tensor, state)[None], self.mask)
         return actions[0]
 
 
@@ -1334,7 +1355,7 @@ class _N17ChunkActions(_ChunkActions):
         nn.Module.__init__(self)
         self.execution_steps, self.action_dim = execution_steps, action_dim
         self.decode = decode
-        self.absolute_step = None
+        self.mask = None
 
     @property
     def reads_state(self) -> bool:

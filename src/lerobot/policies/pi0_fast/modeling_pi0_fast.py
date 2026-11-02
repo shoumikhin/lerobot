@@ -614,11 +614,8 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         """
         Optimized autoregressive decoding for FAST tokens using KV Caching.
 
-        Greedy decoding stops once every sequence emits the end-of-action marker. Under
-        non-strict torch.export (the default) it runs to ``max_decoding_steps``, because an
-        exported program cannot branch on a tensor value; ``detokenize_actions`` ignores the
-        extra tokens.
-        The returned tensor keeps its fixed shape, with positions not generated after the
+        Greedy decoding stops once every sequence emits the end-of-action marker. The
+        returned tensor keeps its fixed shape, with positions not generated after the
         batch-wide stop left zero-filled. Stochastic decoding always runs to
         ``max_decoding_steps`` so early stopping does not change the RNG state used by
         subsequent calls.
@@ -628,20 +625,64 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = tokens.shape[0]
         device = tokens.device
-        lm_head = self.paligemma_with_expert.paligemma.lm_head
         tokenizer = self._require_paligemma_tokenizer()
 
         # detokenize_actions() cuts at the first "|", so greedy decoding can stop once
         # every sequence has emitted it. Keep stochastic decoding unchanged because
         # skipping multinomial calls would shift the RNG state for subsequent calls.
         end_of_action_token_id = tokenizer.convert_tokens_to_ids("|")
-        # torch.compile also reports is_exporting() on PyTorch 2.11, not 2.15; non-strict export skips Dynamo.
-        exporting = torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
-        early_stop = temperature == 0 and not exporting
-        finished = torch.zeros(bsize, dtype=torch.bool, device=device) if early_stop else None
+        finished = torch.zeros(bsize, dtype=torch.bool, device=device) if temperature == 0 else None
 
         # --- 1. PREFILL PHASE ---
         # Process Images + Text Prompt + BOS token once to populate the KV cache.
+        next_token, past_key_values, current_pad_mask = self.prefill_fast(
+            images, img_masks, tokens, masks, temperature
+        )
+
+        # Initialize storage for generated tokens
+        generated_action_tokens = torch.zeros((bsize, max_decoding_steps), dtype=torch.long, device=device)
+        generated_action_tokens[:, 0] = next_token.squeeze(-1)
+        if finished is not None:
+            finished |= next_token.squeeze(-1) == end_of_action_token_id
+            if bool(finished.all()):
+                return generated_action_tokens
+
+        # --- 2. DECODING PHASE ---
+        # Generate remaining tokens one by one using the cache.
+
+        for t in range(1, max_decoding_steps):
+            # Update Pad Mask: append 1s for the new valid token
+            new_column = torch.ones((bsize, 1), dtype=torch.bool, device=device)
+            current_pad_mask = torch.cat([current_pad_mask, new_column], dim=1)
+
+            next_token, past_key_values = self.decode_step_fast(
+                next_token, past_key_values, current_pad_mask, temperature
+            )
+
+            generated_action_tokens[:, t] = next_token.squeeze(-1)
+
+            if finished is not None:
+                finished |= next_token.squeeze(-1) == end_of_action_token_id
+                if bool(finished.all()):
+                    break
+
+        return generated_action_tokens
+
+    def prefill_fast(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        tokens: torch.Tensor,
+        masks: torch.Tensor,
+        temperature: float = 0.0,
+    ) -> tuple[torch.Tensor, Any, torch.Tensor]:
+        """Run the prefix once: the images, the prompt and the BOS token.
+
+        Returns the first action token `[B, 1]`, the prefix's KV cache and its padding mask `[B, prefix]`.
+        """
+        bsize = tokens.shape[0]
+        device = tokens.device
+        tokenizer = self._require_paligemma_tokenizer()
 
         # Add BOS token to the prompt
         bos_token = torch.full((bsize, 1), tokenizer.bos_token_id, dtype=torch.long, device=device)
@@ -650,7 +691,7 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Embed prefix [Images, Language, BOS]
         # fast_action_tokens=None means we are just embedding the condition (images+text)
-        prefix_embs, prefix_pad_masks, prefix_att_masks, total_t_images, _ = self.embed_prefix_fast(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _, _ = self.embed_prefix_fast(
             images, img_masks, tokens_in, masks_in, fast_action_tokens=None, fast_action_masks=None
         )
 
@@ -679,76 +720,55 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         # Sample the first action token from the last logit of the prefix
-        last_logits = lm_head(prefix_out[:, -1:, :])  # (B, 1, V)
+        return self._next_fast_token(prefix_out, temperature), past_key_values, prefix_pad_masks
+
+    def decode_step_fast(
+        self,
+        token: torch.Tensor,
+        past_key_values: Any,
+        pad_mask: torch.Tensor,
+        temperature: float = 0.0,
+    ) -> tuple[torch.Tensor, Any]:
+        """One decoding step with the KV cache: the last token `[B, 1]` in, the next token and the cache out.
+
+        `pad_mask` marks what the token attends to: the positions of the cache, then the token itself. Its sum
+        places the token one position after the last valid one.
+        """
+        # Embed the single previous token
+        # We use embed_language_tokens directly to avoid overhead of full prefix embedding
+        token_emb = self.paligemma_with_expert.embed_language_tokens(token)
+        if (
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            token_emb = token_emb.to(dtype=torch.bfloat16)
+
+        # Update Position IDs for the single new token
+        position_ids = (torch.sum(pad_mask, dim=1, keepdim=True) - 1).long()
+
+        # Create Attention Mask for the single new step
+        # Shape becomes (B, 1, 1, Total_Len) which works with HF's cache logic.
+        att_mask = prepare_attention_masks_4d(pad_mask.unsqueeze(1), dtype=token_emb.dtype)
+
+        # Forward pass (Decoding step)
+        # input_embeds is just the new token (B, 1, D)
+        (step_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=att_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[token_emb, None],
+            use_cache=True,
+            adarms_cond=[None, None],
+        )
+        return self._next_fast_token(step_out, temperature), past_key_values
+
+    def _next_fast_token(self, hidden_states: torch.Tensor, temperature: float) -> torch.Tensor:
+        """The token after the last position of `hidden_states`, `[B, 1]`: sampled, or the likeliest at 0."""
+        last_logits = self.paligemma_with_expert.paligemma.lm_head(hidden_states[:, -1:, :])
         if temperature > 0:
             probs = torch.softmax(last_logits[:, -1] / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-        else:
-            next_token = torch.argmax(last_logits[:, -1], dim=-1, keepdim=True)
-
-        # Initialize storage for generated tokens
-        generated_action_tokens = torch.zeros((bsize, max_decoding_steps), dtype=torch.long, device=device)
-        generated_action_tokens[:, 0] = next_token.squeeze(-1)
-        if finished is not None:
-            finished |= next_token.squeeze(-1) == end_of_action_token_id
-            if bool(finished.all()):
-                return generated_action_tokens
-
-        # Track valid tokens mask (0 for pad, 1 for valid)
-        # We need this to tell the new token what it can attend to (images + text + past actions)
-        current_pad_mask = prefix_pad_masks
-
-        # --- 2. DECODING PHASE ---
-        # Generate remaining tokens one by one using the cache.
-
-        for t in range(1, max_decoding_steps):
-            # Embed the single previous token
-            # We use embed_language_tokens directly to avoid overhead of full prefix embedding
-            next_token_emb = self.paligemma_with_expert.embed_language_tokens(next_token)
-            if prefix_embs.dtype == torch.bfloat16:
-                next_token_emb = next_token_emb.to(dtype=torch.bfloat16)
-
-            # Update Pad Mask: append 1s for the new valid token
-            new_column = torch.ones((bsize, 1), dtype=torch.bool, device=device)
-            current_pad_mask = torch.cat([current_pad_mask, new_column], dim=1)
-
-            # Update Position IDs for the single new token
-            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
-
-            # Create Attention Mask for the single new step
-            # The new token attends to all valid tokens in history (captured by current_pad_mask).
-            # Shape becomes (B, 1, 1, Total_Len) which works with HF's cache logic.
-            step_att_mask = prepare_attention_masks_4d(
-                current_pad_mask.unsqueeze(1), dtype=next_token_emb.dtype
-            )
-
-            # Forward pass (Decoding step)
-            # input_embeds is just the new token (B, 1, D)
-            (step_out, _), past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=step_att_mask,
-                position_ids=current_position_ids,
-                past_key_values=past_key_values,  # Pass updated cache
-                inputs_embeds=[next_token_emb, None],
-                use_cache=True,
-                adarms_cond=[None, None],
-            )
-
-            # Sample next token
-            last_logits = lm_head(step_out[:, -1:, :])
-            if temperature > 0:
-                probs = torch.softmax(last_logits[:, -1] / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(last_logits[:, -1], dim=-1, keepdim=True)
-
-            generated_action_tokens[:, t] = next_token.squeeze(-1)
-
-            if finished is not None:
-                finished |= next_token.squeeze(-1) == end_of_action_token_id
-                if bool(finished.all()):
-                    break
-
-        return generated_action_tokens
+            return torch.multinomial(probs, num_samples=1)
+        return torch.argmax(last_logits[:, -1], dim=-1, keepdim=True)
 
 
 class PI0FastPolicy(PreTrainedPolicy):
@@ -821,10 +841,14 @@ class PI0FastPolicy(PreTrainedPolicy):
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
         revision: str | None = None,
-        strict: bool = True,
+        strict: bool = False,
         **kwargs,
     ) -> T:
-        """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+        """Override the from_pretrained method to handle key remapping and display important disclaimer.
+
+        With `strict`, a checkpoint that leaves a weight of the policy unfilled raises instead of loading with a
+        warning. Weights the policy does not have are skipped either way.
+        """
         print(
             "The PI0Fast model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
@@ -869,6 +893,8 @@ class PI0FastPolicy(PreTrainedPolicy):
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
+                if strict:
+                    raise
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
@@ -892,7 +918,11 @@ class PI0FastPolicy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            if strict and missing_keys:
+                raise RuntimeError(
+                    f"{resolved_file} does not hold these weights of {cls.__name__}: {missing_keys}"
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -918,6 +948,8 @@ class PI0FastPolicy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
+            if strict:
+                raise
             print(f"Warning: Could not load state dict: {e}")
 
         return model

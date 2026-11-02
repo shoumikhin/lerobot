@@ -15,6 +15,7 @@
 """The checks that a bundle's programs can load here, which run before any program loads."""
 
 import json
+from contextlib import nullcontext
 from dataclasses import asdict
 
 import pytest
@@ -29,33 +30,27 @@ from tests.export.torch_backend import TorchTestBackend
 ORIN = Target("cuda", "Orin", "8.7")
 
 
-def test_a_bundle_for_any_device_needs_no_gpu(monkeypatch):
-    monkeypatch.setattr(target, "cuda_gpus", lambda: [])
-    target.check_target(None)
-
-
-def test_a_gpu_bundle_runs_on_the_kind_of_gpu_that_built_it(monkeypatch):
-    monkeypatch.setattr(target, "cuda_gpus", lambda: [("Orin", "8.7")])
-    target.check_target(ORIN)
-
-
-def test_a_gpu_bundle_refuses_a_machine_without_a_gpu(monkeypatch):
-    monkeypatch.setattr(target, "cuda_gpus", lambda: [])
-    with pytest.raises(RuntimeError, match="sees none.*CUDA_VISIBLE_DEVICES"):
-        target.check_target(ORIN)
-
-
-def test_a_gpu_bundle_refuses_another_kind_of_gpu(monkeypatch):
-    monkeypatch.setattr(target, "cuda_gpus", lambda: [("NVIDIA A100", "8.0")])
-    with pytest.raises(
-        RuntimeError, match=r"built for Orin \(compute capability 8.7\).*A100.*export the policy"
-    ):
-        target.check_target(ORIN)
-
-
-def test_a_device_this_version_cannot_check_is_refused():
-    with pytest.raises(ValueError, match="Upgrade LeRobot"):
-        target.check_target(Target("npu", "Ascend", "1.0"))
+@pytest.mark.parametrize(
+    ("built_for", "gpus", "check"),
+    [
+        # A bundle for any device needs no GPU.
+        (None, [], nullcontext()),
+        (ORIN, [("Orin", "8.7")], nullcontext()),
+        (ORIN, [], pytest.raises(RuntimeError, match="sees none.*CUDA_VISIBLE_DEVICES")),
+        (
+            ORIN,
+            [("NVIDIA A100", "8.0")],
+            pytest.raises(
+                RuntimeError, match=r"built for Orin \(compute capability 8.7\).*A100.*export the policy"
+            ),
+        ),
+        (Target("npu", "Ascend", "1.0"), [], pytest.raises(ValueError, match="Upgrade LeRobot")),
+    ],
+)
+def test_a_bundle_runs_only_on_the_kind_of_device_it_was_built_for(monkeypatch, built_for, gpus, check):
+    monkeypatch.setattr(target, "cuda_gpus", lambda: gpus)
+    with check:
+        target.check_target(built_for)
 
 
 def test_a_missing_runtime_package_is_refused_and_another_version_warned(monkeypatch, caplog):

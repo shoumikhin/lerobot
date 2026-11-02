@@ -47,6 +47,7 @@ from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, Program
 from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
 from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
     FLOAT32_TOLERANCE,
     ExportRecipe,
     Part,
@@ -60,7 +61,9 @@ from lerobot.export.recipe import (
     measure_action_scale,
     preprocessor_renames,
     random_frame,
+    refuse_peft_adapter,
     robot_features,
+    split_absolute_step,
     to_policy_input,
     whole_policy_fits,
 )
@@ -69,8 +72,6 @@ from lerobot.policies.common.meta_load import load_checkpoint_modules
 from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attention_masks_4d
 from lerobot.policies.pi_gemma import PiGemmaRMSNorm
 from lerobot.processor import (
-    AbsoluteActionsProcessorStep,
-    DeviceProcessorStep,
     PolicyProcessorPipeline,
     TokenizerProcessorStep,
     TransitionKey,
@@ -131,9 +132,6 @@ EDGE_CASE_TASKS = ("", "!!!", "pick_up_the_cube", "pick up\nthe cube", "  Pick u
 EXTREME_STATE = 1e6
 # Random frames whose prompt is compared with the policy's processor at export, beside the test frame.
 PROMPT_CHECK_FRAMES = 3
-# Ten bfloat16 denoising steps amplify rounding: the LIBERO checkpoint's TensorRT bundle differed from its test
-# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03.
-BFLOAT16_STEPS_TOLERANCE = 0.2
 
 
 class StatePrompt(nn.Module):
@@ -400,17 +398,9 @@ class PI05Actions(nn.Module):
 
     def __init__(self, postprocessor: PolicyProcessorPipeline, execution_steps: int, action_dim: int):
         super().__init__()
-        self.postprocessor, absolute_step = _split_absolute_step(postprocessor)
+        self.postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
         self.execution_steps = execution_steps
         self.action_dim = action_dim
-        self.mask: list[bool] | None = None
-        if absolute_step is not None:
-            if absolute_step.relative_step is None:
-                raise ValueError(
-                    "The postprocessor's relative-to-absolute step is linked to no relative step."
-                )
-            # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
-            self.mask = absolute_step.relative_step._build_mask(action_dim)
 
     def forward(self, actions: Tensor, *state: Tensor) -> Tensor:
         """The actions, and the robot's state for a policy trained on actions relative to it."""
@@ -433,6 +423,9 @@ class PI05ExportRecipe(ExportRecipe):
             The `lerobot-export` configuration.
     """
 
+    # pi0.5 runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
     @classmethod
     def load(cls, cfg: ExportConfig) -> PI05ExportRecipe:
         """The recipe, with no weight loaded yet."""
@@ -442,6 +435,7 @@ class PI05ExportRecipe(ExportRecipe):
         from transformers.utils import cached_file
 
         policy_config = cast("PI05Config", cfg.policy)
+        refuse_peft_adapter(policy_config, "pi0.5")
         self.cfg = cfg
         self._device = torch.device(cfg.backend.device)
         policy_config.device = cfg.backend.device
@@ -459,7 +453,7 @@ class PI05ExportRecipe(ExportRecipe):
         self.tolerance = (
             cfg.tolerance
             if cfg.tolerance is not None
-            else BFLOAT16_STEPS_TOLERANCE
+            else self.bfloat16_tolerance
             if policy_config.dtype == torch.bfloat16
             else FLOAT32_TOLERANCE
         )
@@ -620,8 +614,8 @@ class PI05ExportRecipe(ExportRecipe):
         """The random frame and noise, and the actions the parts compute for them in PyTorch."""
         if self._actions is None:
             raise RuntimeError("The test case is made by `parts`, which has not run yet.")
-        postprocessor, _ = _split_absolute_step(self.postprocessor)
         width = self._actions.shape[-1]
+        postprocessor, _ = split_absolute_step(self.postprocessor, width)
         action_scale = measure_action_scale(
             lambda value: postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
         )
@@ -735,7 +729,7 @@ class PI05ExportRecipe(ExportRecipe):
 
     def _check_against_policy(self, case: TestCase) -> None:
         """Compare the test case with the whole policy's `predict_action_chunk`, when the policy fits in memory."""
-        if not whole_policy_fits(self._model_file, self._device, self.cfg.skip_policy_check):
+        if not whole_policy_fits(self._model_file, self._device, "pi0.5"):
             return
         policy = PI05Policy.from_pretrained(
             str(self._policy_config.pretrained_path),
@@ -762,21 +756,6 @@ class PI05ExportRecipe(ExportRecipe):
                 f"The chained parts compute other actions than pi0.5's predict_action_chunk ({error:.2e} > "
                 f"{self.tolerance} in normalized units), so they do not export this checkpoint correctly."
             )
-
-
-def _split_absolute_step(
-    postprocessor: PolicyProcessorPipeline,
-) -> tuple[PolicyProcessorPipeline, AbsoluteActionsProcessorStep | None]:
-    """The postprocessor's steps before its enabled relative-to-absolute step, and that step."""
-    steps = list(postprocessor.steps)
-    index = next(
-        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
-    )
-    if index is None:
-        return postprocessor, None
-    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
-        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
-    return replace(postprocessor, steps=steps[:index]), cast(AbsoluteActionsProcessorStep, steps[index])
 
 
 def _hold_linear_weights_in_bfloat16(module: nn.Module) -> None:

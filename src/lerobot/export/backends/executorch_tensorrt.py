@@ -27,6 +27,15 @@ if TYPE_CHECKING:
     from torch.export import ExportedProgram
 
 
+def tensorrt_takes_the_plugin_setting() -> bool:
+    """Whether the installed Torch-TensorRT has `fallback_pytorch_plugin_ops` (pytorch/TensorRT#4953)."""
+    import inspect
+
+    import torch_tensorrt
+
+    return "fallback_pytorch_plugin_ops" in inspect.signature(torch_tensorrt.dynamo.compile).parameters
+
+
 @ExportBackendConfig.register_subclass("executorch_tensorrt")
 @dataclass
 class ExecuTorchTensorRTConfig(ExecuTorchConfig):
@@ -45,6 +54,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     device = "cuda"
     # Registers the TensorRT backend with the ExecuTorch runtime.
     runtime_imports = ("torch_tensorrt_executorch_runtime",)
+    # A bundle runs its TensorRT engines one after another, so they can share one scratch buffer for
+    # activations instead of holding one each.
+    runtime_options = {"TensorRTBackend": {"use_shared_activation_scratch": True}}
     runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
     packages = (EXECUTORCH, "torch-tensorrt[executorch]>=2.15,<2.16")
 
@@ -59,7 +71,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
 
         import torch_tensorrt
 
-        if "fallback_pytorch_plugin_ops" not in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+        if not tensorrt_takes_the_plugin_setting():
             raise ImportError(
                 f"Torch-TensorRT {torch_tensorrt.__version__} lacks fallback_pytorch_plugin_ops, a "
                 "compile setting that ExecuTorch programs need (pytorch/TensorRT#4953)."
@@ -77,6 +89,10 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
         }
+        # One host copy of each weight, and of its transpose, instead of one per layer that reads it
+        # (pytorch/TensorRT#4965). An older Torch-TensorRT would ignore the setting without a word.
+        if "deduplicate_weights" in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+            options["deduplicate_weights"] = True
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
         args, _ = program.example_inputs

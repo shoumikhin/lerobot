@@ -27,6 +27,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import ChunkPolicySpec
 from .configuration_fastwam import FastWAMConfig
 from .wan import (
     ActionDiT,
@@ -228,6 +229,19 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Serve the current frame and the configured action horizon.
+
+        The video frames in `observation_delta_indices` are future training targets. Inference predicts
+        the action chunk from the current frame alone.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("FastWAM chunk serving requires n_obs_steps=1.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.action_horizon,
+            execution_steps=self.config.n_action_steps,
+        )
 
     def _batch_to_training_sample(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Adapt a standard LeRobot batch to the FastWAM-native sample that

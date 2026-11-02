@@ -87,6 +87,7 @@ def cuda_partitioner(name: str) -> CudaPartitioner:
     return CudaPartitioner(
         [
             CudaBackend.generate_method_name_compile_spec("forward"),
+            # From pytorch/executorch#24314, which ExecuTorch 1.6 gets with #24324.
             CudaBackend.generate_data_name_compile_spec(name),
         ]
     )

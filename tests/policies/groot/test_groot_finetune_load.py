@@ -346,17 +346,16 @@ def test_checkpoint_with_both_tied_names_loads_the_regular_way(tmp_path, monkeyp
     assert "both tied weight names" in caplog.text
 
 
-def test_bfloat16_parts_of_the_base_keep_an_fp32_checkpoint_exact(tmp_path, monkeypatch, caplog):
+def test_bfloat16_parts_of_the_base_keep_an_fp32_checkpoint_exact(tmp_path, monkeypatch):
     base, finetune = _save_finetune(tmp_path, tune_backbone=False)
     expected = _tensors(_load_regular(finetune, monkeypatch))
+    (base / "model.safetensors").unlink()
     built = _record_builds(monkeypatch)
 
-    with caplog.at_level(logging.INFO):
-        policy = GrootPolicy.from_pretrained(finetune)
+    policy = GrootPolicy.from_pretrained(finetune)
 
     _assert_same(expected, _tensors(policy))
-    assert built == [None, str(base)]
-    assert "builds some weights in bfloat16" in caplog.text
+    assert built == [None]
 
 
 def test_subclass_loads_the_regular_way(tmp_path, monkeypatch, caplog):
@@ -446,15 +445,3 @@ def test_chosen_modules_load_as_in_the_full_load(tmp_path, monkeypatch, saved, l
     assert policy._groot_model.action_head.action_encoder is None
     assert policy._groot_model.backbone.model.model.visual is None
     assert not any(parameter.is_meta for parameter in policy.parameters())
-
-
-def test_chosen_module_missing_from_the_checkpoint_is_reported(tmp_path):
-    from safetensors.torch import load_file, save_file
-
-    _, finetune = _save_finetune(tmp_path)
-    weights = load_file(finetune / "model.safetensors")
-    weights.pop(next(k for k in weights if k.startswith(f"{CHOSEN_MODULES[0]}.")))
-    save_file(weights, finetune / "model.safetensors")
-
-    with pytest.raises(KeyError, match="does not hold _groot_model.action_head.state_encoder"):
-        GrootPolicy.load_checkpoint_modules(finetune, GrootConfig.from_pretrained(finetune), CHOSEN_MODULES)

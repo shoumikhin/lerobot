@@ -24,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from PIL import Image
 
+from lerobot.policies.utils import is_exporting
+
 from .components import (
     WAN22_DIFFUSERS_MODEL_ID,
     WAN_T5_TOKENIZER,
@@ -1238,6 +1240,8 @@ class FastWAM(torch.nn.Module):
         self.vae._apply(fn)
         if self.text_encoder is not None:
             self.text_encoder._apply(fn)
+        # The inputs the model moves itself, such as the prompt's token ids, go where its weights now are.
+        self.device = next(self.parameters()).device
         return self
 
     @staticmethod
@@ -2084,8 +2088,7 @@ class FastWAM(torch.nn.Module):
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError("`infer_action` requires `video_attention_mask_mode='first_frame_causal'`.")
 
-        # torch.compile also reports is_exporting() on PyTorch 2.11, not 2.15; non-strict export skips Dynamo.
-        if noise is None and torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling():
+        if noise is None and is_exporting():
             # An exported program keeps one generator whose state carries over between calls.
             raise ValueError("Pass noise to export FastWAM; its sampling noise must be an input.")
         input_image, _, _ = self._normalize_infer_input_image(input_image)

@@ -15,7 +15,9 @@
 
 """The default export recipe, on a tiny ACT built in memory."""
 
+import logging
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,12 +29,23 @@ from torch import Tensor
 import lerobot.export.recipe as recipe_module
 import lerobot.policies.factory as factory
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.export.recipe import ActionChunkRecipe, ReplayDraws, frame_shapes, load_policy, robot_features
+from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
+    BFLOAT16_TOLERANCE,
+    FLOAT32_TOLERANCE,
+    ActionChunkRecipe,
+    ExportRecipe,
+    ReplayDraws,
+    frame_shapes,
+    load_policy,
+    robot_features,
+)
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.processor import ProcessorStep, TransitionKey
+from lerobot.processor import NormalizerProcessorStep, ProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 IMAGE = f"{OBS_IMAGES}.front"
@@ -70,14 +83,17 @@ def export_config(task: str = "") -> SimpleNamespace:
 
 
 def make(
-    policy_class=ACTPolicy, task: str = "", extra_step: ProcessorStep | None = None
+    policy_class=ACTPolicy,
+    task: str = "",
+    extra_step: ProcessorStep | None = None,
+    recipe_class: type[ActionChunkRecipe] = ActionChunkRecipe,
 ) -> ActionChunkRecipe:
     torch.manual_seed(0)
     config = act_config()
     preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=STATS)
     if extra_step is not None:
         preprocessor.steps.insert(0, extra_step)
-    return ActionChunkRecipe(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
+    return recipe_class(policy_class(config).eval(), preprocessor, postprocessor, export_config(task))
 
 
 class TaskCodes(ProcessorStep):
@@ -117,6 +133,22 @@ class SamplingACT(ACTPolicy):
         return actions + torch.multinomial(actions[0].softmax(-1), 1).float()
 
 
+def seeded_noise() -> Tensor:
+    return torch.randn(1, 4, 5, generator=torch.Generator().manual_seed(0))
+
+
+class SeededACT(ACTPolicy):
+    """ACT that adds a starting noise it draws from a generator it seeds on every call."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        return super().predict_action_chunk(batch) + (seeded_noise() if noise is None else noise)[..., :1]
+
+
+class SeededNoiseRecipe(ActionChunkRecipe):
+    def _seeded_noise(self) -> Tensor:
+        return seeded_noise()
+
+
 def test_recipe_measures_the_action_scale_from_the_postprocessor():
     np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
 
@@ -146,6 +178,18 @@ def test_recipe_refuses_a_policy_that_samples_categories_itself():
         make(SamplingACT)
 
 
+def test_recipe_holds_the_noise_of_a_policy_that_seeds_its_draws():
+    recipe = make(SeededACT, recipe_class=SeededNoiseRecipe)
+    assert recipe.test_case().noise is None
+    [part] = recipe.parts()  # checks the program against the policy, bit for bit, on two frames
+    assert part.inputs == [IMAGE, OBS_STATE]
+    program = torch.export.export(part.module, part.example_inputs).module()
+    with torch.no_grad():
+        # A noise drawn inside the program would differ on the second run.
+        for _ in range(2):
+            np.testing.assert_array_equal(program(*part.example_inputs).numpy(), recipe.test_case().actions)
+
+
 def test_replayed_draws_read_the_noise_in_order():
     noise = torch.arange(6.0).reshape(3, 1, 2)
     with ReplayDraws(noise) as draws:
@@ -158,13 +202,37 @@ def test_replayed_draws_read_the_noise_in_order():
             torch.randn(1, 2)
 
 
-def test_pytorch_samples_one_category_by_an_exponential_race():
-    """What `ReplayDraws` relies on to sample categories as PyTorch does."""
-    probs = torch.softmax(torch.randn(64, 16) / 0.3, -1)
-    for seed in range(20):
-        sampled = torch.multinomial(probs, 1, generator=torch.Generator().manual_seed(seed))
-        race = torch.empty_like(probs).exponential_(generator=torch.Generator().manual_seed(seed))
-        assert torch.equal(sampled, torch.argmax(probs / race, dim=-1, keepdim=True))
+def test_replayed_draws_of_different_shapes_read_one_tensor_each():
+    noise = [torch.randn(1, 2), torch.randn(3)]
+    with ReplayDraws(noise) as draws:
+        drawn = [torch.randn(1, 2), torch.randn_like(torch.ones(3))]
+    assert all(map(torch.equal, drawn, noise)) and draws.shapes == [(1, 2), (3,)]
+    with (
+        pytest.raises(ValueError, match=r"Draw 1 reads noise shaped \[1, 2\], but the noise holds \[3\]"),
+        ReplayDraws(noise),
+    ):
+        torch.randn(1, 2)
+        torch.randn(1, 2)
+
+
+def test_replayed_integers_are_equally_likely():
+    noise = torch.randn(1, 2, 40000, 4, generator=torch.Generator().manual_seed(0))
+    with ReplayDraws(noise) as draws:
+        drawn = torch.randint(3, 7, size=(40000,))
+    assert draws.shapes == [(2, 40000, 4)] and drawn.dtype == torch.int64
+    counts = torch.bincount(drawn - 3, minlength=4) / 40000
+    torch.testing.assert_close(counts, torch.full((4,), 0.25), atol=0.01, rtol=0)
+
+
+def test_integers_are_drawn_as_usual_and_recorded_without_a_noise():
+    with ReplayDraws() as draws:
+        drawn = [
+            torch.randint(5, (2, 3)),
+            torch.randint(0, 5, size=(2,)),
+            torch.randint(low=1, high=4, size=(6,)),
+        ]
+    assert draws.shapes == [(2, 2, 3, 5), (2, 2, 5), (2, 6, 3)]
+    assert [tuple(x.shape) for x in drawn] == [(2, 3), (2,), (6,)]
 
 
 def test_replayed_categories_follow_the_probabilities():
@@ -176,16 +244,47 @@ def test_replayed_categories_follow_the_probabilities():
     torch.testing.assert_close(counts, probs[0], atol=0.01, rtol=0)
 
 
-def test_a_program_samples_from_its_noise_input():
-    class Sample(torch.nn.Module):
-        def forward(self, logits: Tensor, noise: Tensor) -> Tensor:
-            with ReplayDraws(noise):
-                return torch.multinomial(logits.softmax(-1), 1)
+def test_replayed_normal_draws_keep_their_mean_and_std():
+    noise = torch.tensor([0.5, -1.0, 2.0]).expand(4, 3)
+    filled = torch.zeros(3)
+    with ReplayDraws(noise):
+        drawn = [
+            torch.normal(torch.full((3,), 5.0), torch.full((3,), 2.0)),
+            torch.normal(5.0, 2.0, size=(3,)),
+            torch.distributions.Normal(torch.tensor(5.0), torch.tensor(2.0)).sample((3,)),
+            filled.normal_(5.0, std=2.0),
+        ]
+    for value in drawn:
+        assert torch.equal(value, torch.tensor([6.0, 3.0, 9.0])), value
+    assert drawn[-1] is filled
 
-    logits, noise = torch.randn(4, 8), torch.randn(1, 2, 4, 8)
-    program = torch.export.export(Sample(), (logits, noise))
-    assert "multinomial" not in str(program.graph)
-    assert torch.equal(program.module()(logits, noise), Sample()(logits, noise))
+
+class Draws(torch.nn.Module):
+    """`draw` of its input, with the random draws reading its noise input."""
+
+    def __init__(self, draw):
+        super().__init__()
+        self.draw = draw
+
+    def forward(self, x: Tensor, noise: Tensor) -> Tensor:
+        with ReplayDraws(noise):
+            return self.draw(x)
+
+
+@pytest.mark.parametrize(
+    ("draw", "shape", "noise_shape", "op"),
+    [
+        (lambda logits: torch.multinomial(logits.softmax(-1), 1), (4, 8), (1, 2, 4, 8), "multinomial"),
+        (lambda x: x + torch.empty_like(x).normal_(5.0, 2.0), (2, 3), (1, 2, 3), "normal"),
+        (lambda values: values[torch.randint(0, 5, size=(2,))], (5, 3), (1, 2, 2, 5), "randint"),
+    ],
+)
+def test_a_program_draws_from_its_noise_input(draw, shape, noise_shape, op):
+    x, noise = torch.randn(shape), torch.randn(noise_shape)
+    program = torch.export.export(Draws(draw), (x, noise))
+    # ExecuTorch cannot lower a random operation left in the program.
+    assert op not in str(program.graph)
+    assert torch.equal(program.module()(x, noise), Draws(draw)(x, noise))
 
 
 def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
@@ -217,30 +316,40 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
     assert frame_shapes(features) == {IMAGE: (24, 32, 3), f"{IMAGE}_hwc": (24, 32, 3)}
 
 
-def too_big_to_compare(tmp_path, monkeypatch):
-    """A checkpoint on a machine with less memory than twice its weights."""
+@pytest.mark.parametrize(
+    ("meminfo", "pages", "measured"),
+    [
+        # 64 GB installed, of which Linux counts 6.1 GB available.
+        ("MemTotal:       62500000 kB\nMemAvailable:    5957032 kB\n", 15_625_000, "available"),
+        # No /proc/meminfo, as on macOS: 6.1 GB installed.
+        (None, 1_489_258, "installed"),
+    ],
+)
+def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
+    tmp_path, monkeypatch, caplog, meminfo, pages, measured
+):
+    """A 6.15 GB checkpoint (a sparse file) on a machine with 6.1 GB of memory to spare."""
     model_file = tmp_path / "model.safetensors"
-    model_file.write_bytes(bytes(1024))
-    monkeypatch.setattr(recipe_module.os, "sysconf", lambda name: 1)
-    return model_file
-
-
-def test_a_policy_too_big_to_compare_is_refused(tmp_path, monkeypatch):
-    model_file = too_big_to_compare(tmp_path, monkeypatch)
-    with pytest.raises(ValueError, match="--skip_policy_check=true"):
-        recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=False)
-
-
-def test_skip_policy_check_exports_a_policy_too_big_to_compare(tmp_path, monkeypatch):
-    model_file = too_big_to_compare(tmp_path, monkeypatch)
-    assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), skip_policy_check=True)
-
-
-def test_a_policy_without_an_export_module_gets_the_one_program_recipe():
-    assert factory.get_export_recipe_class(act_config()) is ActionChunkRecipe
+    with open(model_file, "wb") as f:
+        f.truncate(6_150_000_000)
+    meminfo_file = tmp_path / "meminfo"
+    if meminfo is not None:
+        meminfo_file.write_text(meminfo)
+    monkeypatch.setattr(recipe_module, "_MEMINFO", meminfo_file)
+    monkeypatch.setattr(
+        recipe_module.os, "sysconf", {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": pages}.__getitem__
+    )
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
+    assert (
+        f"Skipped the comparison with the whole pi0.5 policy: it needs about 12.3 GB, 6.1 GB {measured}. The "
+        "bundle's own check against its test case still runs." in caplog.text
+    )
 
 
 def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
+    # A policy without one gets the one-program recipe.
+    assert factory.get_export_recipe_class(act_config()) is ActionChunkRecipe
     monkeypatch.setattr(
         factory, "_import_sibling_policy_module", lambda *args: SimpleNamespace(__name__="export_act")
     )
@@ -250,13 +359,14 @@ def test_a_policy_export_module_must_name_its_recipe(monkeypatch):
 
 def anonymous_mib() -> int:
     """The memory of this process that no file backs, so not the pages of a memory-mapped checkpoint."""
-    with open("/proc/self/status") as status:
-        return next(int(line.split()[1]) // 1024 for line in status if line.startswith("RssAnon:"))
+    # Not RssAnon, which on a Jetson also counts the GPU's allocations.
+    with open("/proc/self/smaps_rollup") as smaps:
+        return next(int(line.split()[1]) // 1024 for line in smaps if line.startswith("Anonymous:"))
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not Path("/proc/self/status").exists(),
+    not torch.cuda.is_available() or not Path("/proc/self/smaps_rollup").exists(),
     reason="needs a CUDA GPU and Linux's memory counters",
 )
 def test_an_export_loads_the_policy_straight_onto_its_device(tmp_path):
@@ -295,3 +405,92 @@ def test_an_export_loads_the_policy_straight_onto_its_device(tmp_path):
     assert all(parameter.is_cuda for parameter in policy.parameters())
     assert peak[0] - start < weights / 2
     assert torch.cuda.max_memory_allocated() >> 20 < 1.5 * weights
+
+
+class EditedStepsRecipe(ActionChunkRecipe):
+    """A recipe whose program runs the saved preprocessor with its steps changed by `edit`."""
+
+    edit = staticmethod(lambda steps: steps)
+
+    def program_preprocessor(self):
+        return replace(self.preprocessor, steps=self.edit(self.preprocessor.steps))
+
+
+class InexactStepsRecipe(EditedStepsRecipe):
+    """Held to the export's tolerance rather than to rollout's actions bit for bit."""
+
+    exact = False
+
+
+class ScaleState(ProcessorStep):
+    """Scales the state, as a program that computes the same thing in another order rounds it."""
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, transition):
+        observation = transition[TransitionKey.OBSERVATION]
+        state = observation[OBS_STATE] * self.scale
+        return {**transition, TransitionKey.OBSERVATION: {**observation, OBS_STATE: state}}
+
+    def transform_features(self, features):
+        return features
+
+
+@pytest.mark.parametrize(
+    ("recipe_class", "edit", "error"),
+    [
+        # ACT ignores the task codes the first step makes, so the program computes the same without it.
+        (EditedStepsRecipe, lambda steps: steps[1:], None),
+        (
+            EditedStepsRecipe,
+            lambda steps: [step for step in steps if not isinstance(step, NormalizerProcessorStep)],
+            "computes something else",
+        ),
+        # Float32 rounding: the actions are not rollout's bit for bit, but within the tolerance.
+        (InexactStepsRecipe, lambda steps: [ScaleState(1 + 1e-6), *steps], None),
+        (InexactStepsRecipe, lambda steps: [ScaleState(2.0), *steps], "more than the tolerance"),
+    ],
+)
+def test_a_recipe_gives_the_program_a_preprocessor_that_computes_the_same(recipe_class, edit, error):
+    recipe = make(task="pick", extra_step=TaskCodes(), recipe_class=recipe_class)
+    recipe.edit = edit
+    if error:
+        with pytest.raises(ValueError, match=error):
+            list(recipe.parts())
+    else:
+        [part] = recipe.parts()
+        steps = [type(step) for step in part.module.preprocessor.steps]
+        assert steps == [type(step) for step in edit(recipe.preprocessor.steps)]
+
+
+class BareRecipe(ExportRecipe):
+    """A recipe without parts, to read the tolerance it picks."""
+
+    def parts(self):
+        yield from ()
+
+    def test_case(self):
+        raise NotImplementedError
+
+
+class DenoisingRecipe(BareRecipe):
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
+
+@pytest.mark.parametrize(
+    ("dtype", "default", "raised"),
+    [
+        (torch.float32, FLOAT32_TOLERANCE, FLOAT32_TOLERANCE),
+        (torch.bfloat16, BFLOAT16_TOLERANCE, BFLOAT16_STEPS_TOLERANCE),
+    ],
+)
+def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
+    policy = ACTPolicy(act_config()).to(dtype)
+
+    assert BareRecipe(policy, None, None, export_config()).tolerance == default
+    assert DenoisingRecipe(policy, None, None, export_config()).tolerance == raised
+
+
+def test_a_bfloat16_pi0_gets_the_tolerance_of_ten_denoising_steps():
+    assert factory.get_export_recipe_class(PI0Config()).bfloat16_tolerance == BFLOAT16_STEPS_TOLERANCE

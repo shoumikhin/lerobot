@@ -13,21 +13,20 @@
 # limitations under the License.
 
 
-"""Check a bundle on this machine: `python -m lerobot.bundle <bundle folder>`.
+"""Check a bundle on this machine: `python -m lerobot.bundle <bundle folder>`, as `lerobot-check-bundle` does.
 
-It loads the programs and replays the test case as `lerobot-rollout` does before the robot moves, and exits
-with an error if the actions differ by more than the bundle's tolerance.
+Prefer `lerobot-check-bundle` inside a bundle's folder: `python -m` puts the current folder first on the module
+search path before Python imports `lerobot` and parts of the standard library, so a .py file shipped with the
+bundle could load in place of one of them.
 """
 
+import os
 import sys
 
-from lerobot.utils import init_logging
-
-from .engine import BundleEngine
-from .manifest import Bundle
-
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python -m lerobot.bundle <bundle folder>")
-    init_logging()
-    BundleEngine(Bundle.read(sys.argv[1]))
+    # Otherwise a module the manifest names in `runtime_imports` would load from a file shipped with the bundle.
+    if sys.path[0] in ("", os.getcwd()):
+        sys.path.pop(0)
+    from lerobot.scripts.lerobot_check_bundle import main
+
+    main()

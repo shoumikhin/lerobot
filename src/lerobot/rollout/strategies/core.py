@@ -33,9 +33,8 @@ from lerobot.utils import OBS_STR, ActionInterpolator
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import return_to_position
+from lerobot.utils.rollout_status import RolloutStatusReporter
 from lerobot.utils.visualization_utils import log_visualization_data
-
-from ..status import RolloutStatusReporter
 
 if TYPE_CHECKING:
     from ..configs import RolloutConfig, RolloutStrategyConfig
@@ -102,7 +101,7 @@ class RolloutStrategy(abc.ABC):
         cfg = ctx.runtime.cfg
         interval = 0.0 if cfg.interactive else cfg.status_interval_s
         self._engine.latency.configure(interval)
-        self._status = RolloutStatusReporter(self._engine, interval, cfg.device)
+        self._status = RolloutStatusReporter(self._engine.latency, interval, cfg.device)
         logger.info("Starting inference engine...")
         self.reset_control_state()
         self._engine.start()

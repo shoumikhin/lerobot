@@ -64,6 +64,20 @@ _CHECK_REFUSED = """
 assert not _torch_attempts, "torch import attempted:\\n" + _torch_attempts[0]
 """
 
+# `python -m lerobot.bundle argv[1]`: loads a bundle's programs and replays its test case.
+CHECK_BUNDLE = """
+import runpy
+import sys
+
+sys.argv = ["lerobot.bundle", sys.argv[1]]
+runpy.run_module("lerobot.bundle", run_name="__main__")
+"""
+
+
+def refusing_torch(code: str) -> str:
+    """`code` that fails if it tries to load PyTorch, for a child process that the code under test starts."""
+    return _REFUSE_TORCH + code + _CHECK_REFUSED
+
 
 def assert_runs_without_torch(code: str, *args: str, cwd=None) -> None:
     """Run `code` in a fresh interpreter, with PyTorch installed and with PyTorch refused; it must load neither.
@@ -71,7 +85,7 @@ def assert_runs_without_torch(code: str, *args: str, cwd=None) -> None:
     `args` become `sys.argv[1:]` of the code.
     """
     code = textwrap.dedent(code)
-    for script in (code + _CHECK_UNLOADED, _REFUSE_TORCH + code + _CHECK_REFUSED):
+    for script in (code + _CHECK_UNLOADED, refusing_torch(code)):
         result = subprocess.run(
             [sys.executable, "-c", script, *args], capture_output=True, text=True, cwd=cwd, timeout=300
         )

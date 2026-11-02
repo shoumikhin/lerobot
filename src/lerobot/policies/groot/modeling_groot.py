@@ -209,13 +209,11 @@ class GrootPolicy(PreTrainedPolicy):
                 logger.info("Checkpoint keys or shapes differ from GR00T; loading the base weights first.")
                 return None
             # With `load_bf16`, the backbone still builds what its base config freezes in bfloat16, which
-            # rounds a fp32 checkpoint. The regular path casts to fp32 before loading, so it stays exact.
-            if config.dtype == torch.float32 and any(
-                parameter.is_floating_point() and parameter.dtype != torch.float32
-                for parameter in model.parameters()
-            ):
-                logger.info("Base config builds some weights in bfloat16; loading the base weights first.")
-                return None
+            # rounds a fp32 checkpoint. The regular path casts to fp32 before loading, so read those again.
+            if config.dtype == torch.float32:
+                for name, parameter in model.named_parameters():
+                    if parameter.is_floating_point() and parameter.dtype != torch.float32:
+                        parameter.data = state_dict[name].float()
             # Tie first so the shared weight is copied once. Weights that kept their dtype still point into
             # the file, so copy each one out before moving it: a device copy straight from the file is slow
             # and keeps its pages as private memory on Jetson.

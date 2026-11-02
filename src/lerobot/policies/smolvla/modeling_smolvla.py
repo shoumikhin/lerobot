@@ -681,8 +681,8 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
-        # The VLM embeds in bfloat16 and the state projection in float32, and ExecuTorch's to_edge does not
-        # promote mixed-dtype cat, so the embeddings are cast to the dtype torch.cat would promote to.
+        # The VLM embeds in bfloat16 and the state projection in float32. ExecuTorch 1.6's to_edge rejects a
+        # mixed-dtype cat, so cast to the dtype torch.cat promotes to until pytorch/executorch#24381 ships.
         dtype = functools.reduce(torch.promote_types, (emb.dtype for emb in embs))
         embs = torch.cat([emb.to(dtype) for emb in embs], dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)

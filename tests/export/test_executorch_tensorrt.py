@@ -23,13 +23,15 @@ import pytest
 import torch
 from torch import nn
 
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.utils.import_utils import is_package_available
 
 needs_tensorrt = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not is_package_available("torch_tensorrt")
-    or not is_package_available("executorch"),
-    reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
+    or not is_package_available("executorch")
+    or not tensorrt_takes_the_plugin_setting(),
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
 )
 
 # Loads the program the way a bundle does, in a process without PyTorch.
@@ -176,19 +178,28 @@ def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-def test_operators_whose_plugins_need_pytorch_stay_out_of_tensorrt(monkeypatch, tmp_path):
+@pytest.mark.parametrize("deduplicates", [True, False])
+def test_compile_gets_the_settings_the_installed_torch_tensorrt_takes(monkeypatch, tmp_path, deduplicates):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     seen = {}
 
-    def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops=False, **options):
-        seen["fallback_pytorch_plugin_ops"] = fallback_pytorch_plugin_ops
+    def compile_with_both(
+        program, arg_inputs, *, fallback_pytorch_plugin_ops, deduplicate_weights=False, **options
+    ):
+        seen.update(options, fallback=fallback_pytorch_plugin_ops, deduplicate_weights=deduplicate_weights)
         raise ReachedCompileError
 
-    use_fake_tensorrt(monkeypatch, compile)
+    def compile_with_the_plugin_setting(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
+        seen.update(options, fallback=fallback_pytorch_plugin_ops)
+        raise ReachedCompileError
+
+    use_fake_tensorrt(monkeypatch, compile_with_both if deduplicates else compile_with_the_plugin_setting)
     with pytest.raises(ReachedCompileError):
         ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
-    assert seen == {"fallback_pytorch_plugin_ops": True}
+    # Operators whose TensorRT plugins need PyTorch stay out of TensorRT; weights are shared when it can.
+    assert seen["fallback"] is True
+    assert seen.get("deduplicate_weights") is (True if deduplicates else None)
 
 
 def test_a_torch_tensorrt_without_the_plugin_setting_is_refused(monkeypatch, tmp_path):
