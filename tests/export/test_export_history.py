@@ -30,6 +30,7 @@ from lerobot.bundle.manifest import Bundle
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.export.recipe import ReplayDraws
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
@@ -372,8 +373,9 @@ def test_the_parts_are_held_to_the_export_tolerance(tmp_path, monkeypatch, offse
         torch.cuda.is_available()
         and is_package_available("torch_tensorrt")
         and is_package_available("executorch")
+        and tensorrt_takes_the_plugin_setting()
     ),
-    reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
 )
 def test_a_tensorrt_bundle_passes_its_check(checkpoint, tmp_path):
     """A GPU bundle draws its noise on the GPU, where the PyTorch policy cannot replay it, so the export's own check

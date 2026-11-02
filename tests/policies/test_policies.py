@@ -350,6 +350,7 @@ def test_diffusion_loads_weights_saved_with_other_compile_model(dummy_dataset_me
     )
     policy_cls = get_policy_class("diffusion")
     policy = policy_cls(saved)
+    policy.to(saved.device)
     policy.save_pretrained(tmp_path)
     loaded_policy = policy_cls.from_pretrained(tmp_path, config=loaded)
     torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)

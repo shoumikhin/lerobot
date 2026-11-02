@@ -583,7 +583,7 @@ class GrootExportRecipe(ExportRecipe):
 
     def _check_against_policy(self, case: TestCase) -> None:
         """Compare the chained parts with the policy's own `predict_action_chunk`, when the policy fits."""
-        if not whole_policy_fits(self._model_file(), self._device, self.cfg.skip_policy_check):
+        if not whole_policy_fits(self._model_file(), self._device, "GR00T"):
             return
         policy, preprocessor, postprocessor = load_policy(self.cfg)
         policy.to(self._device)
