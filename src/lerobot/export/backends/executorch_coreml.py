@@ -44,13 +44,18 @@ class ExecuTorchCoreMLConfig(ExecuTorchConfig):
             Neural Engine).
         compute_precision (`str`, *optional*, defaults to `"float32"`):
             The float type of the computation, `float32` or `float16`. The Neural Engine runs only `float16`,
-            which moves the actions further from PyTorch's.
+            which moves the actions further from PyTorch's than the default float32 tolerance allows, so it needs
+            a larger `--tolerance`.
     """
 
     device = "cpu"
 
     compute_units: str = "all"
+    """The hardware Core ML may use: `all`, `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (the CPU and the Neural
+    Engine)."""
     compute_precision: str = "float32"
+    """The float type of the computation, `float32` or `float16`. The Neural Engine runs only `float16`, which
+    needs a larger `--tolerance` than a float32 policy's default."""
 
     def __post_init__(self) -> None:
         """Refuse an unknown compute unit or precision before anything is traced."""

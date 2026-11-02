@@ -98,6 +98,7 @@ class BundleRolloutConfig:
 
     bundle: BundleConfig
     robot: RobotConfig
+    # Actions of the bundle played per second.
     fps: float = 30.0
     # Run time in seconds; 0 runs until Ctrl-C.
     duration: float = 0.0
