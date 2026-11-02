@@ -61,6 +61,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     packages = (EXECUTORCH, "torch-tensorrt[executorch]>=2.15,<2.16")
 
     workspace_size: int | None = None
+    """The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine. `None` lets
+    TensorRT decide."""
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
