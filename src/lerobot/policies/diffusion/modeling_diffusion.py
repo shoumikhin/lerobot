@@ -249,6 +249,17 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+    def _load_from_state_dict(
+        self, state_dict: dict[str, Tensor], prefix: str, *args: Any, **kwargs: Any
+    ) -> None:
+        # With `compile_model`, the torch.compile wrapper names the U-Net's weights `unet._orig_mod.*`, so a
+        # checkpoint saved with the other setting names them differently: rename them to this U-Net's names.
+        plain = f"{prefix}unet."
+        current = f"{plain}_orig_mod." if hasattr(self.unet, "_orig_mod") else plain
+        for key in [key for key in state_dict if key.startswith(plain)]:
+            state_dict[current + key.removeprefix(plain).removeprefix("_orig_mod.")] = state_dict.pop(key)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     # ========= inference  ============
     def conditional_sample(
         self,
