@@ -38,6 +38,17 @@ env:
   UV_VERSION: "0.11.30"
   PYTHON_VERSION: "3.12"
   DOCKER_IMAGE_NAME: huggingface/lerobot-gpu
+  # ExecuTorch and Torch-TensorRT are not in uv.lock, which cannot hold ExecuTorch 1.6 until it is on PyPI. ExecuTorch's
+  # CUDA 13.2 build matches PyPI's torch 2.15.0; its 1.6 release candidate is on PyTorch's test index only, so replace
+  # this with `executorch==1.6.0` once that release is on PyPI. The index replaces a release candidate under the same
+  # name, so it is pinned by its hash. ExecuTorch's CUDA backend compiles kernels at export, with the CUDA compiler of
+  # `cuda-toolkit[nvcc]`, which pins nvcc, its device front end and its headers to one CUDA version (`nvidia-cuda-nvcc`
+  # alone lets the other two move to a newer CUDA, whose PTX this nvcc cannot assemble). This ExecuTorch has
+  # pytorch/executorch#24314, so the CUDA backend's tests run. Torch-TensorRT is not installed: no
+  # torch-tensorrt-executorch-runtime, which loads TensorRT programs, takes ExecuTorch 1.6.0 yet, so every TensorRT test
+  # would skip. Install both once one does.
+  EXECUTORCH_CUDA: "executorch @ https://download.pytorch.org/whl/test/cu132/executorch-1.6.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=1e094431df451369c32fd2038fcbd1ac3ebc963380de0127b46212b332cb64af"
+  CUDA_COMPILER: "cuda-toolkit[nvcc]==13.2.2"
 
 # Ensures that only the latest action is built, canceling older runs.
 concurrency:
@@ -201,12 +212,47 @@ jobs:
       - name: Run end-to-end tests
         run: make test-end-to-end
 
+  # This job exports tiny policies with ExecuTorch's CUDA backend and checks the bundles, on the image of GPU Tests with
+  # ExecuTorch installed over it (the CPU backends run in Fast Tests)
+  gpu-export-tests:
+    permissions: {}
+    name: GPU Export Tests
+    needs: [build-and-push-docker]
+    runs-on:
+      group: aws-g6-4xlarge-plus
+    env:
+      HF_HOME: /home/user_lerobot/.cache/huggingface
+      HF_LEROBOT_HOME: /home/user_lerobot/.cache/huggingface/lerobot
+      TORCH_HOME: /home/user_lerobot/.cache/torch
+      TRITON_CACHE_DIR: /home/user_lerobot/.cache/triton
+      CUDA_HOME: /lerobot/.venv/lib/python3.12/site-packages/nvidia/cu13
+    container:
+      image: ${{ needs.build-and-push-docker.outputs.image_tag }} # zizmor: ignore[unpinned-images]
+      options: --gpus all --shm-size "16gb"
+      credentials:
+        username: ${{ secrets.DOCKERHUB_LEROBOT_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_LEROBOT_PASSWORD }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: /lerobot
+    steps:
+      - name: Install ExecuTorch
+        run: uv pip install "$EXECUTORCH_CUDA" "$CUDA_COMPILER"
+      - name: Fix ptxas permissions
+        run: chmod +x /lerobot/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas
+      # Every test of the CUDA backend skips when it cannot run, and a run of skips passes.
+      - name: Check that the CUDA backend can run
+        run: python -c "from tests.export.backends import EXECUTORCH_CUDA; assert EXECUTORCH_CUDA"
+      - name: Run export tests on GPU
+        run: pytest tests -vv --maxfail=10 -m "executorch and gpu"
+
   # This job deletes the test image recently created
-  # It runs everytime after the gpu-tests have finished
+  # It runs everytime after the gpu-tests and gpu-export-tests have finished
   delete-pr-image:
     permissions: {}
     name: Delete PR Image
-    needs: [gpu-tests, build-and-push-docker]
+    needs: [gpu-tests, gpu-export-tests, build-and-push-docker]
     if: always() && ((github.event.review.state == 'approved') || (github.event_name == 'workflow_dispatch')) && needs.build-and-push-docker.result == 'success'
     runs-on: ubuntu-latest
     steps:
