@@ -41,6 +41,7 @@ You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs),
 - **ExecuTorch 1.6 has fixes these backends need.** `executorch_cuda` and `executorch_tensorrt` need [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. `executorch_openvino`, and every program that keeps an input check, need [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298).
 - **Running a bundle never imports PyTorch.** PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), such as Torch-TensorRT 2.15. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load.
+- `executorch_tensorrt` keeps one copy of each weight in host memory while TensorRT builds, instead of one for every layer that reads it transposed, with Torch-TensorRT's `deduplicate_weights` setting from [pytorch/TensorRT#4965](https://github.com/pytorch/TensorRT/pull/4965).
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc`. JetPack and the CUDA toolkit have it in `/usr/local/cuda/bin`. Without them, install it from PyPI and point `CUDA_HOME` at it:
 
@@ -111,24 +112,25 @@ lerobot-check-bundle outputs/export/act_executorch_tensorrt
 
 ### Options
 
-| Flag                               | What it does                                                                                                                                                   |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                                                       |
-| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                                                |
-| `--backend.type`                   | The compiler, from the table above.                                                                                                                            |
-| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                                           |
-| `--task`                           | The task, for a policy that reads one, such as SmolVLA. See [Tasks](#tasks).                                                                                   |
-| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                                          |
-| `--dataset.root`                   | A local folder that holds the dataset, or with `--dataset.streaming=true` a bucket, `hf://buckets/OWNER/BUCKET`. Defaults to LeRobot's cache, as for training. |
-| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                                               |
-| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                  |
-| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                               |
-| `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                       |
-| `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                                                |
-| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                            |
-| `--backend.compute_precision`      | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`, which needs a larger `--tolerance`.                                 |
-| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                                                        |
-| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.                                          |
+| Flag                               | What it does                                                                                                                                                                                               |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                                                                                                   |
+| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                                                                                            |
+| `--backend.type`                   | The compiler, from the table above.                                                                                                                                                                        |
+| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                                                                                       |
+| `--task`                           | The task, for a policy that reads one, such as SmolVLA. See [Tasks](#tasks).                                                                                                                               |
+| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                                                                                      |
+| `--dataset.root`                   | A local folder that holds the dataset, or with `--dataset.streaming=true` a bucket, `hf://buckets/OWNER/BUCKET`. Defaults to LeRobot's cache, as for training.                                             |
+| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                                                                                           |
+| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                                                              |
+| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                                                           |
+| `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                                                                   |
+| `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                                                                                            |
+| `--backend.deduplicate_weights`    | TensorRT only: `true` (the default) keeps one host copy of each shared weight while TensorRT builds; `false` gives each layer its own copy, for a policy whose engines come out wrong with shared weights. |
+| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                                                                        |
+| `--backend.compute_precision`      | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`, which needs a larger `--tolerance`.                                                                             |
+| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                                                                                                    |
+| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.                                                                                      |
 
 `lerobot-export --backend.type=<backend> --help` lists the options of a backend. Of the other `--dataset.*` options it lists, the export reads `--dataset.repo_type` and `--dataset.streaming` as training does, and does not use the rest.
 
@@ -180,6 +182,9 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
   "backend": "executorch_tensorrt",
   "runtime": "executorch",
   "runtime_imports": ["torch_tensorrt_executorch_runtime"],
+  "runtime_options": {
+    "TensorRTBackend": { "use_shared_activation_scratch": true }
+  },
   "programs": {
     "model": { "file": "model.pte", "data": null }
   },
@@ -216,6 +221,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
 - The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time.
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
+- `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too. Engines that share the buffer take turns on the GPU, even when two bundles run on two threads, because the TensorRT delegate makes each wait for the one before ([pytorch/TensorRT#4739](https://github.com/pytorch/TensorRT/pull/4739), in Torch-TensorRT 2.15). Load such bundles one at a time, since loading one changes an environment variable and the module search path of the process while it runs.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
 - `target` is the GPU the programs were built on, when they run only on that kind of GPU, as a TensorRT engine does. A machine whose GPU has another compute capability refuses the bundle, and another GPU model of the same compute capability gets a warning. `runtime_versions` are the versions of the Python modules the programs need to load. Another version of one gets a warning, but one in `exact_runtime_modules` is refused: a TensorRT engine loads only with the TensorRT version that built it.
 
@@ -373,4 +379,4 @@ from lerobot.bundle.runtime import Runtime, register_runtime
 register_runtime("onnxruntime", Runtime(load=OnnxProgram))
 ```
 
-A bundle imports such packages only when it names a runtime LeRobot does not have. Nothing in LeRobot changes, and a runtime must not import PyTorch.
+A bundle imports such packages only when it names a runtime LeRobot does not have. Nothing in LeRobot changes, and a runtime must not import PyTorch. A runtime that takes a bundle's `runtime_options` also passes `configure`, which applies them before the programs load; a runtime without it refuses a bundle that sets some.
