@@ -23,16 +23,7 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
-from lerobot.utils.import_utils import is_package_available
-
-needs_tensorrt = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_package_available("torch_tensorrt")
-    or not is_package_available("executorch")
-    or not tensorrt_takes_the_plugin_setting(),
-    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
-)
+from tests.export.backends import needs_executorch_tensorrt
 
 # Loads the program the way a bundle does, in a process without PyTorch.
 RUN = """
@@ -84,7 +75,7 @@ def run_without_torch(program, data, x, tmp_path):
 
 
 @pytest.mark.gpu
-@needs_tensorrt
+@needs_executorch_tensorrt
 def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
     from executorch.exir._serialize._program import deserialize_pte_binary
     from executorch.exir.schema import DeviceType

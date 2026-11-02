@@ -28,14 +28,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from packaging.version import Version
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, Bundle, ProgramRun
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
-from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.export.recipe import ReplayDraws, frame_shapes
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
@@ -49,6 +47,7 @@ from tests.export import (
     tiny_pi0_fast,
     torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
 )
+from tests.export.backends import BACKENDS as EXECUTORCH_BACKENDS, GPU_BACKENDS
 from tests.export.plugins import use_plugins
 
 IMAGE = "observation.images.front"
@@ -57,26 +56,7 @@ IMAGE = "observation.images.front"
 FRAME = (96, 96)
 CROP = (84, 84)
 TASK = "pick up the cube"
-EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
-BACKENDS = {
-    "torch_test": [],
-    "executorch_xnnpack": [pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")],
-    "executorch_cuda": [
-        pytest.mark.skipif(
-            not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch and a CUDA GPU"
-        )
-    ],
-    "executorch_tensorrt": [
-        pytest.mark.skipif(
-            not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch and a CUDA GPU"
-        ),
-        pytest.mark.skipif(
-            not (is_package_available("torch_tensorrt") and tensorrt_takes_the_plugin_setting()),
-            reason="needs a Torch-TensorRT with pytorch/TensorRT#4953",
-        ),
-    ],
-}
-GPU_BACKENDS = ("executorch_cuda", "executorch_tensorrt")
+BACKENDS = {"torch_test": [], **{name: [mark] for name, mark in EXECUTORCH_BACKENDS.items()}}
 
 
 def _min_max(size: int) -> dict[str, torch.Tensor]:
