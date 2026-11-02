@@ -30,21 +30,17 @@ The vision tower reads the patch grid prepared by an eager call inside `prepare_
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
 
 import torch
 from torch import Tensor
 
-from lerobot.export.configs import ExportConfig
-from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe, Part
-from lerobot.policies import PreTrainedPolicy
-from lerobot.processor import EnvTransition, PolicyProcessorPipeline, ProcessorStep, TransitionKey
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
+from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
-from ..common.qwen_vision import is_exporting, prepare_image_grid
-from ..common.state_prompt import StatePromptTokens, extreme_states
+from ..common.state_prompt import StatePromptStep, StatePromptTokens, uniform_bins
 from .processor_wall_oss_05 import WALL_OSS_ACTION_TOKEN, WallOSS05TokenizerStep
 
 # The long side the tokenizer step resizes every camera image to with Pillow.
@@ -55,24 +51,8 @@ class WallOSS05ExportRecipe(ActionChunkRecipe):
     """[`ActionChunkRecipe`] with Wall-OSS's prompt built in the program and held to the export's tolerance."""
 
     exact = False
-
-    def __init__(
-        self,
-        policy: PreTrainedPolicy,
-        preprocessor: PolicyProcessorPipeline,
-        postprocessor: PolicyProcessorPipeline,
-        cfg: ExportConfig,
-    ) -> None:
-        """The default recipe, with the tolerance of ten bfloat16 denoising steps for a bfloat16 checkpoint."""
-        super().__init__(policy, preprocessor, postprocessor, cfg)
-        if cfg.tolerance is None and any(p.dtype == torch.bfloat16 for p in policy.parameters()):
-            self.tolerance = BFLOAT16_STEPS_TOLERANCE
-
-    def parts(self) -> Iterator[Part]:
-        """The default recipe's part, checked inside `prepare_image_grid()` so the checks prepare the grid."""
-        with prepare_image_grid():
-            (part,) = super().parts()
-        yield part
+    # Wall-OSS runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
 
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its tokenizer step replaced by [`_StatePromptStep`]."""
@@ -83,7 +63,7 @@ class WallOSS05ExportRecipe(ActionChunkRecipe):
         return replace(self.preprocessor, steps=steps)
 
 
-class _StatePromptStep(ProcessorStep):
+class _StatePromptStep(StatePromptStep):
     """Wall-OSS's tokenizer step for one task and camera size, as tensor operations.
 
     The prompt's tokens before and after the state, and the step's inputs that do not change with the frame, are
@@ -104,20 +84,6 @@ class _StatePromptStep(ProcessorStep):
         self.prompt: StatePromptTokens | None = None
         self.constants: dict[str, Tensor] = {}
 
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        if not is_exporting():
-            if self.prompt is None:
-                self._fit(transition)
-                for extreme in extreme_states(transition):
-                    self._check(extreme)
-            self._check(transition)
-        return self._apply(transition)
-
-    def _bins(self, state: Tensor) -> Tensor:
-        """Each state value's bin number plus one, as the step digitizes it against 512 equal bins."""
-        edges = -1 + torch.arange(512, dtype=torch.float32, device=state.device) / 256
-        return (state.flatten()[:, None] >= edges).sum(-1)
-
     def _camera_images(self, observation: dict[str, Any]) -> list[Tensor]:
         """The camera images with the step's values, whole numbers from 0 to 255, in its camera order."""
         return [observation[key][0].clamp(0, 1).mul(255).round() for key in self.step.camera_key_mapping]
@@ -125,8 +91,8 @@ class _StatePromptStep(ProcessorStep):
     def _apply(self, transition: EnvTransition) -> EnvTransition:
         if self.prompt is None:
             raise ValueError("The prompt is made from an eager call before the program is traced.")
-        observation = transition[TransitionKey.OBSERVATION]
-        input_ids, mask = self.prompt(self._bins(observation[OBS_STATE]))
+        observation = transition[TransitionKey.OBSERVATION] or {}
+        input_ids, mask = self.prompt(uniform_bins(observation[OBS_STATE], 512))
         images = self._camera_images(observation)
         pixels = self.image_processor(images=images, return_tensors="pt")["pixel_values"]
         inputs = {
@@ -141,11 +107,11 @@ class _StatePromptStep(ProcessorStep):
 
     def _saved(self, transition: EnvTransition) -> dict[str, Any]:
         """What the saved tokenizer step gives the model for this frame."""
-        return self.step(transition)[TransitionKey.COMPLEMENTARY_DATA]
+        return self.step(transition)[TransitionKey.COMPLEMENTARY_DATA] or {}
 
     def _fit(self, transition: EnvTransition) -> None:
         """Take the prompt around the state, and the inputs that do not change, from the saved step."""
-        observation = transition[TransitionKey.OBSERVATION]
+        observation = transition[TransitionKey.OBSERVATION] or {}
         for key in self.step.camera_key_mapping:
             height, width = observation[key].shape[-2:]
             if max(height, width) != IMAGE_SIZE:
@@ -155,7 +121,7 @@ class _StatePromptStep(ProcessorStep):
                 )
         saved = self._saved(transition)
         ids = saved["input_ids"][0][saved["attention_mask"][0].bool()]
-        bins = self._bins(observation[OBS_STATE])
+        bins = uniform_bins(observation[OBS_STATE], 512)
         device = bins.device
         self.prompt = StatePromptTokens.around(
             ids.tolist(), bins.tolist(), self.pieces, self.pad_id, device=device, padding_side="left"
@@ -171,7 +137,7 @@ class _StatePromptStep(ProcessorStep):
 
     def _check(self, transition: EnvTransition) -> None:
         """Refuse a prompt, pixels or fixed inputs other than the saved step's for this frame."""
-        program = self._apply(transition)[TransitionKey.COMPLEMENTARY_DATA]
+        program = self._apply(transition)[TransitionKey.COMPLEMENTARY_DATA] or {}
         saved = self._saved(transition)
         length = saved["input_ids"].shape[1]
         same_prompt = int(program["attention_mask"].sum()) == length and all(
@@ -179,7 +145,7 @@ class _StatePromptStep(ProcessorStep):
             for key in ("input_ids", "attention_mask", "moe_token_types")
         )
         if not same_prompt:
-            state = transition[TransitionKey.OBSERVATION][OBS_STATE].tolist()
+            state = (transition[TransitionKey.OBSERVATION] or {})[OBS_STATE].tolist()
             raise ValueError(
                 "The program writes another prompt than Wall-OSS's tokenizer step for the normalized state "
                 f"{state}: this tokenizer splits the state's numbers differently inside the prompt, so Wall-OSS "
@@ -190,6 +156,3 @@ class _StatePromptStep(ProcessorStep):
                 raise ValueError(
                     f"The program's {key} differ from the ones Wall-OSS's tokenizer step computes."
                 )
-
-    def transform_features(self, features):
-        return features

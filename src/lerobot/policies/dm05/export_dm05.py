@@ -32,12 +32,11 @@ from dataclasses import replace
 import torch
 from torch import Tensor
 
-from lerobot.export.recipe import ActionChunkRecipe
-from lerobot.processor import EnvTransition, PolicyProcessorPipeline, ProcessorStep, TransitionKey
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
+from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
-from ..common.qwen_vision import is_exporting
-from ..common.state_prompt import StatePromptTokens, extreme_states
+from ..common.state_prompt import StatePromptStep, StatePromptTokens
 from .core.tokenization import action_to_bin_tokens
 from .core.utils import DM05_STATE_BINS
 from .processor_dm05 import MODEL_INPUT_PREFIX, DM05StateBinsProcessorStep, DM05TokenizerProcessorStep
@@ -47,13 +46,15 @@ class DM05ExportRecipe(ActionChunkRecipe):
     """[`ActionChunkRecipe`] with DM05's prompt built in the program and held to the export's tolerance."""
 
     exact = False
+    # DM05 runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
 
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its state bins and tokenizer steps replaced by [`_StatePromptStep`]."""
-        (bins,) = [step for step in self.preprocessor.steps if isinstance(step, DM05StateBinsProcessorStep)]
-        (tokenizer,) = [
+        (bins,) = (step for step in self.preprocessor.steps if isinstance(step, DM05StateBinsProcessorStep))
+        (tokenizer,) = (
             step for step in self.preprocessor.steps if isinstance(step, DM05TokenizerProcessorStep)
-        ]
+        )
         if not tokenizer.add_state:
             raise ValueError(
                 "The DM05 recipe writes the state into the prompt, and this checkpoint leaves it out "
@@ -66,7 +67,7 @@ class DM05ExportRecipe(ActionChunkRecipe):
         return replace(self.preprocessor, steps=steps)
 
 
-class _StatePromptStep(ProcessorStep):
+class _StatePromptStep(StatePromptStep):
     """DM05's state bins and tokenizer steps for one task and camera size, as tensor operations.
 
     The prompt's tokens before and after the state are the saved tokenizer step's on the first eager frame. Every
@@ -88,19 +89,10 @@ class _StatePromptStep(ProcessorStep):
         self.prompt: StatePromptTokens | None = None
         self.token_type_ids: Tensor | None = None
 
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        if not is_exporting():
-            if self.prompt is None:
-                self._fit(transition)
-                for extreme in extreme_states(transition):
-                    self._check(extreme)
-            self._check(transition)
-        return self._apply(transition)
-
     def _apply(self, transition: EnvTransition) -> EnvTransition:
         if self.prompt is None or self.token_type_ids is None:
             raise ValueError("The prompt is made from an eager call before the program is traced.")
-        observation = dict(transition[TransitionKey.OBSERVATION])
+        observation = dict(transition[TransitionKey.OBSERVATION] or {})
         bins = action_to_bin_tokens(observation[OBS_STATE], DM05_STATE_BINS)
         input_ids, mask = self.prompt(bins[0])
         images = self.tokenizer.camera_images(observation, 1)
@@ -116,14 +108,15 @@ class _StatePromptStep(ProcessorStep):
 
     def _saved(self, transition: EnvTransition) -> dict[str, Tensor]:
         """What the saved state bins and tokenizer steps give the model for this frame."""
-        observation = self.tokenizer(self.bins(transition))[TransitionKey.OBSERVATION]
+        observation = self.tokenizer(self.bins(transition))[TransitionKey.OBSERVATION] or {}
         return {key.removeprefix(MODEL_INPUT_PREFIX): value for key, value in observation.items()}
 
     def _fit(self, transition: EnvTransition) -> None:
         """Take the prompt around the state, and its token types, from the saved steps on this frame."""
         saved = self._saved(transition)
         ids = saved["input_ids"][0]
-        bins = action_to_bin_tokens(transition[TransitionKey.OBSERVATION][OBS_STATE], DM05_STATE_BINS)[0]
+        state = (transition[TransitionKey.OBSERVATION] or {})[OBS_STATE]
+        bins = action_to_bin_tokens(state, DM05_STATE_BINS)[0]
         self.prompt = StatePromptTokens.around(
             ids.tolist(), bins.tolist(), self.pieces, self.pad_id, device=ids.device
         )
@@ -134,7 +127,7 @@ class _StatePromptStep(ProcessorStep):
 
     def _check(self, transition: EnvTransition) -> None:
         """Refuse a prompt or pixels other than the saved steps' for this frame."""
-        program = self._apply(transition)[TransitionKey.OBSERVATION]
+        program = self._apply(transition)[TransitionKey.OBSERVATION] or {}
         program = {key.removeprefix(MODEL_INPUT_PREFIX): value for key, value in program.items()}
         saved = self._saved(transition)
         length = saved["input_ids"].shape[1]
@@ -144,7 +137,7 @@ class _StatePromptStep(ProcessorStep):
             for key in ("input_ids", "attention_mask", "token_type_ids")
         )
         if not same_prompt:
-            state = transition[TransitionKey.OBSERVATION][OBS_STATE].tolist()
+            state = (transition[TransitionKey.OBSERVATION] or {})[OBS_STATE].tolist()
             raise ValueError(
                 f"The program writes another prompt than DM05's tokenizer step for the normalized state {state}: "
                 "this tokenizer splits the state's numbers differently inside the prompt, so DM05 cannot be "
@@ -154,6 +147,3 @@ class _StatePromptStep(ProcessorStep):
             raise ValueError(
                 "The program's pixel values differ from the ones DM05's tokenizer step computes."
             )
-
-    def transform_features(self, features):
-        return features

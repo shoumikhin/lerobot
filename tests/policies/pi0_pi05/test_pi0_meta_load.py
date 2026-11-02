@@ -17,6 +17,7 @@
 """PI0Policy.from_pretrained builds parameters on the meta device and matches the regular load."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,8 +25,10 @@ import torch
 pytest.importorskip("transformers")
 
 import transformers.utils  # noqa: E402
+from safetensors import SafetensorError  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
+from lerobot.export.recipe import load_policy  # noqa: E402
 from lerobot.policies.common.meta_load import parameters_on_meta  # noqa: E402
 from lerobot.policies.pi0 import PI0Config, PI0Policy, modeling_pi0  # noqa: E402
 from lerobot.utils import import_utils  # noqa: E402
@@ -177,14 +180,15 @@ def test_meta_build_draws_no_random_numbers(config):
         lambda sd: sd.update({"state_proj.bias": torch.ones(3)}),
     ],
 )
-@pytest.mark.parametrize("strict", [True, False])
-def test_other_checkpoints_load_the_regular_way(config, tmp_path, monkeypatch, capsys, edit, strict):
+def test_other_checkpoints_load_the_regular_way(config, tmp_path, monkeypatch, capsys, edit):
     path = save(config, tmp_path / "ckpt", edit)
-    model, used_meta = load(PI0Policy, path, config, monkeypatch, strict=strict)
+    model, used_meta = load(PI0Policy, path, config, monkeypatch)
     assert "the checkpoint does not fill it exactly" in capsys.readouterr().out
-    expected, _ = load(PI0Policy, path, config, monkeypatch, regular=True, strict=strict)
+    expected, _ = load(PI0Policy, path, config, monkeypatch, regular=True)
     assert not used_meta
     assert_same(model, expected)
+    with pytest.raises(RuntimeError, match="state_proj.bias"):
+        load(PI0Policy, path, config, monkeypatch, strict=True)
 
 
 @pytest.mark.parametrize("strict", [True, False])
@@ -214,6 +218,14 @@ def test_unreadable_checkpoint_loads_the_regular_way(config, tmp_path, monkeypat
     expected, _ = load(PI0Policy, path, config, monkeypatch, regular=True)
     assert not used_meta
     assert_same(model, expected)
+    with pytest.raises(SafetensorError):
+        load(PI0Policy, path, config, monkeypatch, strict=True)
+
+
+def test_an_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(config, tmp_path):
+    config.pretrained_path = save(config, tmp_path / "ckpt", drop_projector_bias)
+    with pytest.raises(RuntimeError, match="multi_modal_projector.linear.bias"):
+        load_policy(SimpleNamespace(policy=config, backend=SimpleNamespace(device="cpu")))
 
 
 @pytest.mark.parametrize("complete", [True, False])

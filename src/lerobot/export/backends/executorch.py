@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..configs import ExportBackendConfig
 
@@ -36,8 +36,8 @@ class ExecuTorchConfig(ExportBackendConfig):
 
     runtime = "executorch"
     file_suffix = ".pte"
-    runtime_modules = ("executorch",)
-    packages = (EXECUTORCH,)
+    runtime_modules: ClassVar[tuple[str, ...]] = ("executorch",)
+    packages: ClassVar[tuple[str, ...]] = (EXECUTORCH,)
     min_torch = "2.15"
     torch_overrides = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
 
@@ -55,8 +55,12 @@ def lower(
     from executorch.exir import to_edge_transform_and_lower
     from executorch.exir.passes.constant_prop_pass import constant_prop_pass
 
+    # Folding skips in-place ops, so a value written in place from constants, as `ids[mask] = ...`, needs the
+    # functional form first. No op is decomposed here.
     return to_edge_transform_and_lower(
-        constant_prop_pass(program), partitioner=[partitioner], compile_config=compile_config
+        constant_prop_pass(program.run_decompositions({})),
+        partitioner=[partitioner],
+        compile_config=compile_config,
     )
 
 
@@ -83,6 +87,7 @@ def cuda_partitioner(name: str) -> CudaPartitioner:
     return CudaPartitioner(
         [
             CudaBackend.generate_method_name_compile_spec("forward"),
+            # From pytorch/executorch#24314, which ExecuTorch 1.6 gets with #24324.
             CudaBackend.generate_data_name_compile_spec(name),
         ]
     )

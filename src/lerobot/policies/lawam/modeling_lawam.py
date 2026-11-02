@@ -205,15 +205,6 @@ class LaWAMPolicy(PreTrainedPolicy):
         self.model.to(config.device)
         self.reset()
 
-    @classmethod
-    def _load_as_safetensor(
-        cls, model: LaWAMPolicy, model_file: str, map_location: str, strict: bool
-    ) -> LaWAMPolicy:
-        """Stage LaWAM checkpoint loading on CPU to avoid duplicate accelerator weights."""
-        del map_location
-        model.to("cpu")
-        return super()._load_as_safetensor(model, model_file, "cpu", strict)
-
     def reset(self) -> None:
         """Clear the queued action chunk used by step-wise inference."""
         self._queues: dict[str, deque[Tensor]] = {ACTION: deque(maxlen=self.config.n_action_steps)}

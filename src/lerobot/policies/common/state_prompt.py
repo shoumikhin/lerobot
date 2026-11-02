@@ -26,13 +26,16 @@ policy's processor, on its eager frames.
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from collections.abc import Iterator
 
 import torch
 from torch import Tensor
 
-from lerobot.processor import EnvTransition, TransitionKey
+from lerobot.processor import EnvTransition, ProcessorStep, TransitionKey
 from lerobot.utils.constants import OBS_STATE
+
+from ..utils import is_exporting
 
 
 class StatePromptTokens:
@@ -139,6 +142,47 @@ def extreme_states(transition: EnvTransition) -> Iterator[EnvTransition]:
     A recipe checks its prompt on these too, so that the check covers the first and last bins.
     """
     for value in (-1e6, 1e6):
-        observation = dict(transition[TransitionKey.OBSERVATION])
+        observation = dict(transition[TransitionKey.OBSERVATION] or {})
         observation[OBS_STATE] = torch.full_like(observation[OBS_STATE], value)
         yield {**transition, TransitionKey.OBSERVATION: observation}
+
+
+def uniform_bins(state: Tensor, count: int) -> Tensor:
+    """Each state value's bin number plus one, as `np.digitize` gives it against `count` equal bins from -1 to 1."""
+    edges = -1 + torch.arange(count, dtype=torch.float32, device=state.device) / (count // 2)
+    return (state.flatten()[:, None] >= edges).sum(-1)
+
+
+class StatePromptStep(ProcessorStep):
+    """A policy's tokenizer step for one task, as tensor operations that write the state into the prompt.
+
+    The first eager call takes the prompt around the state from the saved step (`_fit`). Every eager call then
+    checks that the program builds what the saved step does for its frame (`_check`), the first one also for
+    states beyond the first and last bins. While `torch.export` traces, the step only builds its inputs (`_apply`).
+    """
+
+    prompt: StatePromptTokens | None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if not is_exporting():
+            if self.prompt is None:
+                self._fit(transition)
+                for extreme in extreme_states(transition):
+                    self._check(extreme)
+            self._check(transition)
+        return self._apply(transition)
+
+    @abstractmethod
+    def _fit(self, transition: EnvTransition) -> None:
+        """Take the prompt around the state, and whatever else does not change with the frame, from this frame."""
+
+    @abstractmethod
+    def _check(self, transition: EnvTransition) -> None:
+        """Refuse a prompt, or other inputs, other than the saved step's for this frame."""
+
+    @abstractmethod
+    def _apply(self, transition: EnvTransition) -> EnvTransition:
+        """The saved step's output for this frame, built with tensor operations."""
+
+    def transform_features(self, features):
+        return features

@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The Wall-OSS 0.5 export recipe, on its tokenizer step with a tiny local tokenizer and a stand-in policy."""
+"""A stand-in Wall-OSS 0.5 for its export recipe, on its tokenizer step with a tiny local tokenizer."""
 
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("transformers")
 
 from lerobot.configs import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.policies.common.qwen_vision import is_exporting, is_preparing_image_grid  # noqa: E402
+from lerobot.policies.common.qwen_vision import is_preparing_image_grid  # noqa: E402
 from lerobot.policies.pretrained import PreTrainedPolicy  # noqa: E402
+from lerobot.policies.utils import is_exporting  # noqa: E402
 from lerobot.policies.wall_oss_05.configuration_wall_oss_05 import WallOSS05Config  # noqa: E402
 from lerobot.policies.wall_oss_05.export_wall_oss_05 import WallOSS05ExportRecipe  # noqa: E402
 from lerobot.policies.wall_oss_05.modeling_wall_oss_05 import WallOSS05Policy  # noqa: E402
@@ -136,7 +136,10 @@ def make_recipe(tmp_path, device="cpu", split_words=True, size=448) -> WallOSS05
     )
     tokenizer._processor = SimpleNamespace(
         tokenizer=make_tokenizer(tmp_path / "tokenizer", split_words),
-        image_processor=Qwen2VLImageProcessor(),
+        # Explicit: in transformers 5.5.4, min_pixels/max_pixels in another test change the class default.
+        image_processor=Qwen2VLImageProcessor(
+            size={"shortest_edge": 56 * 56, "longest_edge": 28 * 28 * 1280}
+        ),
     )
     preprocessor = PolicyProcessorPipeline(
         steps=[
@@ -156,45 +159,3 @@ def make_recipe(tmp_path, device="cpu", split_words=True, size=448) -> WallOSS05
         backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
     )
     return WallOSS05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)
-
-
-def program_inputs(recipe: WallOSS05ExportRecipe, state: list[float]) -> tuple[torch.Tensor, ...]:
-    frame = {**recipe.test_case().frame, OBS_STATE: np.array(state, dtype=np.float32)}
-    noise = np.random.default_rng(2).standard_normal(recipe.test_case().noise.shape, dtype=np.float32)
-    return tuple(torch.from_numpy(x) for x in (*frame.values(), noise))
-
-
-def test_the_program_writes_each_states_numbers_into_the_prompt(tmp_path):
-    recipe = make_recipe(tmp_path)
-
-    [part] = recipe.parts()
-    program = torch.export.export(part.module, part.example_inputs, strict=False)
-
-    # Bins -1, 0 and 511, numbers of two, one and three tokens, so the padding before the prompt changes.
-    inputs = program_inputs(recipe, [-2.0, -0.999, 1.0])
-    with torch.no_grad():
-        torch.testing.assert_close(program.module()(*inputs), part.module(*inputs), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_the_prompt_and_pixels_are_the_processors_on_cuda_too(tmp_path):
-    recipe = make_recipe(tmp_path, device="cuda")
-
-    [part] = recipe.parts()
-
-    assert part.module.preprocessor.steps[3].prompt is not None
-
-
-def test_a_tokenizer_that_writes_the_state_otherwise_is_refused(tmp_path):
-    # It reads all the text between special tokens as one word, so a number alone is not its own token there.
-    recipe = make_recipe(tmp_path, split_words=False)
-
-    with pytest.raises(ValueError, match="does not hold the state's numbers once"):
-        list(recipe.parts())
-
-
-def test_cameras_the_step_resizes_are_refused(tmp_path):
-    recipe = make_recipe(tmp_path, size=224)
-
-    with pytest.raises(ValueError, match="long side is 448 pixels"):
-        list(recipe.parts())

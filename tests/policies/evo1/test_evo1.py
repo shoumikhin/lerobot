@@ -950,7 +950,7 @@ def test_internvl3_embedder_loads_default_rope_that_matches_dynamic_and_exports(
     assert all(torch.equal(a, b) for a, b in zip(exported(x, positions), expected, strict=True))
 
 
-def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_length_prompt():
+def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_length_prompt(monkeypatch):
     transformers = pytest.importorskip("transformers")
 
     class Tokenizer:  # one id per image placeholder, then one per word
@@ -995,3 +995,8 @@ def test_internvl3_embedder_checks_truncated_image_tokens_and_exports_a_full_len
     embedder.max_text_length = 8  # exactly the prompt, so the check runs and passes
     exported = torch.export.export(model, (pixels, masks)).module()
     assert torch.equal(exported(pixels, masks), model(pixels, masks))
+    # Eager mode keeps the check even with the switch that turns off the transformers checks.
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    embedder.max_text_length = 3
+    with pytest.raises(ValueError, match="cut into the image placeholder tokens"):
+        model(pixels, masks)

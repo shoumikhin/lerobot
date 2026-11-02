@@ -55,6 +55,18 @@ class TorchProgram:
 register_runtime("torch_test", Runtime(TorchProgram))
 
 
+def record_places(monkeypatch) -> list[tuple[int, ...]]:
+    """From now on, record the shape of each value the runtime copies to where a program reads it."""
+    shapes: list[tuple[int, ...]] = []
+    place = TorchProgram.place
+    monkeypatch.setattr(
+        TorchProgram,
+        "place",
+        lambda self, index, value: shapes.append(value.shape) or place(self, index, value),
+    )
+    return shapes
+
+
 def make_bundle(
     folder: Path,
     module: nn.Module,

@@ -40,6 +40,12 @@ EMBEDDINGS = "token_embeddings.safetensors"
 KNOWN_TASKS = "known_tasks.json"
 # The ops of `TaskTokens.prompt_ops`; `lerobot.bundle.task_tokens` implements them.
 PROMPT_OPS = frozenset({"strip", "lower", "replace", "keep", "default", "template"})
+# The token ids the runs of a policy that writes its actions as tokens generate, and the actions the bundle decodes
+# from them (see `ActionTokens`).
+GENERATED_TOKENS = "generated_tokens"
+DECODED_ACTIONS = "decoded_actions"
+# The file of `action_tokens`, as the export writes it.
+ACTION_TOKENIZER = "action_tokenizer.json"
 
 
 @dataclass
@@ -114,6 +120,53 @@ class TaskTokens:
 
 
 @dataclass
+class ActionTokens:
+    """How the token ids the runs write as `generated_tokens` become the actions later runs read as `decoded_actions`.
+
+    pi0-FAST writes its action chunk as text: `Action: `, the chunk's FAST tokens, then an end marker. FAST quantizes
+    the discrete cosine transform (DCT) of each action component over the chunk, writes each coefficient as one
+    character, and compresses the characters with byte-pair encoding. The bundle keeps the ids before the first end
+    marker, drops every `Action: `, turns each id into its FAST token, joins the tokens' characters back into the
+    coefficients and inverts the DCT, without PyTorch (see `lerobot.bundle.action_tokens`). It decodes once every run
+    that writes `generated_tokens` has run, before the first run that reads `decoded_actions`.
+
+    Args:
+        tokenizer (`str`):
+            The FAST tokenizer file, in the format of the `tokenizers` library: a byte-level BPE.
+        clean_up_spaces (`bool`):
+            Whether the decoded text drops the space before punctuation, as a Transformers tokenizer with
+            `clean_up_tokenization_spaces` does.
+        id_offset (`int`):
+            The FAST token of a generated id is `id_offset - id`.
+        end (`int`):
+            The id of the end marker.
+        prefix (`list[int]`):
+            The ids of `Action: `, dropped wherever they appear.
+        start (`list[int]`):
+            The ids the generated tokens must start with, or none for a policy that does not check.
+        min_token (`int`):
+            The coefficient of the character `chr(0)`.
+        scale (`float`):
+            What the coefficients were multiplied by before they were rounded.
+        horizon (`int`):
+            The number of actions the decoding makes: the rows of `decoded_actions`.
+        action_dim (`int`):
+            The components of one action: the columns of `decoded_actions`.
+    """
+
+    tokenizer: str
+    clean_up_spaces: bool
+    id_offset: int
+    end: int
+    prefix: list[int]
+    start: list[int]
+    min_token: int
+    scale: float
+    horizon: int
+    action_dim: int
+
+
+@dataclass
 class Target:
     """The GPU a bundle's programs were built on, when they run only on that kind of GPU.
 
@@ -145,15 +198,25 @@ class BundleManifest:
         runtime_imports (`list[str]`, *optional*):
             Python modules to import before the programs load, such as one that registers a compiler's
             kernels with the runtime.
+        runtime_options (`dict[str, dict[str, bool | int | str]]`, *optional*):
+            Settings the runtime applies before the programs load, chosen by the backend that compiled them.
+            For ExecuTorch, the options of its backends, by backend name. They hold for the rest of the
+            process, so bundles loaded after this one run with them too.
         programs (`dict[str, ProgramFiles]`):
             The compiled programs, by name.
         runs (`list[ProgramRun]`):
             The runs of the programs, in order.
+        first_runs (`list[list[ProgramRun]]`, *optional*):
+            For a policy whose first chunks after a reset compute otherwise than the later ones, the runs of each
+            of them, one list per chunk. The chunks after them run `runs`.
         constants (`str`, *optional*):
             A safetensors file of named arrays the programs read, such as the timesteps of a sampler.
         task_tokens (`TaskTokens`, *optional*):
             How the task becomes the programs' `task_embeddings` and `task_length`. A bundle with it can run
             any task; one without it runs only `task`.
+        action_tokens (`ActionTokens`, *optional*):
+            How the token ids the runs generate become the actions later runs take, for a policy that writes its
+            actions as tokens.
         noise_shape (`list[int]`, *optional*):
             The shape of the starting noise the programs take as `noise`. `None` for a policy that takes
             none. A run that writes `noise` draws it; without one, the engine draws it on the host. The test
@@ -163,6 +226,11 @@ class BundleManifest:
             programs take that key as its last N frames, oldest first, stacked on a new first axis. After a
             reset, the first frame stands in for the ones not seen yet. Keys not listed are the current frame
             only.
+        carry (`dict[str, list[int] | None]`, *optional*):
+            The values the runs pass from one chunk to the next, by name, with their shapes, such as the warm
+            start of a planner. After a reset each is float32 zeros. The runs read one like any value, and what
+            it holds after the last run is what the next chunk reads. A value without a shape has none after a
+            reset: the runs of the first chunk write it, in its own type and where they run, such as a cache.
         task (`str`, *optional*):
             The task the programs were exported for. `None` for a policy that does not read the task.
         action_names (`list[str]`, *optional*):
@@ -181,19 +249,26 @@ class BundleManifest:
         test_case (`str`, *optional*, defaults to `"test.safetensors"`):
             The test case file: a frame, the noise, and the expected actions under `action`. With `history`,
             each frame value holds the frames of several control ticks, oldest first, and the actions are those
-            computed at the last one.
+            computed at the last one. With `carry`, the frame values and the noise hold those of several chunks,
+            oldest first, and the actions are those of the last chunk. With `first_runs`, the test case plays
+            several chunks from a reset as a robot would: the frame values hold the frames of every control
+            tick, the noise that of each chunk, and the actions the one played at each tick.
     """
 
     format_version: int = FORMAT_VERSION
     backend: str
     runtime: str
     runtime_imports: list[str] = field(default_factory=list)
+    runtime_options: dict[str, dict[str, bool | int | str]] = field(default_factory=dict)
     programs: dict[str, ProgramFiles]
     runs: list[ProgramRun]
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
     constants: str | None = None
     task_tokens: TaskTokens | None = None
+    action_tokens: ActionTokens | None = None
     noise_shape: list[int] | None = None
     history: dict[str, int] = field(default_factory=dict)
+    carry: dict[str, list[int] | None] = field(default_factory=dict)
     task: str | None = None
     action_names: list[str] | None = None
     action_scale: list[float]
@@ -212,13 +287,21 @@ class BundleManifest:
             raise ValueError("The manifest names a different number of actions than it scales.")
         if not self.runs:
             raise ValueError("The manifest lists no run.")
+        if not all(self.first_runs):
+            raise ValueError("The manifest lists no run for one of the first chunks.")
         if not all(type(n) is int and n > 0 for n in self.history.values()):
             raise ValueError(f"The history must keep a whole number of frames above 0, not {self.history}.")
-        names = [run.name for run in self.runs]
-        if len(set(names)) != len(names):
-            raise ValueError(f"The manifest names a run twice: {names}.")
-        if unknown := sorted({run.program for run in self.runs} - set(self.programs)):
-            raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+        if not all(
+            shape is None or (isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape))
+            for shape in self.carry.values()
+        ):
+            raise ValueError(f"The carry must give each value a shape of whole numbers, not {self.carry}.")
+        for runs in (*self.first_runs, self.runs):
+            names = [run.name for run in runs]
+            if len(set(names)) != len(names):
+                raise ValueError(f"The manifest names a run twice: {names}.")
+            if unknown := sorted({run.program for run in runs} - set(self.programs)):
+                raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleManifest:
@@ -236,18 +319,24 @@ class BundleManifest:
             )
         programs = data.get("programs") or {}
         runs = data.get("runs") or []
+        first_runs = data.get("first_runs") or []
         target = data.get("target")
         task_tokens = data.get("task_tokens")
+        action_tokens = data.get("action_tokens")
         # A key added later can change how the programs run, so a reader that does not know it stops.
         unknown = (
             sorted(set(data) - {f.name for f in fields(cls)})
             + sorted(
                 {key for files in programs.values() for key in files} - {f.name for f in fields(ProgramFiles)}
             )
-            + sorted({key for run in runs for key in run} - {f.name for f in fields(ProgramRun)})
+            + sorted(
+                {key for run in [*runs, *(run for chunk in first_runs for run in chunk)] for key in run}
+                - {f.name for f in fields(ProgramRun)}
+            )
             + sorted(set(target or {}) - {f.name for f in fields(Target)})
             + sorted(set(task_tokens or {}) - {f.name for f in fields(TaskTokens)})
             + sorted({op[0] for op in (task_tokens or {}).get("prompt_ops", [])} - PROMPT_OPS)
+            + sorted(set(action_tokens or {}) - {f.name for f in fields(ActionTokens)})
         )
         if unknown:
             raise ValueError(
@@ -258,8 +347,10 @@ class BundleManifest:
                 **data,
                 "programs": {name: ProgramFiles(**files) for name, files in programs.items()},
                 "runs": [ProgramRun(**run) for run in runs],
+                "first_runs": [[ProgramRun(**run) for run in chunk] for chunk in first_runs],
                 "target": None if target is None else Target(**target),
                 "task_tokens": None if task_tokens is None else TaskTokens(**task_tokens),
+                "action_tokens": None if action_tokens is None else ActionTokens(**action_tokens),
             }
         )
 

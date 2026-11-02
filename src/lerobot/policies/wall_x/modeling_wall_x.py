@@ -68,12 +68,11 @@ from ..common.input_checks import check_input
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
 from ..common.qwen_vision import (
     check_visible_images,
-    is_exporting,
     is_preparing_image_grid,
     qwen_image_rope_index,
 )
 from ..pretrained import PreTrainedPolicy
-from ..utils import log_model_loading_keys, populate_queues
+from ..utils import is_exporting, log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
 from .constant import WALL_X_GENERATION_PROMPT_IDS
 from .qwen_model import Qwen2_5_VLConfig

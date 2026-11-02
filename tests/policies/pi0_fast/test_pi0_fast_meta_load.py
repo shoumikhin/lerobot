@@ -81,6 +81,8 @@ def test_incomplete_checkpoint_loads_the_regular_way(config, tmp_path, monkeypat
     expected, _ = load(PI0FastPolicy, path, config, monkeypatch, regular=True, strict=False)
     assert not used_meta
     assert_same(model, expected)
+    with pytest.raises(RuntimeError, match="multi_modal_projector.linear.bias"):
+        load(PI0FastPolicy, path, config, monkeypatch, strict=True)
 
 
 @pytest.mark.parametrize("complete", [True, False])

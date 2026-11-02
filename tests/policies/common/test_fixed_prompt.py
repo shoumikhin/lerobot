@@ -71,9 +71,13 @@ class Program(torch.nn.Module):
 
 
 def test_the_program_keeps_the_prompt_and_computes_the_frame():
-    step = FixedPromptStep(Tokenizer(), pixels)
-    eager = step(frame(0.2))[TransitionKey.COMPLEMENTARY_DATA]
-    assert eager["labels"] is None and eager["task"] == ["pick"]
+    step = FixedPromptStep(ChatTokenizer(), pixels)
+    eager = frame(0.2)
+    eager[TransitionKey.COMPLEMENTARY_DATA]["messages"] = [["pick"]]
+    comp = step(eager)[TransitionKey.COMPLEMENTARY_DATA]
+    # The entries of the step itself: its plain values kept, the messages it renders removed.
+    assert comp.keys() == ChatTokenizer()(eager)[TransitionKey.COMPLEMENTARY_DATA].keys()
+    assert comp["labels"] is None and comp["action_token_start"] == 2 and comp["task"] == ["pick"]
 
     program = torch.export.export(Program(step), (torch.full((1, 3, 2, 2), 0.2),), strict=False)
 
@@ -101,14 +105,3 @@ def test_tracing_before_an_eager_call_is_refused():
 
     with pytest.raises(ValueError, match="eager call before the program is traced"):
         torch.export.export(Program(step), (torch.rand(1, 3, 2, 2),), strict=False)
-
-
-def test_the_step_keeps_plain_values_and_removes_what_the_step_removes():
-    step = FixedPromptStep(ChatTokenizer(), pixels)
-    eager = frame(0.2)
-    eager[TransitionKey.COMPLEMENTARY_DATA]["messages"] = [["pick"]]
-
-    expected = ChatTokenizer()(eager)[TransitionKey.COMPLEMENTARY_DATA]
-    comp = step(eager)[TransitionKey.COMPLEMENTARY_DATA]
-
-    assert comp.keys() == expected.keys() and comp["action_token_start"] == 2

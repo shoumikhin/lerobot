@@ -47,6 +47,7 @@ from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available
 
+from ..utils import is_exporting
 from .input_checks import check_input
 
 if TYPE_CHECKING or _transformers_available:
@@ -72,12 +73,6 @@ def prepare_image_grid() -> Iterator[None]:
         yield
     finally:
         _preparing_image_grid.reset(token)
-
-
-def is_exporting() -> bool:
-    """Whether non-strict `torch.export` is tracing."""
-    # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
-    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
 
 
 def is_preparing_image_grid() -> bool:

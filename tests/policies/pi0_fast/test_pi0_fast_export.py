@@ -14,96 +14,146 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""pi0-FAST's export recipe on a tiny pi0-FAST: its state prompt, its decoding, and what it refuses."""
+
+import json
+import shutil
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
-from torch import nn
+from safetensors.numpy import load_file, save_file
 
 transformers = pytest.importorskip("transformers")
+pytest.importorskip("tokenizers")
+pytest.importorskip("scipy")
 
-from lerobot.policies.factory import get_export_recipe_class  # noqa: E402
-from lerobot.policies.pi0_fast import modeling_pi0_fast  # noqa: E402
+from lerobot.bundle.action_tokens import ActionDecoder  # noqa: E402
+from lerobot.policies import make_pre_post_processors  # noqa: E402
+from lerobot.policies.pi0_fast import PI0FastPolicy  # noqa: E402
 from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig  # noqa: E402
-from lerobot.policies.pi_gemma import PaliGemmaForConditionalGenerationWithPiGemma  # noqa: E402
+from lerobot.policies.pi0_fast.export_pi0_fast import PI0FastExportRecipe, PI0FastPrefill  # noqa: E402
+from lerobot.policies.pi0_fast.processor_pi0_fast import (  # noqa: E402
+    Pi0FastPrepareStateAndLanguageTokenizerProcessorStep,
+)
+from lerobot.processor import TransitionKey  # noqa: E402
+from lerobot.scripts.lerobot_export import export  # noqa: E402
+from lerobot.utils.constants import OBS_STATE  # noqa: E402
+from tests.export.plugins import use_plugins  # noqa: E402
+from tests.export.tiny_pi0_fast import VOCABULARY, save_checkpoint, use_tiny_pi0_fast  # noqa: E402
 
-END_OF_ACTION = 3
-
-
-class TinyPaliGemma(modeling_pi0_fast.PI0FastPaliGemma):
-    """The PI0Fast wrapper around a tiny PaliGemma, so decoding runs without the full-size model."""
-
-    def __init__(self, vlm_config, use_adarms=None, precision=torch.float32):
-        nn.Module.__init__(self)
-        config = transformers.PaliGemmaConfig(
-            text_config=transformers.GemmaConfig(
-                hidden_size=16,
-                intermediate_size=32,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                head_dim=8,
-                vocab_size=64,
-                hidden_activation="gelu_pytorch_tanh",
-            ).to_dict(),
-            vision_config=transformers.SiglipVisionConfig(
-                hidden_size=16,
-                intermediate_size=32,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                image_size=8,
-                patch_size=4,
-            ).to_dict(),
-            image_token_index=63,
-            projection_dim=16,
-            vocab_size=64,
-        )
-        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config)
-        # Every step predicts the end-of-action marker, so greedy decoding stops after one token.
-        self.paligemma.lm_head = nn.Linear(16, 64)
-        with torch.no_grad():
-            self.paligemma.lm_head.weight.zero_()
-            self.paligemma.lm_head.bias.zero_()
-            self.paligemma.lm_head.bias[END_OF_ACTION] = 100
+TASK = "pick up the cube"
 
 
-class Tokenizer:
-    bos_token_id = 1
+def test_state_prompt_step_leaves_the_transition_it_is_given_unchanged():
+    step = Pi0FastPrepareStateAndLanguageTokenizerProcessorStep()
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.tensor([[0.0, 1.0]])},
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["pick up the cube"]},
+    }
+    prompts = [step(transition)[TransitionKey.COMPLEMENTARY_DATA]["task"] for _ in range(2)]
+    assert prompts == [["Task: pick up the cube, State: 128 255;\n"]] * 2
+    assert transition[TransitionKey.COMPLEMENTARY_DATA] == {"task": ["pick up the cube"]}
 
-    def convert_tokens_to_ids(self, token):
-        return END_OF_ACTION
+
+@pytest.fixture(scope="module")
+def checkpoint(tmp_path_factory):
+    """A tiny pi0-FAST checkpoint and its config."""
+    folder = tmp_path_factory.mktemp("pi0_fast")
+    with pytest.MonkeyPatch.context() as patch:
+        return folder / "checkpoint", save_checkpoint(folder / "checkpoint", patch)
 
 
-def test_greedy_decoding_exports_and_keeps_its_early_stop_under_torch_compile(monkeypatch):
-    monkeypatch.setattr(modeling_pi0_fast, "PI0FastPaliGemma", TinyPaliGemma)
-    core = modeling_pi0_fast.PI0FastPytorch(
-        PI0FastConfig(dtype=torch.float32), paligemma_tokenizer=Tokenizer()
+def load_policy(checkpoint, config, monkeypatch):
+    """The tiny pi0-FAST and its processors, as lerobot-rollout loads them."""
+    use_tiny_pi0_fast(monkeypatch)
+    policy = PI0FastPolicy.from_pretrained(checkpoint, config=config).eval()
+    return policy, *make_pre_post_processors(config, pretrained_path=str(checkpoint))
+
+
+def make_recipe(checkpoint, config, monkeypatch) -> PI0FastExportRecipe:
+    cfg = SimpleNamespace(
+        backend=SimpleNamespace(device="cpu"), seed=0, dataset=None, task=TASK, tolerance=None
     )
-
-    class Decode(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.core = core
-
-        def forward(self, image, image_mask, tokens, masks):
-            return self.core.sample_actions_fast_kv_cache(
-                [image], [image_mask], tokens, masks, max_decoding_steps=4, temperature=0
-            )
-
-    model = Decode().eval()
-    tokens = torch.tensor([[4, 5], [6, 7]])
-    image, image_mask = torch.randn(2, 3, 8, 8), torch.ones(2, dtype=torch.bool)
-    inputs = (image, image_mask, tokens, torch.ones_like(tokens, dtype=torch.bool))
-    with torch.no_grad():
-        eager = model(*inputs)
-        assert eager.tolist() == [[END_OF_ACTION, 0, 0, 0]] * 2
-        # torch.compile on PyTorch 2.11 also reports is_exporting(); the early stop must survive it.
-        assert torch.equal(torch.compile(model, backend="eager")(*inputs), eager)
-        # The exported loop runs every step: the tokens after the marker differ and decoding drops them.
-        exported = torch.export.export(model, inputs, strict=False).module()(*inputs)
-    assert exported[:, 0].tolist() == [END_OF_ACTION] * 2
+    return PI0FastExportRecipe(*load_policy(checkpoint, config, monkeypatch), cfg)
 
 
-def test_lerobot_export_refuses_pi0_fast_before_loading_the_checkpoint():
-    recipe = get_export_recipe_class(PI0FastConfig())
+def answers(spec, fast_vocabulary, count):
+    """Answers of random FAST tokens. Some hold `Action: ` again, the end marker, an id of no FAST token, or an
+    unused id from the end of the vocabulary, whose FAST id is negative."""
+    generator = torch.Generator().manual_seed(0)
+    for i in range(count):
+        tokens = spec.id_offset - torch.randint(fast_vocabulary, (12,), generator=generator)
+        extra = [spec.prefix, [spec.end], [spec.id_offset - fast_vocabulary - 3], [spec.id_offset + 2], []][
+            i % 5
+        ]
+        at = int(torch.randint(len(tokens), (1,), generator=generator))
+        yield torch.cat(
+            (torch.tensor(spec.prefix), tokens[:at], torch.tensor(extra, dtype=torch.long), tokens[at:])
+        )
 
-    with pytest.raises(ValueError, match="pi0-FAST cannot be exported: it decodes its actions"):
-        recipe.load(cfg=None)
+
+def test_the_decoding_of_answers_matches_the_policy(checkpoint, monkeypatch):
+    recipe = make_recipe(*checkpoint, monkeypatch)
+    next(recipe.parts())
+    # What the bundle holds: the FAST tokenizer and how the policy reads its answer.
+    decoding = recipe.plan().action_tokens
+    spec = decoding.spec
+    fast = recipe.policy.action_tokenizer.bpe_tokenizer
+    for clean_up in (True, False):
+        monkeypatch.setattr(fast, "clean_up_tokenization_spaces", clean_up)
+        decoder = ActionDecoder(json.loads(decoding.tokenizer), replace(spec, clean_up_spaces=clean_up))
+        for answer in answers(spec, len(fast), 100):
+            expected = recipe.policy.detokenize_actions(answer, spec.horizon, spec.action_dim).numpy()
+            np.testing.assert_allclose(decoder(answer.numpy()), expected, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "change, error",
+    [
+        ({"temperature": 0.7}, "set --policy.temperature=0"),
+        ({"use_kv_cache": False}, "use_kv_cache=true"),
+        ({"dtype": torch.bfloat16}, "set --policy.dtype=float32"),
+    ],
+)
+def test_recipe_refuses_decoding_it_does_not_export(change, error):
+    with pytest.raises(ValueError, match=error):
+        PI0FastExportRecipe(SimpleNamespace(config=PI0FastConfig(**change)), None, None, None)
+
+
+def test_recipe_refuses_a_chain_that_generates_other_tokens(checkpoint, monkeypatch):
+    recipe = make_recipe(*checkpoint, monkeypatch)
+    prefill = PI0FastPrefill.forward
+
+    def first_token_off_by_one(self, *frame):
+        tokens, *rest = prefill(self, *frame)
+        return (tokens + 1) % VOCABULARY, *rest
+
+    monkeypatch.setattr(PI0FastPrefill, "forward", first_token_off_by_one)
+    with pytest.raises(
+        ValueError, match="chain generates token .* where the policy generates .*, at position 0"
+    ):
+        next(recipe.parts())
+
+
+def test_recipe_refuses_a_decoding_that_differs_from_the_policy(checkpoint, monkeypatch):
+    recipe = make_recipe(*checkpoint, monkeypatch)
+    decode = ActionDecoder.__call__
+    monkeypatch.setattr(ActionDecoder, "__call__", lambda self, tokens: decode(self, tokens) + 1)
+    with pytest.raises(ValueError, match="decoding of pi0-FAST's tokens differs from the policy's"):
+        next(recipe.parts())
+
+
+def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, monkeypatch, capfd):
+    partial = tmp_path / "checkpoint"
+    shutil.copytree(checkpoint[0], partial)
+    weights = load_file(partial / "model.safetensors")
+    del weights["paligemma_with_expert.paligemma.model.multi_modal_projector.linear.bias"]
+    save_file(weights, partial / "model.safetensors", metadata={"format": "pt"})
+    use_plugins(monkeypatch, "torch_backend", "tiny_pi0_fast")
+    args = [f"--policy.path={partial}", f"--output_dir={tmp_path / 'bundle'}", f"--task={TASK}"]
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        export(["--backend.type=torch_test", *args])
+    assert "multi_modal_projector.linear.bias" in capfd.readouterr().err

@@ -20,9 +20,9 @@ import abc
 import inspect
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,10 +31,12 @@ import torch
 from torch import Tensor, nn
 from torch.overrides import TorchFunctionMode
 
-from lerobot.bundle.manifest import NOISE, ProgramRun
+from lerobot.bundle.manifest import NOISE, ActionTokens, ProgramRun
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
+    DeviceProcessorStep,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
     policy_output_to_transition,
@@ -58,7 +60,8 @@ logger = logging.getLogger(__name__)
 FLOAT32_TOLERANCE = 2e-5
 BFLOAT16_TOLERANCE = 0.075
 # Ten bfloat16 denoising steps amplify rounding: pi0.5's LIBERO checkpoint's TensorRT bundle differed from its test
-# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03. Another
+# case by 0.11 normalized, where eager PyTorch with another attention kernel moved the same frame by 0.03. EO-1's
+# TensorRT bundle differed from its test case by 0.079 on an H100, where another kernel moved it by 0.076. Another
 # attention kernel moves Wall-OSS 0.5's actions by up to 0.16.
 BFLOAT16_STEPS_TOLERANCE = 0.2
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
@@ -69,6 +72,7 @@ _IMAGE_CELLS = (6, 8)
 _PROBE_TASKS = ("pick up the red cube", "stop")
 _RANDOM_NORMAL = {torch.randn, torch.randn_like, torch.normal, Tensor.normal_}
 _MULTINOMIAL = {torch.multinomial, Tensor.multinomial}
+_RANDOM_INTEGERS = {torch.randint}
 
 
 @dataclass
@@ -103,11 +107,15 @@ class TestCase:
         frame (`dict[str, np.ndarray]`):
             The frame as the robot sends it: uint8 HWC images and float32 arrays. For a recipe whose plan has a
             `history`, the frames of several control ticks, oldest first, stacked on a new first axis; the
-            actions are those computed at the last one.
+            actions are those computed at the last one. For one whose plan has a `carry`, likewise the frames of
+            several chunks, each one's first tick; the actions are those of the last chunk. For one whose plan
+            has `first_runs`, the frames of every tick of several chunks from a reset.
         noise (`np.ndarray`, *optional*):
-            The starting noise, for a policy that takes one.
+            The starting noise, for a policy that takes one. With a `carry` or `first_runs`, the noise of each
+            chunk, stacked on a new first axis like the frames.
         actions (`np.ndarray`):
-            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`.
+            The float32 actions to play, in robot units, shaped `[execution_steps, action_dim]`. With
+            `first_runs`, the action played at each tick.
         action_scale (`np.ndarray`):
             For each action component, the robot units of one step of the policy's normalized actions.
     """
@@ -145,6 +153,21 @@ class TaskTokenData:
 
 
 @dataclass
+class ActionTokenData:
+    """How the token ids a policy generates become its actions, which the bundle decodes without PyTorch.
+
+    Args:
+        tokenizer (`str`):
+            The policy's FAST tokenizer, as the JSON the `tokenizers` library saves.
+        spec (`ActionTokens`):
+            The manifest's `action_tokens`, naming the file `tokenizer` is written to.
+    """
+
+    tokenizer: str
+    spec: ActionTokens
+
+
+@dataclass
 class RunPlan:
     """How the compiled parts of a bundle run, for a recipe whose parts do not simply run once in order.
 
@@ -153,20 +176,32 @@ class RunPlan:
             The runs in order, each naming the part it runs as its program. A part may run several times, for
             example a denoising step. `None` runs each part once, in the order it was yielded, with its own
             names.
+        first_runs (`list[list[ProgramRun]]`):
+            The runs of each of the first chunks after a reset, for a policy whose first chunks compute
+            otherwise (see `BundleManifest.first_runs`).
         constants (`dict[str, np.ndarray]`):
             Named arrays the runs can read, such as each step's timestep.
         task_tokens (`TaskTokenData`, *optional*):
             How the task becomes the `task_embeddings` and `task_length` the parts take, for a policy that
             reads it.
+        action_tokens (`ActionTokenData`, *optional*):
+            How the token ids the runs generate become the actions later runs take, for a policy that writes its
+            actions as tokens.
         history (`dict[str, int]`):
             For each key of the frame the parts read with its past values, how many frames: the parts take it
             as the last ones, oldest first, stacked on a new first axis (see `BundleManifest.history`).
+        carry (`dict[str, tuple[int, ...] | None]`):
+            The values the runs pass from one chunk to the next, with their shapes: float32 zeros after a reset,
+            or, without a shape, what the first chunk's runs write (see `BundleManifest.carry`).
     """
 
     runs: list[ProgramRun] | None = None
+    first_runs: list[list[ProgramRun]] = field(default_factory=list)
     constants: dict[str, np.ndarray] = field(default_factory=dict)
     task_tokens: TaskTokenData | None = None
+    action_tokens: ActionTokenData | None = None
     history: dict[str, int] = field(default_factory=dict)
+    carry: dict[str, tuple[int, ...] | None] = field(default_factory=dict)
 
 
 class ExportRecipe(abc.ABC):
@@ -178,8 +213,7 @@ class ExportRecipe(abc.ABC):
 
     Args:
         policy (`PreTrainedPolicy`):
-            The trained policy, in eval mode on the CPU. The recipe moves what it compiles to the backend's
-            device.
+            The trained policy, in eval mode on the backend's device.
         preprocessor (`PolicyProcessorPipeline`):
             Its saved preprocessor, set to run on the backend's device.
         postprocessor (`PolicyProcessorPipeline`):
@@ -195,6 +229,10 @@ class ExportRecipe(abc.ABC):
         tolerance (`float`):
             The largest allowed action difference on the test case, in normalized action units.
     """
+
+    #: The default tolerance of a bfloat16 checkpoint. A recipe whose policy runs ten bfloat16 denoising steps,
+    #: which amplify rounding, raises it to `BFLOAT16_STEPS_TOLERANCE`.
+    bfloat16_tolerance: float = BFLOAT16_TOLERANCE
 
     @classmethod
     def load(cls, cfg: ExportConfig) -> ExportRecipe:
@@ -219,7 +257,11 @@ class ExportRecipe(abc.ABC):
         self.cfg = cfg
         self.config: PreTrainedConfig = policy.config
         self.task: str | None = None
-        self.tolerance = cfg.tolerance if cfg.tolerance is not None else _default_tolerance(policy)
+        self.tolerance = (
+            cfg.tolerance
+            if cfg.tolerance is not None
+            else _default_tolerance(policy, self.bfloat16_tolerance)
+        )
 
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:
@@ -277,6 +319,8 @@ class ActionChunkRecipe(ExportRecipe):
 
     def parts(self) -> Iterator[Part]:
         """The one part, after checking that it computes what PyTorch does for two different frames."""
+        from lerobot.policies.common.qwen_vision import prepare_image_grid
+
         module = _ActionChunk(
             self.predict_chunk,
             self.policy,
@@ -286,15 +330,18 @@ class ActionChunkRecipe(ExportRecipe):
             self._visual,
             self.task,
             self._steps,
+            self._held_noise,
         )
         frame, noise = random_frame(self._features, self._generator), self._random_noise()
-        for case_frame, case_noise, expected in (
-            (self._case.frame, self._case.noise, self._case.actions),
-            (frame, noise, self._reference(frame, noise)),
-        ):
-            with torch.no_grad():
-                actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
-            self._check_program(actions, expected)
+        # A vision tower that exports on a prepared image grid prepares it in these eager runs.
+        with prepare_image_grid():
+            for case_frame, case_noise, expected in (
+                (self._case.frame, self._case.noise, self._case.actions),
+                (frame, noise, self._reference(frame, noise)),
+            ):
+                with torch.no_grad():
+                    actions = module(*self._inputs(case_frame, case_noise)).cpu().numpy()
+                self._check_program(actions, expected)
         inputs = [*self._features, *([NOISE] if self._noise_shape else [])]
         yield Part("model", module, self._inputs(self._case.frame, self._case.noise), inputs, [ACTION])
 
@@ -348,7 +395,8 @@ class ActionChunkRecipe(ExportRecipe):
 
     def _make_case(self, frame: dict[str, np.ndarray]) -> TestCase:
         """The test case of `frame`: a random noise, if the policy takes one, and the actions PyTorch computes."""
-        self._noise_shape = self._sampled_noise_shape(frame)
+        self._held_noise = self._seeded_noise()
+        self._noise_shape = None if self._held_noise is not None else self._sampled_noise_shape(frame)
         noise = self._random_noise()
         actions = self._reference(frame, noise)
         if not np.array_equal(actions, self._reference(frame, noise)):
@@ -379,6 +427,15 @@ class ActionChunkRecipe(ExportRecipe):
             for name, value in first.items()
             if isinstance(value, Tensor)
         )
+
+    def _seeded_noise(self) -> Tensor | None:
+        """The noise of a policy that draws the same noise for every chunk, as `predict_chunk` takes it.
+
+        Such a policy seeds its own generator each time it predicts a chunk, so it computes the same chunk from
+        the same frame. Its program holds this noise instead of taking one, and its bundle does the same. `None`,
+        the default, for a policy that draws other noise each time, which its bundle draws afresh for each chunk.
+        """
+        return None
 
     def _sampled_noise_shape(self, frame: dict[str, np.ndarray]) -> tuple[int, ...] | None:
         """The shape of the one starting noise the policy draws for a chunk, or `None` if it takes none.
@@ -445,6 +502,7 @@ class _ActionChunk(nn.Module):
         visual: set[str],
         task: str | None,
         execution_steps: int,
+        noise: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.predict_chunk = predict_chunk
@@ -455,6 +513,7 @@ class _ActionChunk(nn.Module):
         self.visual = visual
         self.task = task or ""
         self.execution_steps = execution_steps
+        self.noise = noise
 
     def forward(self, *inputs: Tensor) -> Tensor:
         observation: dict[str, Any] = {
@@ -463,7 +522,7 @@ class _ActionChunk(nn.Module):
         }
         observation["task"] = self.task
         observation["robot_type"] = ""
-        noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else None
+        noise = inputs[-1][None] if len(inputs) > len(self.frame_names) else self.noise
         actions = self.predict_chunk(self.policy, self.preprocessor(observation), noise)
         return self.postprocessor(actions[:, : self.execution_steps])[0].float()
 
@@ -474,19 +533,22 @@ class ReplayDraws(TorchFunctionMode):
     A compiled program cannot draw random numbers the way PyTorch does, so a policy's randomness becomes the
     program's `noise` input, which the bundle draws from a standard normal. The k-th draw reads `noise[k]`:
 
-    - a random normal tensor is `noise[k]` itself;
+    - a random normal tensor is `noise[k]` itself, or `mean + std * noise[k]` for `torch.normal(mean, std)` and
+      `Tensor.normal_(mean, std)`, which also writes it into its tensor;
     - a multinomial draw of one category per row is made the way PyTorch makes it, `argmax(p / q)` with `q`
       exponentially distributed, and takes `q = (a**2 + b**2) / 2` from the two halves of `noise[k]`, shaped
-      `[2, *p.shape]`.
+      `[2, *p.shape]`;
+    - a random integer tensor `torch.randint(low, high, size)` draws each value like a category of
+      `high - low` equally likely ones, reading `noise[k]` shaped `[2, *size, high - low]`.
 
     Without a noise, the draws are made as usual and `shapes` records the shape each would read.
 
     Args:
-        noise (`Tensor`, *optional*):
-            The draws, stacked on the first axis.
+        noise (`Tensor` or `Sequence[Tensor]`, *optional*):
+            The draws, stacked on the first axis, or one tensor per draw for draws of different shapes.
     """
 
-    def __init__(self, noise: Tensor | None = None) -> None:
+    def __init__(self, noise: Tensor | Sequence[Tensor] | None = None) -> None:
         """Read the draws from `noise`, or make them as usual and record their shapes without one."""
         super().__init__()
         self.noise = noise
@@ -495,6 +557,11 @@ class ReplayDraws(TorchFunctionMode):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         """Run `func`, reading it from the noise if it is a random draw."""
         kwargs = kwargs or {}
+        if func is Tensor.normal_ and self.noise is not None:
+            # Not drawn first: writing into a drawn tensor keeps a random operation ExecuTorch cannot lower.
+            tensor = args[0]
+            mean, std = self._mean_and_std(args[1:], kwargs)
+            return tensor.copy_(mean + std * self._next(tuple(tensor.shape)).to(tensor))
         if func in _MULTINOMIAL:
             probs = args[0]
             if (args[1] if len(args) > 1 else kwargs.get("num_samples")) != 1:
@@ -504,28 +571,59 @@ class ReplayDraws(TorchFunctionMode):
                 return func(*args, **kwargs)
             first, second = self._next((2, *probs.shape))
             return torch.argmax(probs / ((first * first + second * second) / 2), dim=-1, keepdim=True)
+        if func in _RANDOM_INTEGERS:
+            low, high, size = _integer_range(args, kwargs)
+            if self.noise is None:
+                self.shapes.append((2, *size, high - low))
+                return func(*args, **kwargs)
+            first, second = self._next((2, *size, high - low))
+            # The multinomial draw above with equal probabilities: the smallest exponential wins.
+            picked = torch.argmin(first * first + second * second, dim=-1)
+            return (low + picked).to(kwargs.get("dtype") or torch.int64)
         result = func(*args, **kwargs)
         if func in _RANDOM_NORMAL:
             if self.noise is None:
                 self.shapes.append(tuple(result.shape))
             else:
                 result = self._next(tuple(result.shape)).to(result)
+                if func is torch.normal:
+                    mean, std = self._mean_and_std(args, kwargs)
+                    result = mean + std * result
         return result
+
+    @staticmethod
+    def _mean_and_std(args: tuple, kwargs: dict[str, Any]) -> tuple[Any, Any]:
+        """The `mean` and `std` of `torch.normal(*args, **kwargs)` or of `tensor.normal_(*args, **kwargs)`."""
+        given = {"mean": 0.0, "std": 1.0, **dict(zip(("mean", "std"), args, strict=False)), **kwargs}
+        return given["mean"], given["std"]
 
     def _next(self, shape: tuple[int, ...]) -> Tensor:
         drawn = len(self.shapes)
-        if self.noise is None or drawn == len(self.noise) or tuple(self.noise.shape[1:]) != shape:
+        if self.noise is None or drawn == len(self.noise):
             raise ValueError(
-                f"Draw {drawn} reads noise shaped {list(shape)}, which the noise "
-                f"{None if self.noise is None else list(self.noise.shape)} does not hold."
+                f"Draw {drawn} reads noise shaped {list(shape)}, but the noise holds only "
+                f"{0 if self.noise is None else len(self.noise)} draws."
+            )
+        if tuple(self.noise[drawn].shape) != shape:
+            raise ValueError(
+                f"Draw {drawn} reads noise shaped {list(shape)}, but the noise holds "
+                f"{list(self.noise[drawn].shape)} for it."
             )
         self.shapes.append(shape)
         return self.noise[drawn]
 
 
-def _default_tolerance(policy: PreTrainedPolicy) -> float:
+def _integer_range(args: tuple, kwargs: dict[str, Any]) -> tuple[int, int, tuple[int, ...]]:
+    """The `low`, `high` and `size` of a call `torch.randint(high, size)` or `torch.randint(low, high, size)`."""
+    named = {"low", "high", "size"} & kwargs.keys()
+    order = ("low", "high", "size") if len(args) + len(named) == 3 else ("high", "size")
+    values = {"low": 0, **dict(zip(order, args, strict=False)), **{name: kwargs[name] for name in named}}
+    return values["low"], values["high"], tuple(values["size"])
+
+
+def _default_tolerance(policy: PreTrainedPolicy, bfloat16_tolerance: float) -> float:
     if any(p.dtype == torch.bfloat16 for p in policy.parameters()):
-        return BFLOAT16_TOLERANCE
+        return bfloat16_tolerance
     return FLOAT32_TOLERANCE
 
 
@@ -537,6 +635,30 @@ def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str
         if isinstance(step, RenameObservationsProcessorStep)
         for old, new in step.rename_map.items()
     }
+
+
+def split_absolute_step(
+    postprocessor: PolicyProcessorPipeline, action_dim: int
+) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
+    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
+
+    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
+    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
+    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
+    """
+    steps = list(postprocessor.steps)
+    index = next(
+        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
+    )
+    if index is None:
+        return postprocessor, None
+    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
+        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
+    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
+    if relative_step is None:
+        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
+    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
+    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
 
 
 def robot_features(
@@ -644,21 +766,42 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
     return np.maximum(np.abs(high - low), 1e-4 * np.abs(low) + 1e-6).astype(np.float32)
 
 
-def whole_policy_fits(model_file: Path, device: torch.device) -> bool:
-    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it."""
+_MEMINFO = Path("/proc/meminfo")
+
+
+def _available_memory() -> int | None:
+    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere."""
+    if not _MEMINFO.exists():
+        return None
+    for line in _MEMINFO.read_text().splitlines():
+        name, value, *_ = line.split()
+        if name == "MemAvailable:":
+            return int(value) * 1024
+    return None
+
+
+def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
+    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it.
+
+    When it does not, logs that the comparison is skipped; the bundle's own check of its test case still runs.
+    """
     size = model_file.stat().st_size
     if device.type == "cuda":
-        available = torch.cuda.mem_get_info(device)[0]
+        available, measured = torch.cuda.mem_get_info(device)[0], "free"
+    elif (linux_available := _available_memory()) is not None:
+        available, measured = linux_available, "available"
     else:
-        available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        available, measured = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "installed"
     # Room for the activations and for what the export already holds.
     if 2 * size <= available:
         return True
-    logger.info(
-        "Not comparing the test case with the whole policy: its %.1f GiB of weights do not fit twice in the "
-        "%.1f GiB this device has.",
-        size / 2**30,
-        available / 2**30,
+    logger.warning(
+        "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB %s. The bundle's "
+        "own check against its test case still runs.",
+        policy_name,
+        2 * size / 1e9,
+        available / 1e9,
+        measured,
     )
     return False
 
@@ -666,22 +809,39 @@ def whole_policy_fits(model_file: Path, device: torch.device) -> bool:
 def load_policy(
     cfg: ExportConfig,
 ) -> tuple[PreTrainedPolicy, PolicyProcessorPipeline, PolicyProcessorPipeline]:
-    """The whole trained policy, in eval mode on the CPU, and its processors set to the backend's device."""
+    """The whole trained policy, in eval mode on the backend's device, and its processors set to that device."""
     from lerobot.policies.factory import load_pretrained_policy
 
     config = cast(PreTrainedConfig, cfg.policy)
-    # Weights load on the CPU; the recipe moves what it compiles to the backend's device.
-    config.device = "cpu"
+    config.device = cfg.backend.device
     # How the policy runs, not how it trained, decides what compiles it.
     if hasattr(config, "compile_model"):
         config.compile_model = False
-    policy = load_pretrained_policy(config)
+    # Built on the device, so the checkpoint is copied there once and its weights are never on the CPU as well.
+    with torch.device(cfg.backend.device):
+        # Strict: a weight the checkpoint does not fill would stay random, and no later check could tell.
+        policy = load_pretrained_policy(config, strict=True)
     if hasattr(policy, "merge_and_unload"):
         # A PEFT adapter: compile the base weights with the adapter folded in.
         policy = policy.merge_and_unload()
     policy.eval()
-    config.device = cfg.backend.device
     return policy, *load_processors(config)
+
+
+def refuse_peft_adapter(config: PreTrainedConfig, policy_name: str) -> None:
+    """Refuse a PEFT adapter, for a recipe that reads each part's weights from the checkpoint's own file."""
+    from lerobot.policies.factory import has_peft_adapter_config
+
+    if (
+        config.use_peft
+        and config.pretrained_path is not None
+        and has_peft_adapter_config(config.pretrained_path, config.pretrained_revision)
+    ):
+        raise ValueError(
+            f"{config.pretrained_path} is a PEFT adapter, and {policy_name}'s export reads each part's weights "
+            "from the checkpoint's model.safetensors, which an adapter does not hold. Merge the adapter into "
+            "its base policy, save that, and export it. See https://huggingface.co/docs/lerobot/export."
+        )
 
 
 def load_processors(config: PreTrainedConfig) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:

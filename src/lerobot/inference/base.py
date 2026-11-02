@@ -31,6 +31,7 @@ import torch
 
 from lerobot.lerobot_types import EnvTransition
 from lerobot.utils import QUERY_KIND, QUERY_TEXT
+from lerobot.utils.latency import LatencyWindow
 
 from .contracts import DEFAULT_MAX_TEXT_INPUT_CHARS, QueryKind
 
@@ -159,6 +160,7 @@ class InferenceEngine(abc.ABC):
 
     def __init__(self, task: str = "") -> None:
         """Initialize task ownership and serialized language-query bookkeeping."""
+        self.latency = LatencyWindow()
         self._task = task
         self._task_changed = False
         self._task_version = 0

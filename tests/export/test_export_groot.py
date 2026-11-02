@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The GR00T N1.7 export recipe, end to end on a tiny random GR00T with its own tiny Qwen3-VL processor."""
-
-import json
+"""The GR00T N1.7 export recipe on a tiny random GR00T with its own tiny Qwen3-VL processor."""
 
 import numpy as np
 import pytest
@@ -22,16 +20,12 @@ import torch
 
 pytest.importorskip("transformers")
 pytest.importorskip("diffusers")
-cv2 = pytest.importorskip("cv2")
+pytest.importorskip("cv2")
 
-from lerobot.bundle.engine import BundleEngine  # noqa: E402
-from lerobot.bundle.manifest import NOISE, TASK_LENGTH, Bundle  # noqa: E402
-from lerobot.configs import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
+from lerobot.bundle.manifest import Bundle  # noqa: E402
+from lerobot.policies import make_pre_post_processors  # noqa: E402
 from lerobot.policies.groot.configuration_groot import GrootConfig  # noqa: E402
 from lerobot.policies.groot.export_groot import image_stages  # noqa: E402
-from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config  # noqa: E402
-from lerobot.policies.groot.modeling_groot import GrootPolicy  # noqa: E402
 from lerobot.policies.groot.processor_groot import (  # noqa: E402
     GrootN17VLMEncodeStep,
     _transform_n1_7_image_for_vlm_albumentations,
@@ -40,165 +34,7 @@ from lerobot.policies.groot.processor_groot import (  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
-
-SPECIAL = [
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|vision_start|>",
-    "<|vision_end|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-]
-WORDS = [
-    "<|endoftext|>",
-    "[UNK]",
-    "user",
-    "pick",
-    "up",
-    "the",
-    "red",
-    "cube",
-    "then",
-    "stop",
-    "perform",
-    "task",
-]
-CHAT_TEMPLATE = (
-    "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n"
-    "{% for content in message['content'] %}{% if content['type'] == 'image' %}"
-    "<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'text' %}{{ content['text'] }}"
-    "{% endif %}{% endfor %}<|im_end|>\n{% endfor -%}"
-)
-TASK = "Pick up the red cube"
-# The geometry each image mode resizes with, and the cameras its checkpoint takes.
-MODES = {
-    "albumentations": (
-        {"image_target_size": [16, 16], "shortest_image_edge": 16, "crop_fraction": 0.75},
-        {"observation.images.front": (3, 32, 32), "observation.images.wrist": (3, 32, 32)},
-    ),
-    "torchvision": (
-        {"image_target_size": [16, 16], "image_crop_size": [12, 12]},
-        {"observation.images.front": (3, 24, 40), "observation.images.wrist": (3, 24, 40)},
-    ),
-}
-
-
-def write_backbone(path):
-    """A tiny Qwen3-VL: its config, a word-level tokenizer with Qwen's special tokens, and its processors."""
-    from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast, Qwen3VLConfig
-    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
-    from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
-
-    vocab = {token: i for i, token in enumerate(SPECIAL + WORDS)}
-    tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer.add_special_tokens(SPECIAL)
-    fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="<|endoftext|>")
-    fast.chat_template = CHAT_TEMPLATE
-    fast.save_pretrained(path)
-    pixels = {"patch_size": 4, "temporal_patch_size": 2, "merge_size": 2}
-    Qwen2VLImageProcessor(**pixels, min_pixels=64, max_pixels=4096).save_pretrained(path)
-    Qwen3VLVideoProcessor(**pixels).save_pretrained(path)
-    Qwen3VLConfig(
-        image_token_id=vocab["<|image_pad|>"],
-        video_token_id=vocab["<|video_pad|>"],
-        vision_start_token_id=vocab["<|vision_start|>"],
-        vision_end_token_id=vocab["<|vision_end|>"],
-        tie_word_embeddings=True,
-        text_config={
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_hidden_layers": 7,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 16,
-            "vocab_size": 64,
-            "rope_scaling": {"rope_type": "default", "mrope_section": [2, 3, 3], "mrope_interleaved": True},
-            "tie_word_embeddings": True,
-        },
-        vision_config={
-            "depth": 3,
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_heads": 2,
-            "out_hidden_size": 32,
-            "patch_size": 4,
-            "temporal_patch_size": 2,
-            "spatial_merge_size": 2,
-            "deepstack_visual_indexes": [0, 1, 2],
-            "num_position_embeddings": 16,
-        },
-    ).save_pretrained(path)
-
-
-def save_checkpoint(path, mode: str):
-    """A fine-tuned GR00T: 7 Qwen3 layers (two language parts), 9 diffusion blocks (two step parts)."""
-    geometry, cameras = MODES[mode]
-    backbone = path / "backbone"
-    write_backbone(backbone)
-    base = path / "base"
-    GR00TN17(
-        GR00TN17Config(
-            model_name=str(backbone),
-            select_layer=7,
-            backbone_embedding_dim=32,
-            hidden_size=32,
-            input_embedding_dim=32,
-            max_state_dim=8,
-            max_action_dim=6,
-            action_horizon=4,
-            max_num_embodiments=12,
-            vl_self_attention_cfg={"num_layers": 1, "num_attention_heads": 2, "attention_head_dim": 16},
-            diffusion_model_cfg={
-                "positional_embeddings": None,
-                "num_layers": 9,
-                "num_attention_heads": 2,
-                "attention_head_dim": 16,
-                "norm_type": "ada_norm",
-                "dropout": 0.0,
-                "final_dropout": False,
-                "output_dim": 32,
-                "interleave_self_attention": True,
-            },
-            load_bf16=True,
-        ),
-        load_backbone_weights=False,
-    ).to(torch.bfloat16).save_pretrained(base)
-    config = GrootConfig(
-        base_model_path=str(base),
-        input_features={
-            **{name: PolicyFeature(type=FeatureType.VISUAL, shape=shape) for name, shape in cameras.items()},
-            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(5,)),
-        },
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(5,))},
-        device="cpu",
-        chunk_size=4,
-        n_action_steps=4,
-        max_state_dim=8,
-        max_action_dim=6,
-        use_bf16=False,
-    )
-    torch.manual_seed(0)
-    policy = GrootPolicy(config)
-    with torch.no_grad():
-        for parameter in policy.parameters():
-            parameter.add_(torch.randn_like(parameter), alpha=0.02)
-    policy.save_pretrained(path / "finetune")
-    stats = {
-        OBS_STATE: {"min": torch.full((5,), -1.0), "max": torch.full((5,), 2.0)},
-        ACTION: {"min": torch.full((5,), -10.0), "max": torch.full((5,), 30.0)},
-    }
-    preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=stats)
-    encode = next(s for s in preprocessor.steps if isinstance(s, GrootN17VLMEncodeStep))
-    encode.model_name = str(backbone)
-    encode.use_albumentations = mode == "albumentations"
-    encode.image_crop_size = encode.shortest_image_edge = encode.crop_fraction = None
-    for key, value in geometry.items():
-        setattr(encode, key, value)
-    for processor in (preprocessor, postprocessor):
-        processor.save_pretrained(path / "finetune")
-    return path / "finetune"
+from tests.export.tiny_groot import MODES, TASK, save_checkpoint  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -209,68 +45,61 @@ def torch_test_backend():
         yield
 
 
-@pytest.fixture(scope="module", params=list(MODES))
-def exported(request, tmp_path_factory):
-    path = tmp_path_factory.mktemp(f"groot_{request.param}")
-    checkpoint = save_checkpoint(path, request.param)
-    bundle = path / "bundle"
+def test_a_bfloat16_policy_without_autocast_exports(tmp_path, capfd):
+    """With autocast off, the parts feed the policy's bfloat16 layers bfloat16 values, as its own forward does."""
+    checkpoint = save_checkpoint(tmp_path, "albumentations", dtype=torch.bfloat16)
+    export(
+        [
+            "--backend.type=torch_test",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={tmp_path / 'bundle'}",
+            f"--task={TASK}",
+        ]
+    )
+    assert "Policy check: the chained parts are" in capfd.readouterr().err
+
+
+@pytest.mark.dataset
+def test_export_takes_the_state_under_the_name_the_saved_preprocessor_renames(tmp_path):
+    """The dataset names the state `observation.joints`, which the checkpoint's preprocessor renames."""
+    from lerobot.datasets import LeRobotDatasetMetadata
+    from lerobot.datasets.io_utils import write_info
+    from lerobot.processor import RenameObservationsProcessorStep
+
+    joints = "observation.joints"
+    image = {"dtype": "image", "names": ["height", "width", "channels"]}
+    features = {
+        **{name: {**image, "shape": (h, w, c)} for name, (c, h, w) in MODES["torchvision"][1].items()},
+        joints: {"dtype": "float32", "shape": (5,), "names": None},
+        ACTION: {"dtype": "float32", "shape": (5,), "names": [f"joint_{i}" for i in range(5)]},
+    }
+    root = tmp_path / "dataset"
+    metadata = LeRobotDatasetMetadata.create(
+        "user/tiny", fps=10, features=features, root=root, use_videos=False
+    )
+    metadata.save_episode_tasks([TASK])
+    metadata.info.total_tasks = 1
+    write_info(metadata.info, root)
+    # With relative actions, the actions part reads the state too.
+    checkpoint = save_checkpoint(tmp_path, "torchvision", dataset_meta=metadata, use_relative_actions=True)
+    config = GrootConfig.from_pretrained(checkpoint)
+    preprocessor, _ = make_pre_post_processors(config, checkpoint)
+    preprocessor.steps.insert(0, RenameObservationsProcessorStep(rename_map={joints: OBS_STATE}))
+    preprocessor.save_pretrained(checkpoint)
+    bundle = tmp_path / "bundle"
     export(
         [
             "--backend.type=torch_test",
             f"--policy.path={checkpoint}",
             f"--output_dir={bundle}",
-            f"--task={TASK}",
+            "--dataset.repo_id=user/tiny",
+            f"--dataset.root={root}",
+            "--tolerance=1e-4",
         ]
     )
-    return checkpoint, Bundle.read(bundle)
-
-
-def test_bundle_is_the_chain_of_parts(exported):
-    _, bundle = exported
-    manifest = bundle.manifest
-    runs = manifest.runs
-    steps = [f"step_{group}_{iteration}" for iteration in range(4) for group in range(2)]
-    names = ["vision", "language_model_0", "language_model_1", "keys_values", *steps, "actions"]
-    assert [run.name for run in runs] == names
-    assert [run.program for run in runs[4:8]] == ["step_0", "step_1", "step_0", "step_1"]
-    assert sorted(manifest.programs) == sorted({run.program for run in runs})
-    assert len(manifest.programs) == 7
-    # Each denoising step reads its own time constants and the actions of the step before.
-    assert runs[4].inputs[-5:] == ["state_features", NOISE, "time_encoding_0", "temb_0", TASK_LENGTH]
-    assert runs[7].inputs[-4:] == ["step_hidden_0", "temb_1", "x_1", TASK_LENGTH]
-    assert runs[7].outputs == ["x_2"]
-    # The last step's run returns the next actions; the actions part reads the last of them.
-    assert runs[-2].outputs == ["x_4"] and runs[-1].inputs == ["x_4"]
-    assert manifest.noise_shape == [4, 6]
-    tokens = manifest.task_tokens
-    known = json.loads((bundle.path / tokens.known_tasks).read_text())
-    assert TASK in known and tokens.max_tokens == len(known[TASK]) + 8
-    assert manifest.task == TASK
-
-
-def test_bundle_plays_the_actions_of_the_pytorch_policy(exported):
-    """Another frame and a task the export never saw, against the policy's own chunk under the same noise."""
-    checkpoint, bundle = exported
-    policy = GrootPolicy.from_pretrained(checkpoint)
-    preprocessor, postprocessor = make_pre_post_processors(policy.config, checkpoint)
-    engines = {task: BundleEngine(bundle, task=task) for task in (TASK, "stop then pick up the cube")}
-    rng = np.random.default_rng(1)
-    frame = {
-        name: rng.integers(0, 256, (shape[0], shape[1], shape[2]), dtype=np.uint8)
-        for name, shape in engines[TASK]._frame_spec.items()
-        if name != OBS_STATE
-    }
-    frame[OBS_STATE] = rng.random(5, dtype=np.float32)
-    noise = rng.standard_normal((4, 6)).astype(np.float32)
-    for task, engine in engines.items():
-        observation = prepare_observation_for_inference(dict(frame), "cpu", task)
-        with torch.no_grad():
-            chunk = policy.predict_action_chunk(
-                preprocessor(observation), noise=torch.from_numpy(noise)[None]
-            )
-            expected = postprocessor(chunk)[0].numpy()
-        actual = engine._run_chunk(frame, engine._task_values, noise)
-        np.testing.assert_allclose(actual / engine._scale, expected / engine._scale, atol=1e-3)
+    runs = Bundle.read(bundle).manifest.runs
+    assert [run.name for run in runs if joints in run.inputs] == ["vision", "actions"]
+    assert not any(OBS_STATE in run.inputs for run in runs)
 
 
 @pytest.mark.gpu
@@ -339,6 +168,26 @@ def test_image_stages_reproduce_the_processor_pixels(mode, height, width, geomet
             assert np.abs(actual - on_gpu).max() <= 1
 
 
+def test_resize_matrices_are_read_off_a_few_lines_at_a_time():
+    """All the lines of a full-size camera at once would take gigabytes."""
+    from lerobot.policies.groot.export_groot import LINE_BATCH_PIXELS, _separable_map
+
+    rng = np.random.default_rng(0)
+    height, width = 320, 320
+    rows, columns = rng.random((16, height)), rng.random((12, width))
+    sizes = []
+
+    def transform(lines):
+        sizes.append(lines.size)
+        return (rows @ lines @ columns.T).astype(np.float32)
+
+    read_rows, read_columns = _separable_map(transform, (height, width))
+    assert max(sizes) <= LINE_BATCH_PIXELS < height * height * width
+    image = rng.random((height, width))
+    actual = read_rows.double() @ torch.from_numpy(image) @ read_columns.double().T
+    np.testing.assert_allclose(actual.numpy(), rows @ image @ columns.T, rtol=1e-4)
+
+
 def test_n17_action_decode_matches_the_processor_step():
     """Unnormalizing, a relative joint group, a relative end-effector pose, and the LIBERO gripper."""
     from lerobot.policies.groot.export_groot import N17ActionDecode
@@ -399,3 +248,40 @@ def test_n17_action_decode_matches_the_processor_step():
     expected = pipeline(actions.clone())
     actual = N17ActionDecode(decode, pack, 4)(actions, torch.from_numpy(state)[None])
     torch.testing.assert_close(actual, expected.float(), rtol=0, atol=1e-5)
+
+
+def test_action_scale_of_a_relative_rotation_is_one():
+    """Constant actions are no rotation, so the scale of a relative end-effector rotation is not measured."""
+    from types import SimpleNamespace
+
+    from lerobot.policies.groot.export_groot import GrootExportRecipe, N17ActionDecode, _N17ChunkActions
+    from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep, GrootN17PackInputsStep
+
+    stats = {"min": [-1.0] * 9, "max": [1.0] * 9, "mean": [0.0] * 9}
+    raw_stats = {"action": {"eef": stats}, "relative_action": {"eef": stats}, "state": {"eef": stats}}
+    modality_config = {
+        "action": {
+            "modality_keys": ["eef"],
+            "delta_indices": list(range(4)),
+            "action_configs": [{"rep": "relative", "type": "eef", "format": "xyz+rot6d"}],
+        },
+        "state": {"modality_keys": ["eef"]},
+    }
+    pack = GrootN17PackInputsStep(raw_stats=raw_stats, modality_config=modality_config)
+    decode = GrootN17ActionDecodeStep(
+        env_action_dim=9,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+        use_percentiles=False,
+        use_relative_action=True,
+        pack_step=pack,
+    )
+    recipe = object.__new__(GrootExportRecipe)
+    recipe._model_config = SimpleNamespace(max_action_dim=9)
+    recipe._frame = {OBS_STATE: np.array([0.1, 0.2, 0.3, 1, 0, 0, 0, 1, 0], np.float32)}
+    recipe._images = SimpleNamespace(state_name=OBS_STATE)
+    recipe._device = torch.device("cpu")
+    recipe._steps = 4
+    recipe._chunk_actions = _N17ChunkActions(4, 9, N17ActionDecode(decode, pack, 4))
+    # The state's rotation is the identity, so the xyz moves by one per normalized unit, as its statistics say.
+    np.testing.assert_allclose(recipe._action_scale(), np.ones(9, np.float32), rtol=1e-6)

@@ -32,7 +32,7 @@ import torch
 
 from lerobot.processor import EnvTransition, ProcessorStep, TransitionKey
 
-from .qwen_vision import is_exporting
+from ..utils import is_exporting
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -71,7 +71,7 @@ class FixedPromptStep(ProcessorStep):
 
     def _check(self, transition: EnvTransition, frame: dict[str, Any]) -> None:
         given = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
-        saved = self.step(transition)[TransitionKey.COMPLEMENTARY_DATA]
+        saved = self.step(transition)[TransitionKey.COMPLEMENTARY_DATA] or {}
         prompt = {key: value for key, value in saved.items() if key not in frame and key not in given}
         removed = given.keys() - saved.keys()
         if self.prompt is None:

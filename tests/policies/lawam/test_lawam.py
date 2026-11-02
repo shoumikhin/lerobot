@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -602,6 +603,9 @@ def test_lam_constructs_without_checkpoint_or_pretrained_dino() -> None:
 
     assert isinstance(loaded_model, LatentLAMModel)
     assert all(not parameter.requires_grad for parameter in loaded_model.parameters())
+    # Built where the caller builds the policy, as an export does on its device.
+    with torch.device("meta"):
+        assert all(parameter.is_meta for parameter in build_latent_action_model(model_config).parameters())
 
 
 def test_action_horizon_is_independent_of_control_frequency() -> None:
@@ -838,10 +842,10 @@ def test_saved_policy_uses_safetensors_without_torch_load(tmp_path, monkeypatch)
     assert torch.equal(loaded_policy.model.weight, policy.model.weight)
 
 
-def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -> None:
+def test_pretrained_load_maps_lawam_checkpoint_on_cpu_and_moves_once(tmp_path, monkeypatch) -> None:
     cfg = make_config()
     cfg.device = "cuda"
-    events = {}
+    events = {"moves": []}
 
     def fake_load(cls, model, model_file, map_location, strict):
         del cls, model_file, strict
@@ -850,7 +854,7 @@ def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -
         return model
 
     def fake_to(self, device):
-        events["final_device"] = str(device)
+        events["moves"].append(str(device))
         if str(device).startswith("cpu"):
             return nn.Module.to(self, device)
         return self
@@ -869,7 +873,7 @@ def test_pretrained_load_stages_lawam_checkpoint_on_cpu(tmp_path, monkeypatch) -
     assert events == {
         "load_device": "cpu",
         "parameter_device_during_load": "cpu",
-        "final_device": "cuda",
+        "moves": ["cuda"],
     }
     assert cfg.device == "cuda"
     assert policy.config.device == "cuda"
@@ -995,6 +999,29 @@ def test_vlm_stage_takes_placeholder_masks_on_the_host() -> None:
         output = backend()._run_vlm_stage(**inputs)
     action_hidden = output["h_vlm"][inputs["act_placeholder_mask"].cuda()].view(2, 2, -1)
     assert torch.equal(output["pred_latent"], action_hidden)
+
+
+def test_vlm_stage_feeds_a_bfloat16_vlm_to_the_float32_head_on_the_cpu() -> None:
+    from lerobot.policies.lawam.vlas.lawam import VLMToLAMQFormer
+
+    qwen, backend, inputs = _vlm_stage_setup()
+    # As LaWAM builds them: the VLM and its queries in `vlm_dtype` (bfloat16 by default), the head in float32.
+    qwen.to(torch.bfloat16)
+    for name in ("act_query", "flow_query"):
+        inputs[name] = inputs[name].bfloat16()
+    stage = backend()
+    stage.vlm_to_lam = head = VLMToLAMQFormer(vlm_hidden_dim=64, lam_code_dim=16, num_heads=2)
+    with torch.no_grad():
+        output = stage._run_vlm_stage(**inputs)
+    assert output["h_vlm"].dtype == torch.bfloat16
+    # The head computes in float32 from the same values, with its queries in the hidden states' dtype.
+    reference = deepcopy(head)
+    action_hidden = output["h_vlm"][inputs["act_placeholder_mask"]].view(2, 2, -1)
+    with torch.no_grad():
+        reference.query.copy_(head.query.bfloat16())
+        expected = reference(action_hidden.float())
+    assert output["pred_latent"].dtype == torch.float32
+    torch.testing.assert_close(output["pred_latent"], expected, rtol=0, atol=0)
 
 
 def test_prepared_vlm_stage_exports_and_matches_stock_qwen(monkeypatch) -> None:

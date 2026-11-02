@@ -288,8 +288,3 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
         config=peft_config,
         revision="adapter-sha",
     )
-
-
-# ---------------------------------------------------------------------------
-# RolloutRingBuffer
-# ---------------------------------------------------------------------------

@@ -24,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from PIL import Image
 
+from lerobot.policies.utils import is_exporting
+
 from .components import (
     WAN22_DIFFUSERS_MODEL_ID,
     WAN_T5_TOKENIZER,
@@ -2086,8 +2088,7 @@ class FastWAM(torch.nn.Module):
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError("`infer_action` requires `video_attention_mask_mode='first_frame_causal'`.")
 
-        # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
-        if noise is None and torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling():
+        if noise is None and is_exporting():
             # An exported program keeps one generator whose state carries over between calls.
             raise ValueError("Pass noise to export FastWAM; its sampling noise must be an input.")
         input_image, _, _ = self._normalize_infer_input_image(input_image)

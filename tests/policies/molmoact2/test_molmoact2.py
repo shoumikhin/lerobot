@@ -2190,14 +2190,8 @@ def test_molmoact2_compile_applies_precision_safe_action_partition(monkeypatch):
     policy = _make_compile_test_policy()
     backbone = policy._backbone()
     state_dict_keys = tuple(policy.state_dict())
-    matmul_precision_calls = []
     lru_cache_calls = []
     ddp_optimizer_disable_calls = []
-    monkeypatch.setattr(
-        torch,
-        "set_float32_matmul_precision",
-        lambda precision: matmul_precision_calls.append(precision),
-    )
     monkeypatch.setattr(
         molmoact2_modeling,
         "_set_dynamo_lru_cache",
@@ -2229,7 +2223,6 @@ def test_molmoact2_compile_applies_precision_safe_action_partition(monkeypatch):
         "fullgraph": False,
     }
 
-    assert matmul_precision_calls == ["high"]
     assert lru_cache_calls == [False]
     assert ddp_optimizer_disable_calls == [True]
     assert tuple(policy.state_dict()) == state_dict_keys
@@ -2244,7 +2237,6 @@ def test_molmoact2_compile_uses_automatic_shapes_without_gradient_checkpointing(
     backbone = policy._backbone()
     lru_cache_calls = []
     ddp_optimizer_disable_calls = []
-    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda precision: None)
     monkeypatch.setattr(
         molmoact2_modeling,
         "_set_dynamo_lru_cache",
@@ -2289,7 +2281,6 @@ def test_molmoact2_compile_marks_only_context_sequence_dynamic(monkeypatch):
 def test_molmoact2_compile_is_limited_to_action_expert_for_every_train_mode(monkeypatch, train_mode_vlm):
     policy = _make_compile_test_policy(train_mode_vlm=train_mode_vlm)
     backbone = policy._backbone()
-    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda precision: None)
     monkeypatch.setattr(molmoact2_modeling, "_set_dynamo_lru_cache", lambda enabled: None)
     monkeypatch.setattr(molmoact2_modeling, "_disable_dynamo_ddp_optimizer", lambda: None)
 
@@ -2312,7 +2303,6 @@ def test_molmoact2_compile_is_limited_to_action_expert_for_every_train_mode(monk
 
 def test_molmoact2_checkpoint_compile_requires_dynamo_cache_order_control(monkeypatch):
     policy = _make_compile_test_policy()
-    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda precision: None)
 
     class MissingEvalFrame:
         pass
@@ -2333,18 +2323,11 @@ def test_molmoact2_checkpoint_compile_disables_dynamo_ddp_optimizer(monkeypatch)
         torch._dynamo.config.optimize_ddp = original_optimize_ddp
 
 
-def test_molmoact2_compile_disabled_is_a_noop(monkeypatch):
+def test_molmoact2_compile_disabled_is_a_noop():
     policy = _make_compile_test_policy(compile_model=False)
-    matmul_precision_calls = []
-    monkeypatch.setattr(
-        torch,
-        "set_float32_matmul_precision",
-        lambda precision: matmul_precision_calls.append(precision),
-    )
 
     policy._apply_compile()
 
-    assert matmul_precision_calls == []
     assert all(module.compile_calls == [] for module in policy.modules() if hasattr(module, "compile_calls"))
 
 
@@ -3300,6 +3283,37 @@ def test_saved_both_checkpoint_continuous_inference_exports():
         expected = module(*inputs)
         assert torch.equal(expected, torch.full((1, 2, 7), float(unmasked)))
         assert torch.equal(program.module()(*inputs), expected)
+
+
+def test_image_input_checks_raise_in_eager_mode_with_the_transformers_checks_off(monkeypatch):
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    # Two images: one crop and two pooled patches, two crops and two pooled patches.
+    end_token_counts, pixel_values = torch.tensor([2]), torch.randn(3, 4, 14 * 14 * 3)
+    pooling, grids, crops = (
+        torch.zeros(4, 2, dtype=torch.long),
+        torch.tensor([[1, 1, 1, 1], [1, 2, 0, 0]]),
+        torch.tensor([1, 2]),
+    )
+    build = hf_molmoact2_modeling.MolmoAct2Model._build_single_example_images
+    with pytest.raises(ValueError, match="Could not infer image counts"):
+        build(torch.tensor([3]), pixel_values, pooling, grids, crops)
+    with pytest.raises(AssertionError, match="Expected 3 crops"):
+        build(end_token_counts, pixel_values[:2], pooling, grids, crops)
+    with pytest.raises(AssertionError, match="Expected 4 pooled patches"):
+        build(end_token_counts, pixel_values, pooling[:3], grids, crops)
+
+    model = object.__new__(hf_molmoact2_modeling.MolmoAct2Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_patch_id=6)
+    model.vision_backbone = lambda images, token_pooling: torch.zeros(3, 8)
+    model.transformer = torch.nn.Module()
+    model.transformer.wte = torch.nn.Embedding(8, 8)
+    model.transformer.emb_drop = torch.nn.Identity()
+    # Two image patch tokens for three image features.
+    with pytest.raises(RuntimeError, match="Expected 2 image patch embeddings, got 3"):
+        model.build_input_embeddings(
+            torch.tensor([[1, 6, 6, 2]]), torch.zeros(1, 1, 4, 588), pooling[None, :3]
+        )
 
 
 def test_single_example_image_inputs_export():

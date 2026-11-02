@@ -44,11 +44,9 @@ from .soft_transformer import SoftPromptedTransformer
 # Florence2 config and modeling depend on transformers
 if TYPE_CHECKING or _transformers_available:
     from transformers import Florence2Config, Florence2Model
-    from transformers.utils import torch_compilable_check
 else:
     Florence2Config = None
     Florence2Model = None
-    torch_compilable_check = None
 
 
 class XVLAModel(nn.Module):
@@ -166,8 +164,9 @@ class XVLAModel(nn.Module):
         Encode text and multi-view images via Florence2 encoder.
 
         Without ``num_valid_views``, ``image_mask`` may mark any views as valid, and the number of valid
-        views is read from it. With ``num_valid_views``, the first that many views of every sample must be
-        the valid ones, so the vision batch has a fixed size under torch.export and fixed-shape backends.
+        views is read from it. With ``num_valid_views``, the first that many views of every sample are the
+        valid ones and ``image_mask`` is not read, so the vision batch has a fixed size under torch.export
+        and fixed-shape backends.
         """
         batch_size, num_views = pixel_values.shape[:2]
         if num_valid_views is None:
@@ -187,12 +186,6 @@ class XVLAModel(nn.Module):
         else:
             if num_valid_views < 1:
                 raise ValueError("At least one image view must be valid per batch.")
-            expected_mask = torch.arange(num_views, device=image_mask.device) < num_valid_views
-            torch_compilable_check(
-                (image_mask.to(dtype=torch.bool) == expected_mask).all(),
-                f"image_mask must mark the first {num_valid_views} views of every sample as valid, "
-                "the rest as padding.",
-            )
             valid_images = pixel_values[:, :num_valid_views].flatten(0, 1)
             valid_feats = self.vlm.get_image_features(valid_images).pooler_output
             tokens_per_view, hidden_dim = valid_feats.shape[1:]

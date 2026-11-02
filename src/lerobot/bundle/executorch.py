@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -30,6 +33,30 @@ def prepare() -> None:
     ExecuTorch returns torch tensors by default. It reads this setting once, when its bindings load.
     """
     os.environ["EXECUTORCH_PYBINDINGS_TENSOR_OUTPUT"] = "executorch"
+
+
+def configure(options: Mapping[str, Mapping[str, bool | int | str]]) -> None:
+    """Set the options of ExecuTorch's backends, by backend name.
+
+    ExecuTorch keeps them for the rest of the process, and a backend reads them when a program loads.
+    """
+    registry = _runtime_module().Runtime.get().backend_registry
+    # Check every name first, so that a bundle naming a missing backend sets nothing that would outlive it.
+    if missing := sorted(backend for backend in options if not registry.is_available(backend)):
+        raise ValueError(
+            f"This bundle sets options of ExecuTorch backends this machine does not have: {missing}."
+        )
+    for backend, values in options.items():
+        registry.set_option(backend, dict(values))
+
+
+def _runtime_module() -> ModuleType:
+    try:
+        return importlib.import_module("executorch.runtime")
+    except ImportError as error:
+        raise ImportError(
+            "Running this bundle needs ExecuTorch 1.6: pip install 'executorch>=1.6.0,<1.7.0'"
+        ) from error
 
 
 class ExecuTorchProgram:
@@ -47,16 +74,10 @@ class ExecuTorchProgram:
 
     def __init__(self, path: Path, data: Path | None = None):
         """Load the program at `path`."""
+        runtime = _runtime_module()
+        self._from_host = runtime.ExecuTorchResult.from_host
         try:
-            from executorch.runtime import ExecuTorchResult, Runtime
-        except ImportError as error:
-            raise ImportError(
-                "Running this bundle needs ExecuTorch 1.6: pip install 'executorch>=1.6.0,<1.7.0'"
-            ) from error
-
-        self._from_host = ExecuTorchResult.from_host
-        try:
-            self._method = Runtime.get().load_program(path, data_path=data).load_method("forward")
+            self._method = runtime.Runtime.get().load_program(path, data_path=data).load_method("forward")
         except RuntimeError as error:
             raise RuntimeError(f"ExecuTorch could not load {path.name}: {error}") from error
         meta = self._method.metadata

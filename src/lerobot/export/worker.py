@@ -25,6 +25,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -48,7 +49,7 @@ from lerobot.bundle.target import runtime_versions
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.policies.factory import get_export_recipe_class
 from lerobot.utils import init_logging, register_third_party_plugins
-from lerobot.utils.import_utils import PLUGIN_KINDS
+from lerobot.utils.import_utils import PLUGIN_KINDS, load_plugin
 
 from . import backends  # noqa: F401
 from .bundle import write_bundle
@@ -73,21 +74,29 @@ class _DrawNoise(torch.nn.Module):
 def trace_step(request: dict[str, Any]) -> dict[str, Any]:
     """Parse the command line `request["args"]`, trace and save each part, and write the rest of the bundle.
 
-    The bundle goes into a new folder beside the output folder. Returns that folder, its manifest, and what is
-    left to compile.
+    The bundle goes into a new folder beside the output folder. The file `request["folders"]` names the folders
+    the step made there. Returns that folder, its manifest, and what is left to compile.
     """
+    argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
     sys.argv = ["lerobot-export", *request["args"]]
-    return cast(Callable[[], dict[str, Any]], _trace)()
+    try:
+        return cast(Callable[[dict[str, Any]], dict[str, Any]], _trace)(request)
+    finally:
+        sys.argv = argv
 
 
 @parser.wrap()
-def _trace(cfg: ExportConfig) -> dict[str, Any]:
+def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
     output_dir = cast(Path, cfg.output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    folder = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
+    # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
+    folder = output_dir.parent / f".{output_dir.name}-{uuid.uuid4().hex[:8]}"
+    folder.mkdir()
     # The traced parts wait here, beside the bundle, until they are compiled.
     traced = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-traced-", dir=output_dir.parent))
+    # Named before anything goes into them, so that lerobot-export removes them if this process is killed.
+    Path(request["folders"]).write_text(json.dumps([str(folder), str(traced)]))
     try:
         recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
         programs: dict[str, ProgramFiles] = {}
@@ -103,28 +112,39 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
         plan = recipe.plan()
         test_case = recipe.test_case()
         runs = runs if plan.runs is None else plan.runs
-        if test_case.noise is not None and cfg.backend.device == "cuda":
+        first_runs = plan.first_runs
+        # A test case with values carried between chunks, or of the first chunks from a reset, holds the noise of
+        # each of its chunks.
+        several = plan.carry or plan.first_runs
+        chunk_noise = test_case.noise if test_case.noise is None or not several else test_case.noise[0]
+        if chunk_noise is not None and cfg.backend.device == "cuda":
             # Drawn where the programs read it, so a chunk uploads only the robot's frame.
-            noise = torch.from_numpy(test_case.noise)
+            noise = torch.from_numpy(chunk_noise)
             draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
             torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
             programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
-            runs = [ProgramRun(NOISE, NOISE, [], [NOISE]), *runs]
-        task_tokens = plan.task_tokens
+            draw_run = ProgramRun(NOISE, NOISE, [], [NOISE])
+            runs = [draw_run, *runs]
+            first_runs = [[draw_run, *chunk] for chunk in first_runs]
+        task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
             runtime_imports=list(cfg.backend.runtime_imports),
+            runtime_options=cfg.backend.runtime_options,
             programs=programs,
             runs=runs,
+            first_runs=first_runs,
             constants=CONSTANTS if plan.constants else None,
             task_tokens=None
             if task_tokens is None
             else TaskTokens(
                 task_tokens.prompt_ops, TOKENIZER, EMBEDDINGS, KNOWN_TASKS, task_tokens.max_tokens
             ),
-            noise_shape=None if test_case.noise is None else list(test_case.noise.shape),
+            action_tokens=None if action_tokens is None else action_tokens.spec,
+            noise_shape=None if chunk_noise is None else list(chunk_noise.shape),
             history=plan.history,
+            carry={name: None if shape is None else list(shape) for name, shape in plan.carry.items()},
             task=recipe.task,
             action_names=getattr(recipe.config, "action_feature_names", None),
             action_scale=test_case.action_scale.tolist(),
@@ -132,7 +152,9 @@ def _trace(cfg: ExportConfig) -> dict[str, Any]:
             target=cfg.backend.target(),
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
         )
-        write_bundle(Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens)
+        write_bundle(
+            Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens, action_tokens
+        )
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         shutil.rmtree(traced, ignore_errors=True)
@@ -151,12 +173,16 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
 
     Returns the name of the data file the backend wrote beside it, if any.
     """
+    for plugin in request["plugins"]:
+        load_plugin(plugin)
     backend = draccus.decode(ExportBackendConfig, request["backend"])
     path = Path(request["path"])
     logger.info("Compiling %s with %s", path.stem, backend.type)
     try:
-        # The trace step of this export wrote the program.
-        data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
+        # Lowering needs no autograd, and some of ExecuTorch's passes fail when it records them (complex views).
+        with torch.no_grad():
+            # The trace step of this export wrote the program.
+            data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
     except ImportError as error:
         if not backend.packages:
             raise

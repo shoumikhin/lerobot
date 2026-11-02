@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The FineART-VLA export recipe, on its text tokenizer step with a tiny local tokenizer and a stand-in policy."""
+"""A stand-in FineART-VLA for its export recipe, on its text tokenizer step with a tiny local tokenizer."""
 
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -80,11 +79,11 @@ class PromptReader(FineARTVLAPolicy):
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
 
 
-def make_recipe(tmp_path, device="cpu", split_words=True) -> FineARTVLAExportRecipe:
+def make_recipe(tmp_path, split_words=True) -> FineARTVLAExportRecipe:
     save_tokenizer(tmp_path / "tokenizer", split_words)
     torch.manual_seed(0)
     config = FineARTVLAConfig(
-        device=device,
+        device="cpu",
         chunk_size=CHUNK,
         n_action_steps=CHUNK,
         enable_fast_action_loss=False,
@@ -96,7 +95,7 @@ def make_recipe(tmp_path, device="cpu", split_words=True) -> FineARTVLAExportRec
     )
     tokenizer = FineARTVLATextTokenizerStep(tokenizer_name=str(tmp_path / "tokenizer"), max_length=32)
     preprocessor = PolicyProcessorPipeline(
-        steps=[AddBatchDimensionProcessorStep(), tokenizer, DeviceProcessorStep(device=device)]
+        steps=[AddBatchDimensionProcessorStep(), tokenizer, DeviceProcessorStep(device="cpu")]
     )
     postprocessor = PolicyProcessorPipeline(
         steps=[DeviceProcessorStep(device="cpu")],
@@ -104,32 +103,6 @@ def make_recipe(tmp_path, device="cpu", split_words=True) -> FineARTVLAExportRec
         to_output=transition_to_policy_action,
     )
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
+        backend=SimpleNamespace(device="cpu"), seed=0, dataset=None, task="pick up the cube", tolerance=None
     )
     return FineARTVLAExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)
-
-
-def program_inputs(recipe: FineARTVLAExportRecipe, state: list[float]) -> tuple[torch.Tensor, ...]:
-    frame = {**recipe.test_case().frame, OBS_STATE: np.array(state, dtype=np.float32)}
-    noise = np.random.default_rng(2).standard_normal(recipe.test_case().noise.shape, dtype=np.float32)
-    return tuple(torch.from_numpy(x) for x in (*frame.values(), noise))
-
-
-def test_the_program_writes_each_states_numbers_into_the_prompt(tmp_path):
-    recipe = make_recipe(tmp_path)
-
-    [part] = recipe.parts()
-    program = torch.export.export(part.module, part.example_inputs, strict=False)
-
-    # Bins -1, 6 and 255: numbers of two, one and three tokens, where the test frame's take three each.
-    inputs = program_inputs(recipe, [-2.0, -0.95, 1.0])
-    with torch.no_grad():
-        torch.testing.assert_close(program.module()(*inputs), part.module(*inputs), rtol=0, atol=0)
-
-
-def test_a_tokenizer_that_writes_the_state_otherwise_is_refused(tmp_path):
-    # It reads all its text as one word, so a number alone is not its own token there.
-    recipe = make_recipe(tmp_path, split_words=False)
-
-    with pytest.raises(ValueError, match="does not hold the state's numbers once"):
-        list(recipe.parts())

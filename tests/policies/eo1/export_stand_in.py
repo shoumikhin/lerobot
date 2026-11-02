@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The EO-1 export recipe, on EO-1's preprocessor with the NumPy Qwen2-VL image processor and a stand-in."""
+"""A stand-in EO-1 for its export recipe, on EO-1's preprocessor with the NumPy Qwen2-VL image processor."""
 
 from types import SimpleNamespace
 
@@ -25,7 +25,7 @@ pytest.importorskip("torchvision")
 from transformers import Qwen2VLImageProcessorPil  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.export.recipe import ActionChunkRecipe, random_frame  # noqa: E402
+from lerobot.export.recipe import ActionChunkRecipe  # noqa: E402
 from lerobot.policies.eo1.configuration_eo1 import EO1Config  # noqa: E402
 from lerobot.policies.eo1.export_eo1 import EO1ExportRecipe  # noqa: E402
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy  # noqa: E402
@@ -111,44 +111,3 @@ def make_recipe(monkeypatch, recipe_class=EO1ExportRecipe, side=56, device="cpu"
         backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
     )
     return recipe_class(PixelEO1(config).eval(), preprocessor, postprocessor, cfg)
-
-
-def program_inputs(recipe: ActionChunkRecipe) -> tuple[torch.Tensor, ...]:
-    frame = random_frame(recipe.config.input_features, torch.Generator().manual_seed(1))
-    noise = torch.randn(recipe.test_case().noise.shape, generator=torch.Generator().manual_seed(2))
-    return tuple(torch.from_numpy(x) for x in (*frame.values(), noise.numpy()))
-
-
-def test_the_program_keeps_the_prompt_and_computes_the_pixels(monkeypatch):
-    recipe = make_recipe(monkeypatch)
-
-    [part] = recipe.parts()
-    program = torch.export.export(part.module, part.example_inputs, strict=False)
-
-    inputs = program_inputs(recipe)
-    with torch.no_grad():
-        torch.testing.assert_close(program.module()(*inputs), part.module(*inputs), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_the_pixels_are_the_processors_on_cuda_too(monkeypatch):
-    recipe = make_recipe(monkeypatch, device="cuda")
-
-    # The eager checks compare the per-frame pixels with what the processor step computes.
-    [part] = recipe.parts()
-
-
-def test_a_camera_size_the_processor_resizes_is_refused(monkeypatch):
-    recipe = make_recipe(monkeypatch, side=64)
-
-    with pytest.raises(ValueError, match="64x64 becomes 56x56"):
-        list(recipe.parts())
-
-
-def test_the_saved_preprocessor_cannot_be_traced(monkeypatch):
-    recipe = make_recipe(monkeypatch, recipe_class=ActionChunkRecipe)
-    [part] = recipe.parts()
-
-    # The NumPy image processor reads the traced pixels.
-    with pytest.raises(RuntimeError, match=r"\.numpy\(\) is not supported for tensor subclasses"):
-        torch.export.export(part.module, part.example_inputs, strict=False)

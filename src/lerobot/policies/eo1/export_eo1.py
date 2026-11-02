@@ -24,19 +24,17 @@ prompt does not depend on it. The vision tower reads the patch grid prepared by 
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from lerobot.export.recipe import ActionChunkRecipe, Part
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
 from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.import_utils import _transformers_available
 
 from ..common.fixed_prompt import FixedPromptStep
-from ..common.qwen_vision import prepare_image_grid
 from .processor_eo1 import EO1PrepareModelMessagesStep, EO1QwenProcessorStep
 
 if TYPE_CHECKING or _transformers_available:
@@ -47,11 +45,14 @@ if TYPE_CHECKING or _transformers_available:
 class EO1ExportRecipe(ActionChunkRecipe):
     """[`ActionChunkRecipe`] with EO-1's processor step made traceable, the vision tower on a fixed grid."""
 
+    # EO-1 runs ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its processor step wrapped in [`FixedPromptStep`]."""
-        (messages,) = [
+        (messages,) = (
             step for step in self.preprocessor.steps if isinstance(step, EO1PrepareModelMessagesStep)
-        ]
+        )
         steps = [
             FixedPromptStep(step, _PixelValues(step, messages._image_keys))
             if isinstance(step, EO1QwenProcessorStep)
@@ -59,12 +60,6 @@ class EO1ExportRecipe(ActionChunkRecipe):
             for step in self.preprocessor.steps
         ]
         return replace(self.preprocessor, steps=steps)
-
-    def parts(self) -> Iterator[Part]:
-        """The default recipe's part, checked inside `prepare_image_grid()` so the checks prepare the grid."""
-        with prepare_image_grid():
-            (part,) = super().parts()
-        yield part
 
 
 class _PixelValues:
@@ -76,7 +71,10 @@ class _PixelValues:
                 "The EO-1 recipe computes the pixels of EO-1's default NumPy image processor, and this "
                 "checkpoint uses the fast one (`use_fast_processor=True`)."
             )
-        image_processor = step._processor.image_processor
+        processor = step._processor
+        if processor is None:
+            raise ValueError("EO-1's processor step has not loaded its Qwen processor.")
+        image_processor = processor.image_processor
         self.image_keys = image_keys
         self.factor = image_processor.patch_size * image_processor.merge_size
         self.min_pixels = step.image_min_pixels or image_processor.size["shortest_edge"]

@@ -34,10 +34,11 @@ from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.optim.ema import EMA, ConstantEMAConfig
 from lerobot.optim.schedulers import FrozenWarmupConstantSchedulerConfig
 from lerobot.policies import factory
 from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors
+from lerobot.policies.flux3 import Flux3Config, Flux3Policy, make_flux3_pre_post_processors, modeling_flux3
 from lerobot.policies.flux3.f3 import (
     JointSingleSeq,
     JointSingleSeqParams,
@@ -56,7 +57,7 @@ from lerobot.policies.flux3.f3.wiring import (
 )
 from lerobot.policies.flux3.utils import grid_shape
 from lerobot.utils.constants import ACTION, OBS_STATE
-from lerobot.utils.import_utils import _datasets_available, _diffusers_available, _peft_available
+from lerobot.utils.import_utils import _peft_available
 from tests.policies.flux3.helpers import (
     DROID_CAMS,
     FRAME_REFERENCE_SETTINGS,
@@ -69,10 +70,6 @@ from tests.policies.flux3.helpers import (
     task_config,
 )
 
-if TYPE_CHECKING or _datasets_available:
-    from lerobot.scripts.lerobot_train import _ema_parameters, _ema_weights
-if TYPE_CHECKING or _diffusers_available:
-    from diffusers.training_utils import EMAModel
 if TYPE_CHECKING or _peft_available:
     from peft import PeftModel
 
@@ -206,7 +203,7 @@ def test_shared_peft_recipe_preserves_checkpoint_contract(tmp_path, monkeypatch,
         )
     )
     assert train.peft.r == train.peft.lora_alpha == 32
-    assert train.ema.enable and train.ema.decay == 0.999
+    assert isinstance(train.ema, ConstantEMAConfig) and train.ema.decay == 0.999
     assert train.policy.caption_dropout == 0.1 and train.policy.gradient_checkpointing
     assert not train.policy.push_to_hub and not train.policy.augment
     accumulation = train.accelerator.gradient_accumulation.steps
@@ -435,15 +432,14 @@ def test_timestep_sampler_and_augmentation():
 
 def test_cosmos_unipc_schedule_and_solver():
     sigmas, ticks = sampling.cosmos_unipc_schedule(4, 5.0)
-    assert ticks.tolist() == [999, 937, 833, 624]
+    assert ticks == [999, 937, 833, 624]
     assert sigmas.shape == (5,) and sigmas[-1] == 0 and sigmas[0] > 0.999
     x0 = {"x_video": torch.randn(1, 6, 2), "x_a": torch.randn(1, 3, 2)}
     torch.manual_seed(0)
     samples = {k: torch.randn_like(v) for k, v in x0.items()}
-    tick_list = ticks.tolist()
 
     def predict(s, tick):  # a perfect velocity model of one sample
-        sigma = sigmas[tick_list.index(int(tick))]
+        sigma = sigmas[ticks.index(tick)]
         return {k: (s[k] - x0[k]) / sigma for k in s}
 
     out = sampling.cosmos_unipc_order2(samples, predict, n_steps=4, shift=5.0)
@@ -840,6 +836,38 @@ def test_frozen_components_stay_unregistered_eval_and_follow_device_moves(monkey
     assert policy.frozen is frozen
 
 
+def test_parts_are_built_on_the_default_device(monkeypatch):
+    # An export builds the policy under `torch.device(<its device>)`; a part made on the CPU would be copied.
+    devices = {}
+
+    def recorder(name):
+        def build(*args, device, **kwargs):
+            devices[name] = torch.device(device)
+
+        return build
+
+    builders = ("build_action_dit", "load_video_vae", "load_text_encoder")
+    for name in builders:
+        monkeypatch.setattr(modeling_flux3, name, recorder(name))
+    builder = SimpleNamespace(dit_params=None, modality="action", dtype_=torch.float32)
+    with torch.device("meta"):
+        Flux3Policy._build_dit(builder, droid_config())
+        Flux3Policy._build_video_vae(builder, droid_config())
+        Flux3Policy._build_text_encoder(builder, droid_config())
+    assert devices == dict.fromkeys(builders, torch.device("meta"))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_checkpoint_loads_into_the_policy_where_it_was_built(fake_vae, tmp_path):
+    policy = Flux3Policy(droid_config())
+    policy.save_pretrained(tmp_path)
+    policy.to("cuda")
+    # As `from_pretrained` calls it: the file mapped on the CPU, the policy moved to its device afterwards.
+    loaded = Flux3Policy._load_as_safetensor(policy, str(tmp_path / "model.safetensors"), "cpu", True)
+    assert loaded.dit.emb_in["action"].weight.device.type == "cuda"
+
+
 def test_compile_model_wraps_the_inference_dit_forward_only(fake_vae, monkeypatch):
     compiled_fns = []
 
@@ -1041,9 +1069,17 @@ def test_unsupported_relative_execution_and_rtc_arguments_fail_early(fake_vae):
             method({}, inference_delay=1, prev_chunk_left_over=None)
 
 
+def test_chunk_serving_takes_frame_checkpoints(fake_vae):
+    spec = Flux3Policy(droid_config(n_action_steps=8)).chunk_inference_spec()
+    assert (spec.prediction_steps, spec.execution_steps) == (32, 8)
+    assert spec.current_observation_only
+    for config in (task_config(), single_config(use_relative_actions=True)):
+        with pytest.raises(ValueError, match="FLUX3"):
+            Flux3Policy(config).chunk_inference_spec()
+
+
 def test_lora_update_ema_resume_and_reload(tmp_path, fake_vae):
-    for package in ("peft", "diffusers", "datasets"):
-        pytest.importorskip(package)
+    pytest.importorskip("peft")
     cfg = single_config(
         gradient_checkpointing=True,
         optimizer_lr=1e-4,
@@ -1060,7 +1096,7 @@ def test_lora_update_ema_resume_and_reload(tmp_path, fake_vae):
     assert trainable and all("lora_" in n or "modules_to_save" in n for n in trainable)
     groups = policy.get_optim_params()
     assert groups[1]["lr"] == 5e-4
-    ema = EMAModel(_ema_parameters(policy), decay=0.999, min_decay=0.999)
+    ema = EMA(policy, ConstantEMAConfig(decay=0.999))
     optimizer = torch.optim.AdamW(groups, lr=1e-4, weight_decay=0)
     batch = {
         "observation.images.top": torch.rand(1, cfg.window_frames, 3, 64, 96),
@@ -1076,26 +1112,28 @@ def test_lora_update_ema_resume_and_reload(tmp_path, fake_vae):
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trainable.values())
     optimizer.step()
     optimizer.zero_grad()
-    ema.step(_ema_parameters(policy))
+    ema.step(policy)
+    assert set(ema.averages) == set(trainable)
     assert all(torch.equal(p, dict(policy.named_parameters())[n]) for n, p in frozen.items())
-    live = [p.clone() for p in _ema_parameters(policy)]
+    live = {n: p.clone() for n, p in trainable.items()}
     adapter = tmp_path / "ema_adapter"
-    with _ema_weights(ema, policy):
+    with ema.average_parameters(policy):
         policy.save_pretrained(adapter)
         policy.config.save_pretrained(adapter)
         expected = {n: p.clone() for n, p in policy.named_parameters()}
-    assert all(torch.equal(a, b) for a, b in zip(live, _ema_parameters(policy), strict=True))
+    assert all(torch.equal(p, trainable[n]) for n, p in live.items())
     restored = PeftModel.from_pretrained(Flux3Policy.from_pretrained(base), adapter, is_trainable=True)
     assert all(torch.equal(p, expected[n]) for n, p in restored.named_parameters())
-    restored_ema = EMAModel(_ema_parameters(restored), decay=0.999, min_decay=0.999)
+    restored_ema = EMA(restored, ConstantEMAConfig(decay=0.999))
     restored_ema.load_state_dict(ema.state_dict())
-    assert restored_ema.optimization_step == ema.optimization_step
-    # Resume one identical EMA update from the same shadow, not a raw-weight reseed.
-    ema.step(_ema_parameters(policy))
-    for dst, src in zip(_ema_parameters(restored), _ema_parameters(policy), strict=True):
-        dst.data.copy_(src)
-    restored_ema.step(_ema_parameters(restored))
-    assert all(torch.equal(a, b) for a, b in zip(ema.shadow_params, restored_ema.shadow_params, strict=True))
+    assert restored_ema.num_updates == ema.num_updates
+    # Resume one identical EMA update from the same averages, not a raw-weight reseed.
+    ema.step(policy)
+    restored_params = dict(restored.named_parameters())
+    for name, param in trainable.items():
+        restored_params[name].data.copy_(param)
+    restored_ema.step(restored)
+    assert all(torch.equal(a, restored_ema.averages[n]) for n, a in ema.averages.items())
 
 
 def test_captions_use_one_paraphrase_per_window():

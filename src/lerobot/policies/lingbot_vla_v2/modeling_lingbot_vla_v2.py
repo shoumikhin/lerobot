@@ -33,10 +33,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
 
 from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
 from lerobot.policies.common.input_checks import check_input
-from lerobot.policies.common.qwen_vision import is_exporting, qwen_image_rope_index
+from lerobot.policies.common.qwen_vision import qwen_image_rope_index
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
-from lerobot.policies.utils import populate_queues
+from lerobot.policies.utils import is_exporting, populate_queues
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.import_utils import require_package
 

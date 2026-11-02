@@ -14,21 +14,33 @@
 
 """`lerobot-rollout --bundle.path`: a bundle on a robot, without PyTorch."""
 
+import logging
+import os
 import sys
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle import rollout as bundle_rollout
+from lerobot.bundle.manifest import TEST_CASE
 from lerobot.bundle.rollout import BundleConfig, BundleRolloutConfig, rollout
 from lerobot.scripts import lerobot_rollout_entry
+from lerobot.utils.constants import OBS_STATE
 from tests.export.numpy_bundle import RecordingRobotConfig, make_numpy_bundle, read_log
 from tests.torch_free import assert_runs_without_torch
 
 REPO = Path(__file__).parents[1]
 MOTORS = ["motor_1.pos", "motor_2.pos", "motor_3.pos"]
+
+
+def _install(monkeypatch, *plugins: str) -> None:
+    """Make the test plugins `plugins` installed packages for the commands a test starts."""
+    folders = [str(REPO / "tests" / "export" / "plugins" / name) for name in plugins]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [*folders, os.environ.get("PYTHONPATH")])))
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +58,17 @@ def _actions(tmp_path) -> list[dict]:
     return [value for event, value in read_log(tmp_path / "robot.jsonl") if event == "action"]
 
 
-def test_the_command_runs_a_bundle_without_torch(tmp_path):
+@pytest.mark.parametrize(
+    ("plugins", "robot_package"),
+    [
+        # The named package adds the robot, so the installed plugin, which imports PyTorch, does not load.
+        (["torch_robot"], ["--robot.discover_packages_path=tests.export.recording_robot"]),
+        # No loaded package has the robot, so the installed plugin that adds it loads.
+        (["recording_robot"], []),
+    ],
+)
+def test_the_command_runs_a_bundle_without_torch(tmp_path, monkeypatch, plugins, robot_package):
+    _install(monkeypatch, *plugins)
     bundle = make_numpy_bundle(tmp_path / "bundle")
     log = tmp_path / "robot.jsonl"
     assert_runs_without_torch(
@@ -60,12 +82,42 @@ def test_the_command_runs_a_bundle_without_torch(tmp_path):
         assert events[0] == "connect" and events[-1] == "disconnect" and "action" in events, events
         """,
         f"--bundle.path={bundle}",
-        "--robot.discover_packages_path=tests.export.recording_robot",
+        *robot_package,
         "--robot.type=recording_robot",
         "--robot.static_values=[1.0, 2.0, 3.0]",
         "--fps=100",
         "--duration=0.1",
+        "--status_interval_s=0.02",
         f"--robot.log={log}",
+        cwd=REPO,
+    )
+
+
+@pytest.mark.parametrize(
+    ("plugins", "robot"),
+    [
+        # The package registers the robot; its kinematics processor, which imports PyTorch, is not loaded.
+        ([], "--robot.discover_packages_path=lerobot.robots.so_follower"),
+        # A robot plugin may import PyTorch, so it loads only when the robot may come from it.
+        (["torch_robot"], "--robot.type=so101_follower"),
+    ],
+)
+def test_a_robot_lerobot_has_loads_no_torch(tmp_path, monkeypatch, plugins, robot):
+    _install(monkeypatch, *plugins)
+    assert_runs_without_torch(
+        """
+        import sys
+        from lerobot.scripts.lerobot_rollout_entry import main
+
+        sys.argv = ["lerobot-rollout", *sys.argv[1:]]
+        try:
+            main()
+        except SystemExit as error:
+            assert error.code == 0, error.code
+        """,
+        f"--bundle.path={make_numpy_bundle(tmp_path / 'bundle')}",
+        robot,
+        "--help",
         cwd=REPO,
     )
 
@@ -83,6 +135,21 @@ def test_actions_follow_the_joint_names_the_bundle_records(tmp_path):
     # The state is read in the bundle's joint order (3, 2, 1), and each action is named the same way.
     assert _actions(tmp_path)[0] == {"motor_3.pos": 3.0, "motor_2.pos": 2.0, "motor_1.pos": 1.0}
     assert _actions(tmp_path)[1] == {"motor_3.pos": 6.0, "motor_2.pos": 4.0, "motor_1.pos": 2.0}
+
+
+@pytest.mark.parametrize("interval", [0.05, 0])
+def test_bundle_mode_logs_its_status_every_interval(tmp_path, caplog, interval):
+    bundle = make_numpy_bundle(tmp_path / "bundle")
+    with caplog.at_level(logging.INFO, logger="lerobot.utils.rollout_status"):
+        rollout(_config(tmp_path, bundle, duration=0.3, status_interval_s=interval))
+    lines = [r.getMessage() for r in caplog.records if r.name == "lerobot.utils.rollout_status"]
+    if interval:
+        # At most one line per interval of the 0.3 s run.
+        assert 0 < len(lines) <= round(0.3 / interval), lines
+        assert all(line.startswith("Rollout: loop ") for line in lines), lines
+        assert any(" infer " in line for line in lines), lines
+    else:
+        assert lines == []
 
 
 def test_interpolation_sends_commands_between_actions(tmp_path):
@@ -107,6 +174,15 @@ def test_a_robot_that_does_not_match_never_connects(tmp_path):
     assert read_log(tmp_path / "robot.jsonl") == []
 
 
+def test_a_robot_frame_of_another_dtype_stops_the_run_before_any_action(tmp_path):
+    bundle = make_numpy_bundle(tmp_path / "bundle")
+    case = load_file(bundle / TEST_CASE)
+    save_file({**case, OBS_STATE: case[OBS_STATE].astype(np.float64)}, bundle / TEST_CASE)
+    with pytest.raises(ValueError, match=r"takes observation.state as float64 \(the robot gives float32\)"):
+        rollout(_config(tmp_path, bundle, return_to_initial_position=True))
+    assert read_log(tmp_path / "robot.jsonl") == [["connect", None], ["disconnect", None]]
+
+
 def test_non_finite_actions_stop_the_run_and_disconnect_without_moving(tmp_path):
     config = _config(tmp_path, make_numpy_bundle(tmp_path / "bundle"), return_to_initial_position=True)
     config.robot.static_values = [float("nan"), 2.0, 3.0]
@@ -121,16 +197,19 @@ def test_a_stop_during_inference_sends_nothing_after_it(tmp_path, monkeypatch):
         bundle_rollout, "ProcessSignalHandler", lambda **_: SimpleNamespace(shutdown_event=stop)
     )
     run_chunk = bundle_rollout.BundleEngine._run_chunk
+    chunks = []
 
     def stop_while_running(engine, frame, task_values, noise=None):
         actions = run_chunk(engine, frame, task_values, noise)
-        if engine.task == "stop now":
+        chunks.append(actions)
+        # The first chunk is the test case, run while the bundle loads; the second is the first live one.
+        if len(chunks) == 2:
             stop.set()
         return actions
 
     monkeypatch.setattr(bundle_rollout.BundleEngine, "_run_chunk", stop_while_running)
-    rollout(_config(tmp_path, make_numpy_bundle(tmp_path / "bundle"), duration=0, task="stop now"))
-    # The test case runs before the robot connects, so the stop comes with the first live chunk.
+    rollout(_config(tmp_path, make_numpy_bundle(tmp_path / "bundle"), duration=0))
+    assert len(chunks) == 2
     assert _actions(tmp_path) == []
     assert read_log(tmp_path / "robot.jsonl")[-1] == ["disconnect", None]
 
@@ -146,14 +225,18 @@ def test_the_config_refuses_a_folder_that_is_not_a_bundle(tmp_path):
         _config(tmp_path, tmp_path)
 
 
-def test_bundle_mode_loads_only_robot_and_camera_plugins(tmp_path, monkeypatch):
+def test_bundle_mode_loads_robot_plugins_only_for_a_robot_no_loaded_package_has(tmp_path, monkeypatch):
     loaded = []
     monkeypatch.setattr(bundle_rollout, "register_third_party_plugins", lambda kinds=(): loaded.append(kinds))
     monkeypatch.setattr(bundle_rollout, "rollout", lambda cfg: None)
-    bundle_rollout.main(
-        [f"--bundle.path={make_numpy_bundle(tmp_path / 'bundle')}", "--robot.type=mock_robot"]
-    )
-    assert loaded == [("robot", "camera")]
+    bundle = f"--bundle.path={make_numpy_bundle(tmp_path / 'bundle')}"
+    config = tmp_path / "rollout.yaml"
+    config.write_text("robot:\n  type: mock_robot\n")
+    bundle_rollout.main([bundle, "--robot.type=mock_robot"])
+    bundle_rollout.main([bundle, f"--config_path={config}"])
+    with pytest.raises(SystemExit):
+        bundle_rollout.main([bundle, "--robot.type=robot_of_a_plugin"])
+    assert loaded == [("camera",), ("robot", "camera"), ("robot", "camera")]
 
 
 def test_bundle_mode_refuses_the_options_it_does_not_have(tmp_path, monkeypatch):
@@ -163,6 +246,7 @@ def test_bundle_mode_refuses_the_options_it_does_not_have(tmp_path, monkeypatch)
         bundle_rollout.main([f"--bundle.path={bundle}", "--robot.type=mock_robot", "--dataset.repo_id=a/b"])
 
 
+@pytest.mark.dataset
 @pytest.mark.parametrize(
     ("argv", "mode"),
     [
@@ -195,6 +279,7 @@ def test_help_with_a_bundle_path_is_the_bundle_mode_help(monkeypatch, capsys):
     assert "--bundle.path" in help_text and "--policy.path" not in help_text
 
 
+@pytest.mark.dataset
 def test_the_policy_mode_points_a_bundle_to_the_bundle_mode(tmp_path, monkeypatch):
     from lerobot.rollout import RolloutConfig
     from tests.mocks.mock_robot import MockRobotConfig

@@ -23,7 +23,6 @@ import torch.nn.functional as functional
 
 from lerobot.policies.common.input_checks import check_input
 from lerobot.policies.common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
-from lerobot.policies.common.qwen_vision import is_exporting
 from lerobot.policies.lawam.lam_core.core.lam_model import build_latent_action_model
 from lerobot.policies.lawam.latent_world.processor_utils import (
     build_latent_world_processor_spec,
@@ -31,6 +30,7 @@ from lerobot.policies.lawam.latent_world.processor_utils import (
 )
 from lerobot.policies.lawam.latent_world.types import LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch
 from lerobot.policies.lawam.utils import sync_managed_modules_training_mode
+from lerobot.policies.utils import is_exporting
 
 from .flowmatching_expert import ConditionalFlowMatchingConfig, ConditionalFlowMatchingHead
 from .qwen3vl import (
@@ -135,8 +135,9 @@ class VLMToLAMQFormer(nn.Module):
         for norm_q, norm_kv, xattn, ffn in zip(
             self.norm_qs, self.norm_kvs, self.cross_attns, self.ffns, strict=True
         ):
-            q = norm_q(queries)
-            kv = norm_kv(context)
+            # CUDA autocast runs these norms in float32, and it does not cover CPU tensors.
+            q = norm_q(queries.to(self.query.dtype))
+            kv = norm_kv(context.to(self.query.dtype))
             attn_out, _ = xattn(q, kv, kv)
             queries = queries + attn_out
             queries = queries + ffn(queries)

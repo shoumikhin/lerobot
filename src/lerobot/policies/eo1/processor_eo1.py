@@ -318,6 +318,9 @@ class EO1QwenProcessorStep(ComplementaryDataProcessorStep):
             # send the batch on the policy device.
             for row in messages:
                 for message in row:
+                    # A text-only message may give its content as a plain string.
+                    if isinstance(message["content"], str):
+                        continue
                     for block in message["content"]:
                         if isinstance(block.get("image"), torch.Tensor):
                             block["image"] = block["image"].cpu()

@@ -1356,6 +1356,70 @@ def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
     assert f"{OBS_IMAGES}.image2" not in output[TransitionKey.OBSERVATION]
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+@pytest.mark.parametrize(
+    ("input_horizon", "video_horizon", "expected_timesteps"),
+    [
+        (None, None, [0]),
+        (3, None, [0, 1, 2]),
+        (2, 4, [0, 0, 0, 1]),
+        (4, 2, [2, 3]),
+    ],
+)
+def test_groot_n1_7_pack_inputs_video_layout(dtype, input_horizon, video_horizon, expected_timesteps):
+    def camera(camera_id):
+        # Every frame is filled with 100 * batch + 10 * camera + timestep.
+        timesteps = input_horizon or 1
+        frame_ids = 100 * torch.arange(2).view(2, 1) + 10 * camera_id + torch.arange(timesteps)
+        image = frame_ids.view(2, timesteps, 1, 1, 1).expand(2, timesteps, 3, 4, 5).to(torch.uint8)
+        if input_horizon is None:
+            image = image[:, 0]
+        return image.to(dtype) / 255 if dtype.is_floating_point else image
+
+    step = GrootN17PackInputsStep(normalize_min_max=False, video_horizon=video_horizon)
+    transition = {
+        TransitionKey.OBSERVATION: {
+            f"{OBS_IMAGES}.wrist": camera(2),
+            f"{OBS_IMAGES}.front": camera(1),
+            OBS_STATE: torch.zeros(2, 8),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Move"]},
+    }
+
+    video = np.asarray(step(transition)[TransitionKey.OBSERVATION]["video"])
+
+    expected_ids = np.array(
+        [[[100 * b + 10 * c + t for c in (1, 2)] for t in expected_timesteps] for b in range(2)],
+        dtype=np.uint8,
+    )
+    assert video.dtype == np.uint8
+    assert video.shape == (2, len(expected_timesteps), 2, 4, 5, 3)
+    np.testing.assert_array_equal(video, np.broadcast_to(expected_ids[..., None, None, None], video.shape))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_groot_n1_7_pack_inputs_keeps_cuda_video_on_device():
+    images = torch.rand(2, 3, 4, 5, generator=torch.Generator().manual_seed(0))
+
+    def pack(device):
+        step = GrootN17PackInputsStep(normalize_min_max=False, video_horizon=2)
+        transition = {
+            TransitionKey.OBSERVATION: {
+                f"{OBS_IMAGES}.front": images.to(device),
+                f"{OBS_IMAGES}.wrist": images.flip(-1).to(device),
+                OBS_STATE: torch.zeros(2, 8, device=device),
+            },
+            TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Move"]},
+        }
+        return step(transition)[TransitionKey.OBSERVATION]["video"]
+
+    video = pack("cuda")
+
+    assert isinstance(video, torch.Tensor)
+    assert video.is_cuda
+    np.testing.assert_array_equal(video.cpu().numpy(), pack("cpu"), strict=True)
+
+
 def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():
     step = GrootActionUnpackUnnormalizeStep(
         env_action_dim=3,
@@ -1938,6 +2002,76 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
         "pixel_values",
         "image_grid_thw",
     }
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_groot_n1_7_vlm_encode_builds_frames_on_target_device(device):
+    frame_ids = np.arange(12, dtype=np.uint8).reshape(2, 2, 3, 1, 1, 1)
+    video = np.broadcast_to(3 * frame_ids + np.arange(3, dtype=np.uint8), (2, 2, 3, 4, 5, 3)).copy()
+
+    frames = GrootN17VLMEncodeStep()._build_sample_images(
+        video, batch_size=2, target_device=torch.device(device)
+    )
+
+    for batch_idx, sample_frames in enumerate(frames):
+        assert len(sample_frames) == 6
+        for frame_idx, frame in enumerate(sample_frames):
+            timestep, view_idx = divmod(frame_idx, 3)
+            assert frame.device.type == device
+            torch.testing.assert_close(
+                frame.cpu(), torch.from_numpy(video[batch_idx, timestep, view_idx]).permute(2, 0, 1)
+            )
+
+
+def test_groot_n1_7_vlm_encode_runs_on_the_cpu_where_its_saved_device_is_missing(monkeypatch):
+    # A checkpoint trained on a GPU saves this step with device="cuda", and loads on machines without one.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    class FakeProcessor:
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, return_tensors, padding):
+            self.image_devices = {image.device.type for image in images}
+            return {"input_ids": torch.zeros(len(text), 1, dtype=torch.long)}
+
+    step = GrootN17VLMEncodeStep(device="cuda")
+    step._proc = FakeProcessor()
+    transition = {
+        TransitionKey.OBSERVATION: {"video": np.zeros((1, 1, 1, 2, 2, 3), dtype=np.uint8)},
+        TransitionKey.COMPLEMENTARY_DATA: {"language": ["task"]},
+    }
+
+    output = step(transition)
+
+    assert step._proc.image_devices == {"cpu"}
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["input_ids"].shape == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_groot_n1_7_vlm_encode_albumentations_accepts_tensor_video(device):
+    pytest.importorskip("cv2", exc_type=ImportError)
+    video = np.random.default_rng(0).integers(0, 256, size=(1, 2, 2, 12, 16, 3), dtype=np.uint8)
+    step = GrootN17VLMEncodeStep(use_albumentations=True, image_target_size=[8, 8], image_crop_size=[6, 6])
+
+    expected = step._build_sample_images(video, batch_size=1, target_device=None)
+    actual = step._build_sample_images(torch.from_numpy(video).to(device), batch_size=1, target_device=None)
+
+    assert len(actual[0]) == len(expected[0]) == 4
+    for actual_frame, expected_frame in zip(actual[0], expected[0], strict=True):
+        np.testing.assert_array_equal(actual_frame, expected_frame)
 
 
 def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
@@ -3149,3 +3283,65 @@ def test_action_encoder_takes_one_time_encoding_for_the_chunk():
     torch.testing.assert_close(
         encoder.encode(actions, time_encoding, cat_ids), encoder(actions, timestep, cat_ids), atol=0, rtol=0
     )
+
+
+def _alternate_vl_dit_before_the_split(
+    model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+):
+    """`AlternateVLDiT.forward` as it was written before its blocks and output became methods."""
+    temb = model.timestep_encoder(timestep)
+    image_attention_mask = image_mask & mask
+    non_image_attention_mask = (~image_mask) & mask
+    for idx, block in enumerate(model.transformer_blocks):
+        if idx % 2 == 1:
+            hidden_states = block(hidden_states, temb=temb)
+        else:
+            encoder_mask = (
+                non_image_attention_mask
+                if idx % (2 * model.attend_text_every_n_blocks) == 0
+                else image_attention_mask
+            )
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_mask,
+                temb=temb,
+            )
+    shift, scale = model.proj_out_1(torch.nn.functional.silu(temb)).chunk(2, dim=1)
+    return model.proj_out_2(model.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None])
+
+
+def test_alternate_vl_dit_computes_what_it_did_before_the_split():
+    pytest.importorskip("diffusers")
+    from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
+
+    torch.manual_seed(0)
+    model = AlternateVLDiT(
+        output_dim=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        num_layers=4,
+        dropout=0.0,
+        final_dropout=False,
+        max_num_positional_embeddings=16,
+        interleave_self_attention=True,
+        cross_attention_dim=6,
+    ).eval()
+    hidden_states, encoder_hidden_states = torch.randn(2, 5, 8), torch.randn(2, 7, 6)
+    timestep = torch.tensor([3, 600])
+    image_mask = torch.tensor([[True, True, True, False, False, False, False]] * 2)
+    mask = torch.tensor([[True] * 7, [True] * 5 + [False] * 2])
+
+    with torch.no_grad():
+        actual = model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            image_mask=image_mask,
+            backbone_attention_mask=mask,
+        )
+        expected = _alternate_vl_dit_before_the_split(
+            model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -16,23 +16,23 @@
 
 import subprocess
 import sys
+import types
 
 import numpy as np
 import pytest
 import torch
 from torch import nn
 
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
 from lerobot.utils.import_utils import is_package_available
 
-pytestmark = [
-    pytest.mark.gpu,
-    pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not is_package_available("torch_tensorrt")
-        or not is_package_available("executorch"),
-        reason="needs a CUDA GPU, Torch-TensorRT and ExecuTorch",
-    ),
-]
+needs_tensorrt = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not is_package_available("torch_tensorrt")
+    or not is_package_available("executorch")
+    or not tensorrt_takes_the_plugin_setting(),
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
+)
 
 # Loads the program the way a bundle does, in a process without PyTorch.
 RUN = """
@@ -83,6 +83,8 @@ def run_without_torch(program, data, x, tmp_path):
     return np.load(tmp_path / "y.npy")
 
 
+@pytest.mark.gpu
+@needs_tensorrt
 def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
     from executorch.exir._serialize._program import deserialize_pte_binary
     from executorch.exir.schema import DeviceType
@@ -120,6 +122,8 @@ class Buckets(nn.Module):
         return torch.bucketize(x, self.boundaries).float()
 
 
+@pytest.mark.gpu
+@needs_tensorrt
 def test_parts_in_one_folder_keep_their_own_weights(tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
@@ -139,6 +143,8 @@ def test_parts_in_one_folder_keep_their_own_weights(tmp_path):
     assert sorted(data.name for data, _ in parts.values()) == ["first.ptd", "second.ptd"]
 
 
+@pytest.mark.gpu
+@needs_tensorrt
 def test_float32_math_stays_float32(tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
@@ -154,3 +160,55 @@ def test_float32_math_stays_float32(tmp_path):
     np.testing.assert_allclose(
         run_without_torch(tmp_path / "model.pte", data, x, tmp_path), expected, atol=2e-5
     )
+
+
+class ReachedCompileError(Exception):
+    pass
+
+
+def use_fake_tensorrt(monkeypatch, compile):
+    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile`."""
+    module = types.ModuleType("torch_tensorrt")
+    module.__version__ = "0.0"
+    module.dynamo = types.SimpleNamespace(compile=compile)
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+
+
+def linear_program():
+    return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
+
+
+@pytest.mark.parametrize("deduplicates", [True, False])
+def test_compile_gets_the_settings_the_installed_torch_tensorrt_takes(monkeypatch, tmp_path, deduplicates):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    seen = {}
+
+    def compile_with_both(
+        program, arg_inputs, *, fallback_pytorch_plugin_ops, deduplicate_weights=False, **options
+    ):
+        seen.update(options, fallback=fallback_pytorch_plugin_ops, deduplicate_weights=deduplicate_weights)
+        raise ReachedCompileError
+
+    def compile_with_the_plugin_setting(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
+        seen.update(options, fallback=fallback_pytorch_plugin_ops)
+        raise ReachedCompileError
+
+    use_fake_tensorrt(monkeypatch, compile_with_both if deduplicates else compile_with_the_plugin_setting)
+    with pytest.raises(ReachedCompileError):
+        ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
+    # Operators whose TensorRT plugins need PyTorch stay out of TensorRT; weights are shared when it can.
+    assert seen["fallback"] is True
+    assert seen.get("deduplicate_weights") is (True if deduplicates else None)
+
+
+def test_a_torch_tensorrt_without_the_plugin_setting_is_refused(monkeypatch, tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    # Such a Torch-TensorRT takes any keyword and ignores the ones it does not know.
+    def compile(program, arg_inputs, **options):
+        raise ReachedCompileError
+
+    use_fake_tensorrt(monkeypatch, compile)
+    with pytest.raises(ImportError, match="fallback_pytorch_plugin_ops"):
+        ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")

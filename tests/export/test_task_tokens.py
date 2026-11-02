@@ -38,8 +38,11 @@ from lerobot.bundle.manifest import (
     TaskTokens,
 )
 from lerobot.bundle.task_tokens import TaskEncoder, clean
+from lerobot.inference import FeatureSpec, ObservationSnapshot
+from lerobot.remote_inference.bundle import BundleRunner
 from lerobot.utils.constants import ACTION, OBS_STATE
-from tests.export.torch_backend import make_bundle
+from tests.export.torch_backend import make_bundle, record_places
+from tests.torch_free import assert_runs_without_torch, refusing_torch
 
 OPS = [["strip"], ["replace", "_", " "], ["template", "task: {task} ."]]
 WORDS = ["task:", ".", "pick", "place", "the", "cube", "box", "and", "then", "it"]
@@ -137,12 +140,51 @@ def test_a_new_task_without_the_tokenizers_package_names_the_install(tmp_path, m
         tokens.ids("place the box")
 
 
+def test_a_new_task_is_tokenized_with_the_tokenizers_package_this_process_sees(tmp_path, monkeypatch):
+    # Found only through PYTHONPATH, as a package in the user site or installed with `pip install --target`.
+    package = tmp_path / "site" / "tokenizers"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "from types import SimpleNamespace\n"
+        "class Tokenizer:\n"
+        "    from_file = staticmethod(lambda path: Tokenizer())\n"
+        "    no_padding = no_truncation = lambda self: None\n"
+        "    encode = lambda self, text: SimpleNamespace(ids=[7] * len(text.split()))\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(package.parent))
+    monkeypatch.syspath_prepend(str(package.parent))
+    assert task_tokens_module.tokenize(tmp_path / TOKENIZER, ["place the box"]) == [[7, 7, 7]]
+
+
 def test_a_tokenizer_that_splits_differently_is_refused(tmp_path):
     tokens = TaskEncoder(
         tmp_path, write_task_files(tmp_path, torch.randn(len(WORDS), 4), {"pick the cube": [0, 2]})
     )
     with pytest.raises(RuntimeError, match="splits the exported tasks into other tokens"):
         tokens.ids("place the box")
+
+
+def test_task_rows_are_made_without_torch(tmp_path):
+    """A known task and a new one; the child process that tokenizes the new one must not load PyTorch either."""
+    spec = write_task_files(tmp_path, torch.randn(len(WORDS), 4), {"pick the cube": PICK})
+    assert_runs_without_torch(
+        """
+        import json
+        import sys
+        from pathlib import Path
+
+        from lerobot.bundle import task_tokens
+        from lerobot.bundle.manifest import TaskTokens
+
+        task_tokens.TOKENIZE = sys.argv[3]
+        encoder = task_tokens.TaskEncoder(Path(sys.argv[1]), TaskTokens(**json.loads(sys.argv[2])))
+        lengths = [encoder(task)[1].tolist() for task in ("pick the cube", "place_the box")]
+        assert lengths == [[5], [5]], lengths
+        """,
+        str(tmp_path),
+        json.dumps(asdict(spec)),
+        refusing_torch(task_tokens_module.TOKENIZE),
+    )
 
 
 class TaskScale(nn.Module):
@@ -154,7 +196,8 @@ class TaskScale(nn.Module):
 
 def task_bundle(tmp_path):
     frame = {OBS_STATE: np.array([1.0, 2.0], np.float32)}
-    table = torch.randn(len(WORDS), 4)
+    # Seeded, so that no expected action lands near zero, where rtol=1e-5 is finer than float32 rounding.
+    table = torch.randn(len(WORDS), 4, generator=torch.Generator().manual_seed(1))
     rows = torch.zeros(6, 4)
     rows[:5] = table[PICK]
     bundle = make_bundle(
@@ -177,28 +220,53 @@ def task_bundle(tmp_path):
 def test_engine_runs_the_task_it_is_given(tmp_path):
     path, table = task_bundle(tmp_path)
     state = np.array([1.0, 2.0], np.float32)
-    engine = BundleEngine(Bundle.read(path))
+    pick, place = state * table[PICK].sum().item() + 5, state * table[PLACE].sum().item() + 5
     np.testing.assert_allclose(
-        engine.get_action({OBS_STATE: state}), state * table[PICK].sum().item() + 5, rtol=1e-5
+        BundleEngine(Bundle.read(path)).get_action({OBS_STATE: state}), pick, rtol=1e-5
     )
     engine = BundleEngine(Bundle.read(path), task="place_the box")
-    place = table[PLACE].sum().item()
-    np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), state * place + 5, rtol=1e-5)
+    np.testing.assert_allclose(engine.get_action({OBS_STATE: state}), place, rtol=1e-5)
     with pytest.raises(ValueError, match="tokens long"):
         BundleEngine(Bundle.read(path), task="pick the cube and then place it")
+    # From the next chunk on, and a task over the budget leaves the one it runs.
+    engine.set_task("pick the cube")
+    np.testing.assert_allclose(engine.predict_chunk({OBS_STATE: state}), [pick], rtol=1e-5)
+    with pytest.raises(ValueError, match="tokens long"):
+        engine.set_task("pick the cube and then place it")
+    assert engine.task == "pick the cube"
+
+
+def test_engine_refuses_a_run_that_writes_the_task_values(tmp_path):
+    path, _ = task_bundle(tmp_path)
+    data = json.loads((path / MANIFEST).read_text())
+    run = data["runs"][0]
+    data["runs"] = [{**run, "name": "retask", "outputs": [TASK_EMBEDDINGS]}, run]
+    (path / MANIFEST).write_text(json.dumps(data))
+    with pytest.raises(
+        ValueError, match=r"run 'retask' writes \['task_embeddings'\], which the bundle makes"
+    ):
+        BundleEngine(Bundle.read(path))
+
+
+def test_a_served_bundle_runs_the_task_of_each_observation(tmp_path):
+    path, table = task_bundle(tmp_path)
+    names = ("motor_1.pos", "motor_2.pos")
+    runner = BundleRunner(
+        BundleEngine(Bundle.read(path)),
+        action_interval=1 / 30,
+        features=(FeatureSpec(OBS_STATE, (2,), "float32", names=names, semantics="units-v1"),),
+        action_feature=FeatureSpec(ACTION, (2,), "float32", names=names, semantics="units-v1"),
+    )
+    state = np.array([1.0, 2.0], np.float32)
+    # An empty task is the bundle's own, "pick the cube".
+    for task, tokens in [("place the box", PLACE), ("", PICK)]:
+        actions = runner.predict(ObservationSnapshot({OBS_STATE: state}, 0.0, task)).canonical_actions
+        np.testing.assert_allclose(actions, [state * table[tokens].sum().item() + 5], rtol=1e-5)
 
 
 def test_engine_places_the_task_values_once(tmp_path, monkeypatch):
-    from tests.export import torch_backend
-
     path, _ = task_bundle(tmp_path)
-    placed = []
-    place = torch_backend.TorchProgram.place
-    monkeypatch.setattr(
-        torch_backend.TorchProgram,
-        "place",
-        lambda self, index, value: placed.append(value.shape) or place(self, index, value),
-    )
+    placed = record_places(monkeypatch)
     engine = BundleEngine(Bundle.read(path), task="place_the box")
     loaded = len(placed)
     for _ in range(3):

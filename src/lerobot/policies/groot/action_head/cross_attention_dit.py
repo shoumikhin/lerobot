@@ -384,6 +384,7 @@ class AlternateVLDiT(DiT):
         self, idx: int, image_mask: torch.Tensor | None, attention_mask: torch.Tensor | None
     ) -> torch.Tensor | None:
         """The text tokens on every `attend_text_every_n_blocks`-th cross-attention block, else the image tokens."""
+        assert image_mask is not None and attention_mask is not None
         if idx % (2 * self.attend_text_every_n_blocks) == 0:
             return ~image_mask & attention_mask
         return image_mask & attention_mask

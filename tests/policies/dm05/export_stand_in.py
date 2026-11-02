@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The DM05 export recipe, on DM05's preprocessor with a tiny Gemma3 processor and a stand-in policy."""
+"""A stand-in DM05 for its export recipe, on DM05's preprocessor with a tiny Gemma3 processor."""
 
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -112,37 +111,3 @@ def make_recipe(tmp_path, device="cpu", split_words=True) -> DM05ExportRecipe:
         backend=SimpleNamespace(device=device), seed=0, dataset=None, task="pick up the cube", tolerance=None
     )
     return DM05ExportRecipe(PromptReader(config).eval(), preprocessor, postprocessor, cfg)
-
-
-def program_inputs(recipe: DM05ExportRecipe, state: list[float]) -> tuple[torch.Tensor, ...]:
-    frame = {**recipe.test_case().frame, OBS_STATE: np.array(state, dtype=np.float32)}
-    noise = np.random.default_rng(2).standard_normal(recipe.test_case().noise.shape, dtype=np.float32)
-    return tuple(torch.from_numpy(x) for x in (*frame.values(), noise))
-
-
-def test_the_program_writes_each_states_numbers_into_the_prompt(tmp_path):
-    recipe = make_recipe(tmp_path)
-
-    [part] = recipe.parts()
-    program = torch.export.export(part.module, part.example_inputs, strict=False)
-
-    # Bins 0, 5 and 191: numbers of one, one and three digits, where the test frame's take three each.
-    inputs = program_inputs(recipe, [-1.0, -0.96, 0.5])
-    with torch.no_grad():
-        torch.testing.assert_close(program.module()(*inputs), part.module(*inputs), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_the_prompt_and_pixels_are_the_processors_on_cuda_too(tmp_path):
-    recipe = make_recipe(tmp_path, device="cuda")
-
-    # The eager checks compare the prompt and the pixels with what the saved steps make.
-    [part] = recipe.parts()
-
-
-def test_a_tokenizer_that_writes_the_state_otherwise_is_refused(tmp_path):
-    # It reads all the text between two special tokens as one word, so a number alone is not its own token there.
-    recipe = make_recipe(tmp_path, split_words=False)
-
-    with pytest.raises(ValueError, match="does not hold the state's numbers"):
-        list(recipe.parts())

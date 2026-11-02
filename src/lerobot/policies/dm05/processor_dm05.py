@@ -225,7 +225,7 @@ class DM05TokenizerProcessorStep(ObservationProcessorStep):
         if self.add_state and (not isinstance(state_bins, list) or len(state_bins) != batch_size):
             raise ValueError("DM05 state bins are missing or do not match the batch size.")
         tasks = normalize_task_batch(complementary_data.get("task"), batch_size, self.default_task)
-        meta = build_meta(list(self.image_keys))
+        meta = build_meta(list(self.image_keys or []))
         samples = [
             {
                 "prompt": tasks[index],

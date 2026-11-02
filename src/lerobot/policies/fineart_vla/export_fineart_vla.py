@@ -29,19 +29,20 @@ from dataclasses import replace
 from typing import Any
 
 import torch
-from torch import Tensor
 
-from lerobot.export.recipe import ActionChunkRecipe
-from lerobot.processor import EnvTransition, PolicyProcessorPipeline, ProcessorStep, TransitionKey
+from lerobot.export.recipe import BFLOAT16_STEPS_TOLERANCE, ActionChunkRecipe
+from lerobot.processor import EnvTransition, PolicyProcessorPipeline, TransitionKey
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
-from ..common.qwen_vision import is_exporting
-from ..common.state_prompt import StatePromptTokens, extreme_states
+from ..common.state_prompt import StatePromptStep, StatePromptTokens, uniform_bins
 from .processor_fineart_vla import FineARTVLATextTokenizerStep
 
 
 class FineARTVLAExportRecipe(ActionChunkRecipe):
     """[`ActionChunkRecipe`] with FineART-VLA's prompt built in the program."""
+
+    # FineART-VLA runs pi0.5's ten bfloat16 denoising steps.
+    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
 
     def program_preprocessor(self) -> PolicyProcessorPipeline:
         """The saved preprocessor with its text tokenizer step replaced by [`_StatePromptStep`]."""
@@ -57,7 +58,7 @@ class FineARTVLAExportRecipe(ActionChunkRecipe):
         return replace(self.preprocessor, steps=steps)
 
 
-class _StatePromptStep(ProcessorStep):
+class _StatePromptStep(StatePromptStep):
     """FineART-VLA's text tokenizer step for one task, as tensor operations.
 
     The prompt's tokens before and after the state, and what the step adds to the complementary data, are the
@@ -74,25 +75,11 @@ class _StatePromptStep(ProcessorStep):
         self.prompt: StatePromptTokens | None = None
         self.complementary: dict[str, Any] = {}
 
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        if not is_exporting():
-            if self.prompt is None:
-                self._fit(transition)
-                for extreme in extreme_states(transition):
-                    self._check(extreme)
-            self._check(transition)
-        return self._apply(transition)
-
-    def _bins(self, state: Tensor) -> Tensor:
-        """The state's bin numbers plus one, as `discretize_state_str` digitizes them against 256 equal bins."""
-        edges = -1 + torch.arange(256, dtype=torch.float32, device=state.device) / 128
-        return (state.flatten()[:, None] >= edges).sum(-1)
-
     def _apply(self, transition: EnvTransition) -> EnvTransition:
         if self.prompt is None:
             raise ValueError("The prompt is made from an eager call before the program is traced.")
-        observation = dict(transition[TransitionKey.OBSERVATION])
-        ids, mask = self.prompt(self._bins(observation[OBS_STATE]))
+        observation = dict(transition[TransitionKey.OBSERVATION] or {})
+        ids, mask = self.prompt(uniform_bins(observation[OBS_STATE], 256))
         observation[OBS_LANGUAGE_TOKENS] = ids[None]
         observation[OBS_LANGUAGE_ATTENTION_MASK] = mask[None]
         complementary = {**(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}), **self.complementary}
@@ -105,30 +92,28 @@ class _StatePromptStep(ProcessorStep):
     def _fit(self, transition: EnvTransition) -> None:
         """Take the prompt around the state, and what the step adds to the complementary data, from this frame."""
         saved = self.step(transition)
-        ids = saved[TransitionKey.OBSERVATION][OBS_LANGUAGE_TOKENS][0]
-        mask = saved[TransitionKey.OBSERVATION][OBS_LANGUAGE_ATTENTION_MASK][0]
-        bins = self._bins(transition[TransitionKey.OBSERVATION][OBS_STATE])
+        tokens = saved[TransitionKey.OBSERVATION] or {}
+        ids = tokens[OBS_LANGUAGE_TOKENS][0]
+        mask = tokens[OBS_LANGUAGE_ATTENTION_MASK][0]
+        bins = uniform_bins((transition[TransitionKey.OBSERVATION] or {})[OBS_STATE], 256)
         self.prompt = StatePromptTokens.around(
             ids[mask].tolist(), bins.tolist(), self.pieces, self.pad_id, len(ids), bins.device
         )
         given = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
-        added = saved[TransitionKey.COMPLEMENTARY_DATA]
+        added = saved[TransitionKey.COMPLEMENTARY_DATA] or {}
         self.complementary = {key: value for key, value in added.items() if key not in given}
 
     def _check(self, transition: EnvTransition) -> None:
         """Refuse a prompt other than the saved step's for this frame."""
-        program = self._apply(transition)[TransitionKey.OBSERVATION]
-        saved = self.step(transition)[TransitionKey.OBSERVATION]
+        program = self._apply(transition)[TransitionKey.OBSERVATION] or {}
+        saved = self.step(transition)[TransitionKey.OBSERVATION] or {}
         if not all(
             torch.equal(program[key], saved[key].to(program[key].device))
             for key in (OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK)
         ):
-            state = transition[TransitionKey.OBSERVATION][OBS_STATE].tolist()
+            state = (transition[TransitionKey.OBSERVATION] or {})[OBS_STATE].tolist()
             raise ValueError(
                 "The program writes another prompt than FineART-VLA's text tokenizer step for the normalized "
                 f"state {state}: this tokenizer splits the state's numbers differently inside the prompt, so "
                 "FineART-VLA cannot be exported this way."
             )
-
-    def transform_features(self, features):
-        return features

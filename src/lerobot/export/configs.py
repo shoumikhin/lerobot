@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import importlib.metadata
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -51,6 +52,9 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         runtime_imports (`tuple[str, ...]`):
             Python modules the runtime imports before it loads the files, such as one that registers the
             compiler's kernels with the runtime.
+        runtime_options (`dict[str, dict[str, bool | int | str]]`):
+            Settings the runtime applies before it loads the files. For ExecuTorch, the options of its
+            backends, by backend name.
         runtime_modules (`tuple[str, ...]`):
             Python modules the files need to load, such as `executorch`. The bundle records their versions as
             its `runtime_versions`.
@@ -59,14 +63,16 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         min_torch (`str`, *optional*):
             The oldest PyTorch whose traced programs the compiler reads, such as `"2.15"`. `None` takes any.
         torch_overrides (`tuple[str, ...]`):
-            The PyTorch pins that replace LeRobot's in an environment for exporting with this backend, such as
-            `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`.
+            The PyTorch pins an export with this backend needs, such as
+            `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`. On macOS, where LeRobot pins an older PyTorch,
+            they replace LeRobot's pins in a second environment.
     """
 
     runtime: ClassVar[str]
     file_suffix: ClassVar[str]
     device: ClassVar[str]
     runtime_imports: ClassVar[tuple[str, ...]] = ()
+    runtime_options: ClassVar[dict[str, dict[str, bool | int | str]]] = {}
     runtime_modules: ClassVar[tuple[str, ...]] = ()
     packages: ClassVar[tuple[str, ...]] = ()
     min_torch: ClassVar[str | None] = None
@@ -101,15 +107,25 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
             "is installed."
         )
         if self.torch_overrides:
-            overrides = "\\n".join(self.torch_overrides)
             packages = " ".join(f'"{package}"' for package in self.packages)
-            message += (
-                " LeRobot pins an older PyTorch, so export from a second environment that overrides the pin:\n\n"
-                f"    printf '{overrides}\\n' > torch-overrides.txt\n"
-                f"    uv pip install --override torch-overrides.txt lerobot {packages}\n\n"
-                "The override replaces every PyTorch pin, so the packages after lerobot are pinned to that PyTorch "
-                "by hand."
-            )
+            if sys.platform == "darwin":
+                overrides = "\\n".join(self.torch_overrides)
+                message += (
+                    " LeRobot pins an older PyTorch on macOS, so export from a second environment that overrides "
+                    "the pin:\n\n"
+                    f"    printf '{overrides}\\n' > torch-overrides.txt\n"
+                    f"    uv pip install --override torch-overrides.txt lerobot {packages}\n\n"
+                    "The override replaces every PyTorch pin, so the packages after lerobot are pinned to that "
+                    "PyTorch by hand."
+                )
+            else:
+                pins = " ".join(f'"{pin}"' for pin in self.torch_overrides)
+                message += (
+                    f" LeRobot allows PyTorch {self.min_torch} on this platform, so install it in this "
+                    "environment:\n\n"
+                    f"    pip install {pins} {packages}\n\n"
+                    "Then export again."
+                )
         raise ValueError(f"{message} See https://huggingface.co/docs/lerobot/export.")
 
     @abc.abstractmethod

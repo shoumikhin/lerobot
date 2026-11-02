@@ -30,11 +30,11 @@ from lerobot.policies.common.input_checks import check_input
 from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
 from lerobot.policies.common.qwen_vision import (
     check_visible_images,
-    is_exporting,
     is_preparing_image_grid,
     qwen_image_rope_index,
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import is_exporting
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import _transformers_available, require_package
 from lerobot.utils.language import require_single_text_output

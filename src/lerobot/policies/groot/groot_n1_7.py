@@ -39,10 +39,10 @@ from ..common.flow_matching import (
 from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
 from ..common.qwen_vision import (
     check_visible_images,
-    is_exporting,
     is_preparing_image_grid,
     qwen_image_rope_index,
 )
+from ..utils import is_exporting
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 

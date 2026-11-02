@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The WALL-X export recipe, on WALL-X's preprocessor with a small Qwen-like processor and a stand-in."""
+"""A stand-in WALL-X for its export recipe, on WALL-X's preprocessor with a small Qwen-like processor."""
 
 import re
 import zlib
@@ -27,7 +27,7 @@ pytest.importorskip("transformers")
 from transformers import Qwen2VLImageProcessor  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
-from lerobot.export.recipe import ActionChunkRecipe, random_frame  # noqa: E402
+from lerobot.export.recipe import ActionChunkRecipe  # noqa: E402
 from lerobot.policies import make_pre_post_processors  # noqa: E402
 from lerobot.policies.pretrained import PreTrainedPolicy  # noqa: E402
 from lerobot.policies.wall_x import WallXConfig  # noqa: E402
@@ -99,28 +99,3 @@ class PixelWallX(WallXPolicy):
         reads = batch["pixel_values"].mean() + batch["input_ids"].float().mean()
         reads = reads + batch["proprioception"].mean()
         return (noise + reads)[..., : self.config.output_features[ACTION].shape[0]]
-
-
-def program_inputs(recipe: ActionChunkRecipe) -> tuple[torch.Tensor, ...]:
-    frame = random_frame(recipe.config.input_features, torch.Generator().manual_seed(1))
-    noise = torch.randn(recipe.test_case().noise.shape, generator=torch.Generator().manual_seed(2))
-    return tuple(torch.from_numpy(x) for x in (*frame.values(), noise.numpy()))
-
-
-def test_the_program_keeps_the_prompt_and_computes_the_pixels_and_state():
-    recipe = make_recipe()
-
-    [part] = recipe.parts()
-    program = torch.export.export(part.module, part.example_inputs, strict=False)
-
-    inputs = program_inputs(recipe)
-    with torch.no_grad():
-        torch.testing.assert_close(program.module()(*inputs), part.module(*inputs), rtol=0, atol=0)
-
-
-def test_the_saved_preprocessor_cannot_be_traced():
-    recipe = make_recipe(recipe_class=ActionChunkRecipe)
-    [part] = recipe.parts()
-
-    with pytest.raises(Exception, match="data-dependent|GuardOnDataDependentSymNode"):
-        torch.export.export(part.module, part.example_inputs, strict=False)

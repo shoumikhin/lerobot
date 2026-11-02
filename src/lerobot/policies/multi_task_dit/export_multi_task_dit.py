@@ -55,7 +55,10 @@ class MultiTaskDiTExportRecipe(DenoisingRecipe):
     def _schedule(self) -> Schedule:
         config = self.policy.config
         if config.is_diffusion:
-            return scheduler_schedule(self.policy.objective.noise_scheduler)
+            objective = self.policy.objective
+            # As `DiffusionObjective.conditional_sample` does before it samples.
+            objective.noise_scheduler.set_timesteps(objective.num_inference_steps)
+            return scheduler_schedule(objective.noise_scheduler)
         if config.integration_method != "euler":
             raise ValueError(f"Only Euler integration can be exported, not {config.integration_method!r}.")
         # The time grid of `FlowMatchingObjective.conditional_sample`, on the device the policy computes it on.

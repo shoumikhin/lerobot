@@ -37,7 +37,9 @@ def check_input(
 
     In eager mode this is a plain check that always raises, as these input checks were before. While
     `torch.export` or `torch.compile` traces, it is transformers' `torch_compilable_check`, a runtime assert in
-    the program (which `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off; a failed assert loses its message).
+    the program (which `TRANSFORMERS_DISABLE_TORCH_CHECK=1` turns off; a failed assert loses its message). For a
+    tensor condition the program holds `aten._is_all_true`, which ExecuTorch's `to_edge` accepts since
+    pytorch/executorch#24222 (in ExecuTorch 1.6 with #24298).
     """
     if torch.compiler.is_compiling() or torch.compiler.is_exporting():
         torch_compilable_check(condition, message, error_type=error_type)

@@ -36,7 +36,6 @@ from lerobot.policies.common.qwen2_5_vision import (  # noqa: E402
 )
 from lerobot.policies.common.qwen_vision import (  # noqa: E402
     check_visible_images,
-    is_exporting,
     prepare_image_grid,
     qwen_image_rope_index,
 )
@@ -158,15 +157,6 @@ def test_a_call_without_images_has_no_grid():
     cache = Qwen2_5VisionGrid.build(visual, torch.tensor(GRID))
     with prepare_image_grid():
         assert Qwen2_5VisionGrid.track(cache, visual, None) is None
-
-
-def test_compiled_code_does_not_take_the_export_path():
-    @torch.compile(backend="eager", fullgraph=True)
-    def exporting(x):
-        return x + 1 if is_exporting() else x
-
-    # torch.compile on PyTorch 2.11 also reports torch.compiler.is_exporting().
-    assert torch.equal(exporting(torch.zeros(2)), torch.zeros(2))
 
 
 def test_exported_program_rejects_a_changed_grid():

@@ -54,8 +54,9 @@ from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
     logging,
-    torch_compilable_check,
 )
+
+from lerobot.policies.common.input_checks import check_input
 
 from .configuration_molmoact2 import (
     MolmoAct2ActionExpertConfig,
@@ -3192,20 +3193,20 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
         assert image_num_crops.size(0) == num_images, (
             f"Expected {num_images} image num crops, but got {image_num_crops.size(0)}"
         )
-        torch_compilable_check(
+        check_input(
             (end_token_counts == num_images) | (end_token_counts == 2 * num_images) | (num_images <= 0),
             lambda: "Could not infer image counts from image end tokens: "
             f"end_tokens={int(end_token_counts.sum())}, image_grids={num_images}.",
         )
         n_crops, n_patches, _ = pixel_values.shape
-        torch_compilable_check(
+        check_input(
             image_num_crops.sum() == n_crops,
             lambda: f"Expected {int(image_num_crops.sum())} crops, but got {n_crops}",
             error_type=AssertionError,
         )
         num_pooled_patches_per_image = image_grids[:, :2].prod(dim=1) + image_grids[:, 2:].prod(dim=1)
         num_pooled_patches = image_token_pooling.size(0)
-        torch_compilable_check(
+        check_input(
             num_pooled_patches_per_image.sum() == num_pooled_patches,
             lambda: f"Expected {int(num_pooled_patches_per_image.sum())} pooled patches, "
             f"but got {num_pooled_patches}",
@@ -3546,7 +3547,7 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
             # parameter storage and autocast can otherwise make them differ.
             image_features = self.vision_backbone(images, token_pooling).to(device=x.device, dtype=x.dtype)
             is_image_patch = input_ids.reshape(-1).to(x.device) == self.config.image_patch_id
-            torch_compilable_check(
+            check_input(
                 is_image_patch.sum() == image_features.shape[0],
                 lambda: f"Expected {int(is_image_patch.sum())} image patch embeddings, got {len(image_features)}.",
                 error_type=RuntimeError,

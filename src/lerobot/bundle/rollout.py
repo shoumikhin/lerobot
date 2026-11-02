@@ -15,9 +15,9 @@
 r"""Run a bundle written by `lerobot-export` on a robot, without PyTorch: `lerobot-rollout --bundle.path`.
 
 It reuses the robot and camera configs, the robot factory, the joint-order rule, the dispatch helpers, the
-interpolator, the cycle timer and the return to the starting pose of `lerobot-rollout`, and loads none of
-the PyTorch packages. So it runs the base strategy only: recording, teleoperation, the planner, RTC and
-remote inference need those packages, and stay with `lerobot-rollout --policy.path`.
+interpolator, the cycle timer, the status logs and the return to the starting pose of `lerobot-rollout`, and
+loads none of the PyTorch packages. So it runs the base strategy only: recording, teleoperation, the planner,
+RTC and remote inference need those packages, and stay with `lerobot-rollout --policy.path`.
 
 ```bash
 lerobot-rollout \\
@@ -30,7 +30,10 @@ lerobot-rollout \\
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import logging
+import math
 import sys
 import time
 from collections.abc import Sequence
@@ -69,9 +72,10 @@ from lerobot.utils import ActionInterpolator, init_logging, register_third_party
 from lerobot.utils.action_dispatch import dispatch_tick
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.cycle_timer import CycleTimer
-from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, filter_arg, load_plugin, parse_plugin_args
+from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, filter_arg, parse_plugin_args
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import policy_features, return_to_position
+from lerobot.utils.rollout_status import RolloutStatusReporter
 
 from .engine import BundleEngine
 from .manifest import Bundle, is_bundle
@@ -105,9 +109,13 @@ class BundleRolloutConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
     # Move the robot back to the joint positions it had when it connected, before disconnecting.
     return_to_initial_position: bool = True
+    # Periodic health logs in seconds; 0 disables them.
+    status_interval_s: float = 5.0
 
     def __post_init__(self) -> None:
-        """Refuse a folder that is not a bundle before anything loads."""
+        """Refuse settings that cannot run, before anything loads."""
+        if not math.isfinite(self.status_interval_s) or self.status_interval_s < 0:
+            raise ValueError("status_interval_s must be finite and >= 0")
         if not is_bundle(self.bundle.path):
             raise ValueError(
                 f"{self.bundle.path} is not a bundle written by lerobot-export: it has no export.json. A "
@@ -168,6 +176,8 @@ def rollout(cfg: BundleRolloutConfig) -> None:
     bundle = Bundle.read(cfg.bundle.path)
     logger.info("Loading the bundle from '%s'...", bundle.path)
     engine = BundleEngine(bundle, task=cfg.task, rename_map=cfg.rename_map, stop_event=stop)
+    engine.latency.configure(cfg.status_interval_s)
+    status = RolloutStatusReporter(engine.latency, cfg.status_interval_s, device=None)
     robot = make_robot_from_config(cfg.robot)
     robot_frame = RobotFrame.of(robot, bundle.manifest.action_names)
     engine.check_robot(robot_frame.shapes(), robot_frame.actions)
@@ -180,13 +190,14 @@ def rollout(cfg: BundleRolloutConfig) -> None:
     logger.info("Connecting robot (%s)...", robot.name)
     robot.connect()
     try:
-        initial_position = {
-            key: value for key, value in robot.get_observation().items() if key.endswith(".pos")
-        }
+        observation = robot.get_observation()
+        engine.check_frame(robot_frame.frame(observation))
+        initial_position = {key: value for key, value in observation.items() if key.endswith(".pos")}
         start = time.perf_counter()
         logger.info("Running the bundle on the robot")
         while not stop.is_set():
             timer.tick(new_cycle=interpolator.needs_new_action())
+            status.report_if_due(timer)
             if cfg.duration > 0 and time.perf_counter() - start >= cfg.duration:
                 logger.info("Duration limit reached (%.0fs)", cfg.duration)
                 break
@@ -210,11 +221,26 @@ def main(args: Sequence[str] | None = None) -> None:
     """`lerobot-rollout --bundle.path`, with the arguments of the command."""
     init_logging()
     args = sys.argv[1:] if args is None else list(args)
-    # Only robots and cameras: policy, environment and strategy plugins may import PyTorch.
-    register_third_party_plugins(kinds=("robot", "camera"))
     for arg, package in parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, args).items():
         if not arg.startswith("robot."):
             raise ValueError(f"--{arg}: bundle mode loads robot and camera plugins only.")
-        load_plugin(package)
+        # Only the package, which registers the robot: its other modules, such as a kinematics processor, may
+        # import PyTorch.
+        importlib.import_module(package)
         args = filter_arg(arg, args)
+    # Any plugin may import PyTorch; camera plugins load anyway, as camera types sit in the robot's config.
+    register_third_party_plugins(
+        kinds=("robot", "camera") if _robot_may_come_from_a_plugin(args) else ("camera",)
+    )
     rollout(draccus.parse(BundleRolloutConfig, args=args))
+
+
+def _robot_may_come_from_a_plugin(args: Sequence[str]) -> bool:
+    """Whether `--robot.type` names a robot that no loaded package registers, or a `--config_path` file may."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--robot.type", dest="robot_type")
+    parser.add_argument("--config_path")
+    selected, _ = parser.parse_known_args(args)
+    if selected.robot_type is None:
+        return selected.config_path is not None
+    return selected.robot_type not in RobotConfig.get_known_choices()

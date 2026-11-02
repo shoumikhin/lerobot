@@ -68,15 +68,9 @@ def test_loads_only_the_listed_modules(config, tmp_path, monkeypatch):
     assert part.model.action_out_proj is None
     assert not any(t.is_meta for t in (*part.parameters(), *part.buffers()))
     assert not part.training
-
-
-def test_no_modules_keeps_only_the_config(config, tmp_path):
-    path = save_checkpoint(PI05Policy, config, tmp_path / "ckpt", RENAMES)
-
-    part = load_checkpoint_modules(PI05Policy, str(path / "model.safetensors"), config, [])
-
-    assert list(part.parameters()) == []
-    assert part.config.chunk_size == config.chunk_size
+    # An export loads no modules to read the policy's settings.
+    empty = load_checkpoint_modules(PI05Policy, str(path / "model.safetensors"), config, [])
+    assert list(empty.parameters()) == [] and empty.config.chunk_size == config.chunk_size
 
 
 def test_raises_when_the_file_misses_a_listed_weight(config, tmp_path):

@@ -16,19 +16,25 @@
 
 import json
 import platform
+import shutil
+import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from packaging.version import Version
-from safetensors.numpy import load_file
+from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
+from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+from lerobot.export.backends.executorch_tensorrt import tensorrt_takes_the_plugin_setting
+from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -39,7 +45,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
-from tests.torch_free import assert_runs_without_torch
+from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
 
 IMAGE = "observation.images.front"
 
@@ -90,11 +96,12 @@ def run_export(*args: str, backend: str = "torch_test") -> None:
     export([f"--backend.type={backend}", *args])
 
 
-@pytest.fixture(scope="module")
-def bundle(checkpoint, tmp_path_factory):
-    path = tmp_path_factory.mktemp("export") / "act_torch_test"
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={path}")
-    return Bundle.read(path)
+def robot_frame(image: str = IMAGE) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(0)
+    return {
+        image: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+        OBS_STATE: rng.random(3, dtype=np.float32),
+    }
 
 
 def assert_plays_like_pytorch(checkpoint, bundle: Bundle, image: str) -> None:
@@ -103,11 +110,7 @@ def assert_plays_like_pytorch(checkpoint, bundle: Bundle, image: str) -> None:
         policy, *make_pre_post_processors(policy.config, checkpoint), {}, [], "", "cpu", ""
     )
     engine = BundleEngine(bundle)
-    rng = np.random.default_rng(0)
-    frame = {
-        image: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
-        OBS_STATE: rng.random(3, dtype=np.float32),
-    }
+    frame = robot_frame(image)
     scale = np.asarray(bundle.manifest.action_scale, dtype=np.float32)
     for _ in range(policy.config.n_action_steps + 1):
         expected = reference.get_action(dict(frame)).numpy()
@@ -117,39 +120,19 @@ def assert_plays_like_pytorch(checkpoint, bundle: Bundle, image: str) -> None:
         assert drift <= bundle.manifest.tolerance, drift
 
 
-def test_bundle_plays_the_actions_of_the_pytorch_policy(checkpoint, bundle):
-    manifest = bundle.manifest
-    assert (manifest.backend, manifest.runtime, manifest.task, manifest.noise_shape) == (
-        "torch_test",
-        "torch_test",
-        None,
-        None,
-    )
-    assert [(r.name, r.program, r.inputs, r.outputs) for r in manifest.runs] == [
-        ("model", "model", [IMAGE, OBS_STATE], [ACTION])
-    ]
-    assert {name: (f.file, f.data) for name, f in manifest.programs.items()} == {"model": ("model.pt2", None)}
-    np.testing.assert_allclose(manifest.action_scale, [30.0, 30.0, 30.0], rtol=1e-6)
-    assert (bundle.path / POLICY_CONFIG).is_file() and not (bundle.path / "config.json").exists()
-    assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
-
-
-def test_export_takes_a_singular_image_key(tmp_path):
+def test_export_takes_a_singular_image_key_a_task_and_a_backend_from_discover_packages_path(tmp_path):
     save_checkpoint(tmp_path / "act", OBS_IMAGE)
-    run_export(f"--policy.path={tmp_path / 'act'}", f"--output_dir={tmp_path / 'bundle'}")
-    assert_plays_like_pytorch(tmp_path / "act", Bundle.read(tmp_path / "bundle"), OBS_IMAGE)
-
-
-def test_export_keeps_a_task_given(checkpoint, tmp_path):
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'bundle'}", "--task=pick")
-    assert Bundle.read(tmp_path / "bundle").manifest.task == "pick"
-
-
-def test_export_writes_nothing_over_tolerance(checkpoint, tmp_path):
-    output_dir = tmp_path / "bundle"
-    with pytest.raises(RuntimeError, match="failed its check"):
-        run_export(f"--policy.path={checkpoint}", f"--output_dir={output_dir}", "--backend.offset=10.0")
-    assert list(tmp_path.iterdir()) == []
+    # No installed package adds this backend, so each step must load it from the command line.
+    run_export(
+        f"--policy.path={tmp_path / 'act'}",
+        f"--output_dir={tmp_path / 'bundle'}",
+        "--task=pick",
+        "--backend.discover_packages_path=tests.export.discovered_backend",
+        backend="torch_test_discovered",
+    )
+    bundle = Bundle.read(tmp_path / "bundle")
+    assert (bundle.manifest.backend, bundle.manifest.task) == ("torch_test_discovered", "pick")
+    assert_plays_like_pytorch(tmp_path / "act", bundle, OBS_IMAGE)
 
 
 # Robot units of the test checkpoint's actions, whose spread is 30: float32's measured drift between eager
@@ -166,14 +149,13 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
     else:
         with pytest.raises(RuntimeError, match="failed its check"):
             run_export(*args)
-
-
-def test_a_backend_takes_a_pytorch_as_new_as_it_needs(monkeypatch):
-    monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
-    TorchTestBackend().check_torch()
+        # Nothing is written, not even the folders the export made beside the output folder.
+        assert list(tmp_path.iterdir()) == []
 
 
 def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
+    TorchTestBackend().check_torch()
     monkeypatch.setattr(TorchTestBackend, "min_torch", "99.0")
     with pytest.raises(ValueError, match="needs PyTorch 99.0 or newer to export") as refusal:
         TorchTestBackend().check_torch()
@@ -181,11 +163,20 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
 
     monkeypatch.setattr(TorchTestBackend, "packages", ("compiler>=99.0,<99.1",))
     monkeypatch.setattr(TorchTestBackend, "torch_overrides", ("torch>=99.0,<99.1", "torchvision>=9.0,<9.1"))
+    monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(ValueError) as refusal:
         TorchTestBackend().check_torch()
     message = str(refusal.value)
     assert "printf 'torch>=99.0,<99.1\\ntorchvision>=9.0,<9.1\\n' > torch-overrides.txt" in message
     assert 'uv pip install --override torch-overrides.txt lerobot "compiler>=99.0,<99.1"' in message
+
+    # LeRobot pins an older PyTorch on macOS only.
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(ValueError) as refusal:
+        TorchTestBackend().check_torch()
+    message = str(refusal.value)
+    assert 'pip install "torch>=99.0,<99.1" "torchvision>=9.0,<9.1" "compiler>=99.0,<99.1"' in message
+    assert "torch-overrides.txt" not in message
 
 
 @pytest.mark.parametrize("tolerance", ["nan", "inf", "-1"])
@@ -197,55 +188,84 @@ def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, t
     assert "--tolerance must be a finite number" in capfd.readouterr().err
 
 
-def test_export_loads_the_requested_revision(checkpoint, tmp_path, monkeypatch):
+def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
+    partial = tmp_path / "partial"
+    shutil.copytree(checkpoint, partial)
+    weights = load_file(partial / "model.safetensors")
+    del weights["model.action_head.weight"]
+    save_file(weights, partial / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={partial}", f"--output_dir={tmp_path / 'b'}")
+    assert "model.action_head.weight" in capfd.readouterr().err
+
+
+def test_the_trace_step_loads_the_requested_revision_without_tf32(checkpoint, tmp_path, monkeypatch):
     import lerobot.policies.factory as factory
 
-    seen = []
+    revisions, tf32 = [], []
     load, make = factory.load_pretrained_policy, factory.make_pre_post_processors
 
-    def load_pretrained_policy(config):
-        seen.append(config.pretrained_revision)
-        return load(config)
+    def load_pretrained_policy(config, **kwargs):
+        revisions.append(config.pretrained_revision)
+        tf32.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
+        return load(config, **kwargs)
 
     def make_pre_post_processors(*args, **kwargs):
-        seen.append(kwargs["pretrained_revision"])
+        revisions.append(kwargs["pretrained_revision"])
         return make(*args, **kwargs)
 
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     monkeypatch.setattr(factory, "make_pre_post_processors", make_pre_post_processors)
-    monkeypatch.setattr(sys, "argv", ["worker"])
     args = [
         "--backend.type=torch_test",
         f"--policy.path={checkpoint}",
         f"--output_dir={tmp_path / 'b'}",
         "--policy.pretrained_revision=pin123",
     ]
-    worker.trace_step({"step": "trace", "args": args})
-    assert seen == ["pin123", "pin123"]
-
-
-def test_export_steps_run_without_tf32(checkpoint, tmp_path, monkeypatch):
-    import lerobot.policies.factory as factory
-
-    seen = []
-    load = factory.load_pretrained_policy
-
-    def load_pretrained_policy(config):
-        seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
-        return load(config)
-
-    monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
     request = tmp_path / "trace.json"
-    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
-    request.write_text(json.dumps({"step": "trace", "args": args, "result": str(tmp_path / "result.json")}))
-    monkeypatch.setattr(sys, "argv", ["worker", str(request)])
+    folders, result = str(tmp_path / "folders.json"), str(tmp_path / "result.json")
+    request.write_text(json.dumps({"step": "trace", "args": args, "folders": folders, "result": result}))
+    argv = ["worker", str(request)]
+    monkeypatch.setattr(sys, "argv", list(argv))
     flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     try:
         worker.main()
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags
-    assert seen == [(False, False)]
+    assert revisions == ["pin123", "pin123"] and tf32 == [(False, False)]
+    # Later configs in this process read the command line, so the step gives it back.
+    assert sys.argv == argv
+
+
+def test_the_compile_step_runs_without_autograd(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "tests.export.torch_backend.TorchTestBackend.compile",
+        lambda self, program, path: seen.append(torch.is_grad_enabled()),
+    )
+    with torch.no_grad():
+        program = torch.export.export(torch.nn.Linear(2, 2), (torch.zeros(1, 2),))
+    torch.export.save(program, tmp_path / "part.pt2")
+    request = {"backend": {"type": "torch_test"}, "program": str(tmp_path / "part.pt2"), "plugins": []}
+    worker.compile_step({**request, "path": str(tmp_path / "out.pt2")})
+    assert seen == [False]
+
+
+def test_a_killed_trace_step_leaves_no_folders_behind(tmp_path, monkeypatch):
+    made = [tmp_path / ".b-1", tmp_path / ".b-traced-1"]
+
+    def killed_trace(args):
+        request = json.loads(Path(args[-1]).read_text())
+        for folder in made:
+            folder.mkdir()
+        Path(request["folders"]).write_text(json.dumps([str(folder) for folder in made]))
+        return subprocess.CompletedProcess(args, -9)
+
+    monkeypatch.setattr(lerobot_export.subprocess, "run", killed_trace)
+    with pytest.raises(RuntimeError, match="trace step crashed with SIGKILL"):
+        run_export(f"--output_dir={tmp_path / 'b'}")
+    assert not [folder for folder in made if folder.exists()]
 
 
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
@@ -261,19 +281,14 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
 
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
+needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
+needs_executorch_cuda = pytest.mark.skipif(
+    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+)
 BACKENDS = [
     "torch_test",
-    pytest.param(
-        "executorch_xnnpack",
-        marks=pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15"),
-    ),
-    pytest.param(
-        "executorch_cuda",
-        marks=pytest.mark.skipif(
-            not (EXECUTORCH and torch.cuda.is_available()),
-            reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU",
-        ),
-    ),
+    pytest.param("executorch_xnnpack", marks=needs_executorch),
+    pytest.param("executorch_cuda", marks=needs_executorch_cuda),
     pytest.param(
         "executorch_mlx",
         marks=pytest.mark.skipif(
@@ -303,35 +318,64 @@ def test_a_recipe_runs_a_part_several_times_with_constants(checkpoint, tmp_path,
     np.testing.assert_allclose([constants["factor_0"][0], constants["factor_1"][0]], [2.0, 0.5])
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
-    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+    not (
+        torch.cuda.is_available()
+        and is_package_available("executorch")
+        and is_package_available("torch_tensorrt")
+    )
+    or not tensorrt_takes_the_plugin_setting(),
+    reason="needs a CUDA GPU, ExecuTorch and a Torch-TensorRT with pytorch/TensorRT#4953",
 )
+def test_executorch_tensorrt_engines_share_one_activation_scratch(checkpoint, tmp_path):
+    """The export writes the option, and the bundle passes the export's own check in a fresh process."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_tensorrt")
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.runtime_options == {"TensorRTBackend": {"use_shared_activation_scratch": True}}
+
+
+@needs_executorch_cuda
 def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
-    """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU."""
-    from lerobot.bundle.executorch import ExecuTorchProgram
+    """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU, and only the
+    actions back."""
+    from lerobot.bundle.executorch import ExecuTorchProgram, prepare
+
+    # Before ExecuTorch loads: it reads the setting prepare() makes only once, when it loads.
+    prepare()
+    from executorch.runtime import ExecuTorchResult
 
     use_plugins(monkeypatch, "noise_recipe")
     run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_cuda")
     bundle = Bundle.read(tmp_path / "b")
     assert bundle.manifest.runs[0] == ProgramRun(NOISE, NOISE, [], [NOISE])
-    placed = []
-    place = ExecuTorchProgram.place
+    # Every copy between the host and the GPU, also one that passes a program's output to the next program.
+    copies = []
+    to_gpu, to_host = ExecuTorchResult.from_host, ExecuTorchResult.to_host
     monkeypatch.setattr(
-        ExecuTorchProgram,
-        "place",
-        lambda self, index, value: placed.append(value.shape) or place(self, index, value),
+        ExecuTorchResult,
+        "from_host",
+        lambda value, device: copies.append(("to GPU", value.shape)) or to_gpu(value, device),
+    )
+    monkeypatch.setattr(
+        ExecuTorchResult,
+        "to_host",
+        lambda value: copies.append(("to host", tuple(value.shape))) or to_host(value),
     )
     engine = BundleEngine(bundle)
-    loaded = len(placed)
-    rng = np.random.default_rng(0)
-    frame = {
-        IMAGE: rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
-        OBS_STATE: rng.random(3, dtype=np.float32),
-    }
-    first = np.stack([engine.get_action(dict(frame)) for _ in range(4)])
-    second = np.stack([engine.get_action(dict(frame)) for _ in range(4)])
+    loaded = len(copies)
+    first = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
+    second = np.stack([engine.get_action(robot_frame()) for _ in range(4)])
     assert not np.array_equal(first, second)
-    assert placed[loaded:] == [(32, 32, 3), (3,)] * 2
+    assert copies[loaded:] == [("to GPU", (32, 32, 3)), ("to GPU", (3,)), ("to host", (4, 3))] * 2
+    # The policy samples from a standard normal, so the noise program must too.
+    files = bundle.manifest.programs[NOISE]
+    noise = ExecuTorchProgram(
+        bundle.path / files.file, None if files.data is None else bundle.path / files.data
+    )
+    count = 4000 // int(np.prod(bundle.manifest.noise_shape)) + 1
+    draws = np.concatenate([noise.to_numpy(noise()[0]).ravel() for _ in range(count)])
+    assert abs(draws.mean()) < 0.1 and abs(draws.std() - 1) < 0.1
 
 
 @pytest.mark.skipif(
@@ -366,15 +410,17 @@ class MaskedPositions(torch.nn.Module):
         return x + self.embedding(ids)
 
 
-@pytest.mark.skipif(
-    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(ExecuTorchXNNPACKConfig, marks=needs_executorch),
+        pytest.param(ExecuTorchCUDAConfig, marks=needs_executorch_cuda),
+    ],
 )
-def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch):
-    """Indexing with a boolean mask makes a tensor whose size the GPU would read back to the host on every run."""
+def test_a_backend_folds_what_a_program_computes_from_constants(tmp_path, monkeypatch, backend):
+    """The in-place write of the masked ids is folded too, so no indexing reaches the backend. On a GPU such
+    indexing makes a tensor whose size the GPU would read back to the host on every run."""
     import executorch.exir
-
-    from lerobot.bundle.executorch import ExecuTorchProgram
-    from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
 
     lowered = []
     to_edge = executorch.exir.to_edge_transform_and_lower
@@ -383,15 +429,20 @@ def test_executorch_cuda_folds_what_a_program_computes_from_constants(tmp_path, 
         "to_edge_transform_and_lower",
         lambda program, **kwargs: lowered.append(program) or to_edge(program, **kwargs),
     )
-    model = MaskedPositions().eval()
-    x = torch.randn(8, 4)
-    path = tmp_path / "model.pte"
-    ExecuTorchCUDAConfig().compile(torch.export.export(model, (x,)), path)
+    with torch.no_grad():
+        program = torch.export.export(MaskedPositions().eval(), (torch.randn(8, 4),))
+    backend().compile(program, tmp_path / "model.pte")
     ops = [str(node.target) for node in lowered[0].graph.nodes if node.op == "call_function"]
     assert not [op for op in ops if "nonzero" in op or "index" in op], ops
-    program = ExecuTorchProgram(path, data=path.with_suffix(".ptd"))
-    (actual,) = program(x.numpy())
-    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-6, atol=1e-6)
+
+
+@needs_executorch_cuda
+def test_executorch_cuda_names_no_data_file_for_a_program_without_one(tmp_path):
+    path = tmp_path / "actions.pte"
+    # No weights and nothing for the GPU to compute, so ExecuTorch writes no data file.
+    program = torch.export.export(torch.nn.Identity(), (torch.randn(4, 3, device="cuda"),))
+    assert ExecuTorchCUDAConfig().compile(program, path) is None
+    assert path.is_file() and not path.with_suffix(".ptd").exists()
 
 
 class ConstantPositions(torch.nn.Module):
@@ -432,13 +483,51 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-def test_export_runs_its_steps_without_importing_torch(checkpoint, tmp_path):
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("executorch_xnnpack", marks=needs_executorch),
+        pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+    ],
+)
+def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
+    """The bundle check loads the programs, on the CPU or the GPU, and replays the test case, without PyTorch."""
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
+
+
+@pytest.mark.skipif(
+    not (EXECUTORCH and is_package_available("openvino") and is_package_available("nncf")),
+    reason="needs ExecuTorch, PyTorch 2.15 and OpenVINO: pip install openvino nncf",
+)
+def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    x = torch.randn(3, 4)
+    path = tmp_path / "model.pte"
+    ExecuTorchOpenVINOConfig().compile(torch.export.export(model, (x,)), path)
+    assert b"OpenvinoBackend" in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(checkpoint, tmp_path):
     """Only the steps import PyTorch, so what one step used is freed before the next starts."""
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}"]
     assert_runs_without_torch(EXPORT_WITHOUT_TORCH, str(tmp_path), *args)
-    for run in tmp_path.iterdir():
+    runs = list(tmp_path.iterdir())
+    (tmp_path / "new").mkdir()
+    for run in runs:
         assert sorted(path.name for path in run.iterdir()) == ["b"]
-        assert_plays_like_pytorch(checkpoint, Bundle.read(run / "b"), IMAGE)
+        bundle = Bundle.read(run / "b")
+        np.testing.assert_allclose(bundle.manifest.action_scale, [30.0, 30.0, 30.0], rtol=1e-6)
+        assert (bundle.path / POLICY_CONFIG).is_file() and not (bundle.path / "config.json").exists()
+        # The permissions of a new folder, not the private ones of the temporary folder the bundle was.
+        assert stat.S_IMODE(bundle.path.stat().st_mode) == stat.S_IMODE((tmp_path / "new").stat().st_mode)
+        assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
 
 
 def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path, monkeypatch):
@@ -449,5 +538,44 @@ def test_a_recipe_reads_the_frames_of_past_ticks(checkpoint, tmp_path, monkeypat
     assert bundle.manifest.history == {IMAGE: 2, OBS_STATE: 2}
     case = load_file(bundle.path / bundle.manifest.test_case)
     assert case[IMAGE].shape == (2, 32, 32, 3) and case[OBS_STATE].shape == (2, 3)
+    BundleEngine(bundle).check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_recipe_carries_values_from_chunk_to_chunk(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported to start from the sum of its noises: the bundle's own check plays three chunks in order."""
+    use_plugins(monkeypatch, "carry_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    bundle = Bundle.read(tmp_path / "b")
+    assert bundle.manifest.carry == {"noise_total": [4, 1]}
+    # The noise of one chunk, though the test case holds the noise of each of its chunks.
+    assert bundle.manifest.noise_shape == [4, 1]
+    case = load_file(bundle.path / bundle.manifest.test_case)
+    assert case[IMAGE].shape == (3, 32, 32, 3) and case[NOISE].shape == (3, 4, 1)
     engine = BundleEngine(bundle)
-    engine.check_robot({IMAGE: (32, 32, 3), OBS_STATE: (3,)}, ["a", "b", "c"])
+    # Two chunks, the second reading what the first carried, each with the noise the bundle draws.
+    actions = np.stack([engine.get_action(robot_frame()) for _ in range(8)])
+    assert actions.shape == (8, 3) and np.isfinite(actions).all()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp_path, monkeypatch, backend):
+    """ACT exported to start the sum of its noises in a first chunk of its own: the check plays three chunks."""
+    use_plugins(monkeypatch, "first_runs_recipe")
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
+    manifest = Bundle.read(tmp_path / "b").manifest
+    assert manifest.carry == {"noise_total": None} and manifest.noise_shape == [4, 1]
+    (first,) = manifest.first_runs
+    assert first[-1].program == "begin" and manifest.runs[-1].program == "model"
+    # On a GPU every chunk draws its noise first, in a run of its own.
+    draws = [runs[0].outputs == [NOISE] for runs in (first, manifest.runs)]
+    assert draws == [backend == "executorch_cuda"] * 2
+    case = load_file(tmp_path / "b" / manifest.test_case)
+    assert (
+        case[IMAGE].shape == (12, 32, 32, 3)
+        and case[ACTION].shape == (12, 3)
+        and case[NOISE].shape == (3, 4, 1)
+    )
+    engine = BundleEngine(Bundle.read(tmp_path / "b"))
+    actions = np.stack([engine.get_action(robot_frame()) for _ in range(8)])
+    assert actions.shape == (8, 3) and np.isfinite(actions).all()

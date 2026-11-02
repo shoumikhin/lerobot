@@ -40,6 +40,7 @@ import torch
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from lerobot.policies.chunk import ChunkPolicySpec
 from lerobot.policies.flux3.configuration_flux3 import Flux3Config
 from lerobot.policies.flux3.f3 import (
     REQUIRED_CONTENT_STREAMS,
@@ -64,6 +65,7 @@ from lerobot.policies.flux3.f3 import (
 )
 from lerobot.policies.flux3.processor_flux3 import PAST_ACTIONS
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import is_exporting
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .utils import resolve_weights
@@ -71,11 +73,6 @@ from .utils import resolve_weights
 logger = logging.getLogger(__name__)
 
 TRUNK_WEIGHTS_FILENAME = "dit.safetensors"
-
-
-def _is_exporting() -> bool:
-    # torch.compile on PyTorch 2.11 also reports is_exporting(); non-strict export runs without Dynamo.
-    return torch.compiler.is_exporting() and not torch.compiler.is_dynamo_compiling()
 
 
 @dataclass
@@ -169,8 +166,9 @@ class Flux3Policy(PreTrainedPolicy):
         return policy
 
     # ------------------------------------------------------------------ construction hooks
-    # Construct on CPU; the factory/from_pretrained device move places the DiT and frozen encoders
-    # together via _apply. These loaders are never called from forward.
+    # Construct on the default device: the CPU, unless the caller builds under `torch.device`, as an export
+    # does. The factory/from_pretrained device move places the DiT and frozen encoders together via _apply.
+    # These loaders are never called from forward.
     def _dit_params(self, config: Flux3Config) -> JointSingleSeqParams:
         base = JointSingleSeqParams(**(config.dit_config or {}))
         base = restrict_content_streams(base, REQUIRED_CONTENT_STREAMS)
@@ -189,7 +187,7 @@ class Flux3Policy(PreTrainedPolicy):
             self.dit_params,
             ckpt,
             modality=self.modality,
-            device="cpu",
+            device=torch.get_default_device(),
             dtype=self.dtype_,
             strict_heads=False,
             head_seed=config.head_init_seed,
@@ -197,13 +195,15 @@ class Flux3Policy(PreTrainedPolicy):
 
     def _build_video_vae(self, config: Flux3Config):
         """Frozen Video VAE (needs NATTEN). Tests replace this hook with a shape-compatible fake."""
-        return load_video_vae(config.video_vae_id, device="cpu", compile_model=config.compile_model)
+        return load_video_vae(
+            config.video_vae_id, device=torch.get_default_device(), compile_model=config.compile_model
+        )
 
     def _build_text_encoder(self, config: Flux3Config) -> nn.Module:
         """Load the frozen Qwen3-VL text encoder."""
         return load_text_encoder(
             config.text_encoder_id,
-            device="cpu",
+            device=torch.get_default_device(),
             compile_model=config.compile_model,
         )
 
@@ -246,6 +246,22 @@ class Flux3Policy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Serve a frame checkpoint chunk by chunk from the current observation.
+
+        The future video frames in ``observation_delta_indices`` are training targets: a frame checkpoint
+        predicts its chunk from the current frame alone. History checkpoints keep image, state and command
+        history in their processors, and relative actions need RTC, so neither is served this way.
+        """
+        if self.config.conditioning != "frame":
+            raise ValueError("FLUX3 chunk serving requires frame conditioning.")
+        if self.config.use_relative_actions:
+            raise ValueError("FLUX3 relative-action execution requires RTC, which is not implemented yet.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.chunk_size,
+            execution_steps=self.config.n_action_steps,
+        )
 
     def _get_default_peft_targets(self) -> dict[str, Any]:
         """LoRA on every attention / MLP projection of the DiT; the fresh heads train in full."""
@@ -321,7 +337,7 @@ class Flux3Policy(PreTrainedPolicy):
             )
             state.update({k: fresh[k.removeprefix("dit.")] for k in fresh_missing})
         model.load_state_dict(state, strict=True)
-        return model.to(map_location)
+        return model
 
     # ------------------------------------------------------------------ batch helpers
     def _flip(self, x: Tensor) -> Tensor:
@@ -412,7 +428,7 @@ class Flux3Policy(PreTrainedPolicy):
             )
             hit = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
             # Tensors traced by torch.export are not real, so they must not be served to later eager calls.
-            if not _is_exporting():
+            if not is_exporting():
                 if len(self._ctx_cache) > 256:
                     self._ctx_cache.clear()
                 self._ctx_cache[caption] = hit
@@ -422,7 +438,7 @@ class Flux3Policy(PreTrainedPolicy):
         """The Euler grid for the current settings, rebuilt outside tracing because a traced one cannot be read."""
         key = (self.config.num_inference_steps, self.config.sampler_shift, torch.get_default_dtype())
         if self._euler_grid is None or self._euler_grid[0] != key:
-            if _is_exporting():
+            if is_exporting():
                 raise RuntimeError(
                     "The Euler schedule is out of date: num_inference_steps or sampler_shift changed after the "
                     "last prediction. Run one eager prediction with the new settings before torch.export."
@@ -547,7 +563,7 @@ class Flux3Policy(PreTrainedPolicy):
         device = cond["x_video_cond"].device
         n_pred = self.packer.predicted_latent_frames(cfg)
         if action_noise is None or video_noise is None:
-            if _is_exporting():
+            if is_exporting():
                 # An exported program keeps one generator whose state carries over between calls.
                 raise ValueError(
                     "Pass both noise and video_noise to export flux3; its sampling noise must be an input."
@@ -593,7 +609,7 @@ class Flux3Policy(PreTrainedPolicy):
         dit = self._inference_dit()
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
-            t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
+            t = t / 1000.0 if isinstance(t, int) else float(t)
             timesteps = {
                 "x_video_timesteps": torch.full((1, samples["x_video"].shape[1]), t, device=device),
                 f"{ak}_timesteps": torch.full((1, cfg.chunk_size), t, device=device),
