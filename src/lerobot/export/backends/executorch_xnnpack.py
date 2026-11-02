@@ -40,4 +40,6 @@ class ExecuTorchXNNPACKConfig(ExecuTorchConfig):
 
         # Without the flag XNNPACK leaves every bfloat16 op, linear layers too, to ExecuTorch's portable kernels.
         edge = lower(program, XnnpackPartitioner(enable_bf16=True))
-        path.write_bytes(edge.to_executorch().buffer)
+        compiled = edge.to_executorch()
+        with path.open("wb") as file:
+            compiled.write_to_file(file)

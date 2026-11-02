@@ -48,4 +48,6 @@ class ExecuTorchMLXConfig(ExecuTorchConfig):
         from executorch.backends.mlx import MLXPartitioner
 
         edge = lower(program, MLXPartitioner())
-        path.write_bytes(edge.to_executorch().buffer)
+        compiled = edge.to_executorch()
+        with path.open("wb") as file:
+            compiled.write_to_file(file)
