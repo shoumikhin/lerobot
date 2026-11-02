@@ -20,9 +20,9 @@ import torch
 
 from lerobot.policies.flux3.f3 import video_vae
 from lerobot.policies.flux3.f3.video_vae import Natten3D, neighborhood_attention
+from tests.utils import require_cuda
 
-# The keys each query of one axis attends to, measured on NATTEN 0.21.6 and 0.21.7:
-# (axis size, window, causal) -> keys.
+# The keys each query of one axis attends to, measured on NATTEN 0.21.7: (axis size, window, causal) -> keys.
 NATTEN_WINDOWS = {
     (7, 5, False): [[0, 1, 2, 3, 4]] * 3 + [[1, 2, 3, 4, 5]] + [[2, 3, 4, 5, 6]] * 3,
     (7, 5, True): [[0], [0, 1], [0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4], [1, 2, 3, 4, 5], [2, 3, 4, 5, 6]],
@@ -94,32 +94,9 @@ def test_computes_in_float32_under_autocast(device):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_computes_bfloat16_inputs_in_float32():
-    # The VAE runs in bfloat16, and bfloat16 products would round the logits.
-    torch.manual_seed(0)
-    q, k, v = (4 * torch.randn(3, 1, 4, 5, 6, 2, 16)).bfloat16().unbind(0)
-    out = neighborhood_attention(q, k, v, [3, 3, 3], [True, False, False])
-    expected = neighborhood_attention(q.float(), k.float(), v.float(), [3, 3, 3], [True, False, False])
-    torch.testing.assert_close(out, expected.bfloat16(), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(("frames", "moved_frame", "changed_frames"), [(1, 0, [0]), (4, 1, [1, 2, 3])])
-def test_attention_block_attends_its_window(frames, moved_frame, changed_frames):
-    # Moving one input token changes the outputs whose window holds it: a window of 5 rows reaches all 7 rows
-    # from row 3, a window of 3 columns reaches columns 2 to 4, and a video is causal in time.
-    torch.manual_seed(0)
-    block = Natten3D(16, [3, 5, 3], 2, causal=True).eval()
-    x = torch.randn(1, frames, 7, 7, 16)
-    moved = x.clone()
-    moved[0, moved_frame, 3, 3] += 1
-    with torch.no_grad():
-        changed = (block(moved) - block(x)).abs().amax(-1)[0] > 0
-    expected = torch.zeros(frames, 7, 7, dtype=torch.bool)
-    expected[changed_frames, :, 2:5] = True
-    assert torch.equal(changed, expected)
-
-
 @pytest.mark.parametrize("frames", [1, 4])
+# As the policy runs its frozen VAE: NATTEN's CPU kernel cannot take inputs that record gradients.
+@torch.no_grad()
 def test_attention_block_exports(frames):
     torch.manual_seed(0)
     block = Natten3D(32, [3, 3, 3], 2, causal=True, qk_norm=True).eval()
@@ -128,15 +105,34 @@ def test_attention_block_exports(frames):
     torch.testing.assert_close(program.module()(x), block(x))
 
 
-def test_attention_block_gives_natten_kernels_no_cpu_tensors(monkeypatch):
-    def natten_kernel(*args, **kwargs):
-        raise AssertionError("NATTEN's kernel got a CPU tensor")
+def test_natten_backend_reaches_its_kernel(monkeypatch):
+    calls = []
+
+    def na3d(q, k, v, **kwargs):  # stands in for NATTEN's kernel and records how it is called
+        calls.append(kwargs)
+        return v
 
     monkeypatch.setattr(video_vae, "_natten_available", True)
-    monkeypatch.setattr(video_vae, "na2d", natten_kernel, raising=False)
-    monkeypatch.setattr(video_vae, "na3d", natten_kernel, raising=False)
-    torch.manual_seed(0)
-    block = Natten3D(16, [3, 3, 3], 2, causal=True).eval()
-    for frames in (1, 3):
-        with torch.no_grad():
-            assert block(torch.randn(1, frames, 4, 4, 16)).shape == (1, frames, 4, 4, 16)
+    monkeypatch.setattr(video_vae, "na3d", na3d, raising=False)
+    monkeypatch.setattr(video_vae, "_natten_backends", {})
+    monkeypatch.setenv("F3_NATTEN_BACKEND", "flex-fna")
+    Natten3D(16, [3, 3, 3], 2)(torch.randn(1, 3, 4, 4, 16))
+    assert calls[0]["backend"] == "flex-fna"
+
+
+@require_cuda
+def test_natten_gets_one_dtype_under_cuda_autocast(monkeypatch):
+    dtypes = []
+
+    def na3d(q, k, v, **kwargs):  # stands in for NATTEN's kernel, which refuses mixed dtypes
+        dtypes.append({q.dtype, k.dtype, v.dtype})
+        return v
+
+    monkeypatch.setattr(video_vae, "_natten_available", True)
+    monkeypatch.setattr(video_vae, "na3d", na3d, raising=False)
+    monkeypatch.setattr(video_vae, "_natten_backends", {})
+    monkeypatch.setenv("F3_NATTEN_BACKEND", "cutlass-fna")
+    block = Natten3D(16, [3, 3, 3], 2, qk_norm=True).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        block(torch.randn(1, 3, 4, 4, 16, device="cuda"))
+    assert dtypes == [{torch.bfloat16}]

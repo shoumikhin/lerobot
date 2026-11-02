@@ -16,10 +16,10 @@
 ``transformer`` (the JointSingleSeq DiT, vendored), ``positional`` (4-axis position ids), ``packing``
 (observation -> tokens, noise, loss), ``sampling`` (Cosmos UniPC + Euler with two-pass CFG), ``wiring``
 (action modality on the shared action branch, fresh heads, checkpoint key remap), ``text_encoder``
-(Qwen3-VL-4B embedder) and ``video_vae`` (Video VAE; NATTEN's kernels on a GPU when NATTEN is installed).
+(Qwen3-VL-4B embedder) and ``video_vae`` (Video VAE; NATTEN's kernels when NATTEN is installed).
 
-Policy code imports these components through this package. On the CPU, and without NATTEN, the Video VAE
-computes the same neighborhood attention in plain PyTorch.
+Policy code imports these components through this package. Without NATTEN the Video VAE computes the
+same neighborhood attention in plain PyTorch.
 """
 
 from . import packing, sampling

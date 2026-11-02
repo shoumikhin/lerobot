@@ -31,6 +31,7 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor
 
+from lerobot.policies.utils import is_exporting
 from lerobot.utils.import_utils import _natten_available
 
 from ..utils import resolve_weights
@@ -55,7 +56,7 @@ _PERSISTENT_KERNEL_BACKENDS = ("blackwell-fna", "hopper-fna")
 _natten_backends: dict[int, str] = {}
 
 
-def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
+def _natten_kernel_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
     backend = _natten_backends.get(q.ndim)
     if backend is None:
         backend = os.environ.get(_NATTEN_BACKEND_ENV)
@@ -332,8 +333,7 @@ class RotaryPositionEmbedding3D(nn.Module):
         return torch.cat([-x2, x1], dim=-1)
 
 
-# Target size of the keys one chunk gathers, in elements. A chunk is at least one row of the first axis
-# (a whole frame of a video), so a large frame goes over it.
+# Gathered keys per chunk of query rows, in elements: bounds the memory long videos need.
 _NEIGHBORHOOD_CHUNK_ELEMENTS = 2**28
 
 
@@ -364,7 +364,7 @@ def _neighbors(x: Tensor, windows: list[Tensor]) -> Tensor:
 def neighborhood_attention(
     q: Tensor, k: Tensor, v: Tensor, kernel_size: Sequence[int], is_causal: Sequence[bool]
 ) -> Tensor:
-    """NATTEN's neighborhood attention in plain PyTorch, so the VAE runs without NATTEN.
+    """NATTEN's neighborhood attention in plain PyTorch, so the VAE runs without NATTEN and exports.
 
     ``q``, ``k`` and ``v`` are ``(batch, *spatial, heads, head_dim)``. Along every spatial axis each query
     attends to the keys of its window (see ``_window``). Computed in float32, returned in the dtype of ``v``.
@@ -436,17 +436,12 @@ class Natten3D(nn.Module):
             kernel_size, is_causal = self.window_size[1:], [False, False]
         else:
             kernel_size, is_causal = self.window_size, [self.causal, False, False]
-        # NATTEN's fused kernels need CUDA. On the CPU it uses flex attention, far slower than the plain path.
-        if _natten_available and q.is_cuda:
+        # NATTEN's kernels are fast but no export backend can run them.
+        if _natten_available and not is_exporting():
             na = na2d if t == 1 else na3d
-            out = na(
-                q,
-                k,
-                v,
-                kernel_size=kernel_size,
-                is_causal=is_causal,
-                attention_kwargs=_natten_attention_kwargs(q, k, v),
-            )
+            # CUDA autocast keeps RMSNorm in float32, and NATTEN takes q, k and v in one dtype.
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            out = na(q, k, v, kernel_size=kernel_size, is_causal=is_causal, **_natten_kernel_kwargs(q, k, v))
         else:
             out = neighborhood_attention(q, k, v, kernel_size, is_causal)
         out = out.reshape(b, t, h, w, c)
@@ -1059,14 +1054,9 @@ def load_video_vae(
 
     ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
     distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). On a GPU its attention runs NATTEN's kernels when NATTEN
-    is installed, and otherwise the same neighborhood attention in plain PyTorch.
+    (default filename ``video_vae.safetensors``). Its attention runs NATTEN's kernels when NATTEN is
+    installed, and the same neighborhood attention in plain PyTorch otherwise.
     """
-    if not _natten_available:
-        logger.info(
-            "NATTEN is not installed, so the Video VAE computes its attention in plain PyTorch, which is much "
-            "slower on a GPU. See docs/source/flux3.mdx to install NATTEN."
-        )
     params = ViTNormInferenceParams(
         use_compile=compile_model,
         compile_decoder=compile_model,

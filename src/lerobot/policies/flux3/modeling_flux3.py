@@ -40,6 +40,7 @@ import torch
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from lerobot.policies.chunk import ChunkPolicySpec
 from lerobot.policies.flux3.configuration_flux3 import Flux3Config
 from lerobot.policies.flux3.f3 import (
     REQUIRED_CONTENT_STREAMS,
@@ -64,6 +65,7 @@ from lerobot.policies.flux3.f3 import (
 )
 from lerobot.policies.flux3.processor_flux3 import PAST_ACTIONS
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import is_exporting
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .utils import resolve_weights
@@ -147,6 +149,8 @@ class Flux3Policy(PreTrainedPolicy):
         self.frozen = FrozenComponents(self._build_video_vae(config), self._build_text_encoder(config))
         self._ctx_cache: dict[str, tuple[Tensor, Tensor]] = {}
         self._compiled_dit: Callable[..., dict[str, Tensor]] | None = None
+        self._euler_grid: tuple[tuple[int, float, torch.dtype], list[float]] | None = None
+        self._euler_timesteps()  # so a freshly loaded policy exports without an eager call first
         self.reset()
 
     @classmethod
@@ -162,8 +166,9 @@ class Flux3Policy(PreTrainedPolicy):
         return policy
 
     # ------------------------------------------------------------------ construction hooks
-    # Construct on CPU; the factory/from_pretrained device move places the DiT and frozen encoders
-    # together via _apply. These loaders are never called from forward.
+    # Construct on the default device: the CPU, unless the caller builds under `torch.device`, as an export
+    # does. The factory/from_pretrained device move places the DiT and frozen encoders together via _apply.
+    # These loaders are never called from forward.
     def _dit_params(self, config: Flux3Config) -> JointSingleSeqParams:
         base = JointSingleSeqParams(**(config.dit_config or {}))
         base = restrict_content_streams(base, REQUIRED_CONTENT_STREAMS)
@@ -182,21 +187,23 @@ class Flux3Policy(PreTrainedPolicy):
             self.dit_params,
             ckpt,
             modality=self.modality,
-            device="cpu",
+            device=torch.get_default_device(),
             dtype=self.dtype_,
             strict_heads=False,
             head_seed=config.head_init_seed,
         )
 
     def _build_video_vae(self, config: Flux3Config):
-        """Frozen Video VAE. Tests replace this hook with a shape-compatible fake."""
-        return load_video_vae(config.video_vae_id, device="cpu", compile_model=config.compile_model)
+        """Frozen Video VAE (needs NATTEN). Tests replace this hook with a shape-compatible fake."""
+        return load_video_vae(
+            config.video_vae_id, device=torch.get_default_device(), compile_model=config.compile_model
+        )
 
     def _build_text_encoder(self, config: Flux3Config) -> nn.Module:
         """Load the frozen Qwen3-VL text encoder."""
         return load_text_encoder(
             config.text_encoder_id,
-            device="cpu",
+            device=torch.get_default_device(),
             compile_model=config.compile_model,
         )
 
@@ -239,6 +246,22 @@ class Flux3Policy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Serve a frame checkpoint chunk by chunk from the current observation.
+
+        The future video frames in ``observation_delta_indices`` are training targets: a frame checkpoint
+        predicts its chunk from the current frame alone. History checkpoints keep image, state and command
+        history in their processors, and relative actions need RTC, so neither is served this way.
+        """
+        if self.config.conditioning != "frame":
+            raise ValueError("FLUX3 chunk serving requires frame conditioning.")
+        if self.config.use_relative_actions:
+            raise ValueError("FLUX3 relative-action execution requires RTC, which is not implemented yet.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.chunk_size,
+            execution_steps=self.config.n_action_steps,
+        )
 
     def _get_default_peft_targets(self) -> dict[str, Any]:
         """LoRA on every attention / MLP projection of the DiT; the fresh heads train in full."""
@@ -314,7 +337,7 @@ class Flux3Policy(PreTrainedPolicy):
             )
             state.update({k: fresh[k.removeprefix("dit.")] for k in fresh_missing})
         model.load_state_dict(state, strict=True)
-        return model.to(map_location)
+        return model
 
     # ------------------------------------------------------------------ batch helpers
     def _flip(self, x: Tensor) -> Tensor:
@@ -400,13 +423,28 @@ class Flux3Policy(PreTrainedPolicy):
         """Text context ``(1, L, ctx_dim)`` in the DiT dtype plus its position ids, cached per caption."""
         hit = self._ctx_cache.get(caption)
         if hit is None or hit[0].device != device:
-            if len(self._ctx_cache) > 256:
-                self._ctx_cache.clear()
             ctx = text_context(
                 self.frozen.text_encoder, caption, device, fixed_length=self.config.text_fixed_length
             )
-            self._ctx_cache[caption] = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
-        return self._ctx_cache[caption]
+            hit = (ctx.to(self.dtype_), packing.pack_text(ctx, VEC_DIM)["ctx_ids"])
+            # Tensors traced by torch.export are not real, so they must not be served to later eager calls.
+            if not is_exporting():
+                if len(self._ctx_cache) > 256:
+                    self._ctx_cache.clear()
+                self._ctx_cache[caption] = hit
+        return hit
+
+    def _euler_timesteps(self) -> list[float]:
+        """The Euler grid for the current settings, rebuilt outside tracing because a traced one cannot be read."""
+        key = (self.config.num_inference_steps, self.config.sampler_shift, torch.get_default_dtype())
+        if self._euler_grid is None or self._euler_grid[0] != key:
+            if is_exporting():
+                raise RuntimeError(
+                    "The Euler schedule is out of date: num_inference_steps or sampler_shift changed after the "
+                    "last prediction. Run one eager prediction with the new settings before torch.export."
+                )
+            self._euler_grid = (key, sampling.euler_timesteps(key[0], key[1]))
+        return self._euler_grid[1]
 
     def _cast_inputs(self, kwargs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Streams, context and vector in the DiT dtype; timesteps stay fp32 (bf16 collapses t near 1); ids stay int."""
@@ -524,10 +562,16 @@ class Flux3Policy(PreTrainedPolicy):
         ak, ck = f"x_{m}", f"x_{m}_cond"
         device = cond["x_video_cond"].device
         n_pred = self.packer.predicted_latent_frames(cfg)
-        rng = torch.Generator().manual_seed(seed)
-        # Draw both samples in their usual order, so passing one of them leaves the other unchanged.
-        drawn_video = torch.randn(1, packing.LATENT_CHANNELS, n_pred, *cfg.latent_hw, generator=rng)
-        drawn_action = torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=rng)
+        if action_noise is None or video_noise is None:
+            if is_exporting():
+                # An exported program keeps one generator whose state carries over between calls.
+                raise ValueError(
+                    "Pass both noise and video_noise to export flux3; its sampling noise must be an input."
+                )
+            rng = torch.Generator().manual_seed(seed)
+            # Draw both samples in their usual order, so passing one of them leaves the other unchanged.
+            drawn_video = torch.randn(1, packing.LATENT_CHANNELS, n_pred, *cfg.latent_hw, generator=rng)
+            drawn_action = torch.randn(1, cfg.action_dim, cfg.chunk_size, generator=rng)
         if video_noise is None:
             video_noise = drawn_video
         else:
@@ -565,7 +609,7 @@ class Flux3Policy(PreTrainedPolicy):
         dit = self._inference_dit()
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
-            t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
+            t = t / 1000.0 if isinstance(t, int) else float(t)
             timesteps = {
                 "x_video_timesteps": torch.full((1, samples["x_video"].shape[1]), t, device=device),
                 f"{ak}_timesteps": torch.full((1, cfg.chunk_size), t, device=device),
@@ -591,7 +635,7 @@ class Flux3Policy(PreTrainedPolicy):
                 flow, predict, n_steps=cfg.num_inference_steps, shift=cfg.sampler_shift
             )
         else:
-            out = sampling.euler(flow, predict, n_steps=cfg.num_inference_steps, alpha=cfg.sampler_shift)
+            out = sampling.euler(flow, predict, timesteps=self._euler_timesteps())
         return out[ak][0].float() / cfg.action_scale
 
     @torch.no_grad()
@@ -608,6 +652,7 @@ class Flux3Policy(PreTrainedPolicy):
         ``noise`` is the starting action sample ``(B, action_dim, chunk_size)`` and ``video_noise`` the
         starting video latent ``(B, 96, n_pred, *latent_hw)``, where ``n_pred`` is the number of predicted
         latent frames. When None, each is drawn from a CPU generator seeded with ``inference_seed``.
+        torch.export needs both, so the exported program takes its noise as inputs.
         """
         if kwargs:
             raise NotImplementedError("flux3 does not implement RTC inference arguments yet")
