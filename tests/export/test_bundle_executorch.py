@@ -20,8 +20,10 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 from lerobot.bundle import executorch
+from tests.export.backends import needs_executorch
 
 
 @pytest.mark.parametrize("preset", [None, "torch"])
@@ -45,10 +47,9 @@ def test_executorch_returns_its_own_results_without_changing_the_environment(tmp
     assert result.stdout.splitlines() == ["loaded with executorch", f"then {preset}"]
 
 
-@pytest.mark.executorch
+@needs_executorch
 def test_a_scalar_input_keeps_its_rank(tmp_path):
-    torch = pytest.importorskip("torch")
-    exir = pytest.importorskip("executorch.exir")
+    from executorch import exir
 
     class Double(torch.nn.Module):
         def forward(self, x):

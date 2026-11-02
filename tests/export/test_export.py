@@ -26,7 +26,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -40,7 +39,14 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
-from lerobot.utils.import_utils import is_package_available
+from tests.export.backends import (
+    GPU_BACKENDS,
+    needs_executorch,
+    needs_executorch_coreml,
+    needs_executorch_cuda,
+    needs_executorch_openvino,
+    needs_executorch_tensorrt,
+)
 from tests.export.plugins import use_plugins
 from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
@@ -191,6 +197,33 @@ def test_executorch_coreml_is_refused_before_tracing_off_a_mac(monkeypatch, plat
         ExecuTorchCoreMLConfig()
     monkeypatch.setattr(sys, "platform", "darwin")
     ExecuTorchCoreMLConfig()
+
+
+SKIP_MARKS = """
+import torch
+
+import lerobot.utils.import_utils
+from lerobot.export.backends import executorch
+
+
+def broken():
+    raise ImportError("a broken install")
+
+
+torch.cuda.is_available = lambda: True
+lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
+executorch.cuda_backend_names_its_weights = broken
+
+from tests.export import backends
+
+assert not backends.EXECUTORCH_CUDA
+"""
+
+
+def test_the_cuda_skip_mark_skips_when_the_cuda_backend_cannot_be_imported():
+    """On a machine with a GPU, the marks probe ExecuTorch's CUDA backend when the test modules load, so a probe
+    that raises would fail the collection of every test that imports them."""
+    subprocess.run([sys.executable, "-c", SKIP_MARKS], check=True, timeout=300)
 
 
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
@@ -519,14 +552,6 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
 
 
-# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
-EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
-needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
-needs_executorch_cuda = pytest.mark.skipif(
-    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
-)
-
-
 @needs_executorch_cuda
 def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
     """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU, and only the
@@ -585,11 +610,7 @@ def test_the_compiled_noise_program_draws_another_noise_each_run(tmp_path):
     assert abs(first.mean()) < 0.1 and abs(first.std() - 1) < 0.1
 
 
-# ExecuTorch installs coremltools only on the Pythons it supports.
-@pytest.mark.skipif(
-    not (sys.platform == "darwin" and EXECUTORCH and is_package_available("coremltools")),
-    reason="needs ExecuTorch, PyTorch 2.15 and coremltools on macOS",
-)
+@needs_executorch_coreml
 def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
     from lerobot.bundle.executorch import ExecuTorchProgram
     from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
@@ -709,16 +730,7 @@ def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
     assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
 
 
-# ExecuTorch for macOS has no OpenVINO backend.
-@pytest.mark.skipif(
-    not (
-        EXECUTORCH
-        and sys.platform != "darwin"
-        and is_package_available("openvino")
-        and is_package_available("nncf")
-    ),
-    reason="needs ExecuTorch, PyTorch 2.15 and OpenVINO, off a Mac: pip install openvino nncf",
-)
+@needs_executorch_openvino
 def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
     from lerobot.bundle.executorch import ExecuTorchProgram
     from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
@@ -765,6 +777,7 @@ def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(
         "torch_test",
         pytest.param("executorch_xnnpack", marks=needs_executorch),
         pytest.param("executorch_cuda", marks=needs_executorch_cuda),
+        pytest.param("executorch_tensorrt", marks=needs_executorch_tensorrt),
     ],
 )
 def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp_path, monkeypatch, backend):
@@ -777,7 +790,7 @@ def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp
     assert first[-1].program == "begin" and manifest.runs[-1].program == "model"
     # On a GPU every chunk draws its noise first, in a run of its own.
     draws = [runs[0].outputs == [NOISE] for runs in (first, manifest.runs)]
-    assert draws == [backend == "executorch_cuda"] * 2
+    assert draws == [backend in GPU_BACKENDS] * 2
     case = load_file(tmp_path / "b" / manifest.test_case)
     assert (
         case[IMAGE].shape == (12, 32, 32, 3)
