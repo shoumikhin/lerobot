@@ -35,11 +35,6 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     An operator TensorRT does not take runs on the GPU too, compiled by ExecuTorch's CUDA backend, which needs
     the CUDA compiler (`nvcc`) at export. A TensorRT engine runs only on the GPU model that built it, so export
     on the kind of board that will run the policy.
-
-    Args:
-        workspace_size (`int`, *optional*):
-            The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine, for
-            example to fit a build into a small board. `None` lets TensorRT decide.
     """
 
     device = "cuda"
@@ -52,6 +47,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     packages = (EXECUTORCH, "torch-tensorrt[executorch]>=2.15,<2.16", "torch-tensorrt-executorch-runtime")
 
     workspace_size: int | None = None
+    """The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine, for example to fit
+    a build into a small board. `None` lets TensorRT decide."""
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.

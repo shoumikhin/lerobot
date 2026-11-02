@@ -39,20 +39,16 @@ class ExecuTorchCoreMLConfig(ExecuTorchConfig):
     Core ML picks the CPU, the GPU or the Neural Engine for each part of the program when it loads it. The
     ExecuTorch package for macOS brings `coremltools` on Python 3.13 and older, the Pythons coremltools 9
     supports.
-
-    Args:
-        compute_units (`str`, *optional*, defaults to `"all"`):
-            The hardware Core ML may use: `all`, `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (the CPU and the
-            Neural Engine).
-        compute_precision (`str`, *optional*, defaults to `"float32"`):
-            The float type of the computation, `float32` or `float16`. The Neural Engine runs only `float16`,
-            which moves the actions further from PyTorch's.
     """
 
     device = "cpu"
 
     compute_units: str = "all"
+    """The hardware Core ML may use: `all`, `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (the CPU and the Neural
+    Engine)."""
     compute_precision: str = "float32"
+    """The float type of the computation, `float32` or `float16`. The Neural Engine runs only `float16`, which
+    needs a larger `--tolerance` than a float32 policy's default."""
 
     def __post_init__(self) -> None:
         """Refuse an unknown option, or a machine whose ExecuTorch has no Core ML, before anything is traced."""
