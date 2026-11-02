@@ -14,7 +14,7 @@
 
 """The executorch_tensorrt backend: TensorRT takes what it can, and ExecuTorch's CUDA backend the rest."""
 
-import subprocess
+import json
 import sys
 import types
 
@@ -23,16 +23,10 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.utils.import_utils import is_package_available
+from tests.export.backends import needs_executorch_tensorrt
+from tests.torch_free import assert_runs_without_torch
 
-needs_tensorrt = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_package_available("torch_tensorrt")
-    or not is_package_available("executorch"),
-    reason="needs a CUDA GPU, ExecuTorch and Torch-TensorRT",
-)
-
-# Loads the program the way a bundle does, in a process without PyTorch.
+# Loads the program the way a bundle does.
 RUN = """
 import sys
 from pathlib import Path
@@ -41,11 +35,10 @@ import numpy as np
 
 from lerobot.bundle.runtime import prepare_runtime
 
-path, data, inputs, outputs, *runtime_imports = sys.argv[1:]
-program = prepare_runtime("executorch", runtime_imports).load(Path(path), Path(data) if data else None)
+path, data, inputs, outputs, imports = sys.argv[1:]
+program = prepare_runtime("executorch", json.loads(imports)).load(Path(path), Path(data) if data else None)
 (result,) = program(np.load(inputs))
 np.save(outputs, program.to_numpy(result))
-assert "torch" not in sys.modules
 """
 
 
@@ -61,28 +54,24 @@ class ErfinvModel(nn.Module):
 
 
 def run_without_torch(program, data, x, tmp_path):
-    """The program's output for `x`, loaded with its data file in a process without PyTorch."""
+    """The program's output for `x`, loaded with its data file and the backend's runtime settings in a process
+    without PyTorch."""
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     np.save(tmp_path / "x.npy", x.cpu().numpy())
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            RUN,
-            str(program),
-            str(data or ""),
-            str(tmp_path / "x.npy"),
-            str(tmp_path / "y.npy"),
-            *ExecuTorchTensorRTConfig.runtime_imports,
-        ],
-        check=True,
+    assert_runs_without_torch(
+        RUN,
+        str(program),
+        str(data or ""),
+        str(tmp_path / "x.npy"),
+        str(tmp_path / "y.npy"),
+        json.dumps(ExecuTorchTensorRTConfig.runtime_imports),
     )
     return np.load(tmp_path / "y.npy")
 
 
 @pytest.mark.gpu
-@needs_tensorrt
+@needs_executorch_tensorrt
 def test_an_operator_tensorrt_rejects_runs_on_the_gpu(tmp_path):
     from executorch.exir._serialize._program import deserialize_pte_binary
     from executorch.exir.schema import DeviceType

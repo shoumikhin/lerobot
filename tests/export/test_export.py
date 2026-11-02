@@ -30,7 +30,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from packaging.version import Version
 from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
@@ -42,7 +41,11 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
-from lerobot.utils.import_utils import is_package_available
+from tests.export.backends import (
+    needs_executorch,
+    needs_executorch_coreml,
+    needs_executorch_openvino,
+)
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
 from tests.export.torch_backend import TorchTestBackend
@@ -201,6 +204,70 @@ def test_executorch_coreml_is_refused_before_tracing_off_a_mac(monkeypatch, plat
         ExecuTorchCoreMLConfig()
     monkeypatch.setattr(sys, "platform", "darwin")
     ExecuTorchCoreMLConfig()
+
+
+SKIP_MARKS = """
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import torch
+
+import lerobot.utils.import_utils
+
+torch.__version__ = "2.15.0"
+torch.cuda.is_available = lambda: True
+lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
+# ExecuTorch's CUDA compiler does not import, as without Triton, though ExecuTorch says its CUDA backend runs.
+sys.modules["executorch.backends.cuda.cuda_partitioner"] = None
+subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="True", stderr="")
+
+from tests.export import backends
+
+assert not backends.EXECUTORCH_CUDA
+"""
+
+
+def test_the_cuda_skip_mark_skips_when_the_cuda_compiler_cannot_be_imported():
+    """On a machine with a GPU, the marks import ExecuTorch's CUDA compiler as they load, so an import that
+    fails must skip the CUDA tests, not stop the tests from loading."""
+    subprocess.run([sys.executable, "-c", SKIP_MARKS], check=True, timeout=300)
+
+
+FAILED_PROBE = """
+import subprocess
+import sys
+from types import ModuleType, SimpleNamespace
+
+import torch
+
+import lerobot.utils.import_utils
+
+torch.__version__ = "2.15.0"
+torch.cuda.is_available = lambda: True
+lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
+sys.modules["executorch.backends.cuda.cuda_partitioner"] = ModuleType("cuda_partitioner")
+# The process that asks ExecuTorch fails, as in a broken install, even though it printed "True".
+subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="True", stderr="broken")
+
+from tests.export import backends
+
+assert not backends.EXECUTORCH_CUDA
+"""
+
+
+def test_the_cuda_skip_mark_skips_when_executorch_cannot_say_whether_cuda_runs():
+    """On a machine with a GPU, a probe process that fails is not trusted, even when it printed "True"."""
+    subprocess.run([sys.executable, "-c", FAILED_PROBE], check=True, timeout=300)
+
+
+@needs_executorch
+def test_the_backend_probe_says_which_backends_run():
+    """Every ExecuTorch package runs XNNPACK programs; a probe that never says yes skips the GPU tests."""
+    from tests.export import backends
+
+    assert backends._backend_runs("XnnpackBackend")
+    assert not backends._backend_runs("NoSuchBackend")
 
 
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
@@ -686,19 +753,7 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
 
 
-# ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
-EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
-needs_executorch = pytest.mark.skipif(not EXECUTORCH, reason="needs ExecuTorch and PyTorch 2.15")
-needs_executorch_cuda = pytest.mark.skipif(
-    not (EXECUTORCH and torch.cuda.is_available()), reason="needs ExecuTorch, PyTorch 2.15 and a CUDA GPU"
-)
-
-
-# ExecuTorch installs coremltools only on the Pythons it supports.
-@pytest.mark.skipif(
-    not (sys.platform == "darwin" and EXECUTORCH and is_package_available("coremltools")),
-    reason="needs ExecuTorch, PyTorch 2.15 and coremltools on macOS",
-)
+@needs_executorch_coreml
 def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
     from lerobot.bundle.executorch import ExecuTorchProgram
     from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
@@ -778,7 +833,8 @@ def test_executorch_xnnpack_takes_the_linear_layers_of_a_bfloat16_program(tmp_pa
         expected = model(x)
     assert not [op for op in ops if "executorch_call_delegate" not in op and "getitem" not in op], ops
     (actual,) = Runtime.get().load_program(path).load_method("forward").execute([x])
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # ExecuTorch's own tensor, since the tests load ExecuTorch as a bundle does (see conftest.py).
+    torch.testing.assert_close(torch.from_dlpack(actual), expected, rtol=2e-2, atol=2e-2)
 
 
 EXPORT_WITHOUT_TORCH = """
@@ -790,16 +846,7 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-# ExecuTorch for macOS has no OpenVINO backend.
-@pytest.mark.skipif(
-    not (
-        EXECUTORCH
-        and sys.platform != "darwin"
-        and is_package_available("openvino")
-        and is_package_available("nncf")
-    ),
-    reason="needs ExecuTorch, PyTorch 2.15 and OpenVINO, off a Mac: pip install openvino nncf",
-)
+@needs_executorch_openvino
 def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
     from lerobot.bundle.executorch import ExecuTorchProgram
     from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
