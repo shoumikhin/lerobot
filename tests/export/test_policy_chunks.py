@@ -35,7 +35,7 @@ from lerobot.export.recipe import random_frame  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.factory import get_policy_class  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
-from tests.export import tiny_groot, tiny_pi05, tiny_smolvla  # noqa: E402
+from tests.export import tiny_groot, tiny_pi0, tiny_pi05, tiny_smolvla  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
 
 TASK = "pick up the cube"
@@ -73,6 +73,14 @@ def save_pi05(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Pa
     return save
 
 
+def save_pi0(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Path]:
+    def save(folder: Path, patch: pytest.MonkeyPatch) -> Path:
+        tiny_pi0.save_checkpoint(folder / "checkpoint", patch, relative_actions=relative_actions)
+        return folder / "checkpoint"
+
+    return save
+
+
 def save_smolvla(folder: Path, patch: pytest.MonkeyPatch) -> Path:
     tiny_smolvla.save_checkpoint(folder / "checkpoint", patch)
     return folder / "checkpoint"
@@ -98,6 +106,30 @@ def smolvla_programs_hold_only_their_weights(policy: torch.nn.Module, bundle: Bu
         assert own <= weights + constants < own + 100, file
 
 
+def pi0_programs_hold_only_their_weights(policy: torch.nn.Module, bundle: Bundle) -> None:
+    from lerobot.policies.pi0.export_pi0 import EMBED_MODULES, EMBED_TOKENS, LANGUAGE_MODEL, STEP_MODULES
+
+    def size(modules) -> int:
+        return sum(p.numel() for name in modules for p in policy.get_submodule(name).parameters())
+
+    layers = [f"{LANGUAGE_MODEL}.layers.{i}" for i in range(4)]
+    for file, own in (
+        # The embedding table stays out: the program holds the rows of the task's tokens instead.
+        ("embed.pt2", size(name for name in EMBED_MODULES if name != EMBED_TOKENS)),
+        ("language_model_0.pt2", size(layers[:3])),
+        ("language_model_1.pt2", size(layers[3:])),
+        ("step.pt2", size(STEP_MODULES)),
+        ("actions.pt2", 0),
+    ):
+        program = torch.export.load(bundle.path / file)
+        weights = sum(t.numel() for t in program.state_dict.values())
+        constants = sum(t.numel() for t in program.constants.values() if isinstance(t, torch.Tensor))
+        # Besides its weights a program holds small tables, like the task's rows and the normalization
+        # statistics. A module of another part would add more: the smallest, the action output projection,
+        # has 136 values.
+        assert own <= weights + constants < own + 120, file
+
+
 PI05 = Chain(
     save_pi05(relative_actions=False),
     tasks=(TASK, "open_the drawer\n"),
@@ -105,6 +137,14 @@ PI05 = Chain(
     plugins=("tiny_pi05",),
     tiny=tiny_pi05.use_tiny_pi05,
     lora=["action_out_proj"],
+)
+PI0 = Chain(
+    save_pi0(relative_actions=False),
+    tasks=(TASK,),
+    programs=["actions", "embed", "language_model_0", "language_model_1", "step"],
+    plugins=("tiny_pi0",),
+    tiny=tiny_pi0.use_tiny_pi0,
+    check=pi0_programs_hold_only_their_weights,
 )
 GROOT = Chain(
     lambda folder, patch: tiny_groot.save_checkpoint(folder, "torchvision"),
@@ -120,6 +160,8 @@ CHAINS = {
     "pi05_absolute": PI05,
     "pi05_relative": replace(PI05, save=save_pi05(relative_actions=True), lora=None),
     "groot_torchvision": GROOT,
+    "pi0_absolute": PI0,
+    "pi0_relative": replace(PI0, save=save_pi0(relative_actions=True)),
     "smolvla": Chain(
         save_smolvla,
         tasks=(TASK,),
