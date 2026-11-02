@@ -129,28 +129,70 @@ def test_compile_gets_the_workspace_size_only_when_it_is_set(monkeypatch, tmp_pa
     assert seen == expected
 
 
-def use_fake_tensorrt(monkeypatch, compile):
-    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile`."""
+def use_fake_tensorrt(monkeypatch, compile, save=None):
+    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile` and whose `save` is `save`, the
+    CUDA partitioner of a part by its name, and the GPU memory config by a string."""
+    from lerobot.export.backends import executorch_tensorrt
+
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
     module.dynamo = types.SimpleNamespace(compile=compile)
+    module.save = save
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: f"partitioner of {name}")
+    monkeypatch.setattr(executorch_tensorrt, "gpu_memory_config", lambda: "GPU memory")
 
 
 def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-def test_operators_whose_plugins_need_pytorch_stay_out_of_tensorrt(monkeypatch, tmp_path):
+def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatch, tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     seen = {}
 
     def compile(program, arg_inputs, **options):
-        seen.update(options)
+        seen["compile"] = options
+        return "engine"
+
+    def save(engine, path, **options):
+        seen["save"] = engine, path, options
+
+    use_fake_tensorrt(monkeypatch, compile, save)
+    assert ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte") is None
+    assert seen["compile"] == {
+        "min_block_size": 1,
+        "fallback_pytorch_plugin_ops": True,
+        "truncate_double": True,
+        "offload_module_to_cpu": True,
+        "disable_tf32": True,
+    }
+    assert seen["save"] == (
+        "engine",
+        str(tmp_path / "model.pte"),
+        {
+            "output_format": "executorch",
+            "retrace": False,
+            "use_cuda_graphs": True,
+            "partitioners": ["partitioner of model"],
+            "backend_config": "GPU memory",
+        },
+    )
+
+
+def test_an_executorch_whose_cuda_backend_does_not_import_is_refused_before_tensorrt_builds(
+    monkeypatch, tmp_path
+):
+    from lerobot.export.backends import executorch_tensorrt
+
+    def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
         raise ReachedCompileError
 
+    def refuse(name):
+        raise ImportError("no CUDA backend")
+
     use_fake_tensorrt(monkeypatch, compile)
-    with pytest.raises(ReachedCompileError):
-        ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
-    assert seen["fallback_pytorch_plugin_ops"] is True
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", refuse)
+    with pytest.raises(ImportError, match="no CUDA backend"):
+        executorch_tensorrt.ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")

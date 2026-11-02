@@ -80,7 +80,10 @@ def gpu_memory_config() -> ExecutorchBackendConfig:
 
 
 def cuda_partitioner(name: str) -> CudaPartitioner:
-    """Hand ExecuTorch's CUDA backend what it takes of the part `name`, its weights file named after the part."""
+    """The partitioner that hands ExecuTorch's CUDA backend what it takes of the part `name`.
+
+    The backend names the part's weights file after the part.
+    """
     from executorch.backends.cuda.cuda_backend import CudaBackend
     from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 
