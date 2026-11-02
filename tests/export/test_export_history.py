@@ -227,6 +227,9 @@ def some_answers_hold_fast_tokens(policy: torch.nn.Module, bundle: Bundle, playe
 def lingbot_va_programs_hold_one_copy_of_their_weights(
     policy: torch.nn.Module, bundle: Bundle, played: np.ndarray
 ) -> None:
+    if bundle.manifest.backend != "torch_test":
+        # The weights are read from the test backend's PyTorch programs.
+        return
     config = policy.config
     policy._ensure_frozen_modules()
     weight = policy.transformer.blocks[0].attn1.to_q.weight
@@ -341,7 +344,7 @@ CHECKPOINTS = {
     # Past the KV cache's first eviction, then a reset and two more chunks.
     "lingbot_va": Checkpoint(
         tiny_lingbot_va.save_checkpoint,
-        ("torch_test",),
+        ("torch_test", "executorch_xnnpack"),
         task=tiny_lingbot_va.TASK,
         ticks=48,
         reset_at=36,
