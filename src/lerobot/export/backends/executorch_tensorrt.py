@@ -52,6 +52,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         """
         import torch_tensorrt
 
+        # Before TensorRT builds, so ExecuTorch's CUDA backend, which needs Triton, fails at once without it.
+        partitioner = cuda_partitioner(path.stem)
         options = {
             "min_block_size": 1,
             # ExecuTorch programs run without libtorch, so a TensorRT plugin that needs it could never run.
@@ -75,7 +77,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             retrace=False,
             use_cuda_graphs=True,
             # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
-            partitioners=[cuda_partitioner(path.stem)],
+            partitioners=[partitioner],
             backend_config=gpu_memory_config(),
         )
         data = path.with_suffix(".ptd")
