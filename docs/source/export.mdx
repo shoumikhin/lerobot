@@ -138,7 +138,6 @@ Then the robot moves, as with any policy. While it runs, an action that is NaN o
 | `--tolerance`                 | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                       |
 | `--max_task_tokens`           | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                           |
 | `--seed`                      | Seeds the random test frame. Defaults to `1000`.                                                                                    |
-| `--skip_policy_check`         | Export without comparing a chain bundle with the whole policy. See [Big models](#big-models-bundles-with-several-programs).         |
 | `--backend.workspace_size`    | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                     |
 | `--backend.compute_units`     | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine). |
 | `--backend.compute_precision` | Core ML only: `float32` (the default) or `float16`. The Neural Engine runs only `float16`.                                          |
@@ -263,7 +262,7 @@ Two things let a board with 8 GB build such a policy:
 - The recipe loads only the weights of the part it is tracing, then frees them.
 - Each part is compiled in a process of its own, and the memory goes back to the system when that process ends.
 
-The export also compares the chain's actions with the whole policy's own, which needs twice the policy's weights in memory. A board that does not have that memory, such as an 8 GB board for pi0.5, refuses the export unless you pass `--skip_policy_check=true`. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
+The export also compares the chain's actions with the whole policy's own, which needs twice the policy's weights in memory. On a board that does not have that memory, such as an 8 GB board for pi0.5, the export skips that comparison and logs a line saying so. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
 
 ### Past frames
 
@@ -307,7 +306,6 @@ lerobot-export \
     --policy.path=<user>/<pi05_checkpoint> \
     --policy.dtype=bfloat16 \
     --backend.type=executorch_tensorrt \
-    --skip_policy_check=true \
     --dataset.repo_id=<user>/<dataset> \
     --task="pick up the cube"
 ```

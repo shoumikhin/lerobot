@@ -27,6 +27,15 @@ if TYPE_CHECKING:
     from torch.export import ExportedProgram
 
 
+def tensorrt_takes_the_plugin_setting() -> bool:
+    """Whether the installed Torch-TensorRT has `fallback_pytorch_plugin_ops` (pytorch/TensorRT#4953)."""
+    import inspect
+
+    import torch_tensorrt
+
+    return "fallback_pytorch_plugin_ops" in inspect.signature(torch_tensorrt.dynamo.compile).parameters
+
+
 @ExportBackendConfig.register_subclass("executorch_tensorrt")
 @dataclass
 class ExecuTorchTensorRTConfig(ExecuTorchConfig):
@@ -55,11 +64,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
 
         Returns the weights file of the CUDA backend's part, if it has one.
         """
-        import inspect
-
         import torch_tensorrt
 
-        if "fallback_pytorch_plugin_ops" not in inspect.signature(torch_tensorrt.dynamo.compile).parameters:
+        if not tensorrt_takes_the_plugin_setting():
             raise ImportError(
                 f"Torch-TensorRT {torch_tensorrt.__version__} lacks fallback_pytorch_plugin_ops, a "
                 "compile setting that ExecuTorch programs need (pytorch/TensorRT#4953)."
