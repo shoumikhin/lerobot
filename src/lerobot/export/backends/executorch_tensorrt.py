@@ -35,11 +35,6 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     An operator TensorRT does not take runs on the GPU too, compiled by ExecuTorch's CUDA backend, which needs
     the CUDA compiler (`nvcc`) at export. A TensorRT engine runs only on the GPU model that built it, so export
     on the kind of board that will run the policy.
-
-    Args:
-        workspace_size (`int`, *optional*):
-            The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine, for
-            example to fit a build into a small board. `None` lets TensorRT decide.
     """
 
     device = "cuda"
@@ -54,6 +49,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     packages = (EXECUTORCH, "torch_tensorrt[executorch]")
 
     workspace_size: int | None = None
+    """The most GPU memory, in bytes, TensorRT may use for scratch while it builds an engine, for example to fit
+    a build into a small board. `None` lets TensorRT decide."""
     deduplicate_weights: bool = True
     """Keep one host copy of each weight, and of its transpose, instead of one per layer that reads it
     (pytorch/TensorRT#4965). `False` gives each layer its own copy, for a policy whose engines come out wrong
