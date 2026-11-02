@@ -47,5 +47,4 @@ class ExecuTorchMLXConfig(ExecuTorchConfig):
         """Lower `program` to MLX and save it as an ExecuTorch program."""
         from executorch.backends.mlx import MLXPartitioner
 
-        edge = lower(program, MLXPartitioner())
-        path.write_bytes(edge.to_executorch().buffer)
+        lower(program, MLXPartitioner(), path)

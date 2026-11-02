@@ -52,5 +52,4 @@ class ExecuTorchOpenVINOConfig(ExecuTorchConfig):
         from executorch.backends.openvino.partitioner import OpenvinoPartitioner
         from executorch.exir.backend.compile_spec_schema import CompileSpec
 
-        edge = lower(program, OpenvinoPartitioner([CompileSpec("device", b"CPU")]))
-        path.write_bytes(edge.to_executorch().buffer)
+        lower(program, OpenvinoPartitioner([CompileSpec("device", b"CPU")]), path)

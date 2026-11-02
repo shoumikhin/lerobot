@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from ..configs import ExportBackendConfig
 
 if TYPE_CHECKING:
     from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
-    from executorch.exir import EdgeCompileConfig, EdgeProgramManager, ExecutorchBackendConfig
+    from executorch.exir import EdgeCompileConfig, ExecutorchBackendConfig, ExecutorchProgramManager
     from executorch.exir.backend.partitioner import Partitioner
     from torch.export import ExportedProgram
 
@@ -43,9 +44,13 @@ class ExecuTorchConfig(ExportBackendConfig):
 
 
 def lower(
-    program: ExportedProgram, partitioner: Partitioner, compile_config: EdgeCompileConfig | None = None
-) -> EdgeProgramManager:
-    """`program` lowered with `partitioner`, the values it computes from constants alone folded first.
+    program: ExportedProgram,
+    partitioner: Partitioner,
+    path: Path,
+    compile_config: EdgeCompileConfig | None = None,
+    backend_config: ExecutorchBackendConfig | None = None,
+) -> ExecutorchProgramManager:
+    """Lower `program` with `partitioner`, what it computes from constants alone folded first, into `path`.
 
     An op that just builds a constant, such as position ids, may be one the backend lacks, so it stays on the
     CPU and splits the program in two, or one whose result size the GPU reads back to the host on every run.
@@ -57,11 +62,15 @@ def lower(
 
     # Folding skips in-place ops, so a value written in place from constants, as `ids[mask] = ...`, needs the
     # functional form first. No op is decomposed here.
-    return to_edge_transform_and_lower(
+    compiled = to_edge_transform_and_lower(
         constant_prop_pass(program.run_decompositions({})),
         partitioner=[partitioner],
         compile_config=compile_config,
-    )
+    ).to_executorch(backend_config)
+    # Streamed piece by piece, so the program is never joined into one more copy in memory.
+    with path.open("wb") as file:
+        compiled.write_to_file(file)
+    return compiled
 
 
 def gpu_memory_config() -> ExecutorchBackendConfig:

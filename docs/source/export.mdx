@@ -316,7 +316,7 @@ from pathlib import Path
 
 from torch.export import ExportedProgram
 
-from lerobot.export.backends.executorch import EXECUTORCH, ExecuTorchConfig
+from lerobot.export.backends.executorch import EXECUTORCH, ExecuTorchConfig, lower
 from lerobot.export.configs import ExportBackendConfig
 
 
@@ -329,11 +329,9 @@ class ExecuTorchMyChipConfig(ExecuTorchConfig):
     packages = (EXECUTORCH, "mychip-executorch")  # what to install beside LeRobot to export
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
-        from executorch.exir import to_edge_transform_and_lower
         from mychip_executorch import MyChipPartitioner
 
-        edge = to_edge_transform_and_lower(program, partitioner=[MyChipPartitioner()])
-        path.write_bytes(edge.to_executorch().buffer)
+        lower(program, MyChipPartitioner(), path)  # lowers and streams the program into `path`
         return None  # or a data file written beside `path`, such as separate weights
 ```
 
