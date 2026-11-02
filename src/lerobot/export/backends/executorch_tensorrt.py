@@ -87,6 +87,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
                 "compile setting that ExecuTorch programs need (pytorch/TensorRT#4953). Install a "
                 "Torch-TensorRT release that has it."
             )
+        # Before TensorRT builds anything, so an ExecuTorch that cannot save the part is refused at once.
+        partitioner = cuda_partitioner(path.stem)
         options = {
             "min_block_size": 1,
             # ExecuTorch programs run without libtorch, so a TensorRT plugin that needs it could never run.
@@ -115,7 +117,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             retrace=False,
             use_cuda_graphs=True,
             # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
-            partitioners=[cuda_partitioner(path.stem)],
+            partitioners=[partitioner],
             backend_config=gpu_memory_config(),
         )
         data = path.with_suffix(".ptd")

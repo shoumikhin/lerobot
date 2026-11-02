@@ -116,11 +116,14 @@ class ReachedCompileError(Exception):
 
 
 def use_fake_tensorrt(monkeypatch, compile):
-    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile`."""
+    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile`, and the CUDA partitioner by None."""
+    from lerobot.export.backends import executorch_tensorrt
+
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
     module.dynamo = types.SimpleNamespace(compile=compile)
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: None)
 
 
 def linear_program():
@@ -161,3 +164,18 @@ def test_a_torch_tensorrt_without_the_plugin_setting_is_refused(monkeypatch, tmp
     use_fake_tensorrt(monkeypatch, compile)
     with pytest.raises(ValueError, match="fallback_pytorch_plugin_ops"):
         ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
+
+
+def test_an_executorch_that_cannot_save_the_part_is_refused_before_tensorrt_builds(monkeypatch, tmp_path):
+    from lerobot.export.backends import executorch_tensorrt
+
+    def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
+        raise ReachedCompileError
+
+    def refuse(name):
+        raise ValueError("pytorch/executorch#24314")
+
+    use_fake_tensorrt(monkeypatch, compile)
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", refuse)
+    with pytest.raises(ValueError, match="24314"):
+        executorch_tensorrt.ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")

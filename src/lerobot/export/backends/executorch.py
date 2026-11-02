@@ -79,11 +79,26 @@ def gpu_memory_config() -> ExecutorchBackendConfig:
     )
 
 
+def cuda_backend_names_its_weights() -> bool:
+    """Whether the installed ExecuTorch's CUDA backend names each part's weights file (pytorch/executorch#24314)."""
+    from executorch.backends.cuda.cuda_backend import CudaBackend
+
+    return hasattr(CudaBackend, "generate_data_name_compile_spec")
+
+
 def cuda_partitioner(name: str) -> CudaPartitioner:
     """Hand ExecuTorch's CUDA backend what it takes of the part `name`, its weights file named after the part."""
+    from importlib.metadata import version
+
     from executorch.backends.cuda.cuda_backend import CudaBackend
     from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
 
+    if not cuda_backend_names_its_weights():
+        # Not an ImportError: the package is installed, so the export's "pip install" hint would not help.
+        raise ValueError(
+            f"ExecuTorch {version('executorch')} cannot name the weights file of each part its CUDA backend "
+            "compiles, which a bundle needs (pytorch/executorch#24314)."
+        )
     return CudaPartitioner(
         [
             CudaBackend.generate_method_name_compile_spec("forward"),

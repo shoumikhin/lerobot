@@ -337,6 +337,15 @@ def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
     np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
 
 
+@needs_executorch
+def test_an_executorch_whose_cuda_backend_cannot_name_weights_files_is_refused(monkeypatch):
+    from lerobot.export.backends import executorch
+
+    monkeypatch.setattr(executorch, "cuda_backend_names_its_weights", lambda: False)
+    with pytest.raises(ValueError, match="pytorch/executorch#24314"):
+        executorch.cuda_partitioner("part")
+
+
 class MaskedPositions(torch.nn.Module):
     """Adds embeddings of position ids picked with a boolean mask made from constants alone, as SmolVLM does."""
 
