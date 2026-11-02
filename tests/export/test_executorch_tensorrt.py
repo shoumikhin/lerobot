@@ -139,7 +139,8 @@ def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatch, tmp_path):
+@pytest.mark.parametrize("changed", [{}, {"deduplicate_weights": False}])
+def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatch, tmp_path, changed):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     seen = {}
@@ -152,7 +153,7 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
         seen["save"] = engine, path, options
 
     use_fake_tensorrt(monkeypatch, compile, save)
-    assert ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte") is None
+    assert ExecuTorchTensorRTConfig(**changed).compile(linear_program(), tmp_path / "model.pte") is None
     assert seen["compile"] == {
         "min_block_size": 1,
         "fallback_pytorch_plugin_ops": True,
@@ -160,6 +161,7 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
         "offload_module_to_cpu": True,
         "disable_tf32": True,
         "deduplicate_weights": True,
+        **changed,
     }
     assert seen["save"] == (
         "engine",
