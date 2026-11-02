@@ -338,6 +338,55 @@ def test_save_pretrained_single_file_artifact(dummy_dataset_metadata, tmp_path):
     torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
 
 
+@pytest.mark.skipif("diffusion" not in AVAILABLE_POLICIES, reason="needs diffusers")
+@pytest.mark.parametrize("compiled", [True, False])
+def test_diffusion_weights_load_whatever_compile_model(dummy_dataset_metadata, tmp_path, compiled):
+    features = dataset_to_policy_features(dummy_dataset_metadata.features)
+    actions = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    inputs = {key: ft for key, ft in features.items() if key not in actions}
+    # A small U-Net keeps the checkpoint small. Nothing runs it, so `compile_model` compiles nothing here.
+    saved, loaded = (
+        make_policy_config(
+            "diffusion", compile_model=c, down_dims=(64, 128), input_features=inputs, output_features=actions
+        )
+        for c in (compiled, not compiled)
+    )
+    policy_cls = get_policy_class("diffusion")
+    policy = policy_cls(saved)
+    policy.to(saved.device)
+    policy.save_pretrained(tmp_path)
+    # The checkpoint keeps the names older versions expect: the wrapper's, with compile_model.
+    keys = load_file(tmp_path / SAFETENSORS_SINGLE_FILE).keys()
+    assert any(key.startswith("diffusion.unet._orig_mod.") for key in keys) == compiled
+    loaded_policy = policy_cls.from_pretrained(tmp_path, config=loaded)
+    assert hasattr(loaded_policy.diffusion.unet, "_orig_mod") == loaded.compile_model
+    torch.testing.assert_close(list(policy.parameters()), list(loaded_policy.parameters()), rtol=0, atol=0)
+
+
+@pytest.mark.skipif("diffusion" not in AVAILABLE_POLICIES, reason="needs diffusers")
+def test_diffusion_peft_copy_of_the_compiled_unet_loads(dummy_dataset_metadata, tmp_path):
+    """PEFT's wrapper around the compiled U-Net forwards `_orig_mod`, so it must not be taken for the compile wrapper."""
+    peft = pytest.importorskip("peft")
+    features = dataset_to_policy_features(dummy_dataset_metadata.features)
+    actions = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    inputs = {key: ft for key, ft in features.items() if key not in actions}
+    config = make_policy_config(
+        "diffusion", compile_model=True, down_dims=(64, 128), input_features=inputs, output_features=actions
+    )
+    policy_cls = get_policy_class("diffusion")
+    policy = policy_cls(config)
+    linear = next(n for n, m in policy.named_modules() if isinstance(m, torch.nn.Linear) and ".unet" not in n)
+    model = peft.get_peft_model(policy, peft.LoraConfig(target_modules=[linear], modules_to_save=["unet"]))
+    trained = model.base_model.model.diffusion.unet.modules_to_save["default"]
+    with torch.no_grad():
+        for param in trained.parameters():
+            param.add_(1.0)
+    model.save_pretrained(tmp_path)
+    loaded = peft.PeftModel.from_pretrained(policy_cls(config), tmp_path)
+    loaded_copy = loaded.base_model.model.diffusion.unet.modules_to_save["default"]
+    torch.testing.assert_close(list(trained.parameters()), list(loaded_copy.parameters()), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("multikey", [True, False])
 def test_multikey_construction(multikey: bool):
     """
