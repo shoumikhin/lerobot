@@ -98,8 +98,10 @@ def _needs_gpu(item) -> bool:
     return _skips_for(item, NEEDS_GPU_REASON)
 
 
-# No CI job installs ExecuTorch yet, so the tests that run it skip there; `-m executorch` selects them for a job that
-# installs it. The mark is added to tests skipped without ExecuTorch; a test that skips at run time marks itself.
+# ExecuTorch is not in uv.lock, so only the export jobs install it and run the tests marked `executorch`: Fast Export
+# Tests on the CPU (see .github/workflows/fast_tests.yml) and GPU Export Tests (see .github/workflows/full_tests.yml).
+# The mark is added to tests whose skip mark names ExecuTorch; other tests that need it mark themselves. An unmarked
+# test that skips for lack of ExecuTorch fails instead, so it cannot silently miss the export jobs.
 NEEDS_EXECUTORCH_REASON = re.compile(r"executorch", re.IGNORECASE)
 # The mark each kind of skip needs, so that a run-time skip without it fails.
 SKIP_MARKS = {"gpu": (NEEDS_GPU_REASON, "CUDA"), "executorch": (NEEDS_EXECUTORCH_REASON, "ExecuTorch")}
@@ -139,7 +141,7 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "executorch: needs ExecuTorch, which no CI job installs yet (added to tests skipped without it)",
+        "executorch: needs ExecuTorch, which only the export jobs install (added to tests skipped without it)",
     )
     _write_libero_config(config)
 
