@@ -6,7 +6,7 @@ A bundle is useful because:
 
 - **It is fast.** A compiler such as NVIDIA TensorRT tunes the policy's math for one chip.
 - **It does not load PyTorch.** The robot process runs the compiled programs instead of the policy's Python code, and never imports PyTorch, so that memory stays free for the policy.
-- **It is built for small boards.** Large policies such as π₀.₅ (pi0.5) and GR00T N1.7 are split into small programs, so they can be built and run on an NVIDIA Jetson Orin Nano with 8 GB of memory.
+- **It is built for small boards.** Large policies such as π₀ (pi0), π₀.₅ (pi0.5) and GR00T N1.7 are split into small programs, so they can be built and run on an NVIDIA Jetson Orin Nano with 8 GB of memory.
 - **It checks itself.** The bundle carries a test frame. It is replayed at export and again by `lerobot-check-bundle`.
 
 ```
@@ -254,7 +254,7 @@ float32 is the default because it matches PyTorch most closely. A big policy, su
 
 ### Big models: bundles with several programs
 
-On an 8 GB board, pi0.5, GR00T N1.7, SmolVLA, LaWAM and VLA-JEPA do not fit well as one program. So their recipes cut one chunk into a **chain** of small programs. The programs run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. pi0.5 starts from random noise and removes it in ten steps, and its chain looks like this:
+On an 8 GB board, pi0, pi0.5, GR00T N1.7, SmolVLA, LaWAM and VLA-JEPA do not fit well as one program. So their recipes cut one chunk into a **chain** of small programs. The programs run in the order the manifest lists their runs, pass values to each other by name, and keep those values in GPU memory. pi0.5 starts from random noise and removes it in ten steps, and its chain looks like this:
 
 ```
 embed                 cameras, state, task          -> the prompt, as vectors
@@ -270,7 +270,7 @@ Two things let a board with 8 GB build such a policy:
 - The recipe loads only the weights of the part it is tracing, then frees them.
 - Each program is compiled in a process of its own, and the memory goes back to the system when that process ends.
 
-The pi0.5 and GR00T recipes read each part's weights from the checkpoint's `model.safetensors`, so they refuse a checkpoint that holds only a PEFT adapter. Merge the adapter into its base policy first, then export the merged folder:
+The pi0, pi0.5 and GR00T recipes read each part's weights from the checkpoint's `model.safetensors`, so they refuse a checkpoint that holds only a PEFT adapter. Merge the adapter into its base policy first, then export the merged folder:
 
 ```python
 from lerobot.configs.policies import PreTrainedConfig
@@ -320,7 +320,7 @@ Some policies also compute their first chunks after a reset in another way, such
 
 A vision-language-action policy reads a task such as "pick up the cube". To read it, the policy first splits the text into **tokens** (word pieces) with its **tokenizer**, and looks up a vector for each token in its **embedding table**. A compiled program cannot run a tokenizer, so a bundle handles the task in one of two ways:
 
-- **Fixed task.** The default recipe stores the task inside the program. Give it with `--task="pick up the cube"`, or let the export take the first task of `--dataset.repo_id`. The bundle then runs only that task.
+- **Fixed task.** The default recipe stores the task inside the program, and pi0's chain stores it inside its `embed` program. Give it with `--task="pick up the cube"`, or let the export take the first task of `--dataset.repo_id`. The bundle then runs only that task.
 - **Any task.** The pi0.5 and GR00T recipes write `task_tokens` into the bundle: the policy's tokenizer file and its embedding table. At run time, the bundle turns any task into vectors without PyTorch. Tasks known at export, such as the dataset's, are stored ready to use. A new task is tokenized once, in a short-lived child process, so the tokenizer's memory does not stay in the robot process. This needs the `tokenizers` package on the robot computer: `pip install "tokenizers>=0.22"`.
 
 For an any-task bundle, the task's prompt must fit in `--max_task_tokens`. The prompt is the task plus a few fixed words the policy adds around it. By default, the budget is a little more than the longest prompt known at export, as far as the policy's prompt has room.
@@ -398,6 +398,7 @@ Two tables list what has been tested. In both:
 | Gaussian actor   | own (one action)       | Yes         | Yes         | Yes             | Yes              |
 | TD-MPC           | own (planner)          | Yes         | Yes         | Yes             | Yes              |
 | X-VLA            | default                | Yes         | Yes         | Yes             | Yes              |
+| pi0              | own (chain)            | Yes         | Yes         | Yes             | Yes              |
 | EVO1             | own (uniform noise)    | Yes         | Yes         | No              | Too big          |
 | FastWAM          | own (seeded noise)     | Yes         | Yes         | Yes             | Too big          |
 | LingBot-VLA v2   | own (vision grid)      | Yes         | Yes         | No              | Too big          |
@@ -414,7 +415,7 @@ Two tables list what has been tested. In both:
 | LingBot-VA       | own (caches)           | Yes         | Yes         | Yes             | Too big          |
 
 - These results used PyTorch 2.15, with builds of ExecuTorch 1.6 and Torch-TensorRT 2.15 that have the fixes from [Install](#install) and other fixes still in review, all listed in pytorch/executorch#24353. In every **Yes** run, the bundle ran without loading PyTorch, and no operation ran on the CPU.
-- The pi0.5, GR00T and SmolVLA results are for their chain recipes. The LaWAM and VLA-JEPA results were measured when each was exported as one program, before its chain recipe.
+- The pi0, pi0.5, GR00T and SmolVLA results are for their chain recipes. The LaWAM and VLA-JEPA results were measured when each was exported as one program, before its chain recipe.
 - **PyTorch fix**: `lerobot-export` saves each traced program and loads it again to compile it. PyTorch 2.15 cannot save the attention masks of DM05 and WALL-X, nor load the autocast regions of MolmoAct2 and LaWAM back. [pytorch/pytorch#202785](https://github.com/pytorch/pytorch/pull/202785) fixes the masks and [pytorch/pytorch#202925](https://github.com/pytorch/pytorch/pull/202925) the autocast regions, and neither is in a release yet. These results used a PyTorch 2.15 build that adds them.
 - WALL-X's bundle lands between 0.060 and 0.125 from PyTorch on the A100, depending on which kernels TensorRT picks, and up to 0.22 on the DGX Spark. Eager PyTorch alone moves it by up to 0.092 on the A100 and 0.12 on the Spark, so its recipe's tolerance is 0.5: a broken program moved its actions by 1.1 or more.
 - **Too big**: most of these policies are bigger than the Orin Nano's 8 GB. LaWAM, VLA-JEPA and EVO1 would fit when they run, but their export does not fit yet. X-VLA ran on the Orin Nano in bfloat16 (`--policy.dtype=bfloat16`), because its float32 export does not fit.
@@ -432,6 +433,7 @@ Two tables list what has been tested. In both:
 | SmolVLA     | No                                     | No (bfloat16 weights) | Program       | -                       |
 | TD-MPC      | Yes (data center GPU)                  | Yes (x86 CPU)         | -             | -                       |
 | EVO1        | Yes (data center GPU)                  | -                     | -             | -                       |
+| pi0         | Yes (data center GPU)                  | Program               | Program       | Program                 |
 | X-VLA       | -                                      | Yes (x86 CPU)         | Yes (x86 CPU) | -                       |
 | FineART VLA | Yes (data center GPU)                  | -                     | -             | -                       |
 | EO-1        | Yes (data center GPU)                  | -                     | -             | -                       |
@@ -443,10 +445,11 @@ Two tables list what has been tested. In both:
 
 The policies missing from this table have not been tested on these backends.
 
-- The ACT XNNPACK and OpenVINO results, and the EVO1, TD-MPC, FineART VLA, EO-1, VLA-JEPA, WALL-X and FLUX3 results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA and SmolVLA results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA and LingBot-VA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
+- The ACT XNNPACK and OpenVINO results, and the EVO1, TD-MPC, FineART VLA, EO-1, VLA-JEPA, WALL-X and FLUX3 results, used PyTorch 2.15 with development builds of ExecuTorch 1.6. The ACT CUDA, SmolVLA and pi0 results used development builds of PyTorch 2.16 and ExecuTorch, not the PyTorch 2.15 that [Install](#install) sets up, so they are still to be confirmed with it. The X-VLA and LingBot-VA results used PyTorch 2.15 and a release candidate of ExecuTorch 1.6.
 - LingBot-VA's XNNPACK export passes its checks, but checking the bundle did not finish within 6 hours on an x86 CPU.
 - The ACT MLX result used an Apple Silicon Mac with PyTorch 2.15 and a development build of ExecuTorch 1.6.
 - The pi0-FAST result used `lerobot/pi0fast-libero` in float32, with PyTorch 2.15 and a development build of ExecuTorch 1.6. Its bundle generated exactly the PyTorch policy's tokens on the frames tested. It always runs all 255 decoding steps, where the PyTorch policy stops at the end of its answer.
+- pi0's CUDA result is for its chain recipe. Its XNNPACK, OpenVINO and MLX results were measured when it was exported as one program.
 - The SmolVLA results here were measured when it was exported as one program, before its chain recipe. The chain needs about half the memory of one program, as checked on a Jetson AGX Thor.
 - SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its one-program `executorch_cuda` export failed because SmolVLA computes its time embedding in float64, which the development build of ExecuTorch's CUDA backend used then could not load. With ExecuTorch 1.6.0, the chain recipe exports and runs on `executorch_cuda` in LeRobot's tests, which use a tiny SmolVLA; the full policy is still to be measured there.
 - `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images, [pytorch/executorch#24317](https://github.com/pytorch/executorch/pull/24317), which came after ExecuTorch 1.6.0.
