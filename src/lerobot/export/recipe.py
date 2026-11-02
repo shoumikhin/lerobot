@@ -740,10 +740,14 @@ class ChainRecipe(ExportRecipe):
         - **policy_name** (`str`) -- The policy's name in messages.
         - **text_steps** (`tuple[type, ...]`) -- The preprocessor's steps that write the prompt and tokenize it,
           which the programs do not run, for a recipe that uses `_tensor_preprocessor`.
+        - **policy_tolerance** (`float | None`) -- The largest allowed difference from `_policy_actions`, in
+          normalized action units, for a recipe that holds the chain closer to the policy than `tolerance`,
+          which allows for the compiler. `None` uses `tolerance`.
     """
 
     policy_name: str
     text_steps: tuple[type, ...]
+    policy_tolerance: float | None = None
     _runs: list[ProgramRun]
     _constants: dict[str, np.ndarray]
 
@@ -783,18 +787,17 @@ class ChainRecipe(ExportRecipe):
         expected = self._policy_actions(case)
         if expected is None:
             return
+        tolerance = self.tolerance if self.policy_tolerance is None else self.policy_tolerance
         # The thresholds are the same PyTorch code in the parts and the policy, so the continuous actions decide.
         actions = case.actions if case.continuous_actions is None else case.continuous_actions
         error = float((np.abs(actions - expected) / case.action_scale).max())
         logger.info(
-            "Test case against the whole policy: largest difference %.2e (tolerance %g)",
-            error,
-            self.tolerance,
+            "Test case against the whole policy: largest difference %.2e (tolerance %g)", error, tolerance
         )
-        if not error <= self.tolerance:
+        if not error <= tolerance:
             raise ValueError(
                 f"The chained parts compute other actions than {self.policy_name}'s predict_action_chunk "
-                f"({error:.2e} > {self.tolerance} in normalized units), so they do not export this checkpoint "
+                f"({error:.2e} > {tolerance} in normalized units), so they do not export this checkpoint "
                 "correctly."
             )
 
@@ -999,8 +1002,9 @@ class ActionChunkRecipe(ExportRecipe):
         )
 
     def _action_scale(self, width: int) -> np.ndarray:
+        postprocess = action_pipelines(self.postprocessor)[-1]
         return measure_action_scale(
-            lambda value: self.postprocessor(torch.full((1, 1, width), value, device=self._device))[0, 0]
+            lambda value: postprocess(torch.full((1, 1, width), value, device=self._device))[0, 0]
         )
 
     def _task(self, frame: dict[str, np.ndarray]) -> str | None:
@@ -1351,6 +1355,30 @@ def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str
     return renames
 
 
+def split_absolute_step(
+    postprocessor: PolicyProcessorPipeline, action_dim: int
+) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
+    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
+
+    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
+    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
+    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
+    """
+    steps = list(postprocessor.steps)
+    index = next(
+        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
+    )
+    if index is None:
+        return postprocessor, None
+    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
+        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
+    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
+    if relative_step is None:
+        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
+    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
+    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
+
+
 # The names of what `action_pipelines` compute, in order: the actions to play, then those without the thresholds.
 ACTION_OUTPUTS = (ACTION, CONTINUOUS_ACTIONS)
 
@@ -1426,42 +1454,22 @@ class PostprocessedActions(nn.Module):
         """`chunk` is `[1, steps, width]`; each output is `[steps, action]` in float32."""
         played = tuple(pipeline(chunk)[0].float() for pipeline in self.pipelines)
         return played if len(played) > 1 else played[0]
-def split_absolute_step(
-    postprocessor: PolicyProcessorPipeline, action_dim: int
-) -> tuple[PolicyProcessorPipeline, list[bool] | None]:
-    """The postprocessor's steps before its enabled relative-to-absolute step, and the mask of that step.
-
-    That step adds back the state the preprocessor cached in Python, which a program would hold as a constant, so a
-    recipe runs the steps before it and adds the state its program takes as an input, with `to_absolute_actions`
-    and the mask of the `action_dim` actions. The mask is None for a postprocessor without that step.
-    """
-    steps = list(postprocessor.steps)
-    index = next(
-        (i for i, s in enumerate(steps) if isinstance(s, AbsoluteActionsProcessorStep) and s.enabled), None
-    )
-    if index is None:
-        return postprocessor, None
-    if not all(isinstance(s, DeviceProcessorStep) for s in steps[index + 1 :]):
-        raise ValueError("The relative-to-absolute action step must be the postprocessor's last step.")
-    relative_step = cast(AbsoluteActionsProcessorStep, steps[index]).relative_step
-    if relative_step is None:
-        raise ValueError("The postprocessor's relative-to-absolute step is linked to no relative step.")
-    # The relative step has no public mask accessor; LeRobot's RTC and statistics code call this one too.
-    return replace(postprocessor, steps=steps[:index]), relative_step._build_mask(action_dim)
 
 
 class ChunkActions(nn.Module):
-    """The denoised actions in, the actions to play out, in robot units.
+    """The denoised actions in, the actions to play out, in robot units, and those without thresholds if any.
 
     A policy trained on actions relative to the state turns them back around the robot's state. The policy's
     postprocessor adds the state its preprocessor cached in Python, which a program would hold as a constant,
-    so this module adds the state it takes as an input instead.
+    so this module adds the state it takes as an input instead. `outputs` names what it returns, in order.
     """
 
     def __init__(self, postprocessor: PolicyProcessorPipeline, execution_steps: int, action_dim: int):
         """Play the first `execution_steps` actions of `action_dim` each through `postprocessor`."""
         super().__init__()
-        self.postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
+        postprocessor, self.mask = split_absolute_step(postprocessor, action_dim)
+        self.pipelines = action_pipelines(postprocessor)
+        self.outputs = list(ACTION_OUTPUTS[: len(self.pipelines)])
         self.execution_steps = execution_steps
         self.action_dim = action_dim
 
@@ -1470,13 +1478,15 @@ class ChunkActions(nn.Module):
         """Whether the module takes the robot's state, for a policy trained on actions relative to it."""
         return self.mask is not None
 
-    def forward(self, actions: Tensor, *state: Tensor) -> Tensor:
+    def forward(self, actions: Tensor, *state: Tensor) -> Tensor | tuple[Tensor, ...]:
         """The actions, and the robot's state for a policy trained on actions relative to it."""
-        actions = self.postprocessor(actions[None, : self.execution_steps, : self.action_dim])
+        chunk = actions[None, : self.execution_steps, : self.action_dim]
+        played = [pipeline(chunk) for pipeline in self.pipelines]
         if self.mask is not None:
             (anchor,) = state
-            actions = to_absolute_actions(actions, anchor[None], self.mask)
-        return actions[0].float()
+            played = [to_absolute_actions(a, anchor[None], self.mask) for a in played]
+        outputs = tuple(a[0].float() for a in played)
+        return outputs if len(outputs) > 1 else outputs[0]
 
 
 def robot_features(
