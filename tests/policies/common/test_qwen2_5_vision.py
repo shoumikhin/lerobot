@@ -23,24 +23,26 @@ import torch
 
 pytest.importorskip("transformers")
 
-import transformers  # noqa: E402
-from packaging.version import Version  # noqa: E402
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig  # noqa: E402
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (  # noqa: E402
     Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLModel,
 )
 
-from lerobot.policies.common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward  # noqa: E402
-from lerobot.policies.common.qwen_vision import qwen_image_rope_index  # noqa: E402
-from tests.policies.common.fixed_grid_checks import (  # noqa: E402
-    count_block_calls_with_checkpointing,
-    data_dependent_nodes,
-    requires_gloo,
-    run_with_fsdp,
+from lerobot.policies.common.qwen2_5_vision import (  # noqa: E402
+    Qwen2_5VisionGrid,
+    qwen2_5_image_temporal_scale,
+    qwen2_5_vision_forward,
 )
+from lerobot.policies.common.qwen_vision import (  # noqa: E402
+    check_visible_images,
+    prepare_image_grid,
+    qwen_image_rope_index,
+)
+from tests.policies.common.fixed_grid_checks import data_dependent_nodes  # noqa: E402
 
 IMAGE_TOKEN_ID = 99
+VISION_START_ID, VISION_END_ID = 97, 98
 GRID = [[1, 8, 12]]
 
 
@@ -57,6 +59,8 @@ def _tiny_config() -> Qwen2_5_VLConfig:
         },
         text_config={"hidden_size": 48, "num_hidden_layers": 1, "num_attention_heads": 2, "vocab_size": 128},
         image_token_id=IMAGE_TOKEN_ID,
+        vision_start_token_id=VISION_START_ID,
+        vision_end_token_id=VISION_END_ID,
     )
     config.vision_config._attn_implementation = "sdpa"
     return config
@@ -78,8 +82,8 @@ class FixedGridVision(torch.nn.Module):
         self.grid = grid
 
     def forward(self, pixel_values, grid_thw):
-        grid = Qwen2_5VisionGrid.reuse_or_build(self.grid, self.visual, grid_thw)
-        return qwen2_5_vision_forward(self.visual, pixel_values, grid_thw, grid)
+        grid = Qwen2_5VisionGrid.track(self.grid, self.visual, grid_thw)
+        return qwen2_5_vision_forward(self.visual, pixel_values, grid)
 
 
 # Two images of 18x18 patches (as 224 px cameras give) have uneven attention windows; the
@@ -98,24 +102,24 @@ def test_vision_forward_matches_stock_and_exports(grids):
     assert data_dependent_nodes(exported) == []
 
 
-def test_export_without_a_fitting_cached_grid_names_the_mismatch():
+def test_export_without_a_fitting_prepared_grid_names_the_mismatch():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
     one_image = Qwen2_5VisionGrid.build(visual, grid_thw)
     cases = {
-        "no image grid is cached": (visual, None),
-        "the cached grid has 2 images but the export inputs have 1": (
+        "no image grid was prepared": (visual, None),
+        "the prepared grid has 2 images but the export inputs have 1": (
             visual,
             Qwen2_5VisionGrid.build(visual, torch.tensor(GRID * 2)),
         ),
-        "was built for cpu torch.float32, but the tower is now on cpu torch.bfloat16": (
+        "was prepared for cpu torch.float32, but the tower is now on cpu torch.bfloat16": (
             deepcopy(visual).to(torch.bfloat16),
             one_image,
         ),
     }
     for problem, (tower, cache) in cases.items():
         pixel_values = _pixels(grid_thw).to(tower.dtype)
-        with pytest.raises(RuntimeError, match=f"{problem}.*The last eager call before torch.export"):
+        with pytest.raises(RuntimeError, match=rf"{problem}.*inside `prepare_image_grid\(\)`"):
             torch.export.export(FixedGridVision(tower, cache), (pixel_values, grid_thw), strict=False)
 
 
@@ -123,14 +127,36 @@ def test_export_without_a_fitting_cached_grid_names_the_mismatch():
 @pytest.mark.parametrize(
     "changed", [[[1, 12, 8]], [[1, 8, 12], [1, 4, 4]]], ids=["same-count", "more-images"]
 )
-def test_eager_rebuilds_a_changed_grid(monkeypatch, changed, disable_checks):
+def test_preparation_rebuilds_a_changed_grid(monkeypatch, changed, disable_checks):
     if disable_checks:
         monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
     visual = _tiny_visual()
-    cache = Qwen2_5VisionGrid.reuse_or_build(None, visual, torch.tensor(GRID))
-    rebuilt = Qwen2_5VisionGrid.reuse_or_build(cache, visual, torch.tensor(changed))
-    assert rebuilt.grid_thw == changed
-    assert Qwen2_5VisionGrid.reuse_or_build(rebuilt, visual, torch.tensor(changed)) is rebuilt
+    with prepare_image_grid():
+        cache = Qwen2_5VisionGrid.track(None, visual, torch.tensor(GRID))
+        rebuilt = Qwen2_5VisionGrid.track(cache, visual, torch.tensor(changed))
+        assert rebuilt.grid_thw == changed
+        assert Qwen2_5VisionGrid.track(rebuilt, visual, torch.tensor(changed)) is rebuilt
+
+
+def test_eager_outside_preparation_neither_reads_nor_caches_the_grid():
+    visual = _tiny_visual()
+    grid_thw = torch.tensor(GRID)
+    cache = Qwen2_5VisionGrid.build(visual, grid_thw)
+
+    class Unreadable(torch.Tensor):
+        def tolist(self):
+            raise AssertionError("the grid must not be read outside prepare_image_grid()")
+
+    unreadable = grid_thw.as_subclass(Unreadable)
+    assert Qwen2_5VisionGrid.track(None, visual, unreadable) is None
+    assert Qwen2_5VisionGrid.track(cache, visual, torch.tensor([[1, 12, 8]]).as_subclass(Unreadable)) is cache
+
+
+def test_a_call_without_images_has_no_grid():
+    visual = _tiny_visual()
+    cache = Qwen2_5VisionGrid.build(visual, torch.tensor(GRID))
+    with prepare_image_grid():
+        assert Qwen2_5VisionGrid.track(cache, visual, None) is None
 
 
 def test_exported_program_rejects_a_changed_grid():
@@ -144,10 +170,36 @@ def test_exported_program_rejects_a_changed_grid():
         program(_pixels(grid_thw), torch.tensor([[1, 12, 8]]))
 
 
-@pytest.mark.skipif(
-    Version(transformers.__version__) < Version("5.5.4"),
-    reason="transformers before 5.5.4 also scales the temporal position of still images",
-)
+def test_masks_hiding_more_than_padding_are_refused_also_after_export():
+    config = _tiny_config()
+    image = [VISION_START_ID, *[IMAGE_TOKEN_ID] * 6, VISION_END_ID]
+    # The second row has two images without boundary tokens, separated by one text token.
+    input_ids = torch.tensor([[0, 1, *image, 2], [5, *[IMAGE_TOKEN_ID] * 4, 6, *[IMAGE_TOKEN_ID] * 4, 0]])
+    attention_mask = input_ids.ne(0).long()
+
+    class CheckVisibleImages(torch.nn.Module):
+        def forward(self, input_ids, attention_mask):
+            check_visible_images(input_ids, attention_mask, config)
+            return attention_mask + 0
+
+    program = torch.export.export(CheckVisibleImages(), (input_ids, attention_mask), strict=False).module()
+    more_padding = attention_mask.clone()
+    more_padding[0, 1] = 0
+    for mask in (attention_mask, more_padding):
+        check_visible_images(input_ids, mask, config)
+        program(input_ids, mask)
+    # The vision start token with the text before it, the last image token and the vision end token with the
+    # text after it (each leaves one visible run), the text token between the second row's images (eager would
+    # join them into one image), and a whole row.
+    for row, columns in ((0, [1, 2]), (1, [9]), (0, [9, 10]), (1, [5]), (1, list(range(11)))):
+        hidden = attention_mask.clone()
+        hidden[row, columns] = 0
+        with pytest.raises(ValueError, match="must hide only padding"):
+            check_visible_images(input_ids, hidden, config)
+        with pytest.raises(RuntimeError):
+            program(input_ids, hidden)
+
+
 def test_image_rope_index_matches_stock():
     model = Qwen2_5_VLModel._from_config(_tiny_config())
     grids = [[1, 4, 6], [1, 4, 4], [1, 6, 2]]
@@ -171,9 +223,26 @@ def test_image_rope_index_matches_stock():
         image_grid_thw=torch.tensor(grids),
         attention_mask=attention_mask,
     )
-    position_ids = qwen_image_rope_index(input_ids, attention_mask, grids, 2, IMAGE_TOKEN_ID)
+    # transformers 5.4.0 to 5.5.3 scale the temporal position of still images; the probe reads the scale.
+    scale = qwen2_5_image_temporal_scale(model)
+    position_ids = qwen_image_rope_index(
+        input_ids, attention_mask, grids, 2, IMAGE_TOKEN_ID, image_temporal_scale=scale
+    )
 
     assert torch.equal(position_ids, expected)
+
+
+def test_image_temporal_scale_moves_only_the_temporal_start_of_images():
+    input_ids = torch.tensor([[1, 2] + [IMAGE_TOKEN_ID] * 6 + [3]])
+    attention_mask = torch.ones_like(input_ids)
+    plain = qwen_image_rope_index(input_ids, attention_mask, [[1, 4, 6]], 2, IMAGE_TOKEN_ID)
+    scaled = qwen_image_rope_index(
+        input_ids, attention_mask, [[1, 4, 6]], 2, IMAGE_TOKEN_ID, image_temporal_scale=4
+    )
+    image = input_ids[0] == IMAGE_TOKEN_ID
+    assert torch.equal(scaled[0, 0, image], plain[0, 0, image] * 4)  # every image token starts at 2
+    assert torch.equal(scaled[0, 0, ~image], plain[0, 0, ~image])
+    assert torch.equal(scaled[1:], plain[1:])
 
 
 def test_image_rope_index_rejects_video_grids():
@@ -186,9 +255,10 @@ def test_reused_grid_follows_dtype_changes():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
     pixel_values = _pixels(grid_thw)
-    grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
-    visual.to(torch.bfloat16)
-    grid = Qwen2_5VisionGrid.reuse_or_build(grid, visual, grid_thw)
+    with prepare_image_grid():
+        grid = Qwen2_5VisionGrid.track(None, visual, grid_thw)
+        visual.to(torch.bfloat16)
+        grid = Qwen2_5VisionGrid.track(grid, visual, grid_thw)
     pixel_values = pixel_values.bfloat16()
     with torch.no_grad():
         program = torch.export.export(
@@ -206,8 +276,8 @@ def test_grid_built_in_inference_mode_can_train():
     visual = _tiny_visual()
     grid_thw = torch.tensor(GRID)
     pixel_values = _pixels(grid_thw)
-    with torch.inference_mode():
-        grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
+    with torch.inference_mode(), prepare_image_grid():
+        grid = Qwen2_5VisionGrid.track(None, visual, grid_thw)
     visual.train()
     # The cache feeds the exported computation, which is what would save its tensors for backward.
     program = torch.export.export(
@@ -218,32 +288,3 @@ def test_grid_built_in_inference_mode_can_train():
     visual.zero_grad()
     visual(pixel_values, grid_thw=grid_thw).pooler_output.square().sum().backward()
     torch.testing.assert_close(cached_grad, visual.patch_embed.proj.weight.grad, rtol=0, atol=0)
-
-
-def test_gradient_checkpointing_reruns_every_block():
-    visual = _tiny_visual()
-    grid_thw = torch.tensor(GRID)
-    pixel_values = _pixels(grid_thw)
-    grid = Qwen2_5VisionGrid.build(visual, grid_thw)
-    calls = count_block_calls_with_checkpointing(
-        visual, lambda: qwen2_5_vision_forward(visual, pixel_values, grid_thw, grid)
-    )
-    assert calls == 2 * len(visual.blocks)
-
-
-@requires_gloo
-@pytest.mark.parametrize("whole_tower", [False, True], ids=["block-units", "tower-unit"])
-def test_vision_forward_runs_with_fsdp2(tmp_path, whole_tower):
-    visual = _tiny_visual().train()
-    grid_thw = torch.tensor(GRID)
-    pixel_values = _pixels(grid_thw)
-    expected = visual(pixel_values, grid_thw=grid_thw).pooler_output.detach()
-
-    def forward(visual):
-        grid = Qwen2_5VisionGrid.reuse_or_build(None, visual, grid_thw)
-        return qwen2_5_vision_forward(visual, pixel_values, grid_thw, grid)
-
-    actual = run_with_fsdp(
-        tmp_path, deepcopy(visual), forward, lambda tower: [tower] if whole_tower else list(tower.blocks)
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

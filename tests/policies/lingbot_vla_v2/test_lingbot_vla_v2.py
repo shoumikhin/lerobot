@@ -27,7 +27,7 @@ import torch
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.lingbot_vla_v2.configuration_lingbot_vla_v2 import LingbotVLAV2Config, SlotMapping
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from tests.utils import skip_if_package_missing
 
 CAMERA = "observation.images.camera_top"
@@ -243,6 +243,12 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
         changed["image_grid_thw"][..., 1] += 2
         with pytest.raises(RuntimeError):
             run(exported.module(), changed)
+        # So does a sample with no visible prefix token, on which eager rope positions fail.
+        empty = {key: batch[key].clone() for key in ("img_masks", OBS_LANGUAGE_ATTENTION_MASK)}
+        for mask in empty.values():
+            mask[1] = False
+        with pytest.raises(RuntimeError):
+            run(exported.module(), {**batch, **empty})
     assert len(grid_builds) == 1
     assert data_dependent_nodes(exported) == []
 
@@ -254,6 +260,14 @@ def test_precompute_grid_thw_prediction_matches_default_and_exports(tiny_backbon
         end = (input_ids[0] == config.vision_end_token_id).nonzero()[0, 0]
         hidden = attention_mask.clone()
         hidden[0, start : end + 1] = 0
+        stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
+        assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
+        # With cameras of two shapes and one token count, the hidden camera must not hand its grid to another.
+        camera = [config.vision_start_token_id, *[config.image_token_id] * 6, config.vision_end_token_id]
+        input_ids = torch.tensor([[1, *camera, *camera, 2]] * 2)
+        hidden = torch.ones_like(input_ids)
+        hidden[0, 1:9] = 0
+        every_grid = [[1, 4, 6], [1, 6, 4]] * 2
         stock = build_prefix_position_ids(input_ids, hidden, image_grid_thw=torch.tensor(every_grid[1:]))
         assert torch.equal(core.build_fixed_grid_position_ids(input_ids, hidden, every_grid), stock)
 
@@ -448,3 +462,22 @@ def test_sparse_moe_matches_per_token_reference():
 
     actual = experts._sparse_forward(weights, selected, hidden)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_a_given_noise_runs_in_the_model_dtype(tiny_backbone):
+    """A float32 starting noise, as callers draw it, runs in the dtype of a bfloat16 policy."""
+    cfg = _tiny_config(tiny_backbone, **_slot_kwargs(arm=[[0, 6]], effector=[[6, 7]]))
+    cfg.dtype = torch.bfloat16
+    meta = _ds_meta(7)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    raw = _raw_batch(7)
+    raw.pop(ACTION)
+    batch = preprocessor(raw)
+    noise = torch.randn(2, CHUNK, cfg.max_action_dim)
+
+    with torch.no_grad():
+        given = policy.predict_action_chunk(batch, noise=noise.clone())
+        cast = policy.predict_action_chunk(batch, noise=noise.to(torch.bfloat16))
+
+    torch.testing.assert_close(given, cast, rtol=0, atol=0)

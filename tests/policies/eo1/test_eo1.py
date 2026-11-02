@@ -26,10 +26,8 @@ from torch import nn
 
 pytest.importorskip("transformers")
 
-import transformers
-from packaging.version import Version
-
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.common.qwen_vision import prepare_image_grid
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 from lerobot.policies.eo1.modeling_eo1 import EO1Policy
 from lerobot.policies.eo1.processor_eo1 import EO1QwenProcessorStep, make_eo1_pre_post_processors
@@ -467,6 +465,37 @@ def test_model_messages_use_recipe_system_prompt_and_only_fall_back_for_action_i
         ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(("use_fast_processor", "image_device"), [(False, "cpu"), (True, "cuda")])
+def test_qwen_step_gives_only_the_slow_processor_cpu_images(monkeypatch, use_fast_processor, image_device):
+    from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep, EO1QwenProcessorStep
+    from lerobot.processor.converters import create_transition
+
+    class RecordingTextProcessor(DummyTextProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            self.images = [b["image"] for row in messages for m in row for b in m["content"] if "image" in b]
+            return super().apply_chat_template(messages, **kwargs)
+
+    processor = RecordingTextProcessor()
+    monkeypatch.setattr(
+        "lerobot.policies.eo1.processor_eo1.Qwen2_5_VLProcessor.from_pretrained",
+        lambda *args, **kwargs: processor,
+    )
+    config = make_eo1_config()
+    image = torch.rand(1, 3, 8, 8, device="cuda")
+    transition = create_transition(
+        observation={OBS_STATE: torch.zeros(1, STATE_DIM, device="cuda"), "observation.images.image": image},
+        complementary_data={"task": ["tidy"]},
+    )
+    transition = RenderRuntimeMessagesStep(config.recipe)(transition)
+    transition = EO1PrepareModelMessagesStep(config.input_features, CHUNK_SIZE)(transition)
+    EO1QwenProcessorStep(use_fast_processor=use_fast_processor)(transition)
+
+    assert [img.device.type for img in processor.images] == [image_device]
+    expected = image[0].clamp(0, 1).mul(255.0).round().to(torch.uint8)
+    assert torch.equal(processor.images[0].to(expected.device), expected)
+
+
 def test_saved_message_processor_registry_name_still_loads():
     from lerobot.policies.eo1.processor_eo1 import EO1PrepareModelMessagesStep
     from lerobot.processor import PolicyProcessorPipeline
@@ -684,88 +713,133 @@ def _sampling_policy_and_batch(monkeypatch):
     return EO1Policy(make_eo1_config()), batch
 
 
-def test_sampling_checks_stay_on_without_precompute_grid_thw(monkeypatch):
-    policy, batch = _sampling_policy_and_batch(monkeypatch)
-    batch["input_ids"] = batch["input_ids"].clone()
-    batch["input_ids"][0, -2] = 2
-    # That switch only turns off the checks of the export option.
-    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
-    with pytest.raises(ValueError, match="exactly 3 action tokens"):
-        policy.predict_action_chunk(batch)
-
-
-def _export_sampling(policy, batch):
+def _export_sampling(policy, batch, noise):
     keys = sorted(key for key, value in batch.items() if isinstance(value, torch.Tensor))
 
     class SampleActions(nn.Module):
-        def forward(self, *tensors):
-            return policy.predict_action_chunk({**batch, **dict(zip(keys, tensors, strict=True))})
+        def forward(self, noise, *tensors):
+            inputs = {**batch, **dict(zip(keys, tensors, strict=True))}
+            return policy.predict_action_chunk(inputs, noise=noise)
 
     with torch.no_grad():
-        program = torch.export.export(SampleActions(), tuple(batch[key] for key in keys), strict=False)
-    return program, lambda inputs: program.module()(*(inputs[key] for key in keys))
+        program = torch.export.export(
+            SampleActions(), (noise.clone(), *(batch[key] for key in keys)), strict=False
+        )
+    return program, lambda inputs: program.module()(noise.clone(), *(inputs[key] for key in keys))
 
 
-requires_transformers_5_5_4 = pytest.mark.skipif(
-    Version(transformers.__version__) < Version("5.5.4"),
-    reason="transformers before 5.5.4 also scales the temporal position of still images",
-)
+def _noise(policy):
+    torch.manual_seed(0)
+    return torch.randn(1, CHUNK_SIZE, policy.config.max_action_dim)
 
 
-def test_precompute_grid_thw_sampling_matches_stock_and_exports(monkeypatch):
+def test_prepared_sampling_exports_and_matches_eager(monkeypatch):
+    import lerobot.policies.eo1.modeling_eo1 as modeling
+
     policy, batch = _sampling_policy_and_batch(monkeypatch)
-    torch.manual_seed(0)
-    expected = policy.predict_action_chunk(batch)
+    noise = _noise(policy)
+    expected = policy.predict_action_chunk(batch, noise=noise.clone())
 
-    builds = count_grid_builds(monkeypatch)
-    policy.config.precompute_grid_thw = True
+    builds, probes = count_grid_builds(monkeypatch), []
+    probe = modeling.qwen2_5_image_temporal_scale
+    monkeypatch.setattr(modeling, "qwen2_5_image_temporal_scale", lambda vlm: probes.append(1) or probe(vlm))
     batch["action_token_start"] = 10
-    for _ in range(2):  # The second call reuses the cached grid.
-        torch.manual_seed(0)
-        assert torch.equal(policy.predict_action_chunk(batch), expected)
+    with prepare_image_grid():
+        for _ in range(2):  # The second call reuses the prepared grid.
+            assert torch.equal(policy.predict_action_chunk(batch, noise=noise.clone()), expected)
     assert len(builds) == 1
-
-    if Version(transformers.__version__).release < (5, 5, 4):
-        with pytest.raises(RuntimeError, match="needs transformers 5.5.4 or later"):
-            _export_sampling(policy, batch)
-        return
-    program, run = _export_sampling(policy, batch)
-    torch.manual_seed(0)
-    torch.testing.assert_close(run(batch), expected)
-    assert len(builds) == 1
+    # The exported positions follow the installed transformers' still-image convention, probed once.
+    program, run = _export_sampling(policy, batch, noise)
+    torch.testing.assert_close(run(batch), expected, rtol=0, atol=0)
+    assert len(builds) == 1 and len(probes) == 1
     assert data_dependent_nodes(program) == []
-    # The exported program keeps the prompt checks: one action token fewer is rejected.
+    # The prompt checks: one action token fewer is rejected by the exported program, and in eager mode
+    # even with the switch that turns off the transformers checks.
     malformed = {**batch, "input_ids": batch["input_ids"].clone()}
     malformed["input_ids"][0, -2] = 2
-    # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        run(malformed)
+    # Also the action tokens out of one chunk at `action_token_start`, and an image token fewer.
+    split = {**batch, "input_ids": batch["input_ids"].clone()}
+    split["input_ids"][0, -2:] = torch.tensor([2, ACTION_TOKEN_ID])
+    fewer_images = {**batch, "input_ids": batch["input_ids"].clone()}
+    fewer_images["input_ids"][0, 4] = 1
+    for wrong in (malformed, split, fewer_images):
+        # no_grad restores grad mode, which the program turns off and would leave off when its assert fails.
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            run(wrong)
+    monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
+    with pytest.raises(ValueError, match="exactly 3 action tokens"):
+        policy.predict_action_chunk(malformed)
+    with pytest.raises(ValueError, match="contiguous chunk"):
+        policy.predict_action_chunk(split)
+    # Samples whose action tokens sit at different places.
+    rows = torch.cat([batch["input_ids"], batch["input_ids"].roll(-1, dims=1)])
+    shifted = {
+        **{key: value for key, value in batch.items() if key != "action_token_start"},
+        OBS_STATE: batch[OBS_STATE].repeat(2, 1),
+        "input_ids": rows,
+        "attention_mask": rows.ne(0).long(),
+        "pixel_values": batch["pixel_values"].repeat(2, 1),
+        "image_grid_thw": batch["image_grid_thw"].repeat(2, 1),
+        "mm_token_type_ids": rows.eq(40).int(),
+    }
+    with pytest.raises(ValueError, match="share the same action token mask"):
+        policy.predict_action_chunk(shifted)
 
 
-def test_precompute_grid_thw_export_refuses_transformers_before_5_5_4(monkeypatch):
+def test_sampling_export_without_preparation_explains(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
-    policy.config.precompute_grid_thw = True
-    batch["action_token_start"] = 10
-    policy.predict_action_chunk(batch)
-    monkeypatch.setattr(transformers, "__version__", "5.5.3")
-    policy.predict_action_chunk(batch)  # eager mode runs the stock code on every version
-    with pytest.raises(RuntimeError, match="needs transformers 5.5.4 or later, found 5.5.3"):
-        _export_sampling(policy, batch)
+    noise = _noise(policy)
+    policy.predict_action_chunk({**batch, "action_token_start": 10}, noise=noise.clone())
+    with pytest.raises(RuntimeError, match="no image grid was prepared"):
+        _export_sampling(policy, {**batch, "action_token_start": 10}, noise)
 
 
-@requires_transformers_5_5_4
-def test_precompute_grid_thw_rebuilds_a_changed_grid(monkeypatch):
+def test_preparation_follows_a_changed_grid(monkeypatch):
     policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
     # Same image count and token count, different shape: a stale cache would give other positions and windows.
-    changed = {**batch, "image_grid_thw": torch.tensor([[1, 2, 8]])}
-    torch.manual_seed(0)
-    expected = policy.predict_action_chunk(changed)
+    changed = {**batch, "image_grid_thw": torch.tensor([[1, 2, 8]]), "action_token_start": 10}
+    expected = policy.predict_action_chunk(changed, noise=noise.clone())
 
     # With the export checks off, only the rebuild keeps the cache right.
     monkeypatch.setenv("TRANSFORMERS_DISABLE_TORCH_CHECK", "1")
-    policy.config.precompute_grid_thw = True
-    for inputs in (batch, changed):
-        policy.predict_action_chunk({**inputs, "action_token_start": 10})
-    _, run = _export_sampling(policy, {**changed, "action_token_start": 10})
-    torch.manual_seed(0)
-    torch.testing.assert_close(run({**changed, "action_token_start": 10}), expected)
+    with prepare_image_grid():
+        for inputs in ({**batch, "action_token_start": 10}, changed):
+            policy.predict_action_chunk(inputs, noise=noise.clone())
+    _, run = _export_sampling(policy, changed, noise)
+    torch.testing.assert_close(run(changed), expected)
+
+
+def test_preparation_and_export_refuse_hidden_vision_tokens(monkeypatch):
+    policy, batch = _sampling_policy_and_batch(monkeypatch)
+    noise = _noise(policy)
+    action_tokens = [ACTION_TOKEN_ID] * CHUNK_SIZE
+    input_ids = torch.tensor([[0, 1, 41, 40, 40, 42, 41, 40, 40, 42, STATE_TOKEN_ID, 10, *action_tokens, 2]])
+    batch = {
+        **batch,
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+        "image_grid_thw": torch.tensor([[1, 2, 4], [1, 4, 2]]),
+        "mm_token_type_ids": input_ids.eq(40).int(),
+        "action_token_start": 12,
+    }
+
+    def hide(*tokens):
+        attention_mask = batch["attention_mask"].clone()
+        attention_mask[0, list(tokens)] = 0
+        return {**batch, "attention_mask": attention_mask}
+
+    # A vision start token, an image token, a vision end token, a text token inside the prompt, and every token.
+    refused = (hide(2), hide(3), hide(5), hide(11), hide(*range(input_ids.shape[1])))
+    with prepare_image_grid():
+        policy.predict_action_chunk(batch, noise=noise.clone())
+        for inputs in refused:
+            with pytest.raises(ValueError, match="must hide only padding"):
+                policy.predict_action_chunk(inputs, noise=noise.clone())
+    _, run = _export_sampling(policy, batch, noise)
+    for inputs in refused:
+        with torch.no_grad(), pytest.raises(RuntimeError):
+            run(inputs)
+    more_padding = hide(1)
+    expected = policy.predict_action_chunk(more_padding, noise=noise.clone())
+    torch.testing.assert_close(run(more_padding), expected, rtol=0, atol=0)

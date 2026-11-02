@@ -22,7 +22,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import packaging.version
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
@@ -40,20 +39,24 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
-from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, qwen_image_rope_index
+from ..common.input_checks import check_input
+from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_image_temporal_scale, qwen2_5_vision_forward
+from ..common.qwen_vision import (
+    check_visible_images,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from ..common.vla_utils import create_sinusoidal_pos_embedding, pad_vector
 from ..pretrained import PreTrainedPolicy
+from ..utils import is_exporting
 from .configuration_eo1 import EO1Config
 from .processor_eo1 import EO1_SPECIAL_TOKENS
 
 if TYPE_CHECKING or _transformers_available:
-    import transformers
     from transformers.activations import ACT2FN
     from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
     from transformers.utils import torch_compilable_check
 else:
-    transformers = None
     ACT2FN = None
     Qwen2_5_VLForConditionalGeneration = None
     Qwen2_5_VLProcessor = None
@@ -134,12 +137,17 @@ class EO1Policy(PreTrainedPolicy):
         return loss, loss_dict
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        """Predict a chunk of actions.
+
+        `noise` is the optional starting sample of the flow, shape `(batch_size, chunk_size, max_action_dim)`.
+        When it is None, standard normal noise is drawn.
+        """
         self.eval()
 
         states = self.prepare_state(batch[OBS_STATE])
         model_inputs = self._get_model_inputs(batch, {OBS_STATE})
-        actions = self.model.sample_actions(states=states, **model_inputs).to(torch.float32)
+        actions = self.model.sample_actions(states=states, noise=noise, **model_inputs).to(torch.float32)
 
         return actions[:, :, : _original_action_dim(self.config)]
 
@@ -204,11 +212,11 @@ class EO1Policy(PreTrainedPolicy):
         return require_single_text_output(outputs, policy_name="EO-1")
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         self.eval()
 
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch, noise=noise)[:, : self.config.n_action_steps]
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
@@ -280,9 +288,16 @@ class EO1VisionFlowMatchingModel(nn.Module):
         self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size, dtype=torch.float32)
         self.gradient_checkpointing_enabled = False
         self._vision_grid: Qwen2_5VisionGrid | None = None
+        self._image_temporal_scale: int | None = None
 
     def get_input_embeddings(self):
         return self.vlm_backbone.get_input_embeddings()
+
+    def _rope_temporal_scale(self) -> int:
+        """The still-image temporal scale of the installed `get_rope_index`, probed once while preparing an export."""
+        if self._image_temporal_scale is None:
+            self._image_temporal_scale = qwen2_5_image_temporal_scale(self.vlm_backbone.model)
+        return self._image_temporal_scale
 
     def flow_head_autocast_context(self):
         if self.config.force_fp32_autocast:
@@ -592,6 +607,7 @@ class EO1VisionFlowMatchingModel(nn.Module):
         *,
         state_token_id: int,
         action_token_id: int,
+        noise: Tensor | None = None,
         action_token_start: int | None = None,
         **kwargs,
     ) -> Tensor:
@@ -650,32 +666,21 @@ class EO1VisionFlowMatchingModel(nn.Module):
         attention_mask = attention_mask.to(device)
         mm_token_type_ids = mm_token_type_ids.to(device)
         vlm = self.vlm_backbone.model
-        vision_grid = None
-        if self.config.precompute_grid_thw and pixel_values is not None:
-            vision_grid = self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
-                self._vision_grid, vlm.visual, image_grid_thw
-            )
-        # Eager mode keeps the stock calls, so FSDP and checkpointing hooks on the backbone run as before.
-        if vision_grid is not None and pixel_values is not None and torch.compiler.is_exporting():
-            installed = transformers.__version__
-            # 5.4.0 to 5.5.3 scale the temporal rope position of still images in `get_rope_index`, which eager
-            # mode calls; the exported positions follow 5.5.4 and later, so they would not match.
-            if packaging.version.Version(installed).release < (5, 5, 4):
-                raise RuntimeError(
-                    f"Exporting EO-1 with precompute_grid_thw needs transformers 5.5.4 or later, found {installed}: "
-                    "earlier releases place still images at other temporal rope positions, so the exported "
-                    "program would not match eager mode."
-                )
+        grid = self._vision_grid = Qwen2_5VisionGrid.track(self._vision_grid, vlm.visual, image_grid_thw)
+        if grid is not None and (is_preparing_image_grid() or is_exporting()):
+            check_visible_images(input_ids, attention_mask, vlm.config)
+            # Probed while preparing, because the export cannot run `get_rope_index`.
+            image_temporal_scale = self._rope_temporal_scale()
+        if grid is not None and pixel_values is not None and is_exporting():
             position_ids = qwen_image_rope_index(
                 input_ids,
                 attention_mask,
-                vision_grid.grid_thw,
+                grid.grid_thw,
                 vlm.visual.spatial_merge_size,
                 vlm.config.image_token_id,
+                image_temporal_scale=image_temporal_scale,
             )
-            image_embeds = qwen2_5_vision_forward(
-                vlm.visual, pixel_values.type(vlm.visual.dtype), image_grid_thw, vision_grid
-            )
+            image_embeds = qwen2_5_vision_forward(vlm.visual, pixel_values.type(vlm.visual.dtype), grid)
             image_mask = input_ids == vlm.config.image_token_id
             check_input(
                 image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match."
@@ -705,10 +710,12 @@ class EO1VisionFlowMatchingModel(nn.Module):
             return_dict=True,
         )
 
-        x_t = self.sample_noise(
-            (batch_size, chunk_size, self.config.max_action_dim),
-            device,
-        ).to(dtype=self.action_in_proj.weight.dtype)
+        if noise is None:
+            noise = self.sample_noise(
+                (batch_size, chunk_size, self.config.max_action_dim),
+                device,
+            )
+        x_t = noise.to(device=device, dtype=self.action_in_proj.weight.dtype)
         past_key_values = outputs.past_key_values
 
         # 3. Denoise only the action chunk while keeping the prefix cache invariant.

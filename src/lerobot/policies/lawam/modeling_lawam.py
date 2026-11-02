@@ -147,7 +147,6 @@ def _build_native_policy_config(config: LaWAMConfig) -> LatentWorldPolicyConfig:
     policy_cfg.repeated_diffusion_steps = int(config.repeated_diffusion_steps)
     policy_cfg.num_action_queries = int(config.num_action_queries)
     policy_cfg.flow_action_num_queries = int(config.flow_action_num_queries)
-    policy_cfg.precompute_grid_thw = bool(config.precompute_grid_thw)
     return policy_cfg
 
 
@@ -205,15 +204,6 @@ class LaWAMPolicy(PreTrainedPolicy):
 
         self.model.to(config.device)
         self.reset()
-
-    @classmethod
-    def _load_as_safetensor(
-        cls, model: LaWAMPolicy, model_file: str, map_location: str, strict: bool
-    ) -> LaWAMPolicy:
-        """Stage LaWAM checkpoint loading on CPU to avoid duplicate accelerator weights."""
-        del map_location
-        model.to("cpu")
-        return super()._load_as_safetensor(model, model_file, "cpu", strict)
 
     def reset(self) -> None:
         """Clear the queued action chunk used by step-wise inference."""

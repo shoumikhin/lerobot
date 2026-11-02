@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-from lerobot.policies.common.qwen_vision import check_input
+from lerobot.policies.common.input_checks import check_input
 
 from .cross_attention_dit import AlternateVLDiT, DiT
 

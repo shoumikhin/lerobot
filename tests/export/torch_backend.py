@@ -1,0 +1,150 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""A test runtime and backend for bundles, so tests need no compiler: programs are saved `torch.export`
+programs, run in PyTorch. A bundle names this module in `runtime_imports`, which registers the runtime, as a
+compiler's own module registers its kernels with a real runtime.
+"""
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from safetensors.numpy import save_file
+from torch import Tensor, nn
+
+from lerobot.bundle.manifest import NOISE, TEST_CASE, Bundle, BundleManifest, ProgramFiles, ProgramRun
+from lerobot.bundle.runtime import Runtime, register_runtime
+from lerobot.export.configs import ExportBackendConfig
+from lerobot.utils.constants import ACTION
+
+
+class TorchProgram:
+    """Runs a saved `torch.export` program. A data file, when given, must exist."""
+
+    def __init__(self, path: Path, data: Path | None = None):
+        if data is not None and not data.is_file():
+            raise FileNotFoundError(data)
+        self._module = torch.export.load(path).module()
+
+    def __call__(self, *inputs: Any) -> tuple[Tensor, ...]:
+        with torch.no_grad():
+            outputs = self._module(*(torch.as_tensor(x) for x in inputs))
+        return outputs if isinstance(outputs, tuple) else (outputs,)
+
+    def to_numpy(self, value: Tensor) -> np.ndarray:
+        return value.numpy()
+
+    def place(self, index: int, value: np.ndarray) -> Tensor:
+        return torch.as_tensor(value)
+
+
+register_runtime("torch_test", Runtime(TorchProgram))
+
+
+def record_places(monkeypatch) -> list[tuple[int, ...]]:
+    """From now on, record the shape of each value the runtime copies to where a program reads it."""
+    shapes: list[tuple[int, ...]] = []
+    place = TorchProgram.place
+    monkeypatch.setattr(
+        TorchProgram,
+        "place",
+        lambda self, index, value: shapes.append(value.shape) or place(self, index, value),
+    )
+    return shapes
+
+
+def make_bundle(
+    folder: Path,
+    module: nn.Module,
+    frame: dict[str, np.ndarray],
+    *,
+    noise_shape: tuple[int, ...] | None = None,
+    task: str | None = None,
+    action_names: list[str] | None = None,
+    data: str | None = None,
+    expected_offset: float = 0.0,
+    history: dict[str, int] | None = None,
+) -> Bundle:
+    """Write a one-program bundle of `module`, whose test case expects its actions plus `expected_offset`.
+
+    With `noise_shape`, the program takes a starting noise after the frame. With `data`, the program names
+    a data file of that name, written beside it. With `history`, each value of `frame` holds the frames of
+    several ticks, and the program takes the last frames of the keys `history` names, as the policies' queues
+    keep them: the first frame repeated until the queue is full.
+    """
+    folder.mkdir(parents=True)
+    case = dict(frame)
+    values = {}
+    for name, value in frame.items():
+        if size := (history or {}).get(name):
+            value = np.stack([value[0]] * max(size - len(value), 0) + list(value[-size:]))
+        elif history:
+            value = value[-1]
+        values[name] = value
+    if noise_shape is not None:
+        case[NOISE] = values[NOISE] = np.random.default_rng(0).standard_normal(noise_shape).astype(np.float32)
+    inputs = tuple(torch.from_numpy(x) for x in values.values())
+    torch.export.save(torch.export.export(module, inputs), folder / "model.pt2")
+    if data is not None:
+        (folder / data).write_bytes(b"")
+    with torch.no_grad():
+        actions = module(*inputs).numpy() + expected_offset
+    save_file({**case, ACTION: actions}, folder / TEST_CASE)
+    manifest = BundleManifest(
+        backend="torch_test",
+        runtime="torch_test",
+        runtime_imports=["tests.export.torch_backend"],
+        programs={"model": ProgramFiles("model.pt2", data)},
+        runs=[ProgramRun("model", "model", list(case), [ACTION])],
+        noise_shape=None if noise_shape is None else list(noise_shape),
+        history=history or {},
+        task=task,
+        action_names=action_names,
+        action_scale=[1.0] * actions.shape[-1],
+        tolerance=1e-4,
+    )
+    Bundle(folder, manifest).write()
+    return Bundle.read(folder)
+
+
+class _Offset(nn.Module):
+    def __init__(self, module: nn.Module, offset: float):
+        super().__init__()
+        self.module = module
+        self.offset = offset
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        return self.module(*inputs) + self.offset
+
+
+@ExportBackendConfig.register_subclass("torch_test")
+@dataclass
+class TorchTestBackend(ExportBackendConfig):
+    """Saves the `torch.export` program. A nonzero `offset` is added to its outputs, to fail the check."""
+
+    runtime = "torch_test"
+    file_suffix = ".pt2"
+    device = "cpu"
+    runtime_imports = ("tests.export.torch_backend",)
+
+    offset: float = 0.0
+
+    def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+        if self.offset:
+            args, _ = program.example_inputs
+            program = torch.export.export(_Offset(program.module(), self.offset), args)
+        torch.export.save(program, path)

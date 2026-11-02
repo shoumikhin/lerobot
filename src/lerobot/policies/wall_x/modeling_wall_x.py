@@ -64,10 +64,15 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
+from ..common.input_checks import check_input
 from ..common.qwen2_5_vision import Qwen2_5VisionGrid, qwen2_5_vision_forward
-from ..common.qwen_vision import check_input, qwen_image_rope_index
+from ..common.qwen_vision import (
+    check_visible_images,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
 from ..pretrained import PreTrainedPolicy
-from ..utils import log_model_loading_keys, populate_queues
+from ..utils import is_exporting, log_model_loading_keys, populate_queues
 from .configuration_wall_x import WallXConfig
 from .constant import WALL_X_GENERATION_PROMPT_IDS
 from .qwen_model import Qwen2_5_VLConfig
@@ -1082,6 +1087,8 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
         agent_pos_mask: torch.FloatTensor | None = None,
         generation_prompt_ids: torch.LongTensor | None = None,
         re_generate: bool = False,
+        *,
+        noise: torch.Tensor | None = None,
         vision_grid: Qwen2_5VisionGrid | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
@@ -1121,9 +1128,11 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             dof_mask (torch.FloatTensor, optional): Degrees of freedom mask
             agent_pos_mask (torch.FloatTensor, optional): Agent position mask
             re_generate (bool, optional): Whether to use sampling for regeneration
-            vision_grid (Qwen2_5VisionGrid, optional): The cache of ``image_grid_thw`` from
-                ``Qwen2_5VisionGrid.reuse_or_build``; under ``torch.export`` the vision tower then runs without
-                reading ``image_grid_thw`` on the host
+            noise (torch.Tensor, optional): Starting sample for diffusion mode, shape
+                (batch_size, pred_horizon, action_dim). Drawn from a standard normal when None.
+            vision_grid (Qwen2_5VisionGrid, optional): The prepared cache of ``image_grid_thw`` (see
+                ``FixedImageGrid.track``), passed under ``torch.export``: the vision tower then runs from it,
+                without reading ``image_grid_thw`` on the host
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -1164,16 +1173,14 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                 if vision_grid is None:
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
                 else:
-                    image_embeds = qwen2_5_vision_forward(
-                        self.visual, pixel_values, image_grid_thw, vision_grid
-                    )
-                n_image_tokens = (input_ids == self.config.image_token_id).sum()
+                    image_embeds = qwen2_5_vision_forward(self.visual, pixel_values, vision_grid)
+                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
 
                 # Validate image token and feature count match
                 check_input(
                     n_image_tokens == n_image_features,
-                    lambda: f"Image features and image tokens do not match: tokens: {int(n_image_tokens)}, features {n_image_features}",
+                    lambda: f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}",
                 )
 
                 mask = input_ids == self.config.image_token_id
@@ -1223,7 +1230,6 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
                     f"Proprioception features and state tokens do not match: each sample needs "
                     f"{tokens_per_sample} state tokens.",
                 )
-                proprio_embed = proprio_embed.to(torch.bfloat16)
                 inputs_embeds = inputs_embeds.masked_scatter(
                     proprioception_mask.unsqueeze(-1).expand_as(inputs_embeds),
                     proprio_embed.reshape(-1, inputs_embeds.shape[-1]).to(inputs_embeds.dtype),
@@ -1394,7 +1400,9 @@ class Qwen2_5_VLMoEForAction(Qwen2_5_VLForConditionalGeneration):  # noqa: N801
             if dof_mask is None:
                 raise ValueError("Diffusion action prediction requires dof_mask.")
             # Initialize with random noise
-            noisy_action = sample_noise((batch_size, pred_horizon, action_dim), inputs_embeds.device)
+            if noise is None:
+                noise = sample_noise((batch_size, pred_horizon, action_dim), inputs_embeds.device)
+            noisy_action = noise.to(device=inputs_embeds.device, dtype=torch.float32)
             dof_mask = dof_mask.to(inputs_embeds.device).to(torch.float32)
 
             action_mask = input_ids == self.action_token_id_set["action_token_id"]
@@ -1913,18 +1921,10 @@ class WallXPolicy(PreTrainedPolicy):
             inputs["rope_deltas"] = rope_deltas
         return inputs
 
-    def _cached_vision_grid(self, batch: BatchFeature) -> Qwen2_5VisionGrid:
-        """Vision metadata of the batch's camera grid, rebuilt in eager mode when the grid changes."""
+    def _static_grid_inputs(self, batch: BatchFeature, vision_grid: Qwen2_5VisionGrid) -> dict[str, Any]:
+        """Vision metadata and rope positions of the prepared camera grid, for `torch.export`."""
         if batch.get("video_grid_thw") is not None:
-            raise ValueError("WALL-X precompute_grid_thw supports images only.")
-        vision_grid = self._vision_grid = Qwen2_5VisionGrid.reuse_or_build(
-            self._vision_grid, self.model.visual, batch["image_grid_thw"]
-        )
-        return vision_grid
-
-    def _static_grid_inputs(self, batch: BatchFeature) -> dict[str, Any]:
-        """Vision metadata and rope positions of the cached camera grid, for `torch.export`."""
-        vision_grid = self._cached_vision_grid(batch)
+            raise ValueError("WALL-X exports image inputs only.")
         position_ids = qwen_image_rope_index(
             batch["input_ids"],
             batch["attention_mask"],
@@ -2026,8 +2026,16 @@ class WallXPolicy(PreTrainedPolicy):
         return require_single_text_output(outputs, policy_name="WALL-X")
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict action chunk for evaluation."""
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        """Predict action chunk for evaluation.
+
+        `noise` is the optional starting sample of the diffusion mode, shape
+        `(batch_size, chunk_size, max_action_dim)`. It is not used by the fast mode.
+
+        The diffusion mode can be exported with `torch.export` under `torch.no_grad()` after an eager call inside
+        `prepare_image_grid()`. With grad enabled, export fails with a `SpecViolationError`: it wraps this method's
+        `no_grad` region, and transformers' vmap-based mask functions inside it do not survive that.
+        """
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
@@ -2039,18 +2047,20 @@ class WallXPolicy(PreTrainedPolicy):
         action_dim = self.config.output_features[ACTION].shape[0]
 
         if self.config.prediction_mode == "diffusion":
-            # Eager mode keeps the stock calls, so FSDP and checkpointing hooks run as before; it only keeps
-            # the cache current for a later export.
-            if self.config.precompute_grid_thw and torch.compiler.is_exporting():
-                batch.update(self._static_grid_inputs(batch))
-            elif self.config.precompute_grid_thw:
-                self._cached_vision_grid(batch)
+            vision_grid = self._vision_grid = Qwen2_5VisionGrid.track(
+                self._vision_grid, self.model.visual, batch["image_grid_thw"]
+            )
+            if vision_grid is not None and (is_preparing_image_grid() or is_exporting()):
+                check_visible_images(batch["input_ids"], batch["attention_mask"], self.model.config)
+            if vision_grid is not None and is_exporting():
+                batch.update(self._static_grid_inputs(batch, vision_grid))
             output = self.model(
                 **batch,
                 action_dim=self.config.max_action_dim,
                 pred_horizon=self.config.chunk_size,
                 mode="predict",
                 predict_mode="diffusion",
+                noise=noise,
             )
         elif self.config.prediction_mode == "fast":
             if not isinstance(generation_prompt_ids, Tensor):
@@ -2077,14 +2087,14 @@ class WallXPolicy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """Select single action for environment execution."""
         self.eval()
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         # Use action queue
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
 
         return self._queues[ACTION].popleft()

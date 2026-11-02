@@ -57,7 +57,6 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
-from tests.policies.common.fixed_grid_checks import requires_gloo
 
 
 def _groot_features(
@@ -221,124 +220,104 @@ def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypa
         )
 
 
-def test_n1_7_backbone_precompute_grid_thw_matches_stock_and_trains(monkeypatch):
-    pytest.importorskip("transformers")
-
+def _tiny_n1_7_backbone(monkeypatch):
     from transformers import Qwen3VLForConditionalGeneration
-    from transformers.feature_extraction_utils import BatchFeature
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
-    from tests.policies.common.fixed_grid_checks import count_grid_builds
-    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+    from tests.policies.common.qwen3_vl_helpers import tiny_qwen3_vl_config
 
     torch.manual_seed(0)
     qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
     monkeypatch.setattr(
         groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
     )
-    batch = BatchFeature(image_prompts(qwen.config))
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, tune_visual=True, precompute_grid_thw=precompute)
-        for precompute in (False, True)
-    )
-
-    builds = count_grid_builds(monkeypatch)
-    for _ in range(2):  # The second step reuses the cached grid, and backward must still reach pos_embed.
-        for backbone in (stock, fixed):
-            backbone.zero_grad()
-        expected = stock(batch)["backbone_features"]
-        expected.square().sum().backward()
-        actual = fixed(batch)["backbone_features"]
-        actual.square().sum().backward()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        torch.testing.assert_close(fixed.visual.pos_embed.weight.grad, stock.visual.pos_embed.weight.grad)
-    assert len(builds) == 1
+    return groot_n1_7.Qwen3Backbone(select_layer=2).eval()
 
 
-def test_n1_7_backbone_precompute_grid_thw_keeps_legacy_positions_and_exports(monkeypatch):
+def test_n1_7_backbone_exports_a_prepared_image_grid_with_legacy_positions(monkeypatch):
     pytest.importorskip("transformers")
 
-    from transformers import Qwen3VLForConditionalGeneration
     from transformers.feature_extraction_utils import BatchFeature
 
-    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
     from tests.policies.common.fixed_grid_checks import count_grid_builds, data_dependent_nodes
-    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts, tiny_qwen3_vl_config
+    from tests.policies.common.qwen3_vl_helpers import STOCK_DEEPSTACK, image_prompts
 
-    torch.manual_seed(0)
-    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
-    monkeypatch.setattr(
-        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
-    )
-    prompts = image_prompts(qwen.config)
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, precompute_grid_thw=precompute).eval()
-        for precompute in (False, True)
-    )
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
     positions = []
 
     def record_positions(module, args, kwargs):
         positions.append(kwargs["position_ids"])
 
-    for backbone in (stock, fixed):
-        backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
-    with torch.no_grad():
-        expected = stock(BatchFeature(prompts))["backbone_features"]
-    with pytest.raises(ValueError, match="images only"):
-        fixed(BatchFeature({**prompts, "pixel_values_videos": prompts["pixel_values"]}))
-
-    builds = count_grid_builds(monkeypatch)
-    keys = sorted(prompts)
+    backbone.language_model.register_forward_pre_hook(record_positions, with_kwargs=True)
 
     class Backbone(torch.nn.Module):
-        def forward(self, *tensors):
-            return fixed(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
+        def __init__(self, keys):
+            super().__init__()
+            self.keys = keys
 
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(self.keys, tensors, strict=True))))["backbone_features"]
+
+    keys = sorted(prompts)
+    inputs = tuple(prompts[key] for key in keys)
+    builds = count_grid_builds(monkeypatch)
     with torch.no_grad():
-        positions.clear()
-        assert torch.equal(Backbone()(*(prompts[key] for key in keys)), expected)
-        exported = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False)
-        torch.testing.assert_close(exported.module()(*(prompts[key] for key in keys)), expected)
+        expected = backbone(BatchFeature(prompts))["backbone_features"]
+        with prepare_image_grid():
+            assert torch.equal(Backbone(keys)(*inputs), expected)
+        exported = torch.export.export(Backbone(keys), inputs, strict=False)
+        torch.testing.assert_close(exported.module()(*inputs), expected)
+        with pytest.raises(ValueError, match="image inputs only"):
+            torch.export.export(
+                Backbone([*keys, "pixel_values_videos"]), (*inputs, prompts["pixel_values"]), strict=False
+            )
     # The stock path adds the legacy text row as a fourth row; the exported path must pass the same.
-    assert positions[0].shape[0] == 4
+    assert torch.equal(backbone._fixed_grid_position_ids(prompts, backbone._vision_grid), positions[0])
     assert positions[-1].shape == positions[0].shape
     assert len(builds) == 1
     assert data_dependent_nodes(exported, skip_functions=STOCK_DEEPSTACK) == []
 
 
-@requires_gloo
-def test_n1_7_backbone_precompute_grid_thw_keeps_a_whole_qwen_fsdp_wrap(monkeypatch, tmp_path):
+def test_n1_7_backbone_refuses_hidden_image_tokens_also_after_export(monkeypatch):
     pytest.importorskip("transformers")
 
-    from transformers import Qwen3VLForConditionalGeneration
     from transformers.feature_extraction_utils import BatchFeature
 
-    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
-    from tests.policies.common.fixed_grid_checks import run_with_fsdp
-    from tests.policies.common.qwen3_vl_helpers import image_prompts, tiny_qwen3_vl_config
+    from lerobot.policies.common.qwen_vision import prepare_image_grid
+    from tests.policies.common.qwen3_vl_helpers import IMAGE_TOKEN_ID, image_prompts
 
-    torch.manual_seed(0)
-    qwen = Qwen3VLForConditionalGeneration(tiny_qwen3_vl_config()).eval()
-    monkeypatch.setattr(
-        groot_n1_7.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *args, **kwargs: deepcopy(qwen)
-    )
-    batch = BatchFeature(image_prompts(qwen.config))
-    stock, fixed = (
-        groot_n1_7.Qwen3Backbone(select_layer=2, tune_visual=True, precompute_grid_thw=precompute)
-        for precompute in (False, True)
-    )
-    expected = stock(batch)["backbone_features"].detach()
+    backbone = _tiny_n1_7_backbone(monkeypatch)
+    prompts = image_prompts(backbone.model.config)
+    keys = sorted(prompts)
+    image_tokens = (prompts["input_ids"][1] == IMAGE_TOKEN_ID).nonzero()[:, 0].tolist()
 
-    # The whole Qwen model as one FSDP2 unit (an `fsdp.wrap_modules` override): its parameters are only gathered
-    # when the model itself is called.
-    actual = run_with_fsdp(
-        tmp_path,
-        fixed,
-        lambda backbone: backbone(batch)["backbone_features"],
-        lambda backbone: [backbone.model],
-        reshard_after_forward=False,
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    def hide(tokens):
+        attention_mask = prompts["attention_mask"].clone()
+        attention_mask[1, tokens] = 0
+        return tuple({**prompts, "attention_mask": attention_mask}[key] for key in keys)
+
+    class Backbone(torch.nn.Module):
+        def forward(self, *tensors):
+            return backbone(BatchFeature(dict(zip(keys, tensors, strict=True))))["backbone_features"]
+
+    # In the second prompt: an image token, the text token between its images (eager would join them into one
+    # image), and every token.
+    refused = (hide(image_tokens[:1]), hide([image_tokens[3] + 1]), hide(slice(None)))
+    with torch.no_grad():
+        with prepare_image_grid():
+            Backbone()(*(prompts[key] for key in keys))
+            for inputs in refused:
+                with pytest.raises(ValueError, match="must hide only padding"):
+                    Backbone()(*inputs)
+        program = torch.export.export(Backbone(), tuple(prompts[key] for key in keys), strict=False).module()
+        for inputs in refused:
+            with pytest.raises(RuntimeError):
+                program(*inputs)
+        # Hiding the first token of the unpadded prompt only adds padding.
+        more_padding = hide([0])
+        torch.testing.assert_close(program(*more_padding), Backbone()(*more_padding))
 
 
 def _write_raw_n1_7_libero_checkpoint(path):
@@ -1377,6 +1356,70 @@ def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
     assert f"{OBS_IMAGES}.image2" not in output[TransitionKey.OBSERVATION]
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+@pytest.mark.parametrize(
+    ("input_horizon", "video_horizon", "expected_timesteps"),
+    [
+        (None, None, [0]),
+        (3, None, [0, 1, 2]),
+        (2, 4, [0, 0, 0, 1]),
+        (4, 2, [2, 3]),
+    ],
+)
+def test_groot_n1_7_pack_inputs_video_layout(dtype, input_horizon, video_horizon, expected_timesteps):
+    def camera(camera_id):
+        # Every frame is filled with 100 * batch + 10 * camera + timestep.
+        timesteps = input_horizon or 1
+        frame_ids = 100 * torch.arange(2).view(2, 1) + 10 * camera_id + torch.arange(timesteps)
+        image = frame_ids.view(2, timesteps, 1, 1, 1).expand(2, timesteps, 3, 4, 5).to(torch.uint8)
+        if input_horizon is None:
+            image = image[:, 0]
+        return image.to(dtype) / 255 if dtype.is_floating_point else image
+
+    step = GrootN17PackInputsStep(normalize_min_max=False, video_horizon=video_horizon)
+    transition = {
+        TransitionKey.OBSERVATION: {
+            f"{OBS_IMAGES}.wrist": camera(2),
+            f"{OBS_IMAGES}.front": camera(1),
+            OBS_STATE: torch.zeros(2, 8),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Move"]},
+    }
+
+    video = np.asarray(step(transition)[TransitionKey.OBSERVATION]["video"])
+
+    expected_ids = np.array(
+        [[[100 * b + 10 * c + t for c in (1, 2)] for t in expected_timesteps] for b in range(2)],
+        dtype=np.uint8,
+    )
+    assert video.dtype == np.uint8
+    assert video.shape == (2, len(expected_timesteps), 2, 4, 5, 3)
+    np.testing.assert_array_equal(video, np.broadcast_to(expected_ids[..., None, None, None], video.shape))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_groot_n1_7_pack_inputs_keeps_cuda_video_on_device():
+    images = torch.rand(2, 3, 4, 5, generator=torch.Generator().manual_seed(0))
+
+    def pack(device):
+        step = GrootN17PackInputsStep(normalize_min_max=False, video_horizon=2)
+        transition = {
+            TransitionKey.OBSERVATION: {
+                f"{OBS_IMAGES}.front": images.to(device),
+                f"{OBS_IMAGES}.wrist": images.flip(-1).to(device),
+                OBS_STATE: torch.zeros(2, 8, device=device),
+            },
+            TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Move"]},
+        }
+        return step(transition)[TransitionKey.OBSERVATION]["video"]
+
+    video = pack("cuda")
+
+    assert isinstance(video, torch.Tensor)
+    assert video.is_cuda
+    np.testing.assert_array_equal(video.cpu().numpy(), pack("cpu"), strict=True)
+
+
 def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():
     step = GrootActionUnpackUnnormalizeStep(
         env_action_dim=3,
@@ -1959,6 +2002,76 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
         "pixel_values",
         "image_grid_thw",
     }
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_groot_n1_7_vlm_encode_builds_frames_on_target_device(device):
+    frame_ids = np.arange(12, dtype=np.uint8).reshape(2, 2, 3, 1, 1, 1)
+    video = np.broadcast_to(3 * frame_ids + np.arange(3, dtype=np.uint8), (2, 2, 3, 4, 5, 3)).copy()
+
+    frames = GrootN17VLMEncodeStep()._build_sample_images(
+        video, batch_size=2, target_device=torch.device(device)
+    )
+
+    for batch_idx, sample_frames in enumerate(frames):
+        assert len(sample_frames) == 6
+        for frame_idx, frame in enumerate(sample_frames):
+            timestep, view_idx = divmod(frame_idx, 3)
+            assert frame.device.type == device
+            torch.testing.assert_close(
+                frame.cpu(), torch.from_numpy(video[batch_idx, timestep, view_idx]).permute(2, 0, 1)
+            )
+
+
+def test_groot_n1_7_vlm_encode_runs_on_the_cpu_where_its_saved_device_is_missing(monkeypatch):
+    # A checkpoint trained on a GPU saves this step with device="cuda", and loads on machines without one.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    class FakeProcessor:
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, return_tensors, padding):
+            self.image_devices = {image.device.type for image in images}
+            return {"input_ids": torch.zeros(len(text), 1, dtype=torch.long)}
+
+    step = GrootN17VLMEncodeStep(device="cuda")
+    step._proc = FakeProcessor()
+    transition = {
+        TransitionKey.OBSERVATION: {"video": np.zeros((1, 1, 1, 2, 2, 3), dtype=np.uint8)},
+        TransitionKey.COMPLEMENTARY_DATA: {"language": ["task"]},
+    }
+
+    output = step(transition)
+
+    assert step._proc.image_devices == {"cpu"}
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["input_ids"].shape == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+    ],
+)
+def test_groot_n1_7_vlm_encode_albumentations_accepts_tensor_video(device):
+    pytest.importorskip("cv2", exc_type=ImportError)
+    video = np.random.default_rng(0).integers(0, 256, size=(1, 2, 2, 12, 16, 3), dtype=np.uint8)
+    step = GrootN17VLMEncodeStep(use_albumentations=True, image_target_size=[8, 8], image_crop_size=[6, 6])
+
+    expected = step._build_sample_images(video, batch_size=1, target_device=None)
+    actual = step._build_sample_images(torch.from_numpy(video).to(device), batch_size=1, target_device=None)
+
+    assert len(actual[0]) == len(expected[0]) == 4
+    for actual_frame, expected_frame in zip(actual[0], expected[0], strict=True):
+        np.testing.assert_array_equal(actual_frame, expected_frame)
 
 
 def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
@@ -2731,13 +2844,7 @@ def test_groot_policy_selects_n1_7_model_class(monkeypatch):
     policy = GrootPolicy(_groot_config())
 
     assert called["pretrained_model_name_or_path"] == GROOT_N1_7_BASE_MODEL
-    assert called["precompute_grid_thw"] is False
     assert isinstance(policy._groot_model, _DummyGrootModel)
-
-    config = _groot_config()
-    config.precompute_grid_thw = True
-    GrootPolicy(config)
-    assert called["precompute_grid_thw"] is True
 
 
 def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
@@ -3159,3 +3266,82 @@ def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     inference_inputs = {key: value for key, value in inputs.items() if key != "action"}
     action_output = model.get_action(inference_inputs)
     assert action_output["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+
+def test_action_encoder_takes_one_time_encoding_for_the_chunk():
+    from lerobot.policies.groot.groot_n1_7 import MultiEmbodimentActionEncoder
+
+    torch.manual_seed(0)
+    encoder = MultiEmbodimentActionEncoder(action_dim=3, hidden_size=8, num_embodiments=2)
+    actions = torch.randn(1, 5, 3)
+    cat_ids = torch.tensor([1])
+    timestep = torch.tensor([7])
+
+    time_encoding = encoder.pos_encoding(timestep[:, None])
+
+    assert time_encoding.shape == (1, 1, 8)
+    torch.testing.assert_close(
+        encoder.encode(actions, time_encoding, cat_ids), encoder(actions, timestep, cat_ids), atol=0, rtol=0
+    )
+
+
+def _alternate_vl_dit_before_the_split(
+    model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+):
+    """`AlternateVLDiT.forward` as it was written before its blocks and output became methods."""
+    temb = model.timestep_encoder(timestep)
+    image_attention_mask = image_mask & mask
+    non_image_attention_mask = (~image_mask) & mask
+    for idx, block in enumerate(model.transformer_blocks):
+        if idx % 2 == 1:
+            hidden_states = block(hidden_states, temb=temb)
+        else:
+            encoder_mask = (
+                non_image_attention_mask
+                if idx % (2 * model.attend_text_every_n_blocks) == 0
+                else image_attention_mask
+            )
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_mask,
+                temb=temb,
+            )
+    shift, scale = model.proj_out_1(torch.nn.functional.silu(temb)).chunk(2, dim=1)
+    return model.proj_out_2(model.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None])
+
+
+def test_alternate_vl_dit_computes_what_it_did_before_the_split():
+    pytest.importorskip("diffusers")
+    from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
+
+    torch.manual_seed(0)
+    model = AlternateVLDiT(
+        output_dim=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        num_layers=4,
+        dropout=0.0,
+        final_dropout=False,
+        max_num_positional_embeddings=16,
+        interleave_self_attention=True,
+        cross_attention_dim=6,
+    ).eval()
+    hidden_states, encoder_hidden_states = torch.randn(2, 5, 8), torch.randn(2, 7, 6)
+    timestep = torch.tensor([3, 600])
+    image_mask = torch.tensor([[True, True, True, False, False, False, False]] * 2)
+    mask = torch.tensor([[True] * 7, [True] * 5 + [False] * 2])
+
+    with torch.no_grad():
+        actual = model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            image_mask=image_mask,
+            backbone_attention_mask=mask,
+        )
+        expected = _alternate_vl_dit_before_the_split(
+            model, hidden_states, encoder_hidden_states, timestep, image_mask, mask
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
