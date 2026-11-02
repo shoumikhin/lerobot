@@ -129,32 +129,74 @@ def test_compile_gets_the_workspace_size_only_when_it_is_set(monkeypatch, tmp_pa
     assert seen == expected
 
 
-def use_fake_tensorrt(monkeypatch, compile):
-    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile`."""
+def use_fake_tensorrt(monkeypatch, compile, save=None):
+    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile` and whose `save` is `save`, the
+    CUDA partitioner of a part by its name, and the GPU memory config by a string."""
+    from lerobot.export.backends import executorch_tensorrt
+
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
     module.dynamo = types.SimpleNamespace(compile=compile)
+    module.save = save
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: f"partitioner of {name}")
+    monkeypatch.setattr(executorch_tensorrt, "gpu_memory_config", lambda: "GPU memory")
 
 
 def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-@pytest.mark.parametrize(("config", "expected"), [({}, True), ({"deduplicate_weights": False}, False)])
-def test_compile_gets_the_plugin_and_weight_sharing_settings(monkeypatch, tmp_path, config, expected):
+@pytest.mark.parametrize(
+    ("config", "deduplicate_weights"), [({}, True), ({"deduplicate_weights": False}, False)]
+)
+def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(
+    monkeypatch, tmp_path, config, deduplicate_weights
+):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     seen = {}
 
     def compile(program, arg_inputs, **options):
-        seen.update(options)
+        seen["compile"] = options
+        return "engine"
+
+    def save(engine, path, **options):
+        seen["save"] = engine, path, options
+
+    use_fake_tensorrt(monkeypatch, compile, save)
+    assert ExecuTorchTensorRTConfig(**config).compile(linear_program(), tmp_path / "model.pte") is None
+    assert seen["compile"] == {
+        "min_block_size": 1,
+        "fallback_pytorch_plugin_ops": True,
+        "truncate_double": True,
+        "offload_module_to_cpu": True,
+        "disable_tf32": True,
+        "deduplicate_weights": deduplicate_weights,
+    }
+    assert seen["save"] == (
+        "engine",
+        str(tmp_path / "model.pte"),
+        {
+            "output_format": "executorch",
+            "retrace": False,
+            "use_cuda_graphs": True,
+            "partitioners": ["partitioner of model"],
+            "backend_config": "GPU memory",
+        },
+    )
+
+
+def test_an_executorch_that_cannot_save_the_part_is_refused_before_tensorrt_builds(monkeypatch, tmp_path):
+    from lerobot.export.backends import executorch_tensorrt
+
+    def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
         raise ReachedCompileError
 
+    def refuse(name):
+        raise ValueError("pytorch/executorch#24314")
+
     use_fake_tensorrt(monkeypatch, compile)
-    with pytest.raises(ReachedCompileError):
-        ExecuTorchTensorRTConfig(**config).compile(linear_program(), tmp_path / "model.pte")
-    # Operators whose TensorRT plugins need PyTorch stay out of TensorRT; weights are shared unless the config
-    # says not to.
-    assert seen["fallback_pytorch_plugin_ops"] is True
-    assert seen["deduplicate_weights"] is expected
+    monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", refuse)
+    with pytest.raises(ValueError, match="24314"):
+        executorch_tensorrt.ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
