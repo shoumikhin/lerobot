@@ -17,6 +17,7 @@
 import pytest
 
 pytest.importorskip("transformers")
+pytest.importorskip("pydantic")
 
 from lerobot.data_processing.sarm_annotations.subtask_annotation import (
     Subtask,
