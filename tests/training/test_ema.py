@@ -26,6 +26,7 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.distributed.checkpoint import load_sharded_ema, save_sharded_ema
 from lerobot.optim.ema import EMA, ConstantEMAConfig, PowerEMAConfig, WarmupEMAConfig
 from lerobot.utils.constants import (
     EMA_STATE,
@@ -86,6 +87,57 @@ def test_ema_decay_schedules():
     assert WarmupEMAConfig().get_decay(10**9) == 0.9999
     # sigma_rel 0.1 is gamma 6.94 in EDM2.
     assert PowerEMAConfig(sigma_rel=0.1).get_decay(11) == pytest.approx((10 / 11) ** (6.9372 + 1), rel=1e-4)
+
+
+def _module_saved_and_resumed(
+    saved_wrapped: bool, whole: bool
+) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
+    """A module, and it with and without torch.compile's wrapper: the one saved from and the one resumed into."""
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    # The wrapper compiles on its first call, so here it only renames the parameters.
+    wrapped = torch.compile(model) if whole else torch.nn.Sequential(torch.compile(model[0]))
+    return (model, wrapped, model) if saved_wrapped else (model, model, wrapped)
+
+
+@pytest.mark.parametrize("whole", [False, True], ids=["submodule", "whole-model"])
+@pytest.mark.parametrize("saved_wrapped", [True, False], ids=["wrapped-to-plain", "plain-to-wrapped"])
+def test_ema_loads_averages_saved_under_the_other_torch_compile_names(saved_wrapped, whole):
+    """A run resumes its EMA with a module wrapped by torch.compile that it saved unwrapped, or the other way round."""
+    model, saved_model, resumed_model = _module_saved_and_resumed(saved_wrapped, whole)
+    saved = EMA(saved_model, ConstantEMAConfig(decay=0.9))
+    saved.step(saved_model)
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+    ema = EMA(resumed_model, ConstantEMAConfig(decay=0.9))
+    assert list(ema.averages) != list(saved.averages)
+    ema.load_state_dict(saved.state_dict())
+    assert ema.num_updates == 1
+    for average, expected in zip(ema.averages.values(), saved.averages.values(), strict=True):
+        assert torch.equal(average, expected)
+
+
+@pytest.mark.parametrize("whole", [False, True], ids=["submodule", "whole-model"])
+@pytest.mark.parametrize("saved_wrapped", [True, False], ids=["wrapped-to-plain", "plain-to-wrapped"])
+def test_sharded_ema_loads_averages_saved_under_the_other_torch_compile_names(tmp_path, saved_wrapped, whole):
+    model, saved_model, resumed_model = _module_saved_and_resumed(saved_wrapped, whole)
+    saved = EMA(saved_model, ConstantEMAConfig(decay=0.9))
+    saved.step(saved_model)
+    save_sharded_ema(saved, tmp_path)
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+    ema = EMA(resumed_model, ConstantEMAConfig(decay=0.9))
+    load_sharded_ema(ema, tmp_path)
+    assert ema.num_updates == 1
+    for average, expected in zip(ema.averages.values(), saved.averages.values(), strict=True):
+        assert torch.equal(average, expected)
+
+
+def test_sharded_ema_refuses_averages_of_other_parameters(tmp_path):
+    """As the non-sharded load does: an average of a parameter the model no longer has is not dropped silently."""
+    save_sharded_ema(EMA(torch.nn.Linear(4, 4), ConstantEMAConfig(decay=0.9)), tmp_path)
+    ema = EMA(torch.nn.Linear(4, 4, bias=False), ConstantEMAConfig(decay=0.9))
+    with pytest.raises(ValueError, match="different set of parameters"):
+        load_sharded_ema(ema, tmp_path)
 
 
 def make_dummy_dataset(tmp_path):
