@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from lerobot.configs import PolicyFeature
     from lerobot.export.configs import ExportConfig
 
+    from ..pi0.modeling_pi0 import PI0Pytorch
     from .configuration_pi05 import PI05Config
 
 logger = logging.getLogger(__name__)
@@ -284,7 +285,7 @@ class PI05LanguageModelLayers(nn.Module):
     alone. Full attention over the whole prompt is what SDPA expresses, so the layers use it.
     """
 
-    def __init__(self, model: PI05Pytorch, layers: range):
+    def __init__(self, model: PI05Pytorch | PI0Pytorch, layers: range):
         super().__init__()
         language_model = model.paligemma_with_expert.paligemma.model.language_model
         language_model.set_attn_implementation("sdpa")
@@ -368,7 +369,7 @@ class PI05Step(nn.Module):
             expert.norm = scheduled(expert.norm)
         del model.time_mlp_in, model.time_mlp_out
         if bfloat16:
-            _hold_linear_weights_in_bfloat16(model)
+            hold_linear_weights_in_bfloat16(model)
 
     def forward(self, prefix_pad_masks: Tensor, *inputs: Tensor) -> Tensor:
         *cache, x_t, timestep = inputs
@@ -531,8 +532,8 @@ class PI05ExportRecipe(ExportRecipe):
         if config.dtype == torch.bfloat16 and self._device.type == "cuda":
             # The policy runs its float32 vision tower under bfloat16 autocast on a GPU (`_vision_autocast`).
             vlm = policy.model.paligemma_with_expert.paligemma.model
-            _hold_linear_weights_in_bfloat16(vlm.vision_tower)
-            _hold_linear_weights_in_bfloat16(vlm.multi_modal_projector)
+            hold_linear_weights_in_bfloat16(vlm.vision_tower)
+            hold_linear_weights_in_bfloat16(vlm.multi_modal_projector)
         language_model = policy.model.paligemma_with_expert.paligemma.model.language_model
         embedding = language_model.embed_tokens
         prompt = StatePrompt(
@@ -758,7 +759,7 @@ class PI05ExportRecipe(ExportRecipe):
             )
 
 
-def _hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
+def hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
     """Store the linear layers of `module`, which runs them only under bfloat16 autocast, in bfloat16.
 
     Autocast casts a float32 linear layer's weight to bfloat16 on every call, so this is the same arithmetic
