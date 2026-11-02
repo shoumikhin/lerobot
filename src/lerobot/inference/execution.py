@@ -33,6 +33,7 @@ import torch
 
 from lerobot.lerobot_types import PolicyPrediction
 from lerobot.policies import ActionQueue, QueueSnapshot, RTCConfig
+from lerobot.utils.latency import LatencyWindow
 
 from .contracts import ActionChunk, ActionProvenance, ExecutionMode, ObservationSnapshot
 
@@ -210,6 +211,7 @@ class ChunkRuntime:
         self.held = False
         self.has_executed = False
         self.started_at = clock()
+        self.latency = LatencyWindow("turnaround")
         self.turnarounds: deque[float] = deque(maxlen=100)
         self._initial_turnaround = 0.0
         self._completed = 0
@@ -441,6 +443,7 @@ class ChunkRuntime:
                 return False
             now = self.clock()
             elapsed = now - request.submitted_at
+            self.latency.record(elapsed, now)
             self._completed += 1
             if self._completed > 1:  # cold start is not a steady-state action latency
                 self.turnarounds.append(elapsed)

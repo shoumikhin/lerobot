@@ -30,6 +30,7 @@ from huggingface_hub.errors import EntryNotFoundError
 
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
+    from lerobot.export.recipe import ExportRecipe
 
 from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
@@ -79,13 +80,12 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         ValueError: If the policy name is not registered.
         ImportError: If the policy's optional dependencies are not installed.
     """
-    try:
-        config_cls = PreTrainedConfig.get_choice_class(name)
-    except KeyError:
-        PreTrainedConfig.load_all_choices()  # a non-string name fails before any policy is imported
+    if name not in PreTrainedConfig.get_known_choices():
         raise ValueError(
             f"Unknown policy name '{name}'. Available policies: {PreTrainedConfig.get_known_choices()}"
-        ) from None
+        )
+
+    config_cls = PreTrainedConfig.get_choice_class(name)
     config_cls_name = config_cls.__name__
 
     model_name = config_cls_name.removesuffix("Config")  # e.g., DiffusionConfig -> Diffusion
@@ -128,7 +128,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     """
     try:
         config_cls = PreTrainedConfig.get_choice_class(policy_type)
-    except KeyError as e:
+    except Exception as e:
         raise ValueError(f"Policy type '{policy_type}' is not available.") from e
     return config_cls(**kwargs)
 
@@ -251,6 +251,60 @@ def has_peft_adapter_config(
     except EntryNotFoundError:  # also raised offline when the file is not cached
         return False
     return True
+
+
+def load_pretrained_policy(policy_config: PreTrainedConfig, strict: bool | None = None) -> PreTrainedPolicy:
+    """Load a trained policy for inference, or the base policy with its PEFT adapter applied.
+
+    The adapter and the base model keep their own revisions. `strict` is passed to the policy's
+    `from_pretrained`; `None` keeps the policy's own default.
+    """
+    load_options: dict[str, Any] = {} if strict is None else {"strict": strict}
+    pretrained_path = policy_config.pretrained_path
+    if pretrained_path is None:
+        raise ValueError("The policy config names no checkpoint to load (pretrained_path is not set).")
+    pretrained_revision = policy_config.pretrained_revision
+    policy_class = get_policy_class(policy_config.type)
+
+    # A `use_peft=True` config can still point at a base model (see `has_peft_adapter_config`).
+    if not (policy_config.use_peft and has_peft_adapter_config(pretrained_path, pretrained_revision)):
+        return policy_class.from_pretrained(
+            pretrained_path,
+            config=policy_config,
+            revision=pretrained_revision,
+            **load_options,
+        )
+
+    require_package("peft", extra="peft")
+
+    peft_config = PeftConfig.from_pretrained(pretrained_path, revision=pretrained_revision)
+    policy = policy_class.from_pretrained(
+        pretrained_name_or_path=peft_config.base_model_name_or_path,
+        config=policy_config,
+        revision=peft_config.revision,
+        **load_options,
+    )
+    return PeftModel.from_pretrained(
+        policy,
+        pretrained_path,
+        config=peft_config,
+        revision=pretrained_revision,
+    )
+
+
+def get_export_recipe_class(config: PreTrainedConfig) -> type[ExportRecipe]:
+    """The policy's own export recipe, from `export_<type>.py` beside its configuration, or the default one."""
+    from lerobot.export.recipe import ActionChunkRecipe
+
+    config_class = type(config)
+    module = _import_sibling_policy_module(config_class, "export")
+    if module is None:
+        return ActionChunkRecipe
+    name = config_class.__name__.removesuffix("Config") + "ExportRecipe"
+    recipe = getattr(module, name, None)
+    if recipe is None:
+        raise ValueError(f"{module.__name__} must define the export recipe {name}.")
+    return recipe
 
 
 def make_policy(

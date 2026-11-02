@@ -157,7 +157,7 @@ def build_latent_action_model(model_cfg: dict[str, Any]):
     if "patch_size" not in model_cfg:
         raise ValueError("LAM config must provide `patch_size`.")
 
-    latent_action_model = LatentLAMModel(**model_cfg).to("cpu")
+    latent_action_model = LatentLAMModel(**model_cfg)
     for parameter in latent_action_model.parameters():
         parameter.requires_grad = False
     return latent_action_model.eval()

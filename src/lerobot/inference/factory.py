@@ -27,20 +27,18 @@ import logging
 import math
 from dataclasses import dataclass, field
 from threading import Event
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import draccus
 
-from lerobot.policies.chunk import ExecutionMode
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies import PreTrainedPolicy, RTCConfig
+from lerobot.processor import PolicyProcessorPipeline
 
+from .base import InferenceEngine, InferenceRobot
 from .chunk_settings import chunk_settings
-
-if TYPE_CHECKING:
-    from lerobot.policies import PreTrainedPolicy
-    from lerobot.processor import PolicyProcessorPipeline
-
-    from .base import InferenceEngine, InferenceRobot
+from .contracts import ExecutionMode
+from .rtc import RTCInferenceEngine
+from .sync import SyncInferenceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +197,6 @@ def create_inference_engine(
             "(which delegates to build_remote_rollout_context) instead of create_inference_engine"
         )
     if isinstance(config, SyncInferenceConfig):
-        from .sync import SyncInferenceEngine
-
         return SyncInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
@@ -212,8 +208,6 @@ def create_inference_engine(
             robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
-        from .rtc import RTCInferenceEngine
-
         return RTCInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,

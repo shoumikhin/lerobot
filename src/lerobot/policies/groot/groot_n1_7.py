@@ -36,6 +36,13 @@ from ..common.flow_matching import (
     sample_beta,
     sample_noise,
 )
+from ..common.qwen3_vision import Qwen3VisionGrid, qwen3_vl_forward
+from ..common.qwen_vision import (
+    check_visible_images,
+    is_preparing_image_grid,
+    qwen_image_rope_index,
+)
+from ..utils import is_exporting
 from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
@@ -244,8 +251,14 @@ class MultiEmbodimentActionEncoder(nn.Module):
         if timesteps.dim() != 1 or timesteps.shape[0] != batch_size:
             raise ValueError("Expected `timesteps` to have shape (B,).")
         timesteps = timesteps.unsqueeze(1).expand(-1, horizon)
+        return self.encode(actions, self.pos_encoding(timesteps), cat_ids)
+
+    def encode(
+        self, actions: torch.Tensor, time_encoding: torch.Tensor, cat_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """The actions `(B, T, action_dim)` encoded with their sinusoidal time encoding, `(B, T, D)` or `(1, 1, D)`."""
         action_emb = self.W1(actions, cat_ids)
-        time_emb = self.pos_encoding(timesteps).to(dtype=action_emb.dtype)
+        time_emb = time_encoding.expand(*action_emb.shape[:2], -1).to(dtype=action_emb.dtype)
         x = swish(self.W2(torch.cat([action_emb, time_emb], dim=-1), cat_ids))
         return self.W3(x, cat_ids)
 
@@ -312,6 +325,7 @@ class Qwen3Backbone(nn.Module):
             self.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self._vision_grid: Qwen3VisionGrid | None = None
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             for parameter in self.parameters():
@@ -439,11 +453,45 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
+            grid = self._vision_grid
+            if grid is not None and is_exporting():
+                self._qwen_on_fixed_grid(model_input, grid)
+                return captured["features"]
             outputs = self.model(**model_input, output_hidden_states=True)
         finally:
             hook.remove()
 
         return captured.get("features", outputs.hidden_states[-1])
+
+    def _qwen_on_fixed_grid(self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid) -> None:
+        """Run `Qwen3VLModel` under `torch.export` on the prepared grid metadata."""
+        if model_input.get("pixel_values_videos") is not None:
+            raise ValueError("GR00T exports image inputs only.")
+        qwen = getattr(self.model, "model", self.model)
+        input_ids = model_input["input_ids"]
+        qwen3_vl_forward(
+            qwen,
+            qwen.get_input_embeddings()(input_ids),
+            model_input["attention_mask"],
+            model_input["pixel_values"],
+            grid,
+            image_mask=input_ids == qwen.config.image_token_id,
+            position_ids=self._fixed_grid_position_ids(model_input, grid),
+        )
+
+    def _fixed_grid_position_ids(
+        self, model_input: dict[str, torch.Tensor], grid: Qwen3VisionGrid
+    ) -> torch.Tensor:
+        """The position ids of `_ensure_legacy_qwen3_position_ids`, from the prepared grid."""
+        qwen = getattr(self.model, "model", self.model)
+        position_ids = qwen_image_rope_index(
+            model_input["input_ids"],
+            model_input["attention_mask"],
+            grid.grid_thw,
+            qwen.visual.spatial_merge_size,
+            qwen.config.image_token_id,
+        )
+        return torch.cat([position_ids[:1], position_ids], dim=0)
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -451,8 +499,15 @@ class Qwen3Backbone(nn.Module):
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
-        self._ensure_mm_token_type_ids(model_input)
-        self._ensure_legacy_qwen3_position_ids(model_input)
+        qwen = getattr(self.model, "model", self.model)
+        grid = self._vision_grid = Qwen3VisionGrid.track(
+            self._vision_grid, qwen.visual, model_input["image_grid_thw"]
+        )
+        if grid is not None and (is_preparing_image_grid() or is_exporting()):
+            check_visible_images(model_input["input_ids"], model_input["attention_mask"], qwen.config)
+        if not is_exporting():
+            self._ensure_mm_token_type_ids(model_input)
+            self._ensure_legacy_qwen3_position_ids(model_input)
         features = self._last_decoder_layer_output(model_input)
         image_mask = model_input["input_ids"] == self.model.config.image_token_id
         attention_mask = model_input["attention_mask"] == 1
@@ -911,7 +966,7 @@ class GR00TN17(PreTrainedModel):
         return next(iter(self.parameters())).dtype
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: str | None, **kwargs):
         tune_visual = kwargs.pop("tune_visual", True)
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
@@ -925,17 +980,18 @@ class GR00TN17(PreTrainedModel):
             if key in kwargs:
                 transformers_loading_kwargs.setdefault(key, kwargs[key])
 
-        try:
-            local_model_path = snapshot_download(
-                pretrained_model_name_or_path,
-                repo_type="model",
-                revision=kwargs.get("revision"),
-                cache_dir=kwargs.get("cache_dir"),
-                local_files_only=kwargs.get("local_files_only", False),
-                token=kwargs.get("token"),
-            )
-        except (HFValidationError, RepositoryNotFoundError):
-            local_model_path = pretrained_model_name_or_path
+        local_model_path = pretrained_model_name_or_path
+        # None means `config` and `state_dict` are passed in, as transformers allows, so there is nothing to download.
+        if pretrained_model_name_or_path is not None:
+            with suppress(HFValidationError, RepositoryNotFoundError):
+                local_model_path = snapshot_download(
+                    pretrained_model_name_or_path,
+                    repo_type="model",
+                    revision=kwargs.get("revision"),
+                    cache_dir=kwargs.get("cache_dir"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                    token=kwargs.get("token"),
+                )
 
         pretrained_model = super().from_pretrained(
             local_model_path,

@@ -61,6 +61,7 @@ from ..common.flow_matching import (
     sample_noise,
     sample_time_beta,
 )
+from ..common.meta_load import load_complete_checkpoint
 from ..common.vla_utils import (
     clone_past_key_values,
     create_sinusoidal_pos_embedding,
@@ -768,6 +769,8 @@ class PI0Policy(PreTrainedPolicy):
 
     config_class = PI0Config
     name = "pi0"
+    # Read from this class only, so each subclass opts in on its own.
+    _supports_meta_load = True
 
     def supports_rtc(self) -> bool:
         return True
@@ -794,7 +797,9 @@ class PI0Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # On the meta device, load_complete_checkpoint places the parameters and then moves the buffers.
+        if not next(self.model.parameters()).is_meta:
+            self.model.to(config.device)
 
         self.reset()
 
@@ -811,10 +816,14 @@ class PI0Policy(PreTrainedPolicy):
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
         revision: str | None = None,
-        strict: bool = True,
+        strict: bool = False,
         **kwargs,
     ) -> T:
-        """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+        """Override the from_pretrained method to handle key remapping and display important disclaimer.
+
+        With `strict`, a checkpoint that leaves a weight of the policy unfilled raises instead of loading with a
+        warning. Weights the policy does not have are skipped either way.
+        """
         print(
             "The PI0 model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
@@ -823,19 +832,29 @@ class PI0Policy(PreTrainedPolicy):
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
+        download_kwargs: dict[str, Any] = {
+            "force_download": force_download,
+            "resume_download": resume_download,
+            "proxies": proxies,
+            "token": token,
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "revision": revision,
+        }
         # Use provided config if available, otherwise create default config
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
+                pretrained_name_or_path=pretrained_name_or_path, **download_kwargs, **kwargs
             )
+
+        print(f"Loading model from: {pretrained_name_or_path}")
+        require_package("transformers", extra="pi")
+        from transformers.utils import cached_file
+
+        resolved_file = cached_file(pretrained_name_or_path, "model.safetensors", **download_kwargs)
+        model = load_complete_checkpoint(cls, resolved_file, config, **kwargs)
+        if model is not None:
+            return model
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
@@ -843,26 +862,14 @@ class PI0Policy(PreTrainedPolicy):
 
         # Load state dict (expects keys with "model." prefix)
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
             try:
-                from transformers.utils import cached_file
-
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
+                if strict:
+                    raise
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
@@ -886,7 +893,11 @@ class PI0Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            if strict and missing_keys:
+                raise RuntimeError(
+                    f"{resolved_file} does not hold these weights of {cls.__name__}: {missing_keys}"
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -912,6 +923,8 @@ class PI0Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
+            if strict:
+                raise
             print(f"Warning: Could not load state dict: {e}")
 
         return model
@@ -919,7 +932,11 @@ class PI0Policy(PreTrainedPolicy):
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
-        """Fix state dict keys to match current model architecture."""
+        """Fix state dict keys to match current model architecture.
+
+        Each key is handled on its own and values are only renamed, copied or dropped, which
+        `load_complete_checkpoint` relies on.
+        """
         import re
 
         fixed_state_dict = {}

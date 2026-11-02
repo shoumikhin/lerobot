@@ -16,20 +16,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypeAlias, TypedDict, final
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, final
 
 import numpy as np
+import torch
 
-from lerobot.utils.import_utils import lazy_exports
-
-# PolicyAction is torch.Tensor, so it is resolved, and torch imported, the first time it is used.
-if TYPE_CHECKING:
-    import torch
-
-    # A plain alias (not PEP 695 `type`), like EnvAction below: at runtime the name is torch.Tensor itself.
-    PolicyAction: TypeAlias = torch.Tensor  # noqa: UP040
-else:
-    __getattr__, __dir__ = lazy_exports(__name__, {"PolicyAction": "torch.Tensor"})
+# Re-exported: robots and teleoperators import them from `lerobot.hardware_types`, which loads without PyTorch.
+from lerobot.hardware_types import RobotAction as RobotAction, RobotObservation as RobotObservation
 
 
 @final
@@ -46,9 +39,9 @@ class TransitionKey:
     COMPLEMENTARY_DATA: Final[Literal["complementary_data"]] = "complementary_data"
 
 
-RobotAction = dict[str, Any]
+# Kept as `TypeAlias` (not PEP 695 `type`): both are used in `isinstance()` checks.
+PolicyAction: TypeAlias = torch.Tensor  # noqa: UP040
 EnvAction: TypeAlias = np.ndarray  # noqa: UP040
-RobotObservation = dict[str, Any]
 BatchType = dict[str, Any]
 
 

@@ -27,13 +27,16 @@ from functools import partial
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any, Protocol
 
+import torch
+
 from lerobot.lerobot_types import EnvTransition
 from lerobot.utils import QUERY_KIND, QUERY_TEXT
+from lerobot.utils.latency import LatencyWindow
 
 from .contracts import DEFAULT_MAX_TEXT_INPUT_CHARS, QueryKind
 
 if TYPE_CHECKING:
-    import torch
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +160,7 @@ class InferenceEngine(abc.ABC):
 
     def __init__(self, task: str = "") -> None:
         """Initialize task ownership and serialized language-query bookkeeping."""
+        self.latency = LatencyWindow()
         self._task = task
         self._task_changed = False
         self._task_version = 0
@@ -828,8 +832,8 @@ class InferenceEngine(abc.ABC):
         """Clear episode state; async backends invalidate motion before queuing worker resets."""
 
     @abc.abstractmethod
-    def get_action(self, obs_frame: dict | None) -> torch.Tensor | EnvTransition | None:
-        """Return a canonical action on the control thread, or ``None`` when unavailable.
+    def get_action(self, obs_frame: dict | None) -> torch.Tensor | np.ndarray | EnvTransition | None:
+        """Return a canonical action (a tensor or a NumPy array) on the control thread, or ``None``.
 
         Sync may block on inference; async only consumes buffered work. Check
         ``dispatch_allowed`` again before sending, including interpolation ticks.

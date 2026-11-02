@@ -18,16 +18,19 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import ClassVar
 
 import draccus
 
+from lerobot.bundle.manifest import is_bundle
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
 from .planner import PlannerConfig
 
@@ -300,6 +303,8 @@ class RolloutConfig:
     # Run time in seconds; 0 = infinite (24/7 mode).  In interactive mode this
     # bounds each /start segment, not the whole session.
     duration: float = 0.0
+    # Periodic health logs in seconds; 0 disables them. Inactive in interactive mode.
+    status_interval_s: float = 5.0
     # Control the rollout from stdin with chat-style commands (/start, /subtask,
     # /vqa, /autosteer, /reset, /stop) while hardware and policy stay warm.  The
     # robot does not move until /start, and logs below ERROR are muted for the
@@ -348,8 +353,8 @@ class RolloutConfig:
 
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
-        from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
-
+        if not math.isfinite(self.status_interval_s) or self.status_interval_s < 0:
+            raise ValueError("status_interval_s must be finite and >= 0")
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
 
@@ -407,6 +412,11 @@ class RolloutConfig:
         ):
             raise ValueError(
                 "Remote inference owns policy/device configuration; omit --policy, --device and --use_torch_compile"
+            )
+        if policy_path and is_bundle(policy_path):
+            raise ValueError(
+                f"{policy_path} is a bundle written by lerobot-export. Run it with "
+                f"`lerobot-rollout --bundle.path={policy_path} --robot.type=...`."
             )
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")

@@ -11,24 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
-import dataclasses
-import importlib
 import inspect
 import json
-import pkgutil
-import re
 import sys
 import tempfile
 from argparse import ArgumentError
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from functools import wraps
 from pathlib import Path
-from pkgutil import ModuleInfo
-from types import ModuleType
-from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args, get_type_hints
+from typing import Any, TypeVar, cast
 
 import draccus
+import torch
 import yaml
 from draccus.help_formatter import SimpleHelpFormatter
 from draccus.utils import DecodingError
@@ -38,15 +32,19 @@ from draccus.wrappers.field_wrapper import FieldWrapper
 from draccus.wrappers.suppressing_argparse import SuppressingArgumentParser
 from draccus.wrappers.wrapper import AggregateWrapper, Wrapper
 
+from lerobot.utils.import_utils import (
+    PLUGIN_DISCOVERY_SUFFIX,
+    PluginLoadError,
+    filter_arg,
+    load_plugin,
+    parse_plugin_args,
+)
 from lerobot.utils.utils import has_method
-
-if TYPE_CHECKING:
-    import torch
 
 F = TypeVar("F", bound=Callable[..., object])
 
 PATH_KEY = "path"
-PLUGIN_DISCOVERY_SUFFIX = "discover_packages_path"
+
 
 # Storage for path args extracted from YAML/JSON config files, so that
 # get_path_arg() can find them even when they weren't passed via CLI.
@@ -56,36 +54,25 @@ _config_path_args: dict[str, str] = {}
 _config_yaml_overrides: dict[str, list[str]] = {}
 
 
-def _decode_dtype(value: Any, path: Sequence[str] = ()) -> "torch.dtype":
+# Register draccus encode/decode functions for the torch.dtype values held by dtype fields.
+@draccus.decode.register(torch.dtype)
+def _decode_dtype(value: Any, path: Sequence[str] = ()) -> torch.dtype:
     """Resolve a dtype name coming from config.json or the command line.
 
     Args:
         value: The raw serialized value, e.g. "bfloat16".
         path: The field breadcrumb draccus prefixes onto error messages, e.g. ("policy", "dtype").
     """
-    import torch
-
     dtype = getattr(torch, str(value).removeprefix("torch."), None)
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"Invalid dtype {value!r}: expected a torch dtype name.")
     return dtype
 
 
-def _encode_dtype(value: "torch.dtype", declared_type: type | None = None) -> str:
+@draccus.encode.register(torch.dtype)
+def _encode_dtype(value: torch.dtype, declared_type: type | None = None) -> str:
     """Serialize a dtype to its bare name, e.g. torch.bfloat16 -> "bfloat16"."""
     return str(value).removeprefix("torch.")
-
-
-def register_torch_dtype_codecs() -> None:
-    """Register the draccus encode/decode functions for `torch.dtype` values.
-
-    The modules that define configs with a `torch.dtype` field call this, so that importing the parser
-    does not load torch. Registering again replaces the functions with the same ones.
-    """
-    import torch
-
-    draccus.decode.register(torch.dtype, _decode_dtype)
-    draccus.encode.register(torch.dtype, _encode_dtype)
 
 
 def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
@@ -147,90 +134,6 @@ def parse_arg(arg_name: str, args: Sequence[str] | None = None) -> str | None:
     return None
 
 
-def parse_plugin_args(plugin_arg_suffix: str, args: Sequence[str]) -> dict[str, str]:
-    """Parse plugin-related arguments from command-line arguments.
-
-    This function extracts arguments from command-line arguments that match a specified suffix pattern.
-    It accepts arguments in the formats '--key=value' and '--key value' and returns them as a dictionary.
-
-    Args:
-        plugin_arg_suffix (str): The suffix to identify plugin-related arguments.
-        cli_args (Sequence[str]): A sequence of command-line arguments to parse.
-
-    Returns:
-        dict: A dictionary containing the parsed plugin arguments where:
-            - Keys are the argument names (with '--' prefix removed if present)
-            - Values are the corresponding argument values
-
-    Example:
-        >>> args = ["--env.discover_packages_path=my_package", "--other_arg=value"]
-        >>> parse_plugin_args("discover_packages_path", args)
-        {'env.discover_packages_path': 'my_package'}
-    """
-    plugin_args = {}
-    for index, arg in enumerate(args):
-        if not arg.startswith("--"):
-            continue
-
-        key, separator, value = arg[2:].partition("=")
-        if plugin_arg_suffix not in key:
-            continue
-        if not separator:
-            if index + 1 >= len(args) or args[index + 1].startswith("--"):
-                continue
-            value = args[index + 1]
-        plugin_args[key] = value
-    return plugin_args
-
-
-class PluginLoadError(Exception):
-    """Raised when a plugin fails to load."""
-
-
-def load_plugin(plugin_path: str) -> None:
-    """Load and initialize a plugin from a given Python package path.
-
-    This function attempts to load a plugin by importing its package and any submodules.
-    Plugin registration is expected to happen during package initialization, i.e. when
-    the package is imported the gym environment should be registered and the config classes
-    registered with their parents using the `register_subclass` decorator.
-
-    Args:
-        plugin_path (str): The Python package path to the plugin (e.g. "mypackage.plugins.myplugin")
-
-    Raises:
-        PluginLoadError: If the plugin cannot be loaded due to import errors or if the package path is invalid.
-
-    Examples:
-        >>> load_plugin("external_plugin.core")  # Loads plugin from external package
-
-    Notes:
-        - The plugin package should handle its own registration during import
-        - All submodules in the plugin package will be imported
-        - Implementation follows the plugin discovery pattern from Python packaging guidelines
-
-    See Also:
-        https://packaging.python.org/en/latest/guides/creating-and-discovering-plugins/
-    """
-    try:
-        package_module = importlib.import_module(plugin_path, __package__)
-    except (ImportError, ModuleNotFoundError) as e:
-        raise PluginLoadError(
-            f"Failed to load plugin '{plugin_path}'. Verify the path and installation: {str(e)}"
-        ) from e
-
-    def iter_namespace(ns_pkg: ModuleType) -> Iterable[ModuleInfo]:
-        return pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + ".")
-
-    try:
-        for _finder, pkg_name, _ispkg in iter_namespace(package_module):
-            importlib.import_module(pkg_name)
-    except ImportError as e:
-        raise PluginLoadError(
-            f"Failed to load plugin '{plugin_path}'. Verify the path and installation: {str(e)}"
-        ) from e
-
-
 def get_path_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
     result = parse_arg(f"{field_name}.{PATH_KEY}", args)
     if result is None:
@@ -244,66 +147,6 @@ def get_yaml_overrides(field_name: str) -> list[str]:
 
 def get_type_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
     return parse_arg(f"{field_name}.{draccus.CHOICE_TYPE_KEY}", args)
-
-
-def get_type_args(field_name: str, args: Sequence[str]) -> list[str]:
-    """Every value given for `--<field_name>.type`, since argparse checks each one against the choices."""
-    option = f"{field_name}.{draccus.CHOICE_TYPE_KEY}"
-    starts = [index for index, arg in enumerate(args) if arg.partition("=")[0] == f"--{option}"]
-    return [value for index in starts if (value := parse_arg(option, args[index:])) is not None]
-
-
-def load_selected_choices(config_class: type, cli_args: Sequence[str]) -> None:
-    """Register the choices draccus needs before it builds its parser, since some registries load their
-    choices on demand: the policies, and the optimizers and schedulers that policy packages add to.
-
-    Every `--<field>.type` value is looked up in its registry, which loads that choice, or everything it
-    could come from for an unknown name. Registries with a `load_all_choices()` also load everything for
-    `--help`, for a nested `--<field>.<sub>.type`, and for `--<field>.*` flags given without that field's
-    `.type`, since its type may then come from a config file and draccus needs that class to accept the
-    flags. The same holds for `--<field>.<sub>.*` flags when `<field>` is a plain dataclass holding such
-    a registry. A field given as `--<field>.path` is skipped: its config is read from that path later."""
-    hints = get_type_hints(config_class)
-    load_all = any(arg in ("--help", "-h") or re.match(r"--\w+\.[\w.]+\.type(=|$)", arg) for arg in cli_args)
-    for field in dataclasses.fields(config_class):
-        candidates = get_args(hints[field.name]) or (hints[field.name],)
-        types = [t for t in candidates if draccus.utils.is_choice_type(t)]
-        lazy = [t for t in types if hasattr(t, "load_all_choices")]
-        if not types:
-            nested_flags = any(
-                arg.partition("=")[0].startswith(f"--{field.name}.") and arg.partition("=")[0].count(".") >= 2
-                for arg in cli_args
-            )
-            if nested_flags and any(
-                isinstance(t, type) and dataclasses.is_dataclass(t) and _lazy_registries(t) for t in candidates
-            ):
-                load_all = True
-            continue
-        if get_path_arg(field.name, cli_args):
-            continue
-        names = get_type_args(field.name, cli_args)
-        for name in names:
-            for choice_type in types:
-                with contextlib.suppress(KeyError):  # draccus reports unknown names itself
-                    choice_type.get_choice_class(name)
-        if not names and lazy and any(arg.startswith(f"--{field.name}.") for arg in cli_args):
-            load_all = True
-    if load_all:
-        for registry in _lazy_registries(config_class):
-            registry.load_all_choices()
-
-
-def _lazy_registries(config_class: type) -> set[Any]:
-    """The on-demand registries of the config's choice fields, including those in nested dataclasses."""
-    registries = set()
-    for field_type in get_type_hints(config_class).values():
-        for candidate in get_args(field_type) or (field_type,):
-            if draccus.utils.is_choice_type(candidate):
-                if hasattr(candidate, "load_all_choices"):
-                    registries.add(candidate)
-            elif isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
-                registries |= _lazy_registries(candidate)
-    return registries
 
 
 def _register_scoped_actions(
@@ -361,27 +204,6 @@ def print_scoped_help(config_class: type, cli_args: Sequence[str]) -> None:
     )
     _register_scoped_actions(DataclassWrapper(config_class), parser, cli_args)
     parser.print_help()
-
-
-def filter_arg(field_to_filter: str, args: Sequence[str] | None = None) -> list[str]:
-    if args is None:
-        return []
-    option = f"--{field_to_filter}"
-    filtered_args = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == option:
-            index += 1
-            if index < len(args) and not args[index].startswith("--"):
-                index += 1
-            continue
-        if arg.startswith(f"{option}="):
-            index += 1
-            continue
-        filtered_args.append(arg)
-        index += 1
-    return filtered_args
 
 
 def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | None = None) -> list[str]:
@@ -508,7 +330,6 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                         # add the relevant CLI arg to the error message
                         raise PluginLoadError(f"{e}\nFailed plugin CLI Arg: {plugin_cli_arg}") from e
                     cli_args = filter_arg(plugin_cli_arg, cli_args)
-                load_selected_choices(argtype, cli_args)
                 if "--help" in cli_args or "-h" in cli_args:
                     print_scoped_help(argtype, cli_args)
                     sys.exit(0)
