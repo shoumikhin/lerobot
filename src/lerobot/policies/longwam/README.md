@@ -1,1 +1,0 @@
-../../../../docs/source/policy_longwam_README.md
