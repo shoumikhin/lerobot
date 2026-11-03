@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from ..configs import ExportBackendConfig
@@ -25,6 +28,7 @@ if TYPE_CHECKING:
     from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
     from executorch.exir import EdgeCompileConfig, EdgeProgramManager, ExecutorchBackendConfig
     from executorch.exir.backend.partitioner import Partitioner
+    from torch import Tensor
     from torch.export import ExportedProgram
 
 EXECUTORCH = "executorch>=1.6.0,<1.7.0"
@@ -40,6 +44,20 @@ class ExecuTorchConfig(ExportBackendConfig):
     packages: ClassVar[tuple[str, ...]] = (EXECUTORCH,)
     min_torch = "2.15"
     torch_pins = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
+
+    def run(self, path: Path, data: Path | None, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
+        """Run the program with ExecuTorch's PyTorch bindings, each input moved where the program reads it."""
+        for module in self.runtime_imports:
+            importlib.import_module(module)
+        from executorch.runtime import Runtime
+
+        from lerobot.bundle.executorch import configure
+
+        configure(self.runtime_options)
+        method = Runtime.get().load_program(path, data_path=data).load_method("forward")
+        meta = method.metadata
+        devices = [meta.input_tensor_meta(i).device() for i in range(meta.num_inputs())]
+        return tuple(method.execute([x.to(device) for x, device in zip(inputs, devices, strict=True)]))
 
 
 def lower(

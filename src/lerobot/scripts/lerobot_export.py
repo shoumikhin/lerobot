@@ -32,11 +32,13 @@ Export on the kind of board that will run the policy, then run the bundle with `
 
 Before writing the bundle, the export replays its test case through the compiled programs, as rollout
 does before the robot moves, and writes nothing if the actions differ from PyTorch's by more than the
-tolerance.
+tolerance. A recipe may also have some parts checked on their own, each compiled program on the inputs the part
+got in PyTorch.
 
-This process never imports PyTorch. It traces the policy in one process and compiles each part in a process
-of its own (see `lerobot.export.worker`), then checks the bundle in another (`python -m lerobot.bundle`), so
-each step starts with the memory the one before it used given back.
+This process never imports PyTorch. It traces the policy in one process, compiles each part in a process
+of its own and checks a part the recipe asks for in one more (see `lerobot.export.worker`), then checks the
+bundle in another (`python -m lerobot.bundle`), so each step starts with the memory the one before it used
+given back.
 """
 
 import json
@@ -96,6 +98,16 @@ def export(args: Sequence[str]) -> Path:
                     "plugins": plugins,
                 }
                 files.data = cast(dict[str, Any], _run_step(work, f"compile-{name}", request))["data"]
+                if name in traced["checks"]:
+                    check = {
+                        "step": "check",
+                        "backend": traced["backend"],
+                        "check": str(Path(traced["traced"]) / f"{name}.check.safetensors"),
+                        "path": request["path"],
+                        "data": None if files.data is None else str(folder / files.data),
+                        "plugins": plugins,
+                    }
+                    _run_step(work, f"check-{name}", check)
             shutil.rmtree(traced["traced"])
             Bundle(folder, manifest).write()
             logger.info("Checking the bundle")
