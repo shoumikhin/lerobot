@@ -163,6 +163,12 @@ def _signal_name(number: int) -> str:
 def main() -> None:
     """CLI entry point for `lerobot-export`."""
     init_logging()
+    # SIGTERM (a `kill`, a timeout, a stopped container) and SIGHUP (a closed terminal or ssh session) would
+    # end this process at once; as an exit each stops the running step and removes the unfinished folders, as
+    # Ctrl-C does. A signal already ignored, such as SIGHUP under nohup, stays ignored. Windows has no SIGHUP.
+    for stop in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if stop is not None and signal.getsignal(stop) is not signal.SIG_IGN:
+            signal.signal(stop, lambda number, _: sys.exit(128 + number))
     try:
         export(sys.argv[1:])
     except RuntimeError as error:

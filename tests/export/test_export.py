@@ -16,7 +16,9 @@
 are installed, real backends."""
 
 import json
+import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -576,6 +578,82 @@ def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(
     usual = stat.S_IMODE((tmp_path / "new").stat().st_mode)
     for name in ("test.safetensors", "constants.safetensors"):
         assert stat.S_IMODE((tmp_path / name).stat().st_mode) == usual, name
+
+
+STOPPED_EXPORT = """
+import json, os, signal, subprocess, sys, threading, time
+from pathlib import Path
+from lerobot.scripts import lerobot_export
+
+stage, stop, mode, run = sys.argv[1], getattr(signal, sys.argv[2]), sys.argv[3], subprocess.run
+output_dir = Path(next(arg for arg in sys.argv if arg.startswith("--output_dir=")).split("=", 1)[1])
+started = os.environ.get("STARTED")
+# Writes its pid, then waits as a compile step would.
+COMPILE = "import os, sys, time; open(sys.argv[1] + '.new', 'w').write(str(os.getpid())); "
+COMPILE += "os.rename(sys.argv[1] + '.new', sys.argv[1]); time.sleep(60)"
+
+def stop_once(found):
+    while not found():
+        time.sleep(0.01)
+    os.kill(os.getpid(), stop)
+
+def run_step(args, **kwargs):
+    request = json.loads(Path(args[-1]).read_text()) if args[-1].endswith(".json") else {}
+    if request.get("step") != stage:
+        return run(args, **kwargs)
+    if mode == "ignore":
+        os.kill(os.getpid(), stop)
+        return run(args, **kwargs)
+    if stage == "trace":
+        # Once the first part is traced: the trace step names its folders before it fills them, and the export
+        # removes what it names.
+        traced = lambda: list(output_dir.parent.glob(f".{output_dir.name}-traced-*/*.pt2"))
+        threading.Thread(target=stop_once, args=(traced,), daemon=True).start()
+        return run(args, **kwargs)
+    threading.Thread(target=stop_once, args=(Path(started).exists,), daemon=True).start()
+    return run([sys.executable, "-c", COMPILE, started], **kwargs)
+
+lerobot_export.subprocess.run = run_step
+# Ignored as nohup starts it, or handled by default even when the test runs under nohup.
+signal.signal(stop, signal.SIG_IGN if mode == "ignore" else signal.SIG_DFL)
+sys.argv = ["lerobot-export", *sys.argv[4:]]
+lerobot_export.main()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="On Windows, os.kill with SIGTERM ends a process at once")
+@pytest.mark.parametrize(
+    ("stage", "stop"), [("trace", "SIGTERM"), ("compile", "SIGTERM"), ("compile", "SIGHUP")]
+)
+def test_lerobot_export_stopped_with_a_signal_removes_what_it_made(
+    checkpoint, tmp_path, tmp_path_factory, stage, stop
+):
+    """A signal while a step runs: the export stops it and removes the folders beside the output folder."""
+    started = tmp_path_factory.mktemp("compile") / "pid"
+    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
+    result = subprocess.run(
+        [sys.executable, "-c", STOPPED_EXPORT, stage, stop, "handle", *args],
+        env={**os.environ, "STARTED": str(started)},
+        timeout=600,
+    )
+    assert result.returncode == 128 + getattr(signal, stop)
+    assert list(tmp_path.iterdir()) == []
+    if stage == "compile":
+        # The compile step had started, and is gone.
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(started.read_text()), 0)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no SIGHUP")
+@pytest.mark.parametrize("stop", ["SIGHUP", "SIGTERM"])
+def test_lerobot_export_keeps_running_on_a_signal_it_was_started_ignoring(checkpoint, tmp_path, stop):
+    """Under nohup SIGHUP is ignored, so closing the ssh session must not stop the export."""
+    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
+    result = subprocess.run(
+        [sys.executable, "-c", STOPPED_EXPORT, "compile", stop, "ignore", *args], timeout=600
+    )
+    assert result.returncode == 0
+    assert [path.name for path in tmp_path.iterdir()] == ["b"]
 
 
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
