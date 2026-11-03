@@ -137,6 +137,9 @@ def _run_step(work: Path, name: str, request: dict[str, Any]) -> dict[str, Any] 
 def main() -> None:
     """CLI entry point for `lerobot-export`."""
     init_logging()
+    # SIGTERM (a `kill`, a timeout, a stopped container) would end this process at once; as an exit it stops the
+    # running step and removes the unfinished folders, as Ctrl-C does.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     try:
         export(sys.argv[1:])
     except RuntimeError as error:

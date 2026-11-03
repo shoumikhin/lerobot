@@ -282,6 +282,43 @@ def test_a_killed_trace_step_leaves_no_folders_behind(tmp_path, monkeypatch):
     assert not [folder for folder in made if folder.exists()]
 
 
+SIGTERMED_EXPORT = """
+import json, os, signal, subprocess, sys, threading
+from pathlib import Path
+from lerobot.scripts import lerobot_export
+
+stage, run = sys.argv[1], subprocess.run
+
+def run_step(args, **kwargs):
+    request = json.loads(Path(args[-1]).read_text()) if args[-1].endswith(".json") else {}
+    if request.get("step") != stage:
+        return run(args, **kwargs)
+    if stage == "trace":
+        # A trace step makes its folders beside the output folder and lists them as it goes.
+        output_dir = Path(next(arg for arg in request["args"] if arg.startswith("--output_dir="))[13:])
+        made = [output_dir.parent / ".b-1", output_dir.parent / ".b-traced-1"]
+        for folder in made:
+            folder.mkdir()
+        Path(request["folders"]).write_text(json.dumps([str(folder) for folder in made]))
+    threading.Timer(1, os.kill, (os.getpid(), signal.SIGTERM)).start()
+    return run([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+
+lerobot_export.subprocess.run = run_step
+sys.argv = ["lerobot-export", *sys.argv[2:]]
+lerobot_export.main()
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="On Windows, os.kill with SIGTERM ends a process at once")
+@pytest.mark.parametrize("stage", ["trace", "compile"])
+def test_lerobot_export_stopped_with_sigterm_removes_what_it_made(checkpoint, tmp_path, stage):
+    """SIGTERM while a step runs: the export stops it and removes the folders beside the output folder."""
+    args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
+    result = subprocess.run([sys.executable, "-c", SIGTERMED_EXPORT, stage, *args], timeout=600)
+    assert result.returncode == 128 + 15
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, monkeypatch):
     run = subprocess.run
     monkeypatch.setattr(
