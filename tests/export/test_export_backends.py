@@ -83,7 +83,7 @@ class Policy:
 
 
 def _act(folder: Path, patch: pytest.MonkeyPatch) -> Path:
-    from tests.export.test_export import IMAGE, save_checkpoint
+    from tests.export.tiny_act import IMAGE, save_checkpoint
 
     save_checkpoint(folder / "checkpoint", IMAGE)
     return folder / "checkpoint"
