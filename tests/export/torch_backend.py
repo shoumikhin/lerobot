@@ -18,6 +18,7 @@ compiler's own module registers its kernels with a real runtime.
 """
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -154,3 +155,6 @@ class TorchTestBackend(ExportBackendConfig):
             args, _ = program.example_inputs
             program = torch.export.export(_Offset(program.module(), self.offset), args)
         torch.export.save(program, path)
+
+    def run(self, path: Path, data: Path | None, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
+        return TorchProgram(path, data)(*inputs)

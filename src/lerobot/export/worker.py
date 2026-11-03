@@ -15,7 +15,8 @@
 """The steps of `lerobot-export` that use PyTorch, each run in a process of its own.
 
 `lerobot-export` never imports PyTorch. It runs `python -m lerobot.export.worker <request.json>` once to
-trace the policy's parts, then once per part to compile it. Each step ends with its process, so the memory
+trace the policy's parts, then once per part to compile it, and once more for a part the recipe checks on its own.
+Each step ends with its process, so the memory
 it used is back with the system before the next step starts, which is what lets a large policy export on a
 small board. A request is a JSON object naming its `step` and the `result` file to write.
 """
@@ -54,6 +55,7 @@ from lerobot.utils.import_utils import PLUGIN_KINDS, load_plugin
 from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
+from .recipe import PROGRAM_FLOOR_FACTOR, ProgramCheck
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,8 @@ def trace_step(request: dict[str, Any]) -> dict[str, Any]:
     """Parse the command line `request["args"]`, trace and save each part, and write the rest of the bundle.
 
     The bundle goes into a new folder beside the output folder. The file `request["folders"]` names the folders
-    the step made there. Returns that folder, its manifest, and what is left to compile.
+    the step made there. Returns that folder, its manifest, what is left to compile, and the parts to check on
+    their own, whose checks wait beside their traced programs.
     """
     argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
@@ -101,11 +104,15 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
         programs: dict[str, ProgramFiles] = {}
         runs: list[ProgramRun] = []
+        checks: list[str] = []
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
             with torch.no_grad():
                 program = torch.export.export(part.module, part.example_inputs)
             torch.export.save(program, traced / f"{part.name}.pt2")
+            if part.check is not None:
+                part.check.save(traced / f"{part.name}.check.safetensors")
+                checks.append(part.name)
             programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
             del part, program
@@ -164,6 +171,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "output_dir": str(output_dir),
         "manifest": manifest.to_dict(),
         "traced": str(traced),
+        "checks": checks,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
     }
 
@@ -191,7 +199,28 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
     return {"data": None if data is None else data.name}
 
 
-STEPS = {"trace": trace_step, "compile": compile_step}
+def check_step(request: dict[str, Any]) -> dict[str, Any]:
+    """Run the compiled program `request["path"]` on the inputs of its part's check `request["check"]`.
+
+    Refuses the program if its outputs differ from the part's by more than `PROGRAM_FLOOR_FACTOR` times what
+    rounding moves them.
+    """
+    for plugin in request["plugins"]:
+        load_plugin(plugin)
+    backend = draccus.decode(ExportBackendConfig, request["backend"])
+    path = Path(request["path"])
+    check = ProgramCheck.load(Path(request["check"]), backend.device)
+    data = None if request["data"] is None else Path(request["data"])
+    outputs = backend.run(path, data, check.inputs)
+    if failures := check.failures(path.stem, outputs):
+        raise RuntimeError(
+            f"The compiled {path.stem} program computes something else than PyTorch on its own inputs, by more "
+            f"than {PROGRAM_FLOOR_FACTOR:g} times what rounding moves it: {'; '.join(failures)}."
+        )
+    return {}
+
+
+STEPS = {"trace": trace_step, "compile": compile_step, "check": check_step}
 
 
 def main() -> None:

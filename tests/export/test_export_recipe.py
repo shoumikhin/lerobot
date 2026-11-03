@@ -35,6 +35,7 @@ from lerobot.export.recipe import (
     FLOAT32_TOLERANCE,
     ActionChunkRecipe,
     ExportRecipe,
+    ProgramCheck,
     ReplayDraws,
     frame_shapes,
     load_policy,
@@ -460,3 +461,69 @@ def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
 
     assert BareRecipe(policy, None, None, export_config()).tolerance == default
     assert DenoisingRecipe(policy, None, None, export_config()).tolerance == raised
+
+
+class _Scores(torch.nn.Module):
+    """A bfloat16 layer, and the index of its largest output, which no rounding may change."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        scores = self.linear(x)
+        return scores, scores.float().argmax(-1)
+
+
+class _Unnormalize(torch.nn.Module):
+    """Float32 arithmetic on a bfloat16 input, which no rerun rounds differently but a compiler may fuse."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x.float() * 3.0 + 1.0
+
+
+def test_a_program_check_lets_arithmetic_that_no_rerun_moves_round_by_a_step():
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_Unnormalize(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    step = torch.finfo(torch.float32).eps
+    assert check.floor == [(step, step)]
+    (actions,) = check.outputs
+    assert check.failures("actions", (actions * (1 + step),)) == []
+    (failure,) = check.failures("actions", (actions * (1 + 4 * step),))
+    assert failure.startswith("actions output 0")
+
+
+@pytest.mark.parametrize(("floor", "spread"), [((0.01, 1.0), False), ((1.0, 0.01), True)])
+def test_a_program_check_holds_each_difference_to_three_times_its_rounding(floor, spread):
+    """The largest and the mean difference each fail a program alone: one far value, or all a little off."""
+    reference = torch.tensor([1.0, -0.5, 0.25, 0.5], dtype=torch.float64)
+    check = ProgramCheck((), (reference,), [floor])
+    for times, passes in ((2.9, True), (3.1, False)):
+        if spread:
+            outputs = reference * (1 + times * 0.01)
+        else:
+            outputs = reference.clone()
+            outputs[0] += times * 0.01
+        assert (check.failures("x", (outputs,)) == []) == passes, times
+
+
+def test_a_program_check_holds_a_program_to_its_rounding(tmp_path):
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_Scores(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    largest, mean = check.floor[0]
+    assert torch.finfo(torch.bfloat16).eps <= largest < 0.05 and 0 < mean < 0.05
+    assert check.floor[1] == (0.0, 0.0)
+    scores, best = check.outputs
+    assert check.failures("scores", (scores, best)) == []
+    assert check.failures("scores", (scores * (1 + 2 * min(largest, mean)), best)) == []
+    (failure,) = check.failures("scores", (scores * (1 + 4 * max(largest, mean)), best))
+    assert failure.startswith("scores output 0")
+    (failure,) = check.failures("scores", (scores, best.roll(1)))
+    assert failure.startswith("scores output 1")
+    check.save(tmp_path / "check.safetensors")
+    loaded = ProgramCheck.load(tmp_path / "check.safetensors", "cpu")
+    assert loaded.floor == check.floor
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip((*loaded.inputs, *loaded.outputs), (*check.inputs, *check.outputs), strict=True)
+    )

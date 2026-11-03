@@ -150,6 +150,25 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
         assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(("offset", "passes"), [(0.0, True), (2.5e-4, False)])
+def test_a_part_checked_on_its_own_refuses_a_program_that_computes_something_else(
+    checkpoint, tmp_path, monkeypatch, offset, passes
+):
+    """A drift the float32 test case lets through is far more than rounding moves the program's own outputs."""
+    use_plugins(monkeypatch, "checked_recipe")
+    args = (
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'bundle'}",
+        f"--backend.offset={offset}",
+    )
+    if passes:
+        run_export(*args)
+    else:
+        with pytest.raises(RuntimeError, match="check-model step failed"):
+            run_export(*args)
+        assert list(tmp_path.iterdir()) == []
+
+
 def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
     TorchTestBackend().check_torch()
