@@ -20,6 +20,7 @@ compiler's own module registers its kernels with a real runtime.
 import logging
 import os
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -162,11 +163,24 @@ class TorchTestBackend(ExportBackendConfig):
     runtime_imports = ("tests.export.torch_backend",)
 
     offset: float = 0.0
+    # Writes a data file beside each program, as a backend that keeps the weights apart does, and runs a program
+    # only with it.
+    data_file: bool = False
 
-    def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+    def compile(self, program: torch.export.ExportedProgram, path: Path) -> Path | None:
         # As a real compiler logs its own work.
         logging.getLogger("torch_test_compiler").info("Lowering %s", path.stem)
         if self.offset:
             args, _ = program.example_inputs
             program = torch.export.export(_Offset(program.module(), self.offset), args)
         torch.export.save(program, path)
+        if not self.data_file:
+            return None
+        data = path.with_suffix(".bin")
+        data.write_bytes(b"")
+        return data
+
+    def run(self, path: Path, data: Path | None, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
+        if self.data_file and data is None:
+            raise ValueError(f"The {path.stem} program runs only with its data file.")
+        return TorchProgram(path, data)(*inputs)

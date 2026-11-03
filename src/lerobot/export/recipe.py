@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import abc
+import contextlib
+import functools
 import inspect
+import json
 import logging
 import os
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -28,7 +31,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import numpy as np
 import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.overrides import TorchFunctionMode
 
 from lerobot.bundle.manifest import NOISE, ActionTokens, ProgramRun
@@ -64,6 +70,17 @@ BFLOAT16_TOLERANCE = 0.075
 # TensorRT bundle differed from its test case by 0.079 on an H100, where another kernel moved it by 0.076. Another
 # attention kernel moves Wall-OSS 0.5's actions by up to 0.16.
 BFLOAT16_STEPS_TOLERANCE = 0.2
+# A part checked on its own (`ProgramCheck`) may differ from PyTorch by this many times what rounding alone moves
+# it. Correct LingBot-VA programs from TensorRT and ExecuTorch's CUDA backend measured up to 1.85 times; a wrong
+# attention head size, swapped keys and values, a skipped layer or a zeroed output measured 9 to 830 times.
+PROGRAM_FLOOR_FACTOR = 3.0
+# A part checked on its own must compute a floating point output again, with nothing changed, within
+# `RERUN_STEPS` rounding steps of the least precise float type it reads, holds or returns, or
+# `RERUN_TOLERANCE` of its largest value, whichever is larger. The fraction covers float32 sums in an order
+# that varies between runs: GPU atomic adds moved a float32 output by 9e-7 on an A100, 7.5 steps. It sits
+# halfway, on a log scale, between that and random numbers of 1e-2 of a part's size, which must be refused.
+RERUN_STEPS = 3
+RERUN_TOLERANCE = 1e-4
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
@@ -73,6 +90,7 @@ _PROBE_TASKS = ("pick up the red cube", "stop")
 _RANDOM_NORMAL = {torch.randn, torch.randn_like, torch.normal, Tensor.normal_}
 _MULTINOMIAL = {torch.multinomial, Tensor.multinomial}
 _RANDOM_INTEGERS = {torch.randint}
+_HALF = (torch.bfloat16, torch.float16)
 
 
 @dataclass
@@ -90,6 +108,9 @@ class Part:
             The names of the inputs: keys of the robot's frame, `noise`, or outputs of earlier parts.
         outputs (`list[str]`):
             The names of the outputs. The last part outputs `action`.
+        check (`ProgramCheck`, *optional*):
+            What the compiled program must compute on its own, checked at export before the bundle's test
+            case.
     """
 
     name: str
@@ -97,6 +118,7 @@ class Part:
     example_inputs: tuple[Tensor, ...]
     inputs: list[str]
     outputs: list[str]
+    check: ProgramCheck | None = None
 
     def __post_init__(self) -> None:
         """Refuse a reserved name, inputs without one name each or one tensor given for two.
@@ -123,6 +145,257 @@ class Part:
             names[id(x)] = name
         # A traced program keeps its example inputs' memory layout, and a bundle passes every input contiguous.
         self.example_inputs = tuple(x.contiguous() for x in self.example_inputs)
+
+
+@dataclass
+class ProgramCheck:
+    """One call of a part, which its compiled program must reproduce on its own, within what rounding moves.
+
+    A long chain of bfloat16 programs, such as many denoising steps with classifier-free guidance, can amplify
+    rounding until two correct compilations play actions as different as a wrong one does, so the bundle's test
+    case cannot tell them apart. Fed the inputs the eager chain gave the part, each program is compared with the
+    part's own outputs before anything builds up. `measure` makes the check. It is meant for bfloat16 and float16
+    parts: a float32 part has no wider rerun to measure its rounding against, so a compiler that orders its float32
+    sums otherwise can miss the floor of one rounding step.
+
+    Args:
+        inputs (`tuple[Tensor, ...]`):
+            The part's inputs, contiguous, as a bundle passes them.
+        outputs (`tuple[Tensor, ...]`):
+            What the part computes from them in PyTorch.
+        floor (`list[tuple[float, float]]`):
+            For each output, the largest and the mean relative difference that rounding alone makes (see
+            `relative_errors`): the part with other attention kernels and matmul settings, and in float32, and at
+            least one rounding step of the output's dtype for the largest. A floating point output that none of
+            these moved, such as a copy, gets one rounding step for both; an integer output must match exactly.
+    """
+
+    inputs: tuple[Tensor, ...]
+    outputs: tuple[Tensor, ...]
+    floor: list[tuple[float, float]]
+
+    @classmethod
+    def measure(
+        cls,
+        module: nn.Module,
+        inputs: Sequence[Tensor],
+        float32: Callable[[], contextlib.AbstractContextManager] | None = None,
+    ) -> ProgramCheck:
+        """Run `module` on `inputs`, then again with each change that only rounds otherwise, and keep the floor.
+
+        `float32` runs the module in float32, by default with its own weights in float32 (see `in_float32`). A
+        recipe whose part also reads a dtype elsewhere, such as from its policy, passes one that sets that too.
+        Refuses a module whose first rerun, with nothing changed, moves an output more than rounding can.
+        """
+        inputs = tuple(x.contiguous() for x in inputs)
+        wide = tuple(x.float() if x.dtype in _HALF else x for x in inputs)
+        with torch.no_grad():
+            # Copies, since a part may return a buffer of its own that the reruns write into.
+            outputs = tuple(x.clone() for x in _call(module, inputs))
+            changes = [
+                (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
+            ]
+            changes.append((float32 or (lambda: in_float32(module)), wide))
+            measured = []
+            for change, change_inputs in changes:
+                with change():
+                    measured.append(relative_errors(_call(module, change_inputs), outputs))
+        # The first rerun changes nothing, so it measures what kernels vary between runs, unless the part
+        # draws random numbers, which every rerun would then fold into the floor. A part may compute in
+        # bfloat16 and return float32, which then varies by bfloat16's steps.
+        step = max(_step(t) for t in (*inputs, *module.parameters(), *module.buffers(), *outputs))
+        for index, ((again, _), x) in enumerate(zip(measured[0], outputs, strict=True)):
+            # An output that holds NaN, or an integer one a rerun moves, is refused below for that reason.
+            if (
+                x.is_floating_point()
+                and again > max(RERUN_STEPS * step, RERUN_TOLERANCE)
+                and not x.isnan().any()
+            ):
+                raise ValueError(
+                    f"Output {index} of the part changes by more than rounding does when it runs again on "
+                    "the same inputs, as when it draws random numbers or keeps dropout on, so a compiled "
+                    "program cannot be checked against it."
+                )
+        floor = [(0.0, 0.0)] * len(outputs)
+        for errors in measured:
+            floor = [(max(a, c), max(b, d)) for (a, b), (c, d) in zip(floor, errors, strict=True)]
+        # A compiler may also round the largest value the other way, or contract arithmetic that no rerun moved,
+        # such as a multiply and an add into one, by a step.
+        floor = [
+            (max(a, _step(x)), b) if b > 0 else (_step(x), _step(x))
+            for (a, b), x in zip(floor, outputs, strict=True)
+        ]
+        for index, pair in enumerate(floor):
+            # An infinite floor would let any output pass.
+            if not np.isfinite(pair).all():
+                raise ValueError(
+                    f"Output {index} of the part holds NaN in PyTorch, or a rerun that only rounds otherwise "
+                    "changes it without bound, such as an integer it computes from rounded values, so a compiled "
+                    "program cannot be checked against it."
+                )
+        return cls(inputs, outputs, floor)
+
+    def failures(self, name: str, outputs: Sequence[Tensor]) -> list[str]:
+        """How the compiled program's `outputs` miss this check, empty when they pass. Logs each output's error."""
+        if len(outputs) != len(self.outputs):
+            return [f"{name} returns {len(outputs)} outputs, not {len(self.outputs)}"]
+        failures = []
+        errors = relative_errors(outputs, self.outputs)
+        for index, (error, floor) in enumerate(zip(errors, self.floor, strict=True)):
+            logger.info(
+                "Program %s output %d on its own: largest relative difference %.2e (rounding %.2e), mean %.2e "
+                "(rounding %.2e)",
+                name,
+                index,
+                error[0],
+                floor[0],
+                error[1],
+                floor[1],
+            )
+            if not all(e <= PROGRAM_FLOOR_FACTOR * f for e, f in zip(error, floor, strict=True)):
+                failures.append(
+                    f"{name} output {index}: largest relative difference {error[0]:.3g} and mean {error[1]:.3g}, "
+                    f"where rounding moves it by up to {floor[0]:.3g} and {floor[1]:.3g}"
+                )
+        return failures
+
+    def save(self, path: Path) -> None:
+        """Write the check to `path`, for the step that runs the compiled program."""
+        # Contiguous copies, since safetensors refuses a tensor that is not contiguous or shares memory with
+        # another.
+        tensors = {
+            f"input.{i}": x.clone(memory_format=torch.contiguous_format) for i, x in enumerate(self.inputs)
+        }
+        tensors.update(
+            {
+                f"output.{i}": x.clone(memory_format=torch.contiguous_format)
+                for i, x in enumerate(self.outputs)
+            }
+        )
+        save_file(tensors, path, metadata={"floor": json.dumps(self.floor)})
+
+    @classmethod
+    def load(cls, path: Path, device: str) -> ProgramCheck:
+        """Read a check `save` wrote, its tensors on `device`."""
+        with safe_open(path, framework="pt") as file:
+            floor = [tuple(pair) for pair in json.loads(file.metadata()["floor"])]
+        tensors = load_file(path, device=device)
+        return cls(
+            tuple(tensors[f"input.{i}"] for i in range(sum(k.startswith("input.") for k in tensors))),
+            tuple(tensors[f"output.{i}"] for i in range(len(floor))),
+            cast(list[tuple[float, float]], floor),
+        )
+
+
+def relative_errors(outputs: Sequence[Tensor], expected: Sequence[Tensor]) -> list[tuple[float, float]]:
+    """For each output, how far it is from `expected`, as two ratios.
+
+    The largest absolute difference over the largest absolute value of `expected`, and the mean absolute
+    difference over the mean absolute value. An output of another shape than `expected` counts as infinitely
+    far. Where `expected` is not floating point, the output counts as infinitely far unless it is equal. Where
+    both hold the same infinity, such as an additive mask, they are equal, and the infinities of `expected`
+    count as 0 in its size. Any other infinity or NaN makes the output infinitely far.
+    """
+    errors = []
+    for output, reference in zip(outputs, expected, strict=True):
+        output = output.to(reference.device)
+        if output.shape != reference.shape:
+            errors.append((float("inf"), float("inf")))
+        elif not reference.is_floating_point():
+            errors.append((0.0, 0.0) if torch.equal(output, reference) else (float("inf"), float("inf")))
+        else:
+            output, reference = output.double(), reference.double()
+            difference = (output - reference).abs().masked_fill(output == reference, 0)
+            magnitude = reference.abs().masked_fill(~reference.isfinite(), 0)
+            errors.append(
+                (
+                    _ratio(difference.max(), magnitude.max()) if difference.numel() else 0.0,
+                    _ratio(difference.mean(), magnitude.mean()) if difference.numel() else 0.0,
+                )
+            )
+    return errors
+
+
+def _ratio(difference: Tensor, magnitude: Tensor) -> float:
+    if torch.isnan(difference):
+        return float("inf")
+    if difference == 0:
+        return 0.0
+    return float(difference / magnitude) if magnitude > 0 else float("inf")
+
+
+def _call(module: nn.Module, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+    # A clone each time, since a part may write into an input, such as a cache.
+    outputs = module(*(x.clone() for x in inputs))
+    return outputs if isinstance(outputs, tuple) else (outputs,)
+
+
+def _rounding_changes(device: torch.device) -> list[Callable[[], contextlib.AbstractContextManager]]:
+    """Settings that change only how a computation rounds: other attention kernels, and more on a GPU.
+
+    On a GPU, besides the attention kernels: TF32, full precision reductions in bfloat16 matmuls, cuDNN's
+    benchmarked convolutions and cuBLASLt's matmuls.
+    """
+    changes: list[Callable[[], contextlib.AbstractContextManager]] = [
+        functools.partial(sdpa_kernel, SDPBackend.MATH)
+    ]
+    if device.type != "cuda":
+        return changes
+    for backend in (SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION):
+        # A kernel that does not take these inputs leaves them to the math one.
+        changes.append(functools.partial(sdpa_kernel, [backend, SDPBackend.MATH]))
+    matmul, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    for owner, setting, value in (
+        (matmul, "allow_tf32", True),
+        (cudnn, "allow_tf32", True),
+        (matmul, "allow_bf16_reduced_precision_reduction", False),
+        (cudnn, "benchmark", True),
+    ):
+        changes.append(functools.partial(_setting, owner, setting, value))
+    changes.append(_cublaslt)
+    return changes
+
+
+@contextlib.contextmanager
+def _setting(owner: Any, name: str, value: Any) -> Iterator[None]:
+    saved = getattr(owner, name)
+    setattr(owner, name, value)
+    try:
+        yield
+    finally:
+        setattr(owner, name, saved)
+
+
+@contextlib.contextmanager
+def _cublaslt() -> Iterator[None]:
+    saved = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_blas_library(saved)
+
+
+@contextlib.contextmanager
+def in_float32(module: nn.Module) -> Iterator[None]:
+    """`module` with its bfloat16 and float16 weights in float32, which convert back exactly, and TF32 off."""
+    tensors = [t for t in [*module.parameters(), *module.buffers()] if t.dtype in _HALF]
+    dtypes = [t.dtype for t in tensors]
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_setting(torch.backends.cuda.matmul, "allow_tf32", False))
+        stack.enter_context(_setting(torch.backends.cudnn, "allow_tf32", False))
+        for tensor in tensors:
+            tensor.data = tensor.data.float()
+        try:
+            yield
+        finally:
+            for tensor, dtype in zip(tensors, dtypes, strict=True):
+                tensor.data = tensor.data.to(dtype)
+
+
+def _step(x: Tensor) -> float:
+    """One rounding step of `x`'s dtype, relative to its values; 0 for one that is not floating point."""
+    return float(torch.finfo(x.dtype).eps) if x.is_floating_point() else 0.0
 
 
 @dataclass
@@ -291,17 +564,18 @@ class ExportRecipe(abc.ABC):
     A recipe that overrides `load` and `__init__`, to load its weights one part at a time, sets the attributes
     below itself; `lerobot-export` reads no other.
 
-    Attributes:
-        config (`PreTrainedConfig`):
-            The policy config the bundle records, naming the frame it takes.
-        task (`str`, *optional*):
-            The task the parts hold, or `None` when none was given and the policy reads none.
-        tolerance (`float`):
-            The largest allowed action difference on the test case, in normalized action units.
+    **Attributes**:
+        - **config** (`PreTrainedConfig`) -- The policy config the bundle records, naming the frame it
+          takes.
+        - **task** (`str | None`) -- The task the parts hold, or `None` when none was given and the policy
+          reads none.
+        - **tolerance** (`float`) -- The largest allowed action difference on the test case, in normalized
+          action units.
+        - **bfloat16_tolerance** (`float`) -- The default tolerance of a bfloat16 or float16 checkpoint. A
+          recipe whose policy runs ten bfloat16 denoising steps, which amplify rounding, raises it to
+          `BFLOAT16_STEPS_TOLERANCE`.
     """
 
-    #: The default tolerance of a bfloat16 checkpoint. A recipe whose policy runs ten bfloat16 denoising steps,
-    #: which amplify rounding, raises it to `BFLOAT16_STEPS_TOLERANCE`.
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE
 
     @classmethod
@@ -320,7 +594,7 @@ class ExportRecipe(abc.ABC):
         postprocessor: PolicyProcessorPipeline,
         cfg: ExportConfig,
     ) -> None:
-        """Keep the policy, its processors and the configuration."""
+        """Keep the policy, its processors and the configuration; the tolerance is `cfg`'s or the dtype's."""
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
@@ -828,7 +1102,7 @@ def _integer_range(args: tuple, kwargs: dict[str, Any]) -> tuple[int, int, tuple
 
 
 def _default_tolerance(policy: PreTrainedPolicy, bfloat16_tolerance: float) -> float:
-    if any(p.dtype == torch.bfloat16 for p in policy.parameters()):
+    if any(p.dtype in _HALF for p in policy.parameters()):
         return bfloat16_tolerance
     return FLOAT32_TOLERANCE
 

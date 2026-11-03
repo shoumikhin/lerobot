@@ -35,6 +35,7 @@ from lerobot.export.recipe import (
     FLOAT32_TOLERANCE,
     ActionChunkRecipe,
     ExportRecipe,
+    ProgramCheck,
     ReplayDraws,
     export_task,
     frame_shapes,
@@ -898,6 +899,7 @@ class DenoisingRecipe(BareRecipe):
     [
         (torch.float32, FLOAT32_TOLERANCE, FLOAT32_TOLERANCE),
         (torch.bfloat16, BFLOAT16_TOLERANCE, BFLOAT16_STEPS_TOLERANCE),
+        (torch.float16, BFLOAT16_TOLERANCE, BFLOAT16_STEPS_TOLERANCE),
     ],
 )
 def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
@@ -905,3 +907,230 @@ def test_a_recipe_can_raise_the_bfloat16_tolerance(dtype, default, raised):
 
     assert BareRecipe(policy, None, None, export_config()).tolerance == default
     assert DenoisingRecipe(policy, None, None, export_config()).tolerance == raised
+
+
+class _Scores(torch.nn.Module):
+    """A bfloat16 layer, and the index of its largest output, which no rounding may change."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        scores = self.linear(x)
+        return scores, scores.float().argmax(-1)
+
+
+class _Unnormalize(torch.nn.Module):
+    """Float32 arithmetic on a bfloat16 input, which no rerun rounds differently but a compiler may fuse."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x.float() * 3.0 + 1.0
+
+
+def test_a_program_check_lets_arithmetic_that_no_rerun_moves_round_by_a_step():
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_Unnormalize(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    step = torch.finfo(torch.float32).eps
+    assert check.floor == [(step, step)]
+    (actions,) = check.outputs
+    assert check.failures("actions", (actions * (1 + step),)) == []
+    (failure,) = check.failures("actions", (actions * (1 + 4 * step),))
+    assert failure.startswith("actions output 0")
+
+
+class _Masked(torch.nn.Module):
+    """A bfloat16 layer whose outputs an additive mask sets to minus infinity in places, as in attention."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear(x).masked_fill(torch.arange(64) % 4 == 0, float("-inf"))
+
+
+def test_a_program_check_holds_an_output_with_infinities_to_its_rounding():
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_Masked(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    assert np.isfinite(check.floor).all()
+    (scores,) = check.outputs
+    assert check.failures("scores", (scores.clone(),)) == []
+    # The masked values stay minus infinity, and the others are far off.
+    (failure,) = check.failures("scores", (scores + 100,))
+    assert failure.startswith("scores output 0")
+    (failure,) = check.failures("scores", (scores.nan_to_num(neginf=0.0),))
+    assert failure.startswith("scores output 0")
+
+
+def test_a_program_check_refuses_a_part_whose_output_holds_nan():
+    with pytest.raises(ValueError, match="Output 0 of the part holds NaN in PyTorch"):
+        ProgramCheck.measure(torch.nn.Identity(), (torch.tensor([1.0, float("nan")], dtype=torch.bfloat16),))
+
+
+def test_a_program_check_refuses_an_output_of_another_shape_or_count():
+    check = ProgramCheck((), (torch.ones(2, 3),), [(1e-3, 1e-3)])
+    (failure,) = check.failures("x", (torch.ones(3, 2),))
+    assert "largest relative difference inf" in failure
+    assert check.failures("x", (torch.ones(2, 3), torch.ones(1))) == ["x returns 2 outputs, not 1"]
+
+
+def test_a_program_check_saves_inputs_and_outputs_that_share_memory(tmp_path):
+    y = torch.randn(4, dtype=torch.bfloat16)
+    check = ProgramCheck((y, y[1:]), (y, y[1:]), [(0.0, 0.0), (0.0, 0.0)])
+    check.save(tmp_path / "check.safetensors")
+    loaded = ProgramCheck.load(tmp_path / "check.safetensors", "cpu")
+    assert all(torch.equal(a, b) for a, b in zip(loaded.inputs, check.inputs, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(loaded.outputs, check.outputs, strict=True))
+
+
+def test_a_program_check_gives_the_part_back_in_its_own_dtype():
+    # Seeded: for a few weights and inputs in a hundred, the float32 rerun picks another largest output.
+    torch.manual_seed(0)
+    part = _Scores()
+    ProgramCheck.measure(part, (torch.randn(8, 64, dtype=torch.bfloat16),))
+    assert {parameter.dtype for parameter in part.parameters()} == {torch.bfloat16}
+
+
+class _WritesItsInput(torch.nn.Module):
+    """A bfloat16 layer that first writes into its input, as a part that updates a cache does."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x.add_(1)
+        return self.linear(x)
+
+
+def test_a_program_check_keeps_the_inputs_a_part_writes_into():
+    torch.manual_seed(0)
+    x = torch.randn(8, 64, dtype=torch.bfloat16)
+    check = ProgramCheck.measure(_WritesItsInput(), (x.clone(),))
+    assert torch.equal(check.inputs[0], x)
+    assert check.floor[0][1] < torch.finfo(torch.bfloat16).eps
+
+
+class _VariesBetweenRuns(torch.nn.Module):
+    """A layer whose result moves by up to `spread` of its size per run.
+
+    `dtype` is in one place, `held_in`: its weights, a buffer that scales their result, its input (which the
+    test makes) or its output. The rest is float32.
+    """
+
+    def __init__(self, spread: float, dtype: torch.dtype, held_in: str):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64, dtype=dtype if held_in == "weights" else torch.float32)
+        self.register_buffer("scale", torch.ones(64, dtype=dtype if held_in == "buffer" else torch.float32))
+        self.output_dtype = dtype if held_in == "output" else torch.float32
+        self.spread = spread
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.linear(x.to(self.linear.weight.dtype))
+        y = (y.to(self.scale.dtype) * self.scale).float()
+        return (y + self.spread * y.abs().max() * torch.rand_like(y)).to(self.output_dtype)
+
+
+# GPU atomic adds move a float32 output by 1e-6 and a bfloat16 one by about half a step, 4e-3; a part that
+# draws random numbers moves it by more.
+@pytest.mark.parametrize(
+    ("spread", "dtype", "held_in", "refused"),
+    [
+        (1e-6, torch.float32, "weights", False),
+        (1e-2, torch.float32, "weights", True),
+        (4e-3, torch.bfloat16, "weights", False),
+        (4e-3, torch.bfloat16, "buffer", False),
+        (4e-3, torch.bfloat16, "input", False),
+        (4e-3, torch.bfloat16, "output", False),
+        (0.1, torch.bfloat16, "weights", True),
+    ],
+)
+def test_a_program_check_takes_kernels_that_vary_between_runs_but_not_random_numbers(
+    spread, dtype, held_in, refused
+):
+    torch.manual_seed(0)
+    part = _VariesBetweenRuns(spread, dtype, held_in)
+    x = torch.randn(8, 64, dtype=dtype if held_in == "input" else torch.float32)
+    if refused:
+        with pytest.raises(ValueError, match="changes by more than rounding does when it runs again"):
+            ProgramCheck.measure(part, (x,))
+    else:
+        ProgramCheck.measure(part, (x,))
+
+
+def test_a_program_check_refuses_a_part_that_keeps_dropout_on():
+    torch.manual_seed(0)
+    part = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout(0.1)).to(torch.bfloat16)
+    x = torch.randn(8, 64, dtype=torch.bfloat16)
+    with pytest.raises(
+        ValueError, match="Output 0 of the part changes by more than rounding does when it runs"
+    ):
+        ProgramCheck.measure(part.train(), (x,))
+    ProgramCheck.measure(part.eval(), (x,))
+
+
+class _ReturnsItsBuffer(torch.nn.Module):
+    """A bfloat16 layer that writes its result into a float32 buffer of its own and returns that buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+        self.register_buffer("result", torch.zeros(8, 64))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.result.copy_(self.linear(x))
+
+
+def test_a_program_check_keeps_what_a_part_returned_before_its_reruns():
+    torch.manual_seed(0)
+    part, x = _ReturnsItsBuffer(), torch.randn(8, 64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = part(x).clone()
+    # The float32 rerun writes other values into the buffer.
+    check = ProgramCheck.measure(part, (x,))
+    assert torch.equal(check.outputs[0], expected)
+
+
+@pytest.mark.parametrize(
+    ("floor", "spread"),
+    [((0.01, 1.0), False), ((1.0, 0.01), True)],
+    ids=["largest-off", "all-slightly-off"],
+)
+def test_a_program_check_holds_each_difference_to_three_times_its_rounding(floor, spread):
+    """The largest and the mean difference each fail a program alone: one far value, or all a little off.
+
+    Each case gives the check it does not test a floor 100 times larger, so only the tested check can fail.
+    """
+    reference = torch.tensor([1.0, -0.5, 0.25, 0.5], dtype=torch.float64)
+    check = ProgramCheck((), (reference,), [floor])
+    for times, passes in ((2.9, True), (3.1, False)):
+        if spread:
+            outputs = reference + times * 0.01 * reference.abs().mean()
+        else:
+            outputs = reference.clone()
+            outputs[0] += times * 0.01
+        assert (check.failures("x", (outputs,)) == []) == passes, times
+
+
+def test_a_program_check_holds_a_program_to_its_rounding(tmp_path):
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_Scores(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    largest, mean = check.floor[0]
+    # Measured: a floor of one rounding step for both would mean that no rerun moved the layer.
+    assert torch.finfo(torch.bfloat16).eps <= largest < 0.05 and 0 < mean < torch.finfo(torch.bfloat16).eps
+    assert check.floor[1] == (0.0, 0.0)
+    scores, best = check.outputs
+    assert check.failures("scores", (scores, best)) == []
+    assert check.failures("scores", (scores * (1 + 2 * min(largest, mean)), best)) == []
+    (failure,) = check.failures("scores", (scores * (1 + 4 * max(largest, mean)), best))
+    assert failure.startswith("scores output 0")
+    (failure,) = check.failures("scores", (scores, best.roll(1)))
+    assert failure.startswith("scores output 1")
+    check.save(tmp_path / "check.safetensors")
+    loaded = ProgramCheck.load(tmp_path / "check.safetensors", "cpu")
+    assert loaded.floor == check.floor
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip((*loaded.inputs, *loaded.outputs), (*check.inputs, *check.outputs), strict=True)
+    )

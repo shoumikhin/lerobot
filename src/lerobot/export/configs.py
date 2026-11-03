@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import math
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal
@@ -32,6 +33,7 @@ from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.default import DatasetConfig
 
 if TYPE_CHECKING:
+    from torch import Tensor
     from torch.export import ExportedProgram
 
 
@@ -124,6 +126,14 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         second file written beside `path` that the runtime loads with the program, such as its weights, or
         `None`.
         """
+
+    def run(self, path: Path, data: Path | None, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
+        """Run the program file `path` once on PyTorch tensors, for a recipe that checks a part on its own.
+
+        `data` is the file `compile` returned. A backend whose programs cannot run in the export's process does
+        not override this, and cannot export such a recipe.
+        """
+        raise NotImplementedError(f"The {self.type} backend cannot run its programs at export.")
 
 
 @dataclass

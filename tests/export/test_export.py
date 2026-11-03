@@ -131,6 +131,39 @@ def test_float32_tolerance_catches_a_tenfold_drift(checkpoint, tmp_path, offset,
         assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("offset", "data_file", "passes"), [(0.0, False, True), (0.0, True, True), (2.5e-4, False, False)]
+)
+def test_a_part_checked_on_its_own_refuses_a_program_that_computes_something_else(
+    checkpoint, tmp_path, monkeypatch, capfd, offset, data_file, passes
+):
+    """A drift the float32 test case lets through is far more than rounding moves the program's own outputs. A
+    program with a data file is checked with it."""
+    use_plugins(monkeypatch, "checked_recipe")
+    args = (
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'bundle'}",
+        f"--backend.offset={offset}",
+        f"--backend.data_file={data_file}",
+    )
+    if passes:
+        run_export(*args)
+        assert (tmp_path / "bundle" / "model.bin").is_file() == data_file
+    else:
+        with pytest.raises(RuntimeError, match="check-model step failed"):
+            run_export(*args)
+        assert "computes something else than PyTorch on its own inputs" in capfd.readouterr().err
+        assert list(tmp_path.iterdir()) == []
+
+
+def test_a_backend_that_cannot_run_its_programs_says_so():
+    from lerobot.export.configs import ExportBackendConfig
+    from tests.export.torch_backend import TorchTestBackend
+
+    with pytest.raises(NotImplementedError, match="The torch_test backend cannot run its programs at export"):
+        ExportBackendConfig.run(TorchTestBackend(), Path("model.pt2"), None, ())
+
+
 def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     monkeypatch.setattr(TorchTestBackend, "min_torch", "2.0")
     TorchTestBackend().check_torch()
@@ -921,6 +954,39 @@ from lerobot.scripts.lerobot_export import export
 
 export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
+
+
+# In a process of its own: the backend returns PyTorch's tensors only from an ExecuTorch loaded without
+# `prepare()`, which conftest.py calls in this process.
+RUN_PART = """
+import sys
+from pathlib import Path
+
+import torch
+
+from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
+
+model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+x = torch.randn(3, 4)
+backend = ExecuTorchXNNPACKConfig()
+path = Path(sys.argv[1]) / "model.pte"
+backend.compile(torch.export.export(model, (x,)), path)
+(actual,) = backend.run(path, None, [x])
+torch.testing.assert_close(actual, model(x).detach(), rtol=1e-5, atol=1e-5)
+# Options for a backend this machine lacks are refused with the bundle's message, not ExecuTorch's code.
+ExecuTorchXNNPACKConfig.runtime_options = {"NoSuchBackend": {"option": True}}
+try:
+    backend.run(path, None, [x])
+except ValueError as error:
+    assert "ExecuTorch backends this machine does not have" in str(error), error
+else:
+    raise AssertionError("an option for a missing backend was not refused")
+"""
+
+
+@needs_executorch
+def test_an_executorch_part_runs_at_export_the_way_a_bundle_loads_it(tmp_path):
+    subprocess.run([sys.executable, "-c", RUN_PART, str(tmp_path)], check=True, timeout=300)
 
 
 @needs_executorch_openvino

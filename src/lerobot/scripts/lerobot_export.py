@@ -32,11 +32,13 @@ Export on the kind of board that will run the policy, then run the bundle with `
 
 Before writing the bundle, the export replays its test case through the compiled programs, as rollout
 does before the robot moves, and writes nothing if the actions differ from PyTorch's by more than the
-tolerance.
+tolerance. A recipe may also have some parts checked on their own, each compiled program on the inputs the part
+got in PyTorch.
 
-This process never imports PyTorch. It traces the policy in one process and compiles each part in a process
-of its own (see `lerobot.export.worker`), then checks the bundle in another (`python -m lerobot.bundle`), so
-each step starts with the memory the one before it used given back.
+This process never imports PyTorch. It traces the policy in one process, compiles each program in a process of
+its own (on a CUDA device, for a policy that takes a noise, also the one that draws it), checks each part the
+recipe asks for in one more process each (see `lerobot.export.worker`), then checks the bundle in another
+(`python -m lerobot.bundle`), so each step starts with the memory the one before it used given back.
 """
 
 import json
@@ -90,9 +92,11 @@ def export(args: Sequence[str]) -> Path:
                 if key.startswith("backend.")
             ]
             manifest = BundleManifest.from_dict(traced["manifest"])
-            steps = len(manifest.programs) + 1
+            steps = len(manifest.programs) + len(traced["checks"]) + 1
             logger.info("Traced the policy in %.0f s", time.monotonic() - start)
-            for step, (name, files) in enumerate(manifest.programs.items(), start=1):
+            step = 0
+            for name, files in manifest.programs.items():
+                step += 1
                 request = {
                     "step": "compile",
                     "backend": traced["backend"],
@@ -103,6 +107,19 @@ def export(args: Sequence[str]) -> Path:
                 }
                 with _step(f"[{step}/{steps}] Compiling {name} with {traced['backend']['type']}"):
                     files.data = cast(dict[str, Any], _run_step(work, f"compile-{name}", request))["data"]
+                if name in traced["checks"]:
+                    step += 1
+                    check = {
+                        "step": "check",
+                        "backend": traced["backend"],
+                        "check": str(Path(traced["traced"]) / f"{name}.check.safetensors"),
+                        "path": request["path"],
+                        "data": None if files.data is None else str(folder / files.data),
+                        "plugins": plugins,
+                        "log_level": traced["log_level"],
+                    }
+                    with _step(f"[{step}/{steps}] Checking the compiled {name} on its own inputs"):
+                        _run_step(work, f"check-{name}", check)
             shutil.rmtree(traced["traced"])
             Bundle(folder, manifest).write()
             with _step(f"[{steps}/{steps}] Checking the bundle"):
