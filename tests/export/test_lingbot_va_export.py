@@ -24,7 +24,7 @@ pytest.importorskip("transformers")
 
 from lerobot.policies.lingbot_va import export_lingbot_va  # noqa: E402
 from lerobot.policies.lingbot_va.configuration_lingbot_va import LingBotVAConfig  # noqa: E402
-from lerobot.policies.lingbot_va.export_lingbot_va import LingBotVAExportRecipe  # noqa: E402
+from lerobot.policies.lingbot_va.export_lingbot_va import VALID, LingBotVAExportRecipe  # noqa: E402
 from tests.export import tiny_lingbot_va  # noqa: E402
 
 
@@ -95,3 +95,19 @@ def test_blocks_hold_the_text_the_policy_attends_to(tmp_path):
         text = torch.cat([prompt.to(torch.bfloat16), negative.to(torch.bfloat16)])
         expected = policy.transformer.condition_embedder.text_embedder(text)
     assert torch.equal(blocks.module.text, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_each_part_is_checked_on_a_kv_cache_past_its_first_eviction(tmp_path, dtype):
+    """The tiny KV cache holds two chunks, so the test case's third chunk frees some of it. In half precision every
+    part is checked on its own, on the inputs of its last call: the cache then holds keys, and it was full when the
+    third chunk took its slots."""
+    parts = {part.name: part for part in make_recipe(tmp_path / "checkpoint", dtype=dtype).parts()}
+
+    assert all(part.check is not None for part in parts.values())
+    blocks = parts["blocks"]
+    assert blocks.example_inputs[blocks.inputs.index(VALID)].any()
+    for name in ("alloc_video", "alloc_action"):
+        allocate = parts[name]
+        free = (~allocate.example_inputs[allocate.inputs.index(VALID)]).sum()
+        assert free < allocate.module.count, name
