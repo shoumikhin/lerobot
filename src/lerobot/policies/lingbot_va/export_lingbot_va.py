@@ -44,6 +44,8 @@ taken and freed the way the policy's own cache takes and frees them.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import math
 from collections import deque
@@ -59,12 +61,13 @@ from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, ProgramRun
 from lerobot.export.recipe import (
-    BFLOAT16_STEPS_TOLERANCE,
     ActionChunkRecipe,
     Part,
+    ProgramCheck,
     RunPlan,
     TestCase,
     export_task,
+    in_float32,
     preprocessor_renames,
     random_frame,
     to_policy_input,
@@ -607,11 +610,16 @@ class LingBotVAExportRecipe(ActionChunkRecipe):
     The test case plays the first chunks of an episode from a reset, tick by tick, with the policy's own
     `select_action` as `lerobot-rollout` calls it, and each chunk's noise. Before the parts are traced, they are run
     the way the bundle runs them, on the test case and on other random frames and noise, and must play the same
-    actions within the tolerance.
+    actions within the tolerance. In bfloat16 and float16, each compiled program is also checked on its own
+    (`ProgramCheck`).
     """
 
-    # LingBot-VA runs 20 video and 50 action denoising steps in bfloat16.
-    bfloat16_tolerance = BFLOAT16_STEPS_TOLERANCE
+    # In bfloat16, each chunk's 20 video steps run classifier-free guidance at scale 5, and over the test case's
+    # 3 chunks eager PyTorch with only another attention kernel or matmul setting moved the actions by up to 0.52,
+    # about as much as a bundle whose encoders used a wrong attention head size (0.57). So each part is checked on
+    # its own, and the test case only catches a bundle that runs them wrong: lost feedback, swapped keys and values
+    # or a zeroed output moved the actions by 1.9.
+    bfloat16_tolerance = 1.0
     policy: LingBotVAPolicy
 
     def __init__(
@@ -740,11 +748,28 @@ class LingBotVAExportRecipe(ActionChunkRecipe):
                     f"(largest difference {difference:.3g} of the actions' spread, tolerance {self.tolerance})."
                 )
         runs = {run.program: run for chunk in self._chunk_runs() for run in chunk}
+        checked = next(self.policy.transformer.parameters()).dtype in (torch.bfloat16, torch.float16)
         for name, module in modules.items():
             # A setting can leave a program to no run, such as `video_out` with a single video pass.
             if name not in runs:
                 continue
-            yield Part(name, module, examples[name], runs[name].inputs, runs[name].outputs)
+            check = (
+                ProgramCheck.measure(module, examples[name], functools.partial(self._float32, module))
+                if checked
+                else None
+            )
+            yield Part(name, module, examples[name], runs[name].inputs, runs[name].outputs, check)
+
+    @contextlib.contextmanager
+    def _float32(self, module: nn.Module) -> Iterator[None]:
+        """`module` in float32, with the camera frames the policy converts to its dtype in float32 too."""
+        dtype = self.policy.dtype
+        self.policy.dtype = torch.float32
+        try:
+            with in_float32(module):
+                yield
+        finally:
+            self.policy.dtype = dtype
 
     def plan(self) -> RunPlan:
         """The runs of the first two chunks and of every later one, their constants, carry and camera history."""
