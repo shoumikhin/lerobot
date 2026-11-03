@@ -852,6 +852,8 @@ class PI0Policy(PreTrainedPolicy):
                     "model.safetensors",
                     cache_dir=cache_dir,
                     force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
                     token=token,
                     revision=revision,
                     local_files_only=local_files_only,
