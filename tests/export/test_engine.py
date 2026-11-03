@@ -486,6 +486,14 @@ def test_engine_refuses_a_test_case_whose_ticks_play_more_chunks_than_it_has_noi
         ({"history": {OBS_STATE: 0}}, "whole number of frames above 0"),
         ({"carry": {"total": 3}}, "shape of whole numbers"),
         ({"first_runs": [[]]}, "no run for one of the first chunks"),
+        # An infinite scale would make every difference 0, so any program would pass its check.
+        ({"action_scale": [float("inf"), 1.0, 1.0]}, "action scale must hold finite numbers above 0"),
+        ({"action_names": ["shoulder"]}, "different number of actions than it scales"),
+        ({"runs": []}, "lists no run"),
+        (
+            {"runs": [{"name": "model", "program": "model", "inputs": [], "outputs": []}] * 2},
+            "names a run twice",
+        ),
     ],
 )
 def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):

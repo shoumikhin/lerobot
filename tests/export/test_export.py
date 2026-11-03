@@ -166,6 +166,20 @@ def test_export_refuses_a_task_token_budget_for_a_policy_that_takes_no_task(chec
     assert "--max_task_tokens applies only to a policy whose bundle takes any task" in capfd.readouterr().err
 
 
+def test_export_refuses_a_task_token_budget_below_one(checkpoint, tmp_path, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--max_task_tokens=0")
+    assert "--max_task_tokens must be at least 1" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize(("option", "value"), [("compute_units", "tpu"), ("compute_precision", "int8")])
+def test_executorch_coreml_refuses_an_unknown_option_on_any_platform(option, value):
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    with pytest.raises(ValueError, match=f"--backend.{option} must be one of"):
+        ExecuTorchCoreMLConfig(**{option: value})
+
+
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
     partial = tmp_path / "partial"
     shutil.copytree(checkpoint, partial)
