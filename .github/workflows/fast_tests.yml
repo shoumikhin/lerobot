@@ -48,10 +48,6 @@ on:
 env:
   UV_VERSION: "0.11.30"
   PYTHON_VERSION: "3.12"
-  # ExecuTorch is not in uv.lock, which cannot hold ExecuTorch 1.6 until it is on PyPI. Its 1.6 release candidate is on
-  # PyTorch's test index only; replace this with `executorch==1.6.0` once that release is on PyPI. The index replaces a
-  # release candidate under the same name, so it is pinned by its hash.
-  EXECUTORCH_CPU: "executorch @ https://download.pytorch.org/whl/test/cpu/executorch-1.6.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=533a8269b1c406d59b74c590e0ddc8a7ffacdfeb5d162a0117aa42d12c8a1f1c"
 
 # Ensures that only the latest commit for a PR or branch is built, canceling older runs.
 concurrency:
@@ -135,9 +131,10 @@ jobs:
         run: uv run pytest tests -vv --maxfail=10 -m viz
 
   # This job exports tiny policies with the backends ExecuTorch runs on the CPU and checks the bundles: it installs
-  # ExecuTorch over the extras of those policies and runs the tests that need it (`-m executorch`, see
-  # tests/conftest.py). Their GPU backends run in the GPU Export Tests job of Full Tests. The OpenVINO backend needs the
-  # openvino and nncf packages, which no job installs, and the Core ML and MLX backends need macOS, so no job runs them.
+  # ExecuTorch with the `export` extra over the extras of those policies and runs the tests that need it (`-m executorch`,
+  # see tests/conftest.py). Their GPU backends run in the GPU Export Tests job of Full Tests. The OpenVINO backend needs
+  # the openvino and nncf packages, which no job installs, and the Core ML and MLX backends need macOS, so no job runs
+  # them.
   fast-export-tests:
     permissions:
       contents: read
@@ -171,8 +168,7 @@ jobs:
 
       - name: "Install: export"
         run: |
-          uv sync --locked --extra test --extra pi --extra smolvla --extra groot --extra diffusion
-          uv pip install "$EXECUTORCH_CPU"
+          uv sync --locked --extra test --extra pi --extra smolvla --extra groot --extra diffusion --extra export
 
       # Every export test skips without ExecuTorch, and a run of skips passes.
       - name: "Check: ExecuTorch"
