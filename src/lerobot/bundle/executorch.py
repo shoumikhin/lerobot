@@ -66,7 +66,8 @@ def _runtime_module() -> ModuleType:
         return importlib.import_module("executorch.runtime")
     except ImportError as error:
         raise ImportError(
-            "Running this bundle needs ExecuTorch 1.6: pip install 'executorch>=1.6.0,<1.7.0'"
+            "Running this bundle needs ExecuTorch 1.6, which pip install 'lerobot[export]' installs on Linux "
+            "(x86_64, aarch64), Windows (x86_64) and Apple Silicon Macs, the platforms it has wheels for."
         ) from error
 
 

@@ -1120,3 +1120,15 @@ def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp
     engine = BundleEngine(Bundle.read(tmp_path / "b"))
     actions = np.stack([engine.get_action(robot_frame()) for _ in range(8)])
     assert actions.shape == (8, 3) and np.isfinite(actions).all()
+
+
+def test_the_install_hints_name_an_extra_that_lerobot_defines():
+    import tomllib
+
+    from packaging.requirements import Requirement
+
+    from lerobot.export.backends.executorch import EXPORT_EXTRA
+
+    project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())["project"]
+    extra = Requirement(EXPORT_EXTRA)
+    assert extra.name == project["name"] and extra.extras <= set(project["optional-dependencies"])

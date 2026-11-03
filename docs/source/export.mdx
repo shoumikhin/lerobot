@@ -628,7 +628,7 @@ from pathlib import Path
 
 from torch.export import ExportedProgram
 
-from lerobot.export.backends.executorch import EXECUTORCH, ExecuTorchConfig
+from lerobot.export.backends.executorch import EXPORT_EXTRA, ExecuTorchConfig
 from lerobot.export.configs import ExportBackendConfig
 
 
@@ -638,7 +638,7 @@ class ExecuTorchMyChipConfig(ExecuTorchConfig):
     device = "cpu"  # where the programs run; the parts are traced and compiled there too
     runtime_imports = ("mychip_executorch",)  # modules that register the chip with the runtime, if any
     runtime_modules = ("executorch", "mychip_executorch")  # modules whose versions the bundle records
-    packages = (EXECUTORCH, "mychip-executorch")  # what to install beside LeRobot to export
+    packages = (EXPORT_EXTRA, "mychip-executorch")  # what to install to export
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         from executorch.exir import to_edge_transform_and_lower

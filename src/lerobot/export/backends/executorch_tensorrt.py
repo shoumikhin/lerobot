@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import EXECUTORCH, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
+from .executorch import EXPORT_EXTRA, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
 
 if TYPE_CHECKING:
     from torch import Tensor, nn
@@ -65,7 +65,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     # activations instead of holding one each.
     runtime_options = {"TensorRTBackend": {"use_shared_activation_scratch": True}}
     runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
-    packages = (EXECUTORCH, "torch-tensorrt[executorch]>=2.15,<2.16", "torch-tensorrt-executorch-runtime")
+    packages = (EXPORT_EXTRA, "torch-tensorrt[executorch]>=2.15,<2.16", "torch-tensorrt-executorch-runtime")
     quantizations = ("fp8",)
     # Registers `tensorrt::quantize_op`, which a part traced with --quantize=fp8 holds.
     quantization_imports = {"fp8": "modelopt.torch.quantization"}
