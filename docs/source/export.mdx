@@ -17,26 +17,31 @@ checkpoint ─────────────────> bundle folder
 
 ## Install
 
-You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs), and the compiler of the **backend** you choose. Install them on the machine that will run the policy.
+Install LeRobot with its `export` extra, on the machine that will run the policy:
 
-| `--backend.type`      | Runs the policy on                                              | Install                                                                  |
-| --------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `executorch_xnnpack`  | Arm and x86 CPUs                                                | `pip install lerobot 'executorch>=1.6.0,<1.7.0'`                         |
-| `executorch_openvino` | Intel CPUs                                                      | `pip install lerobot 'executorch>=1.6.0,<1.7.0' openvino nncf`           |
-| `executorch_mlx`      | Apple Silicon Macs (GPU, through MLX)                           | `pip install lerobot 'executorch>=1.6.0,<1.7.0'`                         |
-| `executorch_coreml`   | Apple Silicon Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install lerobot 'executorch>=1.6.0,<1.7.0'` on Python 3.13 or older |
-| `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT                 | `pip install lerobot 'executorch>=1.6.0,<1.7.0'` on Linux                |
-| `executorch_tensorrt` | NVIDIA GPUs, including Jetson                                   | `pip install lerobot` and `torch_tensorrt[executorch]` on Linux          |
+```bash
+pip install 'lerobot[export]'
+```
 
-- The NVIDIA backends export on the GPU and load the policy straight onto it, and transformers then needs `accelerate` to load the models a policy builds from a checkpoint, such as its vision or text encoder, so install `accelerate` with them.
-- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. This holds for every backend in the table. LeRobot's own pins allow PyTorch 2.15, and the ExecuTorch 1.6 package pins `torch==2.15.0`, so each command above installs everything in one environment.
-- On Linux, ExecuTorch's wheel on PyPI is its CUDA 13.2 build, for the same CUDA as the PyTorch 2.15 on PyPI, so `executorch_cuda` needs nothing more. The same wheel imports and runs the CPU backends on a machine without an NVIDIA driver. For `executorch_tensorrt`, add Torch-TensorRT:
+The extra brings ExecuTorch 1.6, the runtime that loads the compiled programs, and PyTorch 2.15, which exporting needs. ExecuTorch's wheels already contain the compilers of most **backends**:
+
+| `--backend.type`      | Runs the policy on                                              | Install                                                                     |
+| --------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `executorch_xnnpack`  | Arm and x86 CPUs                                                | `pip install 'lerobot[export]'`                                             |
+| `executorch_openvino` | Intel CPUs                                                      | `pip install 'lerobot[export]' openvino nncf`                               |
+| `executorch_mlx`      | Apple Silicon Macs (GPU, through MLX)                           | `pip install 'lerobot[export]'`                                             |
+| `executorch_coreml`   | Apple Silicon Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install 'lerobot[export]'` on Python 3.13 or older                     |
+| `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT                 | `pip install 'lerobot[export]'` on Linux                                    |
+| `executorch_tensorrt` | NVIDIA GPUs, including Jetson                                   | `pip install 'lerobot[export]'` and `torch_tensorrt[executorch]` on Linux   |
+
+- The extra covers Linux (x86_64 and aarch64), Windows (x86_64) and Apple Silicon Macs with macOS 14 or newer, the platforms ExecuTorch and PyTorch 2.15 publish wheels for.
+- On Linux, ExecuTorch's wheel on PyPI is its CUDA 13.2 build, for the same CUDA as the PyTorch 2.15 on PyPI, so the extra already brings the CUDA backend. The same wheel imports and runs the CPU backends on a machine without an NVIDIA driver. For `executorch_tensorrt`, add Torch-TensorRT:
 
   ```bash
-  pip install lerobot 'torch_tensorrt[executorch]'
+  pip install 'lerobot[export]' 'torch_tensorrt[executorch]'
   ```
 
-  Torch-TensorRT's `executorch` extra brings ExecuTorch and `torch-tensorrt-executorch-runtime`, which loads the TensorRT engines of a bundle without PyTorch, so do not install them separately. It must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
+  Torch-TensorRT's `executorch` extra brings ExecuTorch and `torch-tensorrt-executorch-runtime`, which loads the TensorRT engines of a bundle without PyTorch, so do not install them separately. Torch-TensorRT is not part of LeRobot's `export` extra, because only NVIDIA machines need it. It must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 
 - With an older PyTorch, `lerobot-export` stops before it starts and prints the install command for its backend.
 - **ExecuTorch 1.6 has fixes these backends need.** `executorch_cuda` and `executorch_tensorrt` need [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. `executorch_openvino`, and every program that keeps an input check, need [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298).
@@ -565,7 +570,7 @@ from pathlib import Path
 
 from torch.export import ExportedProgram
 
-from lerobot.export.backends.executorch import EXECUTORCH, ExecuTorchConfig
+from lerobot.export.backends.executorch import EXPORT_EXTRA, ExecuTorchConfig
 from lerobot.export.configs import ExportBackendConfig
 
 
@@ -575,7 +580,7 @@ class ExecuTorchMyChipConfig(ExecuTorchConfig):
     device = "cpu"  # where the programs run; the parts are traced and compiled there too
     runtime_imports = ("mychip_executorch",)  # modules that register the chip with the runtime, if any
     runtime_modules = ("executorch", "mychip_executorch")  # modules whose versions the bundle records
-    packages = (EXECUTORCH, "mychip-executorch")  # what to install beside LeRobot to export
+    packages = (EXPORT_EXTRA, "mychip-executorch")  # what to install to export
 
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         from executorch.exir import to_edge_transform_and_lower
