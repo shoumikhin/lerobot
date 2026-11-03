@@ -47,33 +47,9 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.processor import NormalizerProcessorStep, ProcessorStep, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from tests.export.tiny_act import IMAGE, act_config, act_stats
 
-IMAGE = f"{OBS_IMAGES}.front"
-STATS = {
-    IMAGE: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
-    OBS_STATE: {"mean": torch.zeros(3), "std": torch.ones(3)},
-    ACTION: {"mean": torch.full((3,), 10.0), "std": torch.tensor([30.0, 3.0, 0.3])},
-}
-
-
-def act_config() -> ACTConfig:
-    return ACTConfig(
-        input_features={
-            IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
-            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
-        },
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
-        chunk_size=4,
-        n_action_steps=4,
-        use_vae=False,
-        dim_model=16,
-        n_heads=2,
-        dim_feedforward=32,
-        n_encoder_layers=1,
-        n_decoder_layers=1,
-        pretrained_backbone_weights=None,
-        device="cpu",
-    )
+STATS = act_stats(action_std=(30.0, 3.0, 0.3))
 
 
 def export_config(task: str = "") -> SimpleNamespace:

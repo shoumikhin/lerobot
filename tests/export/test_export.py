@@ -28,12 +28,10 @@ from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
-from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.export import worker
 from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
-from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
@@ -41,10 +39,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export.backends import EXECUTORCH, needs_executorch, needs_executorch_cuda
 from tests.export.plugins import use_plugins
+from tests.export.tiny_act import IMAGE, save_checkpoint
 from tests.export.torch_backend import TorchTestBackend
 from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
-
-IMAGE = "observation.images.front"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -52,34 +49,6 @@ def torch_test_backend():
     with pytest.MonkeyPatch.context() as monkeypatch:
         use_plugins(monkeypatch, "torch_backend")
         yield
-
-
-def save_checkpoint(path, image: str) -> None:
-    config = ACTConfig(
-        input_features={
-            image: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
-            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
-        },
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,))},
-        chunk_size=4,
-        n_action_steps=4,
-        use_vae=False,
-        dim_model=16,
-        n_heads=2,
-        dim_feedforward=32,
-        n_encoder_layers=1,
-        n_decoder_layers=1,
-        pretrained_backbone_weights=None,
-        device="cpu",
-    )
-    stats = {
-        image: {"mean": torch.full((3, 1, 1), 0.5), "std": torch.full((3, 1, 1), 0.2)},
-        OBS_STATE: {"mean": torch.zeros(3), "std": torch.ones(3)},
-        ACTION: {"mean": torch.full((3,), 10.0), "std": torch.full((3,), 30.0)},
-    }
-    ACTPolicy(config).save_pretrained(path)
-    for processor in make_pre_post_processors(config, dataset_stats=stats):
-        processor.save_pretrained(path)
 
 
 @pytest.fixture(scope="module")
