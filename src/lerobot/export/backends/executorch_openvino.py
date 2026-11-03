@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import EXECUTORCH, ExecuTorchConfig, lower
+from .executorch import EXPORT_EXTRA, ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
@@ -34,7 +34,7 @@ class ExecuTorchOpenVINOConfig(ExecuTorchConfig):
     """ExecuTorch programs whose work runs through OpenVINO, Intel's compiler, on the CPU."""
 
     device = "cpu"
-    packages = (EXECUTORCH, "openvino", "nncf")
+    packages = (EXPORT_EXTRA, "openvino", "nncf")
     # ExecuTorch's OpenVINO backend loads the OpenVINO runtime that this package installs.
     runtime_imports = ("openvino",)
     runtime_modules = ("executorch", "openvino")

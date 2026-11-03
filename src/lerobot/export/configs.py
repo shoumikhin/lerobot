@@ -45,38 +45,33 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     A backend knows its compiler, never a policy. Backends whose files the same runtime loads share that
     runtime and `lerobot-rollout` unchanged.
 
-    Attributes:
-        runtime (`str`):
-            The runtime that loads the program files, such as `executorch`.
-        file_suffix (`str`):
-            The suffix of the program files, such as `.pte`.
-        device (`str`):
-            Where the programs run, such as `cuda` or `cpu`. The parts are traced and compiled there too.
-        runtime_imports (`tuple[str, ...]`):
-            Python modules the runtime imports before it loads the files, such as one that registers the
-            compiler's kernels with the runtime.
-        runtime_options (`dict[str, dict[str, bool | int | str]]`):
-            Settings the runtime applies before it loads the files. For ExecuTorch, the options of its
-            backends, by backend name.
-        runtime_modules (`tuple[str, ...]`):
-            Python modules the files need to load, such as `executorch`. The bundle records their versions as
-            its `runtime_versions`.
-        exact_runtime_modules (`tuple[str, ...]`):
-            The modules of `runtime_modules` the files load only at the version that built them, such as
-            `tensorrt`. A bundle is refused where another version of one is installed.
-        packages (`tuple[str, ...]`):
-            What to install beside LeRobot to export with this backend, such as `"executorch>=1.6.0,<1.7.0"`.
-        min_torch (`str`, *optional*):
-            The oldest PyTorch whose traced programs the compiler reads, such as `"2.15"`. `None` takes any.
-        torch_pins (`tuple[str, ...]`):
-            The PyTorch pins an export with this backend needs, such as
-            `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`. The refusal of an older PyTorch prints them
-            with `packages` as one install command.
-        quantizations (`tuple[str, ...]`):
-            The `--quantize` modes the backend offers, such as `fp8`. Empty for none.
-        quantization_imports (`dict[str, str]`):
-            For a `--quantize` mode whose parts hold operators that a Python module registers on import, that
-            module. The compile step imports it before it loads such a part.
+    **Attributes**:
+        - **runtime** (`str`) -- The runtime that loads the program files, such as `executorch`.
+        - **file_suffix** (`str`) -- The suffix of the program files, such as `.pte`.
+        - **device** (`str`) -- The PyTorch device the parts are traced, compiled and checked on, such as
+          `cuda` or `cpu`. The programs run there too, except that Core ML and MLX programs traced on `cpu`
+          may run on the GPU or the Neural Engine.
+        - **runtime_imports** (`tuple[str, ...]`) -- Python modules the runtime imports before it loads the
+          files, such as one that registers the compiler's kernels with the runtime.
+        - **runtime_options** (`dict[str, dict[str, bool | int | str]]`) -- Settings the runtime applies
+          before it loads the files. For ExecuTorch, the options of its backends, by backend name.
+        - **runtime_modules** (`tuple[str, ...]`) -- Python modules the files need to load, such as
+          `executorch`. The bundle records their versions as its `runtime_versions`.
+        - **exact_runtime_modules** (`tuple[str, ...]`) -- The modules of `runtime_modules` the files load
+          only at the version that built them, such as `tensorrt`. A bundle is refused where another version
+          of one is installed.
+        - **packages** (`tuple[str, ...]`) -- What to install to export with this backend, such as
+          `"lerobot[export]"`.
+        - **min_torch** (`str | None`) -- The oldest PyTorch whose traced programs the compiler reads, such
+          as `"2.15"`. `None` takes any.
+        - **torch_pins** (`tuple[str, ...]`) -- The PyTorch pins an export with this backend needs, such as
+          `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`. The refusal of an older PyTorch prints them
+          with `packages` as one install command.
+        - **quantizations** (`tuple[str, ...]`) -- The `--quantize` modes the backend offers, such as `fp8`.
+          Empty for none.
+        - **quantization_imports** (`dict[str, str]`) -- For a `--quantize` mode whose parts hold operators
+          that a Python module registers on import, that module. The compile step imports it before it loads
+          such a part.
     """
 
     runtime: ClassVar[str]

@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.export import ExportedProgram
 
-EXECUTORCH = "executorch>=1.6.0,<1.7.0"
+EXPORT_EXTRA = "lerobot[export]"
 
 
 @dataclass
@@ -41,7 +41,7 @@ class ExecuTorchConfig(ExportBackendConfig):
     runtime = "executorch"
     file_suffix = ".pte"
     runtime_modules: ClassVar[tuple[str, ...]] = ("executorch",)
-    packages: ClassVar[tuple[str, ...]] = (EXECUTORCH,)
+    packages: ClassVar[tuple[str, ...]] = (EXPORT_EXTRA,)
     min_torch = "2.15"
     torch_pins = ("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")
 

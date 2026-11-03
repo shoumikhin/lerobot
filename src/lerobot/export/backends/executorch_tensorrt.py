@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import EXECUTORCH, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
+from .executorch import EXPORT_EXTRA, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
 
 if TYPE_CHECKING:
     from torch import Tensor, nn
@@ -67,7 +67,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     runtime_modules = ("executorch", "tensorrt", "torch_tensorrt_executorch_runtime")
     # TensorRT loads an engine only with the TensorRT version that built it, unless built version compatible.
     exact_runtime_modules = ("tensorrt",)
-    packages = (EXECUTORCH, "torch_tensorrt[executorch]")
+    packages = (EXPORT_EXTRA, "torch_tensorrt[executorch]")
     quantizations = ("fp8",)
     # Registers `tensorrt::quantize_op`, which a part traced with --quantize=fp8 holds.
     quantization_imports = {"fp8": "modelopt.torch.quantization"}

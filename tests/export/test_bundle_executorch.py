@@ -15,12 +15,16 @@
 """The ExecuTorch runtime of a bundle."""
 
 import os
+import re
 import subprocess
 import sys
+import tomllib
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from packaging.requirements import Requirement
 
 from lerobot.bundle import executorch
 from tests.export.backends import needs_executorch
@@ -45,6 +49,26 @@ def test_executorch_returns_its_own_results_without_changing_the_environment(tmp
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
     # The bindings load while the setting holds; a process started later, such as an export, gets PyTorch's tensors.
     assert result.stdout.splitlines() == ["loaded with executorch", f"then {preset}"]
+
+
+def test_without_executorch_the_bundle_says_why_how_and_where_to_install_it(monkeypatch):
+    # On a platform the export extra does not cover, installing it brings no ExecuTorch.
+    monkeypatch.setitem(sys.modules, "executorch.runtime", None)
+    message = (
+        r"which runs it \(.*None in sys\.modules\)\. "
+        r".*'lerobot\[export\]', on Linux .* Apple Silicon"
+    )
+    with pytest.raises(ImportError, match=message):
+        executorch.prepare()
+
+
+def test_the_bundle_names_an_extra_that_lerobot_defines(monkeypatch):
+    monkeypatch.setitem(sys.modules, "executorch.runtime", None)
+    with pytest.raises(ImportError) as error:
+        executorch.prepare()
+    project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())["project"]
+    extra = Requirement(re.search(r"pip install '([^']+)'", str(error.value)).group(1))
+    assert extra.name == project["name"] and extra.extras <= set(project["optional-dependencies"])
 
 
 @needs_executorch

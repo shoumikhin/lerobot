@@ -722,7 +722,10 @@ def test_the_compile_step_names_what_its_backend_needs_installed(tmp_path, monke
         "path": str(tmp_path / "out.pt2"),
         "plugins": [],
     }
-    message = r'The torch_test backend needs: pip install "compiler>=1.0"'
+    message = (
+        r"could not import what it needs \(No module named 'compiler'\)\. "
+        r'If it is not installed: pip install "compiler>=1.0"'
+    )
     with pytest.raises(ImportError, match=message) as error:
         worker.compile_step(request)
     assert isinstance(error.value.__cause__, ModuleNotFoundError)
@@ -1171,3 +1174,15 @@ def test_a_recipe_runs_its_first_chunk_with_a_program_of_its_own(checkpoint, tmp
     engine = BundleEngine(Bundle.read(tmp_path / "b"))
     actions = np.stack([engine.get_action(robot_frame()) for _ in range(8)])
     assert actions.shape == (8, 3) and np.isfinite(actions).all()
+
+
+def test_the_install_hints_name_an_extra_that_lerobot_defines():
+    import tomllib
+
+    from packaging.requirements import Requirement
+
+    from lerobot.export.backends.executorch import EXPORT_EXTRA
+
+    project = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())["project"]
+    extra = Requirement(EXPORT_EXTRA)
+    assert extra.name == project["name"] and extra.extras <= set(project["optional-dependencies"])

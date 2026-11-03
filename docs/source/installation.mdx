@@ -179,12 +179,13 @@ _This installs only the core ML dependencies. You will need to add extras for mo
 **Feature Extras:**
 LeRobot provides **feature-scoped extras** that map to common workflows. If you are using `uv`, replace `pip install` with `uv pip install` in the commands below.
 
-| Extra      | What it adds                                | Typical use case                    |
-| ---------- | ------------------------------------------- | ----------------------------------- |
-| `dataset`  | `datasets`, `av`, `torchcodec`, `jsonlines` | Loading & creating datasets         |
-| `training` | `dataset` + `accelerate`, `trackio`         | Training policies                   |
-| `hardware` | `pynput`, `pyserial`, `deepdiff`            | Connecting to real robots           |
-| `viz`      | `rerun-sdk`, `foxglove-sdk`                 | Visualization during recording/eval |
+| Extra      | What it adds                                | Typical use case                                                      |
+| ---------- | ------------------------------------------- | --------------------------------------------------------------------- |
+| `dataset`  | `datasets`, `av`, `torchcodec`, `jsonlines` | Loading & creating datasets                                           |
+| `training` | `dataset` + `accelerate`, `trackio`         | Training policies                                                     |
+| `hardware` | `pynput`, `pyserial`, `deepdiff`            | Connecting to real robots                                             |
+| `viz`      | `rerun-sdk`, `foxglove-sdk`                 | Visualization during recording/eval                                   |
+| `export`   | `executorch` (not part of `all`)            | Compiling policies with [`lerobot-export`](./export) and running them |
 
 **Composite Extras** combine feature extras for common CLI scripts:
 
@@ -230,7 +231,7 @@ pip install lerobot              # from PyPI
 > [!NOTE]
 > `cu126` is the build PyTorch keeps for drivers that only support CUDA 12. torch 2.15 has no CUDA 12 build, so this index installs torch 2.14, and staying on CUDA 12 means staying on torch 2.14 or older.
 
-With `uv pip`, `--torch-backend` selects the index in one step, e.g. `uv pip install --torch-backend cu126 lerobot`. `uv sync` always installs the committed lock: to change the CUDA build there, add the index to `[tool.uv.index]` and `[tool.uv.sources]` in `pyproject.toml` and re-run `uv lock`.
+With `uv pip`, `--torch-backend` selects the index in one step, e.g. `uv pip install --torch-backend cu126 lerobot`. `uv sync` always installs the committed lock: to change the CUDA build there, add the index to `[tool.uv.index]` and `[tool.uv.sources]` in `pyproject.toml` and re-run `uv lock`. The lock also resolves the `export` extra, whose ExecuTorch 1.6 needs torch 2.15, and torch 2.15 has no CUDA 12 build, so the `export` extra cannot be installed with CUDA 12. For CUDA 12, use the `pip` or `uv pip` commands above, without the `export` extra.
 
 ### Troubleshooting
 
