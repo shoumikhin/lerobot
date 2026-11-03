@@ -153,8 +153,9 @@ class ExportConfig:
     # policy's normalized action units (robot units divided by the spread of each action in the training
     # data). Defaults to the recipe's.
     tolerance: float | None = None
-    # For a policy that reads its task, the most tokens a task may take in the bundle. Defaults to the
-    # recipe's, which fits the tasks known at export.
+    # For a policy whose bundle takes any task, such as pi0.5 or GR00T, the most tokens a task may take in the
+    # bundle. Defaults to the recipe's: a little more than the longest task known at export, as far as the
+    # policy's prompt has room.
     max_task_tokens: int | None = None
     # Seeds the random test case.
     seed: int = 1000
