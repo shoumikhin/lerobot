@@ -126,8 +126,8 @@ class _FakeNativeLaWAM(nn.Module):
         return {"total_loss": loss_total, "loss_flow": loss_flow}
 
     def predict_action(self, batch, **kwargs):
-        del kwargs
         self.predict_calls += 1
+        self.last_kwargs = kwargs
         self.last_batch = batch
         batch_size = int(batch["input_ids"].shape[0])
         actions = torch.arange(
@@ -1185,5 +1185,36 @@ def test_vlm_stage_refuses_a_vision_grid_built_for_another_grid() -> None:
             stage._run_vlm_stage(**changed, vision_grid=grid)
         with pytest.raises(ValueError, match="vision_grid needs pixel_values and image_grid_thw"):
             stage._run_vlm_stage(**{**inputs, "pixel_values": None}, vision_grid=grid)
-        with pytest.raises(ValueError, match="needs a vision_grid, which only the VLM stage takes so far"):
+        with pytest.raises(ValueError, match="needs a vision_grid"):
             torch.export.export(VLMStage(None), tuple(inputs[key] for key in keys), strict=False)
+
+
+def test_action_prediction_hands_the_vision_grid_to_the_vlm_stage(monkeypatch) -> None:
+    """The whole prediction exports on a grid only if the grid reaches the VLM stage."""
+    from lerobot.policies.lawam.vlas.lawam import LatentWorldPolicyBackend
+
+    grid = object()
+    policy, native_model = make_policy()
+    policy.predict_action_chunk(make_prepared_batch(batch_size=1), vision_grid=grid)
+    assert native_model.last_kwargs["vision_grid"] is grid
+
+    reached = []
+
+    def run_vlm_stage(self, *, vision_grid=None, **inputs):
+        reached.append(vision_grid)
+        raise RuntimeError("stopped after the VLM stage")
+
+    monkeypatch.setattr(LatentWorldPolicyBackend, "_run_vlm_stage", run_vlm_stage)
+    backend = _bare_backend(
+        model_cfg=SimpleNamespace(vlm_dtype=torch.float32),
+        _prepare_queries=lambda device, vlm_stage_dtype: (None, None),
+    )
+    batch = {
+        **make_prepared_batch(batch_size=1),
+        "image_grid_thw": None,
+        "act_placeholder_mask": None,
+        "flow_placeholder_mask": None,
+    }
+    with pytest.raises(RuntimeError, match="stopped after the VLM stage"):
+        backend.predict_action(batch=batch, guidance_scale=1.0, num_inference_steps=1, vision_grid=grid)
+    assert reached == [grid]
