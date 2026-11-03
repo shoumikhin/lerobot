@@ -315,7 +315,8 @@ def forward_without_grid_thw(
         # detach: the learned positional embedding must keep receiving gradients.
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
-    hidden_states = hidden_states + pos_embeds
+    # Interpolation weights are float32, so the embeddings come out in float32 for a bfloat16 tower.
+    hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
 

@@ -317,6 +317,22 @@ def test_default_image_settings_match_upstream(tiny_backbone):
     assert int(grid.prod()) // 4 == 64 == 8 * 8  # 2x2 merge; upstream `llm.image_token_size: 8`
 
 
+def test_a_bfloat16_policy_predicts_on_the_cpu(tiny_backbone):
+    """A bfloat16 policy keeps its vision tower in bfloat16, which the CPU's layer norm requires."""
+    cfg = _tiny_config(tiny_backbone, **_slot_kwargs(arm=[[0, 6]], effector=[[6, 7]]))
+    cfg.dtype = torch.bfloat16
+    meta = _ds_meta(7)
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    preprocessor, _ = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    raw = _raw_batch(7)
+    raw.pop(ACTION)
+
+    with torch.no_grad():
+        actions = policy.predict_action_chunk(preprocessor(raw))
+
+    assert torch.isfinite(actions).all()
+
+
 @skip_if_package_missing("transformers")
 def test_sparse_moe_matches_per_token_reference():
     """The padded sparse expert path equals a naive per-token top-k mixture."""
