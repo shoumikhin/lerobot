@@ -17,35 +17,36 @@ checkpoint ─────────────────> bundle folder �
 
 ## Install
 
-You need LeRobot, ExecuTorch 1.6 (the runtime that loads the compiled programs), and the compiler of the **backend** you choose. Install them on the machine that will run the policy.
+Install LeRobot with its `export` extra, on the machine that will run the policy:
 
-| `--backend.type`      | Runs the policy on                                | Install                                                                                                             |
-| --------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `executorch_tensorrt` | NVIDIA GPUs, including Jetson                     | `pip install "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16" torch-tensorrt-executorch-runtime` |
-| `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT   | `pip install "executorch>=1.6.0,<1.7.0"` (on Linux, the CUDA build)                                                 |
-| `executorch_xnnpack`  | Arm and x86 CPUs                                  | `pip install "executorch>=1.6.0,<1.7.0"` (XNNPACK ships with ExecuTorch)                                            |
-| `executorch_openvino` | Intel CPUs                                        | `pip install "executorch>=1.6.0,<1.7.0" openvino nncf`                                                              |
-| `executorch_mlx`      | Apple Silicon Macs (GPU, through MLX)             | `pip install "executorch>=1.6.0,<1.7.0"` (the macOS wheel includes MLX)                                             |
-| `executorch_coreml`   | Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install "executorch>=1.6.0,<1.7.0"` (the macOS wheel includes Core ML)                                         |
+```bash
+pip install 'lerobot[export]'
+```
 
-- LeRobot has no `export` extra yet, so install these packages yourself. ExecuTorch 1.6 is not on PyPI yet, so LeRobot's lock file cannot hold it. Torch-TensorRT would stay out of such an extra anyway, because it pins one PyTorch minor version. The Install column is each backend's `packages` setting, the same list `lerobot-export` prints when one of them is missing.
-- **Exporting needs PyTorch 2.15 or newer**, because ExecuTorch 1.6 and Torch-TensorRT 2.15 read only programs traced by PyTorch 2.15. This holds for every backend in the table. LeRobot's own pins allow PyTorch 2.15, and the ExecuTorch 1.6 package pins `torch==2.15.0`, so install everything in one environment:
+The extra brings ExecuTorch 1.6, the runtime that loads the compiled programs, and PyTorch 2.15, which exporting needs. ExecuTorch's wheels already contain the compilers of most **backends**:
+
+| `--backend.type`      | Runs the policy on                                              | Install                                                                     |
+| --------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `executorch_xnnpack`  | Arm and x86 CPUs                                                | `pip install 'lerobot[export]'`                                             |
+| `executorch_openvino` | Intel CPUs                                                      | `pip install 'lerobot[export]' openvino nncf`                               |
+| `executorch_mlx`      | Apple Silicon Macs (GPU, through MLX)                           | `pip install 'lerobot[export]'`                                             |
+| `executorch_coreml`   | Apple Silicon Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install 'lerobot[export]'`                                             |
+| `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT                 | `pip install 'lerobot[export]'` on Linux                                    |
+| `executorch_tensorrt` | NVIDIA GPUs, including Jetson                                   | `pip install 'lerobot[export]'` and `torch-tensorrt[executorch]`, see below |
+
+- The extra covers Linux (x86_64 and aarch64), Windows (x86_64) and Apple Silicon Macs with macOS 14 or newer, the platforms ExecuTorch and PyTorch 2.15 publish wheels for.
+- On Linux, ExecuTorch's wheel on PyPI is its CUDA 13.2 build, for the same CUDA as the PyTorch 2.15 on PyPI, so the extra already brings the CUDA backend. The same wheel imports and runs the CPU backends on a machine without an NVIDIA driver. For `executorch_tensorrt`, add Torch-TensorRT:
 
   ```bash
-  pip install lerobot "executorch>=1.6.0,<1.7.0" "torch-tensorrt[executorch]>=2.15,<2.16" torch-tensorrt-executorch-runtime
+  pip install 'lerobot[export]' 'torch-tensorrt[executorch]>=2.15,<2.16' torch-tensorrt-executorch-runtime
   ```
 
-  With an older PyTorch, `lerobot-export` stops before it starts and prints the install command for its backend.
+  `torch-tensorrt-executorch-runtime` loads the TensorRT engines of a bundle without PyTorch. Torch-TensorRT's `executorch` extra installs it too. Torch-TensorRT is not part of LeRobot's `export` extra, because only NVIDIA machines need it. It must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 
-  `torch-tensorrt-executorch-runtime` loads the TensorRT engines of a bundle without PyTorch. Torch-TensorRT's `executorch` extra does not install it, and its releases so far each pin a development build of ExecuTorch 1.6, so none installs beside ExecuTorch 1.6.0 yet.
-
-- On Linux, ExecuTorch's wheel on PyPI is its CUDA 13.2 build, for the same CUDA as the PyTorch 2.15 on PyPI, so `executorch_cuda` needs nothing more. The same wheel imports and runs the CPU backends on a machine without an NVIDIA driver.
-
-- **ExecuTorch 1.6 has fixes these backends need, and it is not released yet.** `executorch_cuda` and `executorch_tensorrt` need [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. `executorch_openvino`, and every program that keeps an input check, need [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298). Both are merged into ExecuTorch 1.6, so until 1.6.0 is on PyPI, use its release candidate from PyTorch's test index, `https://download.pytorch.org/whl/test/`.
-
+- With an older PyTorch, `lerobot-export` stops before it starts and prints the install command for its backend.
+- **ExecuTorch 1.6 has fixes these backends need.** `executorch_cuda` and `executorch_tensorrt` need [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. `executorch_openvino`, and every program that keeps an input check, need [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298).
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
-- Torch-TensorRT must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
-- `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), which is not in a release yet. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load.
+- `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), such as Torch-TensorRT 2.15. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load.
 - `executorch_tensorrt` keeps one copy of each weight in host memory while TensorRT builds, instead of one for every layer that reads it transposed, with Torch-TensorRT's `deduplicate_weights` setting from [pytorch/TensorRT#4965](https://github.com/pytorch/TensorRT/pull/4965).
 - A policy that starts from a random noise, such as pi0.5, SmolVLA or GR00T, draws that noise in a small program on the GPU. pytorch/TensorRT#4953 is also what lets `executorch_tensorrt` save that program.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
