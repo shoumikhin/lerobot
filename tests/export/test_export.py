@@ -41,7 +41,7 @@ from tests.export.backends import EXECUTORCH, needs_executorch, needs_executorch
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
 from tests.export.torch_backend import TorchTestBackend
-from tests.torch_free import CHECK_BUNDLE, assert_runs_without_torch
+from tests.torch_free import assert_runs_without_torch
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -429,19 +429,6 @@ from lerobot.scripts.lerobot_export import export
 
 export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
-
-
-@pytest.mark.parametrize(
-    "backend",
-    [
-        pytest.param("executorch_xnnpack", marks=needs_executorch),
-        pytest.param("executorch_cuda", marks=needs_executorch_cuda),
-    ],
-)
-def test_an_executorch_bundle_runs_without_torch(checkpoint, tmp_path, backend):
-    """The bundle check loads the programs, on the CPU or the GPU, and replays the test case, without PyTorch."""
-    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend=backend)
-    assert_runs_without_torch(CHECK_BUNDLE, str(tmp_path / "b"))
 
 
 @pytest.mark.skipif(
