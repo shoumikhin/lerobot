@@ -186,16 +186,58 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     assert 'pip install "torch>=99.0,<99.1" "torchvision>=9.0,<9.1" "compiler>=99.0,<99.1"' in message
 
 
-def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, capfd):
-    with pytest.raises(RuntimeError, match="trace step failed"):
-        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--tolerance=nan")
-    assert "--tolerance must be a finite number" in capfd.readouterr().err
-
-
 def test_export_refuses_a_task_token_budget_for_a_policy_that_takes_no_task(checkpoint, tmp_path, capfd):
     with pytest.raises(RuntimeError, match="trace step failed"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--max_task_tokens=8")
     assert "--max_task_tokens applies only to a policy whose bundle takes any task" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("args", "min_torch", "error"),
+    [
+        (["--output_dir={b}"], None, "--policy.path is required"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=nan"], None, "not nan"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=inf"], None, "not inf"),
+        (["--policy.path={checkpoint}", "--output_dir={b}", "--tolerance=-1"], None, "not -1"),
+        (
+            ["--policy.path={checkpoint}", "--output_dir={b}", "--max_task_tokens=0"],
+            None,
+            "at least 1, not 0",
+        ),
+        (["--policy.path={checkpoint}", "--output_dir={tmp}"], None, "already exists. Pick another"),
+        (["--policy.path={checkpoint}", "--output_dir={link}"], None, "already exists. Pick another"),
+        (["--policy.path={checkpoint}", "--output_dir={b}"], "99.0", "needs PyTorch 99.0 or newer"),
+    ],
+)
+def test_export_refuses_a_command_line_before_it_traces(
+    checkpoint, tmp_path, monkeypatch, args, min_torch, error
+):
+    from lerobot.configs import parser
+    from lerobot.export.configs import ExportConfig
+
+    @parser.wrap()
+    def parse(cfg: ExportConfig) -> ExportConfig:
+        return cfg
+
+    if min_torch is not None:
+        monkeypatch.setattr("tests.export.torch_backend.TorchTestBackend.min_torch", min_torch)
+    # A link to nothing is taken as there too: the export could not rename its bundle onto it.
+    (tmp_path / "link").symlink_to(tmp_path / "nothing")
+    values = {"checkpoint": checkpoint, "b": tmp_path / "b", "tmp": tmp_path, "link": tmp_path / "link"}
+    argv = ["lerobot-export", "--backend.type=torch_test", *(arg.format(**values) for arg in args)]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(Exception) as refusal:
+        parse()
+    # draccus raises its own error from a ValueError the config's checks raise.
+    assert error in str(refusal.value.__cause__ or refusal.value)
+
+
+@pytest.mark.parametrize(("option", "value"), [("compute_units", "tpu"), ("compute_precision", "int8")])
+def test_executorch_coreml_refuses_an_unknown_option_on_any_platform(option, value):
+    from lerobot.export.backends.executorch_coreml import ExecuTorchCoreMLConfig
+
+    with pytest.raises(ValueError, match=f"--backend.{option} must be one of"):
+        ExecuTorchCoreMLConfig(**{option: value})
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32"])
