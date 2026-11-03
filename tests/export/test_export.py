@@ -191,6 +191,12 @@ def test_export_refuses_a_tolerance_that_passes_anything(checkpoint, tmp_path, c
     assert "--tolerance must be a finite number" in capfd.readouterr().err
 
 
+def test_export_refuses_a_task_token_budget_for_a_policy_that_takes_no_task(checkpoint, tmp_path, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--max_task_tokens=8")
+    assert "--max_task_tokens applies only to a policy whose bundle takes any task" in capfd.readouterr().err
+
+
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):
     partial = tmp_path / "partial"
     shutil.copytree(checkpoint, partial)
