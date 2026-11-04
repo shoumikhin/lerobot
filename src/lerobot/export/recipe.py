@@ -619,7 +619,8 @@ class VisionGridRecipe(ActionChunkRecipe):
     A Qwen-VL vision tower reads its image grid (`image_grid_thw`) on the host, which `torch.export` cannot
     trace, so the policy takes what the tower derives from the grid as `vision_grid`. The recipe builds it from
     the first preprocessed batch, in the eager runs before the export (the test case and the checks), and
-    passes it on every call; the policy refuses a frame with another grid.
+    passes it on every call; the policy refuses a frame with another grid. The batch's `image_grid_thw` holds one
+    row per image, or one per camera of each sample, as LingBot-VLA v2's does.
     """
 
     grid_type: ClassVar[Any]
@@ -633,7 +634,9 @@ class VisionGridRecipe(ActionChunkRecipe):
     def predict_chunk(self, policy: PreTrainedPolicy, batch: dict[str, Any], noise: Tensor | None) -> Tensor:
         """The default recipe's chunk, with the policy's vision tower on the grid of the first batch."""
         if self._vision_grid is None:
-            self._vision_grid = self.grid_type.build(self.vision_tower(policy), batch["image_grid_thw"])
+            self._vision_grid = self.grid_type.build(
+                self.vision_tower(policy), batch["image_grid_thw"].flatten(0, -2)
+            )
         options: dict[str, Any] = {
             "vision_grid": self._vision_grid,
             **({} if noise is None else {NOISE: noise}),

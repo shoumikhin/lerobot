@@ -21,6 +21,7 @@ built locally, so every test runs the real processors and policy without the Hub
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -394,6 +395,50 @@ def test_export_refuses_float32_flash_attention_in_the_vision_tower(tiny_backbon
         policy.model.qwenvl_with_expert.qwenvl.model.visual.config._attn_implementation = "flash_attention_2"
         with pytest.raises(ValueError, match="flash_attention_2 needs bfloat16 weights"):
             torch.export.export(module, module.inputs(noise, batch), strict=False)
+
+
+def test_lerobot_export_writes_a_bundle_that_plays_the_policys_chunk(tiny_backbone, tmp_path, monkeypatch):
+    """`lerobot-export` runs the vision tower on the image grid of the export's frames, here of two cameras,
+    and the bundle plays the chunk the policy predicts for another frame."""
+    from lerobot.bundle.engine import BundleEngine
+    from lerobot.bundle.manifest import Bundle
+    from lerobot.export.recipe import random_frame
+    from lerobot.policies import prepare_observation_for_inference
+    from lerobot.scripts.lerobot_export import export
+    from tests.export.plugins import use_plugins
+
+    meta = _ds_meta(7, (CAMERA, WRIST))
+    cfg = _tiny_config(tiny_backbone, **_slot_kwargs(arm=[[0, 6]], effector=[[6, 7]]))
+    policy = make_policy(cfg, ds_meta=meta).eval()
+    preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=meta.stats)
+    checkpoint = tmp_path / "checkpoint"
+    for obj in (policy, preprocessor, postprocessor):
+        obj.save_pretrained(checkpoint)
+    # The export's own processes read the tiny Qwen3-VL config from here, as the patch gives it to this one.
+    policy.model.qwenvl_with_expert.qwenvl.config.save_pretrained(tiny_backbone)
+    use_plugins(monkeypatch, "torch_backend")
+    task = "pick up the cube"
+    export(
+        [
+            "--backend.type=torch_test",
+            f"--policy.path={checkpoint}",
+            f"--output_dir={tmp_path / 'bundle'}",
+            f"--task={task}",
+        ]
+    )
+
+    bundle = Bundle.read(tmp_path / "bundle")
+    frame = random_frame(policy.config.input_features, torch.Generator().manual_seed(1))
+    engine = BundleEngine(bundle, task=task)
+    np.random.seed(0)
+    actions = np.stack([engine.get_action(dict(frame)) for _ in range(CHUNK)])
+    noise = np.random.RandomState(0).standard_normal(bundle.manifest.noise_shape).astype(np.float32)
+    observation = prepare_observation_for_inference(dict(frame), torch.device("cpu"), task)
+    with torch.no_grad():
+        chunk = policy.predict_action_chunk(preprocessor(observation), noise=torch.from_numpy(noise)[None])
+        expected = postprocessor(chunk[:, :CHUNK])[0].numpy()
+    scale = np.asarray(bundle.manifest.action_scale)
+    np.testing.assert_allclose(actions / scale, expected / scale, rtol=0, atol=bundle.manifest.tolerance)
 
 
 def test_align_query_tokens(tiny_backbone, monkeypatch):
