@@ -97,6 +97,12 @@ def test_subclass_conversion_runs_the_regular_way(config, tmp_path, monkeypatch)
     assert not used_meta and model.converted
 
 
+def test_strict_refuses_a_checkpoint_that_leaves_a_weight_unfilled(config, tmp_path, monkeypatch):
+    path = save_checkpoint(PI0FastPolicy, config, tmp_path / "ckpt", edit=drop_projector_bias)
+    with pytest.raises(RuntimeError, match="multi_modal_projector.linear.bias"):
+        load(PI0FastPolicy, path, config, monkeypatch, strict=True)
+
+
 def test_download_arguments_reach_the_weights(config, tmp_path, monkeypatch):
     path = save_checkpoint(PI0FastPolicy, config, tmp_path / "ckpt", edit=drop_projector_bias)
     cached_file = transformers.utils.cached_file

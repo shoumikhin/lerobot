@@ -17,6 +17,7 @@
 """PI0Policy.from_pretrained builds parameters on the meta device and matches the regular load."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,8 +25,10 @@ import torch
 pytest.importorskip("transformers")
 
 import transformers.utils  # noqa: E402
+from safetensors import SafetensorError  # noqa: E402
 
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
+from lerobot.export.recipe import load_policy  # noqa: E402
 from lerobot.policies.pi0 import PI0Config, PI0Policy, modeling_pi0  # noqa: E402
 from tests.policies.common.meta_load import (  # noqa: E402
     DOWNLOAD_ARGUMENTS,
@@ -153,6 +156,36 @@ def test_bigger_action_space_loads_the_regular_way(config, tmp_path, monkeypatch
     expected, _ = load(PI0Policy, path, config, monkeypatch, regular=True)
     assert not used_meta
     assert_same(model, expected)
+
+
+@pytest.mark.parametrize(
+    ("edit", "weight"),
+    [
+        (drop_projector_bias, "multi_modal_projector.linear.bias"),
+        (lambda sd: sd.update({"state_proj.bias": torch.ones(3)}), "state_proj.bias"),
+    ],
+    ids=["missing", "other_shape"],
+)
+def test_strict_refuses_a_checkpoint_that_leaves_a_weight_unfilled(
+    config, tmp_path, monkeypatch, edit, weight
+):
+    path = save(config, tmp_path / "ckpt", edit)
+    with pytest.raises(RuntimeError, match=weight):
+        load(PI0Policy, path, config, monkeypatch, strict=True)
+
+
+def test_strict_refuses_an_unreadable_checkpoint(config, tmp_path, monkeypatch):
+    path = tmp_path / "ckpt"
+    path.mkdir()
+    (path / "model.safetensors").write_bytes(b"not a safetensors file")
+    with pytest.raises(SafetensorError):
+        load(PI0Policy, path, config, monkeypatch, strict=True)
+
+
+def test_an_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(config, tmp_path):
+    config.pretrained_path = save(config, tmp_path / "ckpt", drop_projector_bias)
+    with pytest.raises(RuntimeError, match="multi_modal_projector.linear.bias"):
+        load_policy(SimpleNamespace(policy=config, backend=SimpleNamespace(device="cpu")))
 
 
 def test_download_arguments_reach_the_weights(config, tmp_path, monkeypatch):
