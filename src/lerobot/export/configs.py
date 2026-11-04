@@ -24,7 +24,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import draccus
 from packaging.version import Version
@@ -180,6 +180,9 @@ class ExportConfig:
     # Compute in fewer bits, with a mode the backend offers, such as `fp8` with `executorch_tensorrt`.
     # The bundle is still checked against the unquantized policy, so `tolerance` must then be given.
     quantize: str | None = None
+    # INFO logs each step of the export and how long it took; DEBUG adds the logs of torch.export, ExecuTorch and
+    # the backend's compiler.
+    log_level: Literal["INFO", "DEBUG"] = "INFO"
 
     def __post_init__(self) -> None:
         """Check the PyTorch version, load the policy config from `--policy.path` and pick the bundle folder."""

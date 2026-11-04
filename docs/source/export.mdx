@@ -79,15 +79,22 @@ The export runs in three steps, each in its own process:
 2. It **compiles** that graph for the backend.
 3. It **checks** the result against PyTorch.
 
-The last lines look like this:
+It logs each step as it starts and how long it took:
 
 ```
 INFO ... Tracing model
-INFO ... Compiling model with executorch_tensorrt
-INFO ... Checking the bundle
-INFO ... Bundle test case: largest difference 5.40e-06 (tolerance 2e-05)
-INFO ... Wrote outputs/export/act_executorch_tensorrt
+INFO ... Traced the policy in 19 s
+INFO ... [1/2] Compiling model with executorch_tensorrt
+INFO ... [1/2] Compiling model with executorch_tensorrt: done in 37 s
+INFO ... [2/2] Checking the bundle
+INFO ... Bundle test case: largest difference 5.56e-07 (tolerance 2e-05)
+INFO ... [2/2] Checking the bundle: done in 3 s
+INFO ... Wrote outputs/export/act_executorch_tensorrt in 59 s
 ```
+
+A step that runs longer than a minute says so every minute, such as `[1/2] Compiling model with executorch_cuda: still running after 60 s`, so the export of a large policy is never silent.
+
+The compiler's own logs, such as a line for each operator TensorRT converts, are left out, except its warnings. `--log_level=DEBUG` shows them, with the logs of ExecuTorch and of PyTorch (torch.export, and Inductor for `executorch_cuda`). For PyTorch's own debug logs, also set `TORCH_LOGS`, for example `TORCH_LOGS="+export"` (see [PyTorch logging](https://docs.pytorch.org/docs/stable/logging.html)).
 
 The bundle is a plain folder:
 
@@ -150,6 +157,7 @@ Then the robot moves, as with any policy. Every 5 seconds it logs the loop rate,
 | `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                                                                                                  |
 | `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                                                           |
 | `--quantize`                       | Computes in fewer bits, with a mode the backend offers: `fp8` with `executorch_tensorrt`. Needs `--tolerance`. See [FP8](#fp8-with---quantizefp8).                                                         |
+| `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                                                                   |
 | `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                                                                                            |
 | `--backend.deduplicate_weights`    | TensorRT only: `true` (the default) keeps one host copy of each shared weight while TensorRT builds; `false` gives each layer its own copy, for a policy whose engines come out wrong with shared weights. |
 | `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                                                                        |
