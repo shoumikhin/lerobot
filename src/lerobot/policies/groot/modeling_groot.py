@@ -41,6 +41,7 @@ from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError, HFValidationError
 from huggingface_hub.utils import httpx
 from safetensors import safe_open
+from safetensors.torch import load_file
 from torch import Tensor
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
@@ -48,6 +49,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..chunk import ChunkPolicySpec
+from ..common.openpi_checkpoint import load_modules, parameters_on_meta
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
@@ -396,6 +398,71 @@ class GrootPolicy(PreTrainedPolicy):
                     data = data.clone()
                 tensor.data = data.to(config.device)
         return model
+
+    @classmethod
+    def load_checkpoint_modules(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        config: GrootConfig,
+        modules: list[str],
+        *,
+        revision: str | None = None,
+    ) -> T:
+        """Build the policy without weights and load only the weights of `modules` from a fine-tuned checkpoint.
+
+        For exporting one part of a policy too large for the machine's memory. GR00T is built from its config
+        with its parameters on the meta device, so no base weights are downloaded or read. Only the listed
+        submodules, like `_groot_model.action_head`, get real tensors, read one at a time, in the dtype the
+        regular load gives them. Every other submodule holding parameters is replaced by None, so code that
+        reaches one fails instead of reading random weights. Raises if a listed submodule has a parameter the
+        checkpoint does not hold. Returns the policy in evaluation mode on `config.device`.
+        """
+        if cls is not GrootPolicy:
+            # As in `from_pretrained`: weights a subclass adds would keep their random values here.
+            raise ValueError(f"Only GrootPolicy loads chosen modules; {cls.__name__} may add weights.")
+        require_package("transformers", extra="groot")
+        model_id = str(pretrained_name_or_path)
+        if os.path.isdir(model_id):
+            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+        else:
+            model_file = hf_hub_download(
+                repo_id=model_id, filename=SAFETENSORS_SINGLE_FILE, revision=revision
+            )
+        checkpoint = Path(model_file).parent
+        if config.base_config_sha256 and not os.path.isdir(model_id):
+            # The copy of the base model config from the weights file's commit, as from_pretrained reads it.
+            with suppress(OSError, httpx.HTTPError):
+                snapshot_download(
+                    repo_id=model_id,
+                    allow_patterns=[f"{_BASE_CONFIG_DIR}/{CONFIG_NAME}"],
+                    revision=checkpoint.name,
+                )
+        base_config = _read_copy(checkpoint, config.base_config_sha256)
+        if base_config is None:
+            base_config, _ = _read_base(config.base_model_path)
+        if base_config is None:
+            raise ValueError(
+                f"Found no GR00T base config.json in {checkpoint} or at {config.base_model_path}, which building "
+                "the policy without its weights needs."
+            )
+        # Building draws random numbers, so the global generator is left as it was, as in `from_pretrained`.
+        with parameters_on_meta(), torch.random.fork_rng(devices=[]):
+            # Built in the dtypes `from_pretrained` gives the base model, as the regular load builds it.
+            model = GR00TN17._from_config(
+                cls._groot_model_config(base_config, config), load_backbone_weights=False
+            )
+        if config.dtype == torch.float32:
+            # As the regular load, which casts a float32 policy's parameters to float32 after building it.
+            cls._cast_model_parameters_to_fp32(model)
+        with _weight_source(config, checkpoint):
+            policy = cls(config, _groot_model=model, _base_config=base_config)
+        # Tensors that still point into the file, so only the chosen weights are read.
+        state_dict = load_file(model_file)
+        lm_head, embedding = (f"_groot_model.{name}" for name in _TIED_WEIGHT_NAMES)
+        for name, twin in ((lm_head, embedding), (embedding, lm_head)):
+            if twin in state_dict:
+                state_dict.setdefault(name, state_dict[twin])
+        return load_modules(policy, state_dict, modules, config.device)
 
     @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, Any]]:

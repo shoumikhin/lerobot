@@ -14,7 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint loading shared by the openpi-derived policies that remap keys (pi0, pi05, pi0_fast)."""
+"""Checkpoint loading shared by the openpi-derived policies that remap keys (pi0, pi05, pi0_fast).
+
+GR00T builds on the meta device and loads chosen submodules with `parameters_on_meta` and `load_modules`.
+"""
 
 import logging
 import threading
@@ -64,7 +67,7 @@ def _register_hook_once() -> None:
 
 
 @contextmanager
-def _parameters_on_meta() -> Iterator[None]:
+def parameters_on_meta() -> Iterator[None]:
     """Create the parameters of modules built inside this block on the meta device.
 
     A meta tensor has a shape and a dtype but no memory. Modules like `nn.Linear` allocate a parameter and
@@ -96,7 +99,7 @@ def building_on_meta() -> bool:
 def _load_state_dict_into_meta_model(
     model: nn.Module, state_dict: dict[str, Tensor], device: str | None, strict: bool = True
 ) -> None:
-    """Load a complete checkpoint into a model built under `_parameters_on_meta`.
+    """Load a complete checkpoint into a model built under `parameters_on_meta`.
 
     `state_dict` must have exactly the model's keys, or, with `strict=False`, some of them. Each tensor is copied into the dtype the constructor gave
     the matching parameter or buffer, on the device it was read on, then moved to `device`, so the
@@ -172,7 +175,7 @@ def load_complete_checkpoint(
     # PyTorch raises NotImplementedError for an operation with no meta kernel. Any other constructor error
     # is raised here, once, instead of again by the regular build.
     try:
-        with _parameters_on_meta():
+        with parameters_on_meta():
             policy = policy_cls(config, **kwargs)
     except NotImplementedError as e:
         _log_fallback(f"cannot build {policy_cls.__name__} on the meta device ({e})", logging.WARNING)
@@ -225,7 +228,7 @@ def load_checkpoint_modules(
     """
     if not vars(policy_cls).get("_supports_meta_load", False):
         raise ValueError(f"{policy_cls.__name__} does not support loading on the meta device.")
-    with _parameters_on_meta():
+    with parameters_on_meta():
         policy = policy_cls(config, **kwargs)
     return load_modules(policy, _convert_checkpoint(policy, load_file(model_file)), modules, config.device)
 
