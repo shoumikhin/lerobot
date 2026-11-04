@@ -127,6 +127,7 @@ lerobot-check-bundle outputs/export/act_executorch_tensorrt
 | `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                                                              |
 | `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                                                                                                  |
 | `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                                                           |
+| `--quantize`                       | Computes in fewer bits, with a mode the backend offers: `fp8` with `executorch_tensorrt`. Needs `--tolerance`. See [FP8](#fp8-with---quantizefp8).                                                         |
 | `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                                                                   |
 | `--backend.workspace_size`         | TensorRT only: the most GPU memory, in bytes, that TensorRT may use as scratch while it builds.                                                                                                            |
 | `--backend.deduplicate_weights`    | TensorRT only: `true` (the default) keeps one host copy of each shared weight while TensorRT builds; `false` gives each layer its own copy, for a policy whose engines come out wrong with shared weights. |
@@ -329,6 +330,31 @@ For an any-task bundle, the task's prompt must fit in `--max_task_tokens`. The p
 
 - The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the processes that trace the policy, compile each program and check a part on its own. They give their memory back when they end.
 - `lerobot-check-bundle` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads a runtime plugin only when the bundle names a runtime no loaded package has, since a plugin may import PyTorch.
+
+## FP8 with `--quantize=fp8`
+
+A bundle computes in bfloat16 by default. GPUs with 8-bit float units (compute capability 8.9 or higher: Ada, Hopper, Blackwell, Jetson Thor) can run a policy's matrix multiplications in FP8 instead. The bundle is then smaller and faster, and its actions move, by an amount that depends on the policy.
+
+```bash
+pip install "nvidia-modelopt>=0.48"
+lerobot-export --backend.type=executorch_tensorrt --policy.path=<checkpoint> \
+    --quantize=fp8 --tolerance=<largest difference you accept>
+```
+
+On a GPU without FP8, or without NVIDIA Model Optimizer, the export stops before it quantizes anything and says which one is missing.
+
+The export quantizes each part right before it traces it, with NVIDIA Model Optimizer's FP8 settings, measuring value ranges on the one frame the export traces with, which has random images, not your data. The vision towers of vision-language models such as pi0.5 and GR00T stay in bfloat16, and so do the inputs of LayerNorm layers and any input that was all zeros while measuring. The log says how many layers each part quantized.
+
+The bundle's test case still compares the bundle with the unquantized policy, which is why `--tolerance` is required: give the largest difference you accept, in normalized action units. Check the result on real frames of your task before you rely on it.
+
+Measured on an H100 with LIBERO checkpoints, one bundle at a time. The difference is between the normalized actions of the FP8 and the bfloat16 bundles, over 16 dataset frames:
+
+| Policy     | Bundle, bfloat16 to FP8 | Per chunk, bfloat16 to FP8 | Difference, mean / max |
+| ---------- | ----------------------- | -------------------------- | ---------------------- |
+| GR00T N1.7 | 5.3 GiB to 3.3 GiB      | 19.6 ms to 16.5 ms         | 0.045 / 0.080          |
+| pi0.5      | 5.9 GiB to 3.8 GiB      | 33.3 ms to 30.5 ms         | 0.37 / 2.0             |
+
+GR00T stays close to its bfloat16 bundle. pi0.5 moves much more, so with this calibration it needs a large `--tolerance` and is not recommended in FP8.
 
 ## Run pi0.5 and GR00T on a Jetson Orin Nano
 
