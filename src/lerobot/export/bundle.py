@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+from copy import copy
+from pathlib import Path
 
 import numpy as np
 from huggingface_hub.constants import CONFIG_NAME
@@ -77,5 +80,12 @@ def write_bundle(
         (folder / manifest.task_tokens.known_tasks).write_text(json.dumps(task_tokens.known_tasks))
     if manifest.action_tokens is not None and action_tokens is not None:
         (folder / manifest.action_tokens.tokenizer).write_text(action_tokens.tokenizer, encoding="utf-8")
+    # Without the exporter's checkpoint path or another local path, such as a local copy of a model, which can
+    # name its user. Running a bundle reads none of them; a local copy keeps only its folder's name.
+    config = copy(config)
+    config.pretrained_path = None
+    for name, value in vars(config).items():
+        if isinstance(value, str | Path) and os.path.isabs(value) and os.path.exists(value):
+            setattr(config, name, type(value)(Path(value).name))
     config.save_pretrained(folder)
     (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)

@@ -571,6 +571,29 @@ def test_a_killed_trace_step_leaves_no_folders_behind(tmp_path, monkeypatch, cod
     assert not [folder for folder in made if folder.exists()]
 
 
+class SavedConfig(SimpleNamespace):
+    def save_pretrained(self, path: Path) -> None:
+        (path / "config.json").write_text(json.dumps(vars(self)))
+
+
+def test_a_bundle_keeps_no_local_path_of_the_exporter(tmp_path):
+    """A field naming a local copy of a model keeps only its folder's name; other names stay as they are."""
+    from lerobot.export.bundle import write_bundle
+
+    (tmp_path / "SmolVLM2").mkdir()
+    config = SavedConfig(
+        pretrained_path=str(tmp_path), vlm_model_name=str(tmp_path / "SmolVLM2"), tokenizer="org/model"
+    )
+    manifest = SimpleNamespace(
+        test_case="test.safetensors", constants=None, task_tokens=None, action_tokens=None
+    )
+    case = SimpleNamespace(frame={}, actions=np.zeros((1, 3), np.float32), noise=None)
+    (tmp_path / "b").mkdir()
+    write_bundle(SimpleNamespace(path=tmp_path / "b", manifest=manifest), case, config)
+    saved = json.loads((tmp_path / "b" / POLICY_CONFIG).read_text())
+    assert saved == {"pretrained_path": None, "vlm_model_name": "SmolVLM2", "tokenizer": "org/model"}
+
+
 def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(tmp_path):
     """safetensors writes an array's memory in order, and its save_file makes files only the owner reads."""
     from lerobot.export.bundle import write_bundle
@@ -914,6 +937,7 @@ def test_export_writes_a_bundle_that_plays_like_pytorch_without_importing_torch(
         bundle = Bundle.read(run / "b")
         np.testing.assert_allclose(bundle.manifest.action_scale, [30.0, 30.0, 30.0], rtol=1e-6)
         assert (bundle.path / POLICY_CONFIG).is_file() and not (bundle.path / "config.json").exists()
+        assert json.loads((bundle.path / POLICY_CONFIG).read_text())["pretrained_path"] is None
         # The permissions of a new folder, not the private ones of the temporary folder the bundle was.
         assert stat.S_IMODE(bundle.path.stat().st_mode) == stat.S_IMODE((tmp_path / "new").stat().st_mode)
         assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
