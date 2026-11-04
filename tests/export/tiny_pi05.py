@@ -15,6 +15,7 @@
 """A tiny pi0.5 checkpoint with a local tokenizer, for export tests on the CPU without the Hub."""
 
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import torch
@@ -33,12 +34,18 @@ def use_tiny_pi05(patch: Any) -> None:
     builtin `setattr` in a process that stays tiny.
     """
     from lerobot.policies.pi05 import modeling_pi05
+
+    use_tiny_gemma(patch, modeling_pi05)
+
+
+def use_tiny_gemma(patch: Any, modeling_module: ModuleType) -> None:
+    """Give the pi0 or pi0.5 of `modeling_module` a four-layer Gemma 16 wide, as `use_tiny_pi05` says."""
     from tests.policies.common.meta_load import use_tiny_backbone
 
-    use_tiny_backbone(patch, modeling_pi05)
-    tiny = modeling_pi05.GemmaConfig(width=16, depth=4, mlp_dim=32, num_heads=2, num_kv_heads=1, head_dim=8)
-    patch.setattr(modeling_pi05, "get_gemma_config", lambda variant: tiny)
-    paligemma = modeling_pi05.PaliGemmaForConditionalGenerationWithPiGemma
+    use_tiny_backbone(patch, modeling_module)
+    tiny = modeling_module.GemmaConfig(width=16, depth=4, mlp_dim=32, num_heads=2, num_kv_heads=1, head_dim=8)
+    patch.setattr(modeling_module, "get_gemma_config", lambda variant: tiny)
+    paligemma = modeling_module.PaliGemmaForConditionalGenerationWithPiGemma
 
     def small_projector(config):
         # The policy fixes the image projector at Gemma 2B's width; this Gemma is narrower.
@@ -46,7 +53,7 @@ def use_tiny_pi05(patch: Any) -> None:
         config.vision_config.intermediate_size = 32
         return paligemma(config=config)
 
-    patch.setattr(modeling_pi05, "PaliGemmaForConditionalGenerationWithPiGemma", small_projector)
+    patch.setattr(modeling_module, "PaliGemmaForConditionalGenerationWithPiGemma", small_projector)
 
 
 def save_tokenizer(path: Path) -> None:

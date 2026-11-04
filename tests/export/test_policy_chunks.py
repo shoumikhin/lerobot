@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -37,7 +38,7 @@ from lerobot.export.recipe import random_frame  # noqa: E402
 from lerobot.policies import make_pre_post_processors, prepare_observation_for_inference  # noqa: E402
 from lerobot.policies.factory import get_policy_class  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
-from tests.export import tiny_groot, tiny_pi05, tiny_smolvla  # noqa: E402
+from tests.export import tiny_groot, tiny_pi0, tiny_pi05, tiny_smolvla  # noqa: E402
 from tests.export.plugins import use_plugins  # noqa: E402
 
 TASK = "pick up the cube"
@@ -67,9 +68,11 @@ class Chain:
     marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
-def save_pi05(relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Path]:
+def save_paligemma(tiny: Any, relative_actions: bool) -> Callable[[Path, pytest.MonkeyPatch], Path]:
+    """The saver of the tiny pi0 or pi0.5 in the module `tiny`."""
+
     def save(folder: Path, patch: pytest.MonkeyPatch) -> Path:
-        tiny_pi05.save_checkpoint(folder / "checkpoint", patch, relative_actions=relative_actions)
+        tiny.save_checkpoint(folder / "checkpoint", patch, relative_actions=relative_actions)
         return folder / "checkpoint"
 
     return save
@@ -109,7 +112,32 @@ def programs_hold_only_their_weights(
     return check
 
 
+PALIGEMMA = "model.paligemma_with_expert.paligemma.model"
+LAYERS = f"{PALIGEMMA}.language_model.layers"
+# The embedding table stays out of the embed program, which holds the rows of the task's tokens instead.
+PALIGEMMA_PARTS = {
+    "embed": (f"{PALIGEMMA}.vision_tower", f"{PALIGEMMA}.multi_modal_projector"),
+    "language_model_0": (f"{LAYERS}.0", f"{LAYERS}.1", f"{LAYERS}.2"),
+    "language_model_1": (f"{LAYERS}.3",),
+}
+EXPERT = "model.paligemma_with_expert.gemma_expert.model"
 ACTION_PROJECTIONS = ("model.action_in_proj", "model.action_out_proj")
+pi0_programs_hold_only_their_weights = programs_hold_only_their_weights(
+    PALIGEMMA_PARTS
+    | {
+        "step": (
+            EXPERT,
+            "model.state_proj",
+            *ACTION_PROJECTIONS,
+            "model.action_time_mlp_in",
+            "model.action_time_mlp_out",
+        )
+    }
+)
+# pi0.5's step holds a table of each timestep's adaptive norms instead of the time MLP and the norms' layers.
+pi05_programs_hold_only_their_weights = programs_hold_only_their_weights(
+    PALIGEMMA_PARTS | {"step": (EXPERT, *ACTION_PROJECTIONS)}, transformed=("norm.dense",)
+)
 VLM = "model.vlm_with_expert.vlm.model"
 smolvla_programs_hold_only_their_weights = programs_hold_only_their_weights(
     {
@@ -131,12 +159,22 @@ smolvla_programs_hold_only_their_weights = programs_hold_only_their_weights(
 
 
 PI05 = Chain(
-    save_pi05(relative_actions=False),
+    save_paligemma(tiny_pi05, relative_actions=False),
     tasks=(TASK, "open_the drawer\n"),
     programs=["actions", "embed", "language_model_0", "language_model_1", "step"],
     plugins=("tiny_pi05",),
     tiny=tiny_pi05.use_tiny_pi05,
     lora=["action_out_proj"],
+    check=pi05_programs_hold_only_their_weights,
+)
+PI0 = Chain(
+    save_paligemma(tiny_pi0, relative_actions=False),
+    tasks=(TASK,),
+    programs=["actions", "embed", "language_model_0", "language_model_1", "step"],
+    plugins=("tiny_pi0",),
+    tiny=tiny_pi0.use_tiny_pi0,
+    lora=["action_out_proj"],
+    check=pi0_programs_hold_only_their_weights,
 )
 GROOT = Chain(
     lambda folder, patch: tiny_groot.save_checkpoint(folder, "torchvision"),
@@ -150,8 +188,10 @@ GROOT = Chain(
 )
 CHAINS = {
     "pi05_absolute": PI05,
-    "pi05_relative": replace(PI05, save=save_pi05(relative_actions=True), lora=None),
+    "pi05_relative": replace(PI05, save=save_paligemma(tiny_pi05, relative_actions=True), lora=None),
     "groot_torchvision": GROOT,
+    "pi0_absolute": PI0,
+    "pi0_relative": replace(PI0, save=save_paligemma(tiny_pi0, relative_actions=True), lora=None),
     "smolvla": Chain(
         save_smolvla,
         tasks=(TASK,),
