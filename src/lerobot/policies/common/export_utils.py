@@ -48,13 +48,16 @@ class PolicyPart(nn.Module):
 
     `torch.export` keeps every weight of the module it exports, used or not. So the policy is held as a plain
     reference, not a submodule, and only the modules the part runs are registered: the program holds their
-    weights, not the whole policy's.
+    weights, not the whole policy's. Each is named after its path in the policy, with `__` for each `.`, so
+    `--quantize` matches the names it knows.
     """
 
     def __init__(self, policy: PreTrainedPolicy, modules: tuple[str, ...] = ()):
         super().__init__()
         object.__setattr__(self, "policy", policy)
-        self.weights = nn.ModuleList(policy.get_submodule(name) for name in modules)
+        self.weights = nn.ModuleDict(
+            {name.replace(".", "__"): policy.get_submodule(name) for name in modules}
+        )
 
 
 def hold_linear_weights_in_bfloat16(module: nn.Module) -> None:
