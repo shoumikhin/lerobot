@@ -266,3 +266,33 @@ def test_policy_that_cannot_be_built_on_meta_loads_the_regular_way(caplog):
         with pytest.raises(RuntimeError, match="tokenizer not found"):
             load_complete_checkpoint(NoTokenizer, download, SimpleNamespace(device="cpu"))
     assert "regular way: cannot build MetaUnsupported on the meta device (no meta kernel)" in caplog.text
+
+
+class Parent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.toy = Toy()
+        self.own = nn.Parameter(torch.ones(4))
+
+
+def parent_on_meta():
+    """A `Parent` whose parameters are on the meta device, as building it on the meta device leaves them."""
+    parent = Parent()
+    for module in parent.modules():
+        for name, parameter in list(module.named_parameters(recurse=False)):
+            setattr(module, name, nn.Parameter(parameter.to("meta"), requires_grad=parameter.requires_grad))
+    return parent
+
+
+def test_loading_a_module_drops_the_weights_of_the_modules_on_its_way():
+    expected = Toy()
+    state_dict = {f"toy.{name}": tensor for name, tensor in expected.state_dict().items()}
+    loaded = openpi_checkpoint.load_modules(parent_on_meta(), state_dict, ["toy"], "cpu")
+    assert loaded.own is None
+    assert_same(loaded.toy, expected)
+
+
+def test_loading_a_module_raises_when_the_file_misses_its_persistent_buffer():
+    state_dict = {f"toy.{name}": tensor for name, tensor in Toy().state_dict().items() if name != "scale"}
+    with pytest.raises(KeyError, match=r"does not hold toy\.scale and 0 more"):
+        openpi_checkpoint.load_modules(parent_on_meta(), state_dict, ["toy"], "cpu")

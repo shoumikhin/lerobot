@@ -18,7 +18,7 @@
 
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 import torch
@@ -93,11 +93,11 @@ def building_on_meta() -> bool:
 
 
 def _load_state_dict_into_meta_model(
-    model: nn.Module, state_dict: dict[str, Tensor], device: str | None
+    model: nn.Module, state_dict: dict[str, Tensor], device: str | None, strict: bool = True
 ) -> None:
     """Load a complete checkpoint into a model built under `_parameters_on_meta`.
 
-    `state_dict` must have exactly the model's keys. Each tensor is copied into the dtype the constructor gave
+    `state_dict` must have exactly the model's keys, or, with `strict=False`, some of them. Each tensor is copied into the dtype the constructor gave
     the matching parameter or buffer, on the device it was read on, then moved to `device`, so the
     constructor's precision choices are kept and, for a GPU, the host holds one copied tensor at a time.
     `load_complete_checkpoint` has already checked that the model shares no parameter between modules, since
@@ -112,11 +112,19 @@ def _load_state_dict_into_meta_model(
         tensors[name] = tensor.to(
             dtype=targets[name].dtype, memory_format=torch.contiguous_format, copy=True
         ).to(device)
-    model.load_state_dict(tensors, strict=True, assign=True)
+    model.load_state_dict(tensors, strict=strict, assign=True)
 
 
 def _log_fallback(reason: str, level: int = logging.INFO) -> None:
     logger.log(level, "Loading the weights the regular way: %s.", reason)
+
+
+def _convert_checkpoint(policy: nn.Module, checkpoint: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Map `checkpoint` onto the names of the policy's weights, as the regular load does."""
+    state_dict = policy._convert_openpi_state_dict(checkpoint)
+    # load_state_dict renames these in a pre-hook, too late for the checks that read the names first.
+    rename_legacy_vision_model_keys(policy, state_dict, "")
+    return state_dict
 
 
 def load_complete_checkpoint(
@@ -179,12 +187,10 @@ def load_complete_checkpoint(
         _log_fallback(f"cannot read {path} ({e})")
         return None
     try:
-        state_dict = policy._convert_openpi_state_dict(checkpoint)
+        state_dict = _convert_checkpoint(policy, checkpoint)
     except Exception as e:
         _log_fallback(f"cannot convert the checkpoint ({e})")
         return None
-    # load_state_dict renames these in a pre-hook, too late for the checks below.
-    rename_legacy_vision_model_keys(policy, state_dict, "")
     expected = {name: tensor.shape for name, tensor in policy.state_dict().items()}
     for name, shape in expected.items():
         if name not in state_dict or state_dict[name].shape != shape:
@@ -204,3 +210,64 @@ def load_complete_checkpoint(
     policy.to(config.device)
     log_model_loading_keys([], sorted(name for name in state_dict if name not in expected))
     return policy
+
+
+def load_checkpoint_modules(
+    policy_cls: type[T], model_file: str, config: PreTrainedConfig, modules: list[str], **kwargs
+) -> T:
+    """Build `policy_cls` on the meta device and load only the weights of `modules` from `model_file`.
+
+    For exporting one part of a policy too large for the machine's memory: only the listed submodules, like
+    `model.paligemma_with_expert.gemma_expert`, get real tensors, as `load_modules` says. The checkpoint is
+    converted as `load_complete_checkpoint` converts it, on tensors that still point into the file, so only
+    the listed weights are read. The same promises as `load_complete_checkpoint` apply.
+    """
+    if not vars(policy_cls).get("_supports_meta_load", False):
+        raise ValueError(f"{policy_cls.__name__} does not support loading on the meta device.")
+    with _parameters_on_meta():
+        policy = policy_cls(config, **kwargs)
+    return load_modules(policy, _convert_checkpoint(policy, load_file(model_file)), modules, config.device)
+
+
+def load_modules(policy: T, state_dict: Mapping[str, Tensor], modules: list[str], device: str | None) -> T:
+    """Fill the `modules` of `policy`, built on the meta device, from `state_dict`, and drop the rest.
+
+    `state_dict` maps names in the policy's state dict to tensors and may hold more than `modules` needs. Each
+    weight of a listed submodule is copied in the dtype the constructor gave it. Every other submodule holding
+    parameters is replaced by None, as the policy already does for modules it never runs, so code that reaches
+    one fails instead of reading random weights, and an export of one part holds only its own weights. A
+    parameter or buffer still on the meta device, such as one held directly by a module on the way to a listed
+    one, is replaced by None too. Raises if a listed submodule has a weight or a persistent buffer that
+    `state_dict` does not hold. Returns the policy in evaluation mode, as from `from_pretrained`, since a
+    policy's own `train` may reach a module that is now None, and on `device`.
+    """
+    prefixes = tuple(f"{name}." for name in modules)
+    targets = policy.state_dict()
+    chosen = {
+        name: tensor for name, tensor in state_dict.items() if name.startswith(prefixes) and name in targets
+    }
+    _load_state_dict_into_meta_model(policy, chosen, device, strict=False)
+    for name in modules:
+        module = policy.get_submodule(name)
+        missing = [p for p, param in module.named_parameters() if param.is_meta]
+        weights = {p for p, _ in module.named_parameters(remove_duplicate=False)}
+        # A persistent buffer the file lacks would silently keep the value its constructor gave it.
+        missing += [b for b in module.state_dict() if b not in weights and f"{name}.{b}" not in chosen]
+        if missing:
+            raise KeyError(f"The checkpoint does not hold {name}.{missing[0]} and {len(missing) - 1} more")
+    policy.eval()
+    _drop_unloaded(policy)
+    # Buffers the constructor computed, like rotary tables, are not in the checkpoint and are still on the CPU.
+    return policy.to(device)
+
+
+def _drop_unloaded(module: nn.Module) -> None:
+    for name, tensor in [*module.named_parameters(recurse=False), *module.named_buffers(recurse=False)]:
+        if tensor.is_meta:
+            setattr(module, name, None)
+    for name, child in list(module.named_children()):
+        parameters = list(child.parameters())
+        if parameters and all(parameter.is_meta for parameter in parameters):
+            setattr(module, name, None)
+        else:
+            _drop_unloaded(child)
