@@ -17,6 +17,7 @@ programs, run in PyTorch. A bundle names this module in `runtime_imports`, which
 compiler's own module registers its kernels with a real runtime.
 """
 
+import logging
 import os
 import zipfile
 from dataclasses import dataclass
@@ -152,6 +153,8 @@ class TorchTestBackend(ExportBackendConfig):
     offset: float = 0.0
 
     def compile(self, program: torch.export.ExportedProgram, path: Path) -> None:
+        # As a real compiler logs its own work.
+        logging.getLogger("torch_test_compiler").info("Lowering %s", path.stem)
         if self.offset:
             args, _ = program.example_inputs
             program = torch.export.export(_Offset(program.module(), self.offset), args)

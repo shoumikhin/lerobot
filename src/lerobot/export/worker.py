@@ -43,7 +43,8 @@ from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
 
-logger = logging.getLogger(__name__)
+# By name: run with `python -m`, this module is `__main__`, which is not a LeRobot logger.
+logger = logging.getLogger("lerobot.export.worker")
 
 
 def _robot_action_names(names: list[str] | None) -> list[str] | None:
@@ -54,6 +55,23 @@ def _robot_action_names(names: list[str] | None) -> list[str] | None:
     a PyTorch policy. A checkpoint can also save an empty list, which names no actions.
     """
     return names if names and all(name.endswith(MOTOR_CHANNEL_SUFFIXES) for name in names) else None
+
+
+def set_log_level(level: str) -> None:
+    """Log LeRobot's lines from `level` up.
+
+    At INFO other libraries log only their warnings. DEBUG adds every library's logs, such as those of ExecuTorch
+    and of the backend's compiler, and the INFO logs of torch.export and Inductor.
+    """
+    init_logging(console_level=level)
+    logging.getLogger("lerobot").setLevel(level)
+    if level == "INFO":
+        # A compiler's own INFO lines, such as one per node Torch-TensorRT converts, would bury the export's steps.
+        logging.getLogger().setLevel(logging.WARNING)
+    else:
+        # PyTorch's loggers print through handlers of their own, only warnings unless asked. Its other logs, such
+        # as every graph or DEBUG, run to thousands of lines for even a tiny policy: TORCH_LOGS asks for them.
+        torch._logging.set_logs(export=logging.INFO, inductor=logging.INFO)
 
 
 def trace_step(request: dict[str, Any]) -> dict[str, Any]:
@@ -74,6 +92,7 @@ def trace_step(request: dict[str, Any]) -> dict[str, Any]:
 
 @parser.wrap()
 def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
+    set_log_level(cfg.log_level)
     output_dir = cast(Path, cfg.output_dir)
     tag = uuid.uuid4().hex[:8]
     folder = output_dir.parent / f".{output_dir.name}-{tag}"
@@ -128,6 +147,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "manifest": manifest.to_dict(),
         "traced": str(traced),
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
+        "log_level": cfg.log_level,
     }
 
 
@@ -140,7 +160,6 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
         load_plugin(plugin)
     backend = draccus.decode(ExportBackendConfig, request["backend"])
     path = Path(request["path"])
-    logger.info("Compiling %s with %s", path.stem, backend.type)
     try:
         # Lowering needs no autograd, and some of ExecuTorch's passes fail when it records them (complex views).
         with torch.no_grad():
@@ -160,7 +179,8 @@ STEPS = {"trace": trace_step, "compile": compile_step}
 def main() -> None:
     """Run the step `sys.argv[1]` names and write its result."""
     request = json.loads(Path(sys.argv[1]).read_text())
-    init_logging()
+    # The trace step learns the level from the command line it parses.
+    set_log_level(request.get("log_level", "INFO"))
     register_third_party_plugins(kinds=("policy", "backend"))
     # The test case is the policy's float32 arithmetic, and the compiled programs must match it. TF32, which
     # PyTorch uses for cuDNN convolutions by default, moves a float32 policy's actions by about 1e-3 of their

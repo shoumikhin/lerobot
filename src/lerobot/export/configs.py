@@ -21,7 +21,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import draccus
 
@@ -96,6 +96,9 @@ class ExportConfig:
     tolerance: float | None = None
     # Seeds the random test case.
     seed: int = 1000
+    # INFO logs each step of the export and how long it took; DEBUG adds the logs of torch.export, ExecuTorch and
+    # the backend's compiler.
+    log_level: Literal["INFO", "DEBUG"] = "INFO"
 
     def __post_init__(self) -> None:
         """Load the policy config from `--policy.path` and pick the bundle folder."""

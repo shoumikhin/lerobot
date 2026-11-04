@@ -47,8 +47,10 @@ import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
-from contextlib import suppress
+import threading
+import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -58,17 +60,25 @@ from lerobot.utils.import_utils import PLUGIN_DISCOVERY_SUFFIX, parse_plugin_arg
 
 logger = logging.getLogger(__name__)
 
+# How often a step that is still running says so.
+HEARTBEAT_SECONDS = 60
+
 
 def export(args: Sequence[str]) -> Path:
     """Write the bundle the `lerobot-export` command line `args` asks for, and return its folder.
 
     `args` is the command line, such as `["--policy.path=...", "--backend.type=executorch_tensorrt"]`.
     """
+    start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="lerobot-export-") as requests:
         work = Path(requests)
         folders = work / "folders.json"
         try:
-            traced = _run_step(work, "trace", {"step": "trace", "args": list(args), "folders": str(folders)})
+            # Not `_step`: the trace step logs each part it traces, and `--help` should print only the help.
+            with _heartbeat("Tracing the policy"):
+                traced = _run_step(
+                    work, "trace", {"step": "trace", "args": list(args), "folders": str(folders)}
+                )
             if traced is None:
                 # The command line asked for help, which the trace step printed.
                 raise SystemExit(0)
@@ -80,20 +90,24 @@ def export(args: Sequence[str]) -> Path:
                 if key.startswith("backend.")
             ]
             manifest = BundleManifest.from_dict(traced["manifest"])
-            for name, files in manifest.programs.items():
+            steps = len(manifest.programs) + 1
+            logger.info("Traced the policy in %.0f s", time.monotonic() - start)
+            for step, (name, files) in enumerate(manifest.programs.items(), start=1):
                 request = {
                     "step": "compile",
                     "backend": traced["backend"],
                     "program": str(Path(traced["traced"]) / f"{name}.pt2"),
                     "path": str(folder / files.file),
                     "plugins": plugins,
+                    "log_level": traced["log_level"],
                 }
-                files.data = cast(dict[str, Any], _run_step(work, f"compile-{name}", request))["data"]
+                with _step(f"[{step}/{steps}] Compiling {name} with {traced['backend']['type']}"):
+                    files.data = cast(dict[str, Any], _run_step(work, f"compile-{name}", request))["data"]
             shutil.rmtree(traced["traced"])
             Bundle(folder, manifest).write()
-            logger.info("Checking the bundle")
-            # -P: nothing loads from the current folder, which can hold any .py file.
-            code = subprocess.run([sys.executable, "-P", "-m", "lerobot.bundle", str(folder)]).returncode
+            with _step(f"[{steps}/{steps}] Checking the bundle"):
+                # -P: nothing loads from the current folder, which can hold any .py file.
+                code = subprocess.run([sys.executable, "-P", "-m", "lerobot.bundle", str(folder)]).returncode
             if code:
                 reason = f"crashed with {_signal_name(-code)}" if code < 0 else "failed its check (see above)"
                 raise RuntimeError(f"The bundle {reason} on this machine, so it was not written.")
@@ -109,7 +123,7 @@ def export(args: Sequence[str]) -> Path:
             with suppress(FileNotFoundError, ValueError):
                 _remove_made(json.loads(folders.read_text()))
             raise
-    logger.info("Wrote %s", output_dir)
+    logger.info("Wrote %s in %.0f s", output_dir, time.monotonic() - start)
     return output_dir
 
 
@@ -121,6 +135,38 @@ def _remove_made(folders: dict[str, list[str]]) -> None:
         # One that holds anything else, such as another export's bundle, stays.
         with suppress(OSError):
             Path(path).rmdir()
+
+
+@contextmanager
+def _heartbeat(doing: str) -> Iterator[None]:
+    """Log every `HEARTBEAT_SECONDS` while the block runs that it is still `doing`, so a long step is not silent.
+
+    A plain line each time, never a progress bar redrawn in place, which a log file or CI would show garbled.
+    """
+    start = time.monotonic()
+    done = threading.Event()
+
+    def beat() -> None:
+        while not done.wait(HEARTBEAT_SECONDS):
+            logger.info("%s: still running after %.0f s", doing, time.monotonic() - start)
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join()
+
+
+@contextmanager
+def _step(doing: str) -> Iterator[None]:
+    """Log `doing` when the block starts, that it still runs while it does, and how long it took once done."""
+    logger.info(doing)
+    start = time.monotonic()
+    with _heartbeat(doing):
+        yield
+    logger.info("%s: done in %.0f s", doing, time.monotonic() - start)
 
 
 def _run_step(work: Path, name: str, request: dict[str, Any]) -> dict[str, Any] | None:

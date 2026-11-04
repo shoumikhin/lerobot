@@ -16,7 +16,9 @@
 are installed, real backends."""
 
 import json
+import logging
 import os
+import re
 import shutil
 import signal
 import stat
@@ -240,6 +242,39 @@ def test_export_prints_its_help_and_writes_nothing(tmp_path, monkeypatch, capfd)
     assert list(tmp_path.iterdir()) == []
 
 
+def test_export_logs_each_step_with_its_time_and_leaves_out_the_compilers_logs(
+    checkpoint, tmp_path, monkeypatch, caplog, capfd
+):
+    # Each step takes seconds, so each says at least once that it is still running.
+    monkeypatch.setattr(lerobot_export, "HEARTBEAT_SECONDS", 0.1)
+    with caplog.at_level(logging.INFO, logger=lerobot_export.__name__):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    lines = [
+        re.sub(r"\d+ s$", "N s", record.getMessage())
+        for record in caplog.records
+        if record.name == lerobot_export.__name__
+    ]
+    assert [line for line in lines if "still running" not in line] == [
+        "Traced the policy in N s",
+        "[1/2] Compiling model with torch_test",
+        "[1/2] Compiling model with torch_test: done in N s",
+        "[2/2] Checking the bundle",
+        "[2/2] Checking the bundle: done in N s",
+        f"Wrote {tmp_path / 'b'} in N s",
+    ]
+    for doing in ("Tracing the policy", "[1/2] Compiling model with torch_test", "[2/2] Checking the bundle"):
+        assert f"{doing}: still running after N s" in lines
+    assert "Lowering model" not in capfd.readouterr().err
+
+
+def test_export_at_log_level_debug_shows_the_compilers_and_pytorchs_logs(checkpoint, tmp_path, capfd):
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--log_level=DEBUG")
+    err = capfd.readouterr().err
+    assert "Lowering model" in err
+    # PyTorch's own format, such as `I1104 09:27:58.123000 4242 torch/fx/experimental/symbolic_shapes.py:3712]`.
+    assert re.search(r"^I\d{4} [\d:.]+ +\d+ torch/", err, re.MULTILINE)
+
+
 @pytest.mark.usefixtures("restore_torch_backend_flags")
 def test_the_trace_step_loads_the_requested_revision_without_tf32(checkpoint, tmp_path, monkeypatch):
     import lerobot.policies.factory as factory
@@ -271,7 +306,7 @@ def test_the_trace_step_loads_the_requested_revision_without_tf32(checkpoint, tm
     monkeypatch.setattr(sys, "argv", list(argv))
     # The step sets up logging and loads the installed plugins for a process of its own; here both would stay
     # for every later test.
-    monkeypatch.setattr(worker, "init_logging", lambda: None)
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
     loaded = []
     monkeypatch.setattr(worker, "register_third_party_plugins", lambda kinds: loaded.append(kinds))
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
@@ -305,6 +340,8 @@ def test_the_trace_step_records_only_action_names_a_robot_can_have(
         return policy
 
     monkeypatch.setattr(factory, "load_pretrained_policy", load_pretrained_policy)
+    # The step sets up logging for a process of its own; here it would stay for every later test.
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
     args = ["--backend.type=torch_test", f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}"]
     traced = worker.trace_step({"args": args, "folders": str(tmp_path / "folders.json")})
     assert traced["manifest"].get("action_names") == recorded
@@ -337,7 +374,7 @@ def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(sys, "argv", ["worker", str(request)])
     # The step sets up logging and loads the installed plugins for a process of its own.
-    monkeypatch.setattr(worker, "init_logging", lambda: None)
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
     monkeypatch.setattr(worker, "register_third_party_plugins", lambda **kwargs: None)
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     worker.main()
