@@ -1003,7 +1003,8 @@ class LingBotVAExportRecipe(ActionChunkRecipe):
     ) -> np.ndarray:
         """The actions the parts play at each tick of `frames`, run as the bundle runs them, from a reset.
 
-        The first inputs each part gets are kept in `examples`, to trace it with.
+        The last inputs each part gets are kept in `examples`, to trace and check it with: by then the KV cache
+        holds the earlier chunks, and has freed some if it holds fewer chunks than the test case plays.
         """
         chunk_runs = self._chunk_runs()
         constants = {
@@ -1026,7 +1027,7 @@ class LingBotVAExportRecipe(ActionChunkRecipe):
                     values.update({name: torch.stack(list(past)) for name, past in history.items()})
                     for run in chunk_runs[min(chunk, len(chunk_runs) - 1)]:
                         inputs = tuple(values[name] for name in run.inputs)
-                        examples.setdefault(run.program, inputs)
+                        examples[run.program] = inputs
                         outputs = modules[run.program](*inputs)
                         outputs = outputs if isinstance(outputs, tuple) else (outputs,)
                         values.update(zip(run.outputs, outputs, strict=True))
