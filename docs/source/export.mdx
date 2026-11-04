@@ -453,7 +453,7 @@ Two tables list what has been tested. In both:
 | pi0              | own (chain)            | Yes         | Yes         | Yes             | Yes              |
 | EVO1             | own (uniform noise)    | Yes         | Yes         | No              | Too big          |
 | FastWAM          | own (seeded noise)     | Yes         | Yes         | Yes             | Too big          |
-| LingBot-VLA v2   | default                | Yes         | Yes         | No              | Too big          |
+| LingBot-VLA v2   | own (vision grid)      | Yes         | Yes         | No              | Too big          |
 | FineART VLA      | own (state in prompt)  | Yes         | Yes         | Yes             | Too big          |
 | DM05             | own (state in prompt)  | PyTorch fix | PyTorch fix | PyTorch fix     | Too big          |
 | Wall-OSS 0.5     | own (state in prompt)  | Yes         | Yes         | Yes             | Too big          |
@@ -472,7 +472,7 @@ Two tables list what has been tested. In both:
 - WALL-X misses its check on the A100: the bundle lands between 0.060 and 0.125 from PyTorch, depending on which kernels TensorRT picks, and eager PyTorch alone moves it by 0.043 to 0.092 there, so its 0.075 tolerance sits at the rounding noise.
 - **Too big**: most of these policies are bigger than the Orin Nano's 8 GB. LaWAM, VLA-JEPA and EVO1 would fit when they run, but their export does not fit yet. X-VLA ran on the Orin Nano in bfloat16 (`--policy.dtype=bfloat16`), because its float32 export does not fit.
 - On the Jetson AGX Thor only, the bfloat16 bundles of EVO1 and LingBot-VLA v2 miss their check against PyTorch. Each part of EVO1 matches PyTorch when it is compiled alone there, but the whole program does not. The cause is TensorRT's fused attention kernel, which on the Thor only rounds the attention scores to bfloat16 whenever the attention has a mask; on the H100, A100 and Orin Nano it keeps them in float32.
-- LingBot-VLA v2 was exported with `--policy.precompute_grid_thw=true`. It makes its vision model compute the layout of image patches once, instead of on every call, so it assumes that the camera layout does not change while the robot runs.
+- LingBot-VLA v2's recipe computes the layout of image patches of the export's frames once, so it assumes that the camera layout does not change while the robot runs. Its results above were measured with an export that used `--policy.precompute_grid_thw=true` for the same purpose.
 - FLUX3's TensorRT export stops at attention layers whose query, key or value is a constant, which [pytorch/TensorRT#4964](https://github.com/pytorch/TensorRT/pull/4964) fixes. With that fix, the FLUX3 checkpoint tested runs out of GPU memory in the TensorRT build, even alone on an H100.
 - LingBot-VA's recipe keeps the policy's KV cache and its video encoder's cache between chunks (see [Values kept between chunks](#values-kept-between-chunks)). In bfloat16 or float16 its 3 test chunks amplify rounding so much that the bundle's test case cannot tell a correct program from a wrong one, so each program is also checked on its own (see [Built-in checks](#built-in-checks)), and the test case only has to stay within 1.0. Exporting its 5B LIBERO checkpoint in bfloat16 used up to about 70 GiB of GPU memory.
 - Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FastWAM, FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
