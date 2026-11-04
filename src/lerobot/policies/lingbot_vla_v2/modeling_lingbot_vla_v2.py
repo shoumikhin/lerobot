@@ -1312,7 +1312,7 @@ class FlowMatchingV2(FlowMatchingV1):
                     _denoise_cache=denoise_cache,
                 )
 
-            x_t += dt * v_t
+            x_t = x_t + dt * v_t
         logger.debug("Denoised %s steps%s", count, " (RTC guided)" if guided else "")
         return x_t
 
