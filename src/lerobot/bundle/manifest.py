@@ -279,7 +279,7 @@ class BundleManifest:
     test_case: str = TEST_CASE
 
     def __post_init__(self) -> None:
-        """Refuse values that would let any program pass its check."""
+        """Refuse values that would let any program pass its check, and files outside the bundle folder."""
         if not math.isfinite(self.tolerance) or self.tolerance < 0:
             raise ValueError(f"The tolerance must be a finite number of at least 0, not {self.tolerance}.")
         if not self.action_scale or not all(math.isfinite(s) and s > 0 for s in self.action_scale):
@@ -303,6 +303,16 @@ class BundleManifest:
                 raise ValueError(f"The manifest names a run twice: {names}.")
             if unknown := sorted({run.program for run in runs} - set(self.programs)):
                 raise ValueError(f"The manifest runs the programs {unknown}, which it does not list.")
+        files = [self.test_case, self.constants]
+        files += [name for program in self.programs.values() for name in (program.file, program.data)]
+        if self.task_tokens is not None:
+            files += [self.task_tokens.tokenizer, self.task_tokens.embeddings, self.task_tokens.known_tasks]
+        if self.action_tokens is not None:
+            files.append(self.action_tokens.tokenizer)
+        if outside := [
+            name for name in files if name is not None and (Path(name).anchor or ".." in Path(name).parts)
+        ]:
+            raise ValueError(f"The manifest names files outside the bundle folder: {outside}.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleManifest:

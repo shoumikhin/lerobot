@@ -46,6 +46,25 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 from tests.export.torch_backend import TorchProgram, make_bundle, record_places
 
 FRAME = {OBS_STATE: np.array([1.0, 2.0, 3.0], np.float32)}
+TASK_TOKENS = {
+    "prompt_ops": [],
+    "tokenizer": "tokenizer.json",
+    "embeddings": "embeddings.safetensors",
+    "known_tasks": "known_tasks.json",
+    "max_tokens": 4,
+}
+ACTION_TOKENS = {
+    "tokenizer": "fast.json",
+    "clean_up_spaces": False,
+    "id_offset": 0,
+    "end": 1,
+    "prefix": [],
+    "start": [],
+    "min_token": 0,
+    "scale": 1.0,
+    "horizon": 2,
+    "action_dim": 3,
+}
 MODEL_RUN = {"name": "model", "program": "model", "inputs": [OBS_STATE], "outputs": [ACTION]}
 
 
@@ -693,6 +712,16 @@ def test_engine_refuses_a_test_case_whose_ticks_play_another_number_of_chunks_th
             {"runs": [{"name": "model", "program": "model", "inputs": [], "outputs": []}] * 2},
             "names a run twice",
         ),
+        # A downloaded bundle reads only its own files.
+        ({"test_case": "../test.safetensors"}, r"outside the bundle folder: \['\.\./test\.safetensors'\]"),
+        ({"programs": {"model": {"file": "/model.pt2"}}}, r"outside the bundle folder: \['/model\.pt2'\]"),
+        ({"constants": "../c.safetensors"}, r"outside the bundle folder: \['\.\./c\.safetensors'\]"),
+        ({"programs": {"model": {"file": "model.pt2", "data": "../w.bin"}}}, r"folder: \['\.\./w\.bin'\]"),
+        (
+            {"task_tokens": {**TASK_TOKENS, "embeddings": "../e.safetensors"}},
+            r"folder: \['\.\./e\.safetensors'\]",
+        ),
+        ({"action_tokens": {**ACTION_TOKENS, "tokenizer": "../fast.json"}}, r"folder: \['\.\./fast\.json'\]"),
     ],
 )
 def test_bundle_refuses_a_manifest_it_cannot_run(tmp_path, change, error):
