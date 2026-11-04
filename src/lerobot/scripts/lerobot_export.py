@@ -103,6 +103,7 @@ def export(args: Sequence[str]) -> Path:
                     "program": str(Path(traced["traced"]) / f"{name}.pt2"),
                     "path": str(folder / files.file),
                     "plugins": plugins,
+                    "quantize": traced["quantize"],
                     "log_level": traced["log_level"],
                 }
                 with _step(f"[{step}/{steps}] Compiling {name} with {traced['backend']['type']}"):

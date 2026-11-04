@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import math
 import os
 from collections.abc import Sequence
@@ -33,7 +34,7 @@ from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.default import DatasetConfig
 
 if TYPE_CHECKING:
-    from torch import Tensor
+    from torch import Tensor, nn
     from torch.export import ExportedProgram
 
 
@@ -71,6 +72,11 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
             The PyTorch pins an export with this backend needs, such as
             `("torch>=2.15,<2.16", "torchvision>=0.29.2,<0.30")`. The refusal of an older PyTorch prints them
             with `packages` as one install command.
+        quantizations (`tuple[str, ...]`):
+            The `--quantize` modes the backend offers, such as `fp8`. Empty for none.
+        quantization_imports (`dict[str, str]`):
+            For a `--quantize` mode whose parts hold operators that a Python module registers on import, that
+            module. The compile step imports it before it loads such a part.
     """
 
     runtime: ClassVar[str]
@@ -83,6 +89,8 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     packages: ClassVar[tuple[str, ...]] = ()
     min_torch: ClassVar[str | None] = None
     torch_pins: ClassVar[tuple[str, ...]] = ()
+    quantizations: ClassVar[tuple[str, ...]] = ()
+    quantization_imports: ClassVar[dict[str, str]] = {}
 
     def target(self) -> Target | None:
         """The GPU the files are built on when `device` is `cuda`, since they then run only on that kind of GPU.
@@ -117,6 +125,16 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
             pins = " ".join(f'"{pin}"' for pin in self.torch_pins + self.packages)
             message += f" Install it in this environment:\n\n    pip install {pins}\n\nThen export again."
         raise ValueError(f"{message} See https://huggingface.co/docs/lerobot/export.")
+
+    def quantized(
+        self, module: nn.Module, example_inputs: tuple[Tensor, ...], mode: str
+    ) -> contextlib.AbstractContextManager:
+        """Quantize the part `module` in place as `--quantize=mode` asks, and return the context to trace it in.
+
+        `mode` is one of `quantizations`. `example_inputs` are the part's own inputs, for a mode that measures
+        the range of its activations on them.
+        """
+        raise NotImplementedError(f"The {self.type} backend offers no quantization.")
 
     @abc.abstractmethod
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
@@ -163,6 +181,9 @@ class ExportConfig:
     max_task_tokens: int | None = None
     # Seeds the random test case.
     seed: int = 1000
+    # Compute in fewer bits, with a mode the backend offers, such as `fp8` with `executorch_tensorrt`.
+    # The bundle is still checked against the unquantized policy, so `tolerance` must then be given.
+    quantize: str | None = None
     # INFO logs each step of the export and how long it took; DEBUG adds the logs of torch.export, ExecuTorch and
     # the backend's compiler.
     log_level: Literal["INFO", "DEBUG"] = "INFO"
@@ -170,6 +191,17 @@ class ExportConfig:
     def __post_init__(self) -> None:
         """Check the PyTorch version, load the policy config from `--policy.path` and pick the bundle folder."""
         self.backend.check_torch()
+        if self.quantize is not None and self.quantize not in self.backend.quantizations:
+            offered = ", ".join(self.backend.quantizations) or "none"
+            raise ValueError(
+                f"The {self.backend.type} backend cannot --quantize={self.quantize}. It offers: {offered}."
+            )
+        if self.quantize is not None and self.tolerance is None:
+            raise ValueError(
+                "--quantize needs --tolerance: the bundle is checked against the unquantized policy, and "
+                "quantization moves the actions by more than the default tolerance allows. Pass the largest "
+                "difference you accept, in normalized action units."
+            )
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")

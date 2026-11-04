@@ -22,6 +22,9 @@ large policy export on a small board. A request is a JSON object naming its `ste
 write.
 """
 
+import contextlib
+import copy
+import importlib
 import json
 import logging
 import shutil
@@ -56,7 +59,7 @@ from lerobot.utils.robot_utils import MOTOR_CHANNEL_SUFFIXES
 from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
-from .recipe import PROGRAM_FLOOR_FACTOR, ProgramCheck
+from .recipe import PROGRAM_FLOOR_FACTOR, Part, ProgramCheck
 
 # By name: run with `python -m`, this module is `__main__`, which is not a LeRobot logger.
 logger = logging.getLogger("lerobot.export.worker")
@@ -137,7 +140,13 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
         folder.mkdir()
         traced.mkdir(mode=0o700)
-        recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(cfg)
+        recipe_cfg = cfg
+        if cfg.quantize is not None:
+            # The recipe compares its parts with the policy as it does without --quantize, so only the
+            # bundle's check of its test case takes the --tolerance.
+            recipe_cfg = copy.copy(cfg)
+            recipe_cfg.tolerance = None
+        recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
         programs: dict[str, ProgramFiles] = {}
         runs: list[ProgramRun] = []
         checks: list[str] = []
@@ -145,7 +154,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             logger.info("Tracing %s", part.name)
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
             # default, and its Dynamo cannot run some policies' Python, such as ACT's.
-            with torch.no_grad():
+            with torch.no_grad(), _quantized(cfg, part):
                 program = torch.export.export(part.module, part.example_inputs, strict=False)
                 # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
                 # flat_apply that Transformers' vmap attention masks trace to.
@@ -200,7 +209,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             task=recipe.task,
             action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
             action_scale=test_case.action_scale.tolist(),
-            tolerance=recipe.tolerance,
+            tolerance=recipe.tolerance if cfg.quantize is None else cast(float, cfg.tolerance),
             target=cfg.backend.target(),
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
             exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
@@ -218,9 +227,22 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "manifest": manifest.to_dict(),
         "traced": str(traced),
         "checks": checks,
+        "quantize": cfg.quantize,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
         "log_level": cfg.log_level,
     }
+
+
+def _quantized(cfg: ExportConfig, part: Part) -> contextlib.AbstractContextManager:
+    """Quantize `part` as `--quantize` asks, and return the context to trace it in."""
+    if cfg.quantize is None:
+        return contextlib.nullcontext()
+    if part.check is not None:
+        raise ValueError(
+            f"The {cast(PreTrainedConfig, cfg.policy).type} policy checks its {part.name} program to within what "
+            "rounding moves it, which a quantized program cannot meet. Export it without --quantize."
+        )
+    return cfg.backend.quantized(part.module, part.example_inputs, cfg.quantize)
 
 
 def compile_step(request: dict[str, Any]) -> dict[str, Any]:
@@ -232,6 +254,16 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
         load_plugin(plugin)
     backend = draccus.decode(ExportBackendConfig, request["backend"])
     path = Path(request["path"])
+    quantize = request.get("quantize")
+    if quantize in backend.quantization_imports:
+        module = backend.quantization_imports[quantize]
+        try:
+            importlib.import_module(module)
+        except ImportError as error:
+            raise ImportError(
+                f"A part traced with --quantize={quantize} holds operators that {module} registers, and it does "
+                f"not import: {error}"
+            ) from error
     try:
         # Lowering needs no autograd, and some of ExecuTorch's passes fail when it records them (complex views).
         with torch.no_grad():

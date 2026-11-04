@@ -15,6 +15,7 @@
 """`lerobot-export` and the bundle it writes, end to end on a tiny ACT, with the test backend and, where they
 are installed, real backends."""
 
+import contextlib
 import json
 import logging
 import os
@@ -34,7 +35,10 @@ from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
+from lerobot.configs import parser
 from lerobot.export import worker
+from lerobot.export.configs import ExportBackendConfig, ExportConfig
+from lerobot.export.recipe import ExportRecipe
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -157,9 +161,6 @@ def test_a_part_checked_on_its_own_refuses_a_program_that_computes_something_els
 
 
 def test_a_backend_that_cannot_run_its_programs_says_so():
-    from lerobot.export.configs import ExportBackendConfig
-    from tests.export.torch_backend import TorchTestBackend
-
     with pytest.raises(NotImplementedError, match="The torch_test backend cannot run its programs at export"):
         ExportBackendConfig.run(TorchTestBackend(), Path("model.pt2"), None, ())
 
@@ -214,9 +215,6 @@ def test_export_refuses_a_task_token_budget_for_a_policy_that_takes_no_task(chec
 def test_export_refuses_a_command_line_before_it_traces(
     checkpoint, tmp_path, monkeypatch, args, min_torch, error
 ):
-    from lerobot.configs import parser
-    from lerobot.export.configs import ExportConfig
-
     @parser.wrap()
     def parse(cfg: ExportConfig) -> ExportConfig:
         return cfg
@@ -232,6 +230,32 @@ def test_export_refuses_a_command_line_before_it_traces(
         parse()
     # draccus raises its own error from a ValueError the config's checks raise.
     assert error in str(refusal.value.__cause__ or refusal.value)
+
+
+def test_export_refuses_a_quantization_its_backend_does_not_offer(checkpoint, tmp_path, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--quantize=fp8")
+    assert "The torch_test backend cannot --quantize=fp8. It offers: none." in capfd.readouterr().err
+
+
+def test_export_refuses_a_quantization_without_a_tolerance(tmp_path, monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "quantizations", ("fp8",))
+    with pytest.raises(ValueError, match="--quantize needs --tolerance"):
+        ExportConfig(TorchTestBackend(), output_dir=tmp_path / "b", quantize="fp8")
+
+
+def test_a_part_checked_on_its_own_is_refused_quantization():
+    """Its check holds the program to rounding, which quantization exceeds by design."""
+    from types import SimpleNamespace
+
+    from lerobot.export.recipe import Part, ProgramCheck
+
+    linear = torch.nn.Linear(2, 2)
+    x = torch.zeros(1, 2)
+    check = ProgramCheck((x,), (linear(x),), [(0.0, 0.0)])
+    cfg = SimpleNamespace(quantize="fp8", policy=SimpleNamespace(type="tiny"), backend=None)
+    with pytest.raises(ValueError, match="checks its model program to within what rounding moves it"):
+        worker._quantized(cfg, Part("model", linear, (x,), ["x"], ["y"], check))
 
 
 @pytest.mark.parametrize(("option", "value"), [("compute_units", "tpu"), ("compute_precision", "int8")])
@@ -541,6 +565,55 @@ def test_the_trace_step_records_only_action_names_a_robot_can_have(
     assert traced["manifest"].get("action_names") == recorded
 
 
+def test_the_trace_step_quantizes_each_part_and_traces_it_in_the_backends_context(
+    checkpoint, tmp_path, monkeypatch
+):
+    events = []
+
+    @contextlib.contextmanager
+    def context():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def quantized(self, module, example_inputs, mode):
+        events.append(f"quantize {mode}")
+        return context()
+
+    export = torch.export.export
+    monkeypatch.setattr(TorchTestBackend, "quantizations", ("fp8",))
+    monkeypatch.setattr(TorchTestBackend, "quantized", quantized)
+    monkeypatch.setattr(
+        torch.export, "export", lambda *args, **kwargs: events.append("export") or export(*args, **kwargs)
+    )
+    args = [
+        "--backend.type=torch_test",
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--quantize=fp8",
+        "--tolerance=1",
+    ]
+    request = tmp_path / "trace.json"
+    folders, result = str(tmp_path / "folders.json"), str(tmp_path / "result.json")
+    request.write_text(json.dumps({"step": "trace", "args": args, "folders": folders, "result": result}))
+    monkeypatch.setattr(sys, "argv", ["worker", str(request)])
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    recipe_tolerances, load = [], ExportRecipe.load.__func__
+    monkeypatch.setattr(
+        ExportRecipe,
+        "load",
+        classmethod(lambda cls, cfg: recipe_tolerances.append(cfg.tolerance) or load(cls, cfg)),
+    )
+    worker.main()
+    assert events == ["quantize fp8", "enter", "export", "exit"]
+    # The recipe checks PyTorch against PyTorch with its own tolerance; the bundle's test case takes --tolerance.
+    assert recipe_tolerances == [None]
+    traced = json.loads(Path(result).read_text())
+    assert traced["manifest"]["tolerance"] == 1
+    # The compile steps load the parts knowing how they were quantized.
+    assert traced["quantize"] == "fp8"
+
+
 def test_the_trace_step_records_what_the_programs_were_built_for_and_with(checkpoint, tmp_path, monkeypatch):
     from lerobot.bundle.manifest import Target
 
@@ -587,6 +660,44 @@ def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     worker.main()
     assert seen == [(False, False, False)]
+
+
+def compile_part(tmp_path, quantize):
+    with torch.no_grad():
+        program = torch.export.export(torch.nn.Linear(2, 2), (torch.zeros(1, 2),))
+    torch.export.save(program, tmp_path / "part.pt2")
+    worker.compile_step(
+        {
+            "backend": {"type": "torch_test"},
+            "program": str(tmp_path / "part.pt2"),
+            "path": str(tmp_path / "out.pt2"),
+            "plugins": [],
+            "quantize": quantize,
+        }
+    )
+
+
+@pytest.mark.parametrize("quantize", [None, "fp8"])
+def test_the_compile_step_imports_what_a_quantized_part_needs_before_it_loads_it(
+    tmp_path, monkeypatch, quantize
+):
+    """A quantized part holds operators that only a module's import registers, and loading needs them."""
+    order = []
+    monkeypatch.setattr(TorchTestBackend, "quantization_imports", {"fp8": "registers_ops"})
+    monkeypatch.setattr(worker.importlib, "import_module", lambda name: order.append(f"import {name}"))
+    load = torch.export.load
+    monkeypatch.setattr(torch.export, "load", lambda path: order.append("load") or load(path))
+    monkeypatch.setattr(TorchTestBackend, "compile", lambda self, program, path: None)
+    compile_part(tmp_path, quantize)
+    assert order == (["load"] if quantize is None else ["import registers_ops", "load"])
+
+
+def test_the_compile_step_says_which_quantization_needs_a_module_that_does_not_import(tmp_path, monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "quantization_imports", {"fp8": "missing_module_for_quantized_ops"})
+    with pytest.raises(
+        ImportError, match="--quantize=fp8 holds operators that missing_module_for_quantized_ops"
+    ):
+        compile_part(tmp_path, "fp8")
 
 
 def test_the_noise_program_draws_another_standard_normal_noise_each_run():
