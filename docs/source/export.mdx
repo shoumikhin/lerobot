@@ -501,6 +501,7 @@ Two tables list what has been tested. In both:
 | FLUX3            | own (two noises)       | No          | No          | -               | Too big          |
 | LingBot-VA       | own (caches)           | Yes         | Yes         | Yes             | Too big          |
 | G0.5             | own (chain)            | Yes         | Yes         | Yes             | Too big          |
+| Cosmos3          | own (solver steps)     | Yes         | Yes         | Yes             | Too big          |
 
 - These results used PyTorch 2.15, with builds of ExecuTorch 1.6 and Torch-TensorRT 2.15 that have the fixes from [Install](#install) and other fixes still in review, all listed in pytorch/executorch#24353. In every **Yes** run, the bundle ran without loading PyTorch, and no operation ran on the CPU. It ran in `lerobot-rollout`, except TD-MPC's: the PushT TD-MPC tested reads a state that `lerobot-rollout` cannot give it, so its bundle ran on its own.
 - The pi0, pi0.5, GR00T and SmolVLA results are for their chain recipes.
@@ -511,6 +512,7 @@ Two tables list what has been tested. In both:
 - LingBot-VLA v2's recipe computes the layout of image patches of the export's frames once, so it assumes that the camera layout does not change while the robot runs. Its results above were measured with an export that used `--policy.precompute_grid_thw=true` for the same purpose.
 - FLUX3's TensorRT export stops at attention layers whose query, key or value is a constant, which [pytorch/TensorRT#4964](https://github.com/pytorch/TensorRT/pull/4964) fixes. With that fix, the FLUX3 checkpoint tested runs out of GPU memory in the TensorRT build, even alone on an H100.
 - LingBot-VA's recipe keeps the policy's KV cache and its video encoder's cache between chunks (see [Values kept between chunks](#values-kept-between-chunks)). In bfloat16 or float16 its 3 test chunks amplify rounding so much that the bundle's test case cannot tell a correct program from a wrong one, so each program is also checked on its own (see [Built-in checks](#built-in-checks)), and the test case only has to stay within 1.0. Exporting its 5B LIBERO checkpoint in bfloat16 used up to about 70 GiB of GPU memory.
+- Cosmos3's results used `lerobot/Cosmos3-Edge-Policy-LIBERO` in bfloat16. Its recipe exports the sampling without classifier-free guidance, and the one embodiment domain its config names (`domain_id`).
 - Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FastWAM, FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
 
 ### Other backends
