@@ -444,6 +444,8 @@ Two tables list what has been tested. In both:
 | pi0-FAST         | own (chain)            | Yes         | Yes         | Yes             | Too big          |
 | FLUX3            | own (two noises)       | No          | No          | -               | Too big          |
 | LingBot-VA       | own (caches)           | Yes         | Yes         | Yes             | Too big          |
+| G0.5             | own (chain)            | Yes         | Yes         | Yes             | Too big          |
+| Cosmos3          | own (solver steps)     | Yes         | Yes         | Yes             | Too big          |
 
 - These results used PyTorch 2.15, with builds of ExecuTorch 1.6 and Torch-TensorRT 2.15 that have the fixes from [Install](#install) and other fixes still in review, all listed in pytorch/executorch#24353. In every **Yes** run, the bundle ran without loading PyTorch, and no operation ran on the CPU.
 - The pi0, pi0.5, GR00T and SmolVLA results are for their chain recipes. The LaWAM and VLA-JEPA results were measured when each was exported as one program, before its chain recipe.
@@ -454,6 +456,7 @@ Two tables list what has been tested. In both:
 - LingBot-VLA v2's recipe computes the layout of image patches of the export's frames once, so it assumes that the camera layout does not change while the robot runs. Its results above were measured with an export that used `--policy.precompute_grid_thw=true` for the same purpose.
 - FLUX3's TensorRT export stops at attention layers whose query, key or value is a constant, which [pytorch/TensorRT#4964](https://github.com/pytorch/TensorRT/pull/4964) fixes. With that fix, the FLUX3 checkpoint tested runs out of GPU memory in the TensorRT build, even alone on an H100.
 - LingBot-VA's recipe keeps the policy's KV cache and its video encoder's cache between chunks (see [Values kept between chunks](#values-kept-between-chunks)). In bfloat16 or float16 its 3 test chunks amplify rounding so much that the bundle's test case cannot tell a correct program from a wrong one, so each program is also checked on its own (see [Built-in checks](#built-in-checks)), and the test case only has to stay within 1.0. Exporting its 5B LIBERO checkpoint in bfloat16 used up to about 70 GiB of GPU memory.
+- Cosmos3's results used `lerobot/Cosmos3-Edge-Policy-LIBERO` in bfloat16. Its recipe exports the sampling without classifier-free guidance, and the one embodiment domain its config names (`domain_id`).
 - Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FastWAM, FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
 
 ### Other backends
@@ -473,6 +476,7 @@ Two tables list what has been tested. In both:
 | FLUX3       | No                                     | -                     | -             | -                       |
 | pi0-FAST    | Yes (data center GPU)                  | -                     | -             | -                       |
 | LingBot-VA  | Yes (data center GPU)                  | No                    | Yes (x86 CPU) | -                       |
+| G0.5        | Yes (data center GPU)                  | Yes (x86 CPU)         | -             | -                       |
 
 The policies missing from this table have not been tested on these backends.
 
@@ -483,6 +487,7 @@ The policies missing from this table have not been tested on these backends.
 - pi0's CUDA result is for its chain recipe. Its XNNPACK, OpenVINO and MLX results were measured when it was exported as one program.
 - The SmolVLA results here were measured when it was exported as one program, before its chain recipe. The chain needs about half the memory of one program, as checked on a Jetson AGX Thor.
 - SmolVLA keeps almost all of its weights in bfloat16. Its XNNPACK export fails today, and XNNPACK would not compute those bfloat16 matrix products anyway. Its one-program `executorch_cuda` export failed because SmolVLA computes its time embedding in float64, which the development build of ExecuTorch's CUDA backend used then could not load. With ExecuTorch 1.6.0, the chain recipe exports and runs on `executorch_cuda` in LeRobot's tests, which use a tiny SmolVLA; the full policy is still to be measured there.
+- The G0.5 results used `lerobot/g05_libero` and its chain recipe, with PyTorch 2.15: in float32 on XNNPACK with ExecuTorch 1.6.0, and in bfloat16 on CUDA with a CUDA build of ExecuTorch 1.6. The recipe exports G0.5's System 1 flow head only, and the task it was exported for.
 - `executorch_coreml` was tested on a small model, and on ACT on an Apple Silicon Mac's CPU and GPU with ExecuTorch's fix for 8-bit camera images, [pytorch/executorch#24317](https://github.com/pytorch/executorch/pull/24317), which came after ExecuTorch 1.6.0.
 - FineART VLA, EO-1 and VLA-JEPA were checked with random weights. FineART VLA's `executorch_cuda` result used a PyTorch 2.15 build with pytorch/pytorch#202785.
 - FLUX3's `executorch_cuda` bundle misses its check because of a bug in the attention kernel of ExecuTorch's CUDA backend. WALL-X does not export with PyTorch 2.15 (see **PyTorch fix** above), and its `executorch_cuda` export also needs the attention kernel from [pytorch/executorch#24326](https://github.com/pytorch/executorch/pull/24326).
