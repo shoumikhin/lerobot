@@ -750,6 +750,8 @@ class ChainRecipe(ExportRecipe):
     policy_tolerance: float | None = None
     _runs: list[ProgramRun]
     _constants: dict[str, np.ndarray]
+    _frame: dict[str, np.ndarray]
+    _device: torch.device
 
     @abc.abstractmethod
     def _policy_actions(self, case: TestCase) -> np.ndarray | None:
@@ -774,6 +776,28 @@ class ChainRecipe(ExportRecipe):
         """The part, which runs once per chunk with its own names."""
         self._runs.append(ProgramRun(name, name, input_names, output_names))
         return Part(name, module, inputs, input_names, output_names)
+
+    def _held_batch(self, names: Iterable[str]) -> dict[str, Any]:
+        """The preprocessed test frame, refused unless a second random frame gives the same `names`.
+
+        The programs hold those values.
+        """
+        batches = []
+        with torch.no_grad():
+            for frame in (self._frame, random_frame(self._features, self._generator)):
+                self.preprocessor.reset()
+                observation = prepare_observation_for_inference(dict(frame), self._device, self.task)
+                batches.append(self.preprocessor(observation))
+        first, other = batches
+        for name in names:
+            a, b = first.get(name), other.get(name)
+            if isinstance(a, Tensor) != isinstance(b, Tensor) or (
+                isinstance(a, Tensor) and not torch.equal(a, b)
+            ):
+                raise ValueError(
+                    f"{self.policy_name}'s {name} differs between two frames, so the programs cannot hold it."
+                )
+        return first
 
     def _tensor_preprocessor(self) -> PolicyProcessorPipeline:
         """The preprocessor without `text_steps`."""
