@@ -2276,3 +2276,28 @@ def test_recipe_training_uses_the_rendered_task_rephrasing():
 
     assert rephrased["command"] == "gather every cube in the blue square"
     assert canonical["command"] == "operator task"
+
+
+class _IslandBackend(TinyG05Backend):
+    """Keeps its bias in float32, as the native backend keeps its float32 islands."""
+
+    def apply_fp32_params(self):
+        self.proj.bias.data = self.proj.bias.data.float()
+
+
+def test_a_bfloat16_policy_reaches_the_gpu_with_its_weights_already_cast(tmp_path, monkeypatch):
+    # Cast after the move, the whole float32 checkpoint would be on the GPU first, more than a small board holds.
+    saved = G05Policy(_config(), backend=TinyG05Backend()).state_dict()
+    save_file(saved, tmp_path / "model.safetensors")
+    with torch.device("meta"):
+        policy = G05Policy(_config(dtype=torch.bfloat16), backend=_IslandBackend())
+    # The CPU stands in for the GPU this test does not have.
+    monkeypatch.setattr(
+        "lerobot.policies.g05.modeling_g05.resolve_safetensors_device", lambda location: "cpu"
+    )
+    G05Policy._load_as_safetensor(policy, str(tmp_path / "model.safetensors"), "cuda", strict=True)
+    weight, bias = policy.backend.proj.weight, policy.backend.proj.bias
+    # Each tensor lands in its parameter's final dtype, with the values `to` would give it on the GPU.
+    assert (weight.dtype, bias.dtype) == (torch.bfloat16, torch.float32)
+    assert torch.equal(weight, saved["backend.proj.weight"].to(torch.bfloat16))
+    assert torch.equal(bias, saved["backend.proj.bias"].to(torch.bfloat16).float())

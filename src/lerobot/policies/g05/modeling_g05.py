@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as functional
 from huggingface_hub import snapshot_download
-from safetensors.torch import load_file
+from safetensors import safe_open
 from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -1811,9 +1811,25 @@ class G05Policy(PreTrainedPolicy):
         map_location: str,
         strict: bool,
     ) -> G05Policy:
-        """Load the weights from a safetensors file."""
+        """Load the weights from a safetensors file, one tensor at a time.
+
+        A bfloat16 policy on a GPU runs with the precision `to` gives it, so the weights take their final dtypes
+        on the meta device first and each tensor is cast on the CPU on its way: the float32 checkpoint is never
+        on the GPU, nor all in memory at once.
+        """
         device = resolve_safetensors_device(map_location)
-        state_dict = load_file(model_file, device=device, backend="pread")
+        cast = model.config.dtype == torch.bfloat16 and torch.device(map_location).type == "cuda"
+        if cast:
+            model._apply_author_inference_precision()
+        targets = model.state_dict()
+        state_dict = {}
+        with safe_open(model_file, framework="pt", backend="pread") as checkpoint:
+            for name in checkpoint.keys():  # noqa: SIM118
+                tensor = checkpoint.get_tensor(name)
+                if cast and name in targets and tensor.is_floating_point():
+                    # Through bfloat16 to the float32 islands too, as `_apply_author_inference_precision` rounds them.
+                    tensor = tensor.to(torch.bfloat16).to(targets[name].dtype)
+                state_dict[name] = tensor.to(device)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False, assign=True)
         model.backend.materialize_runtime_buffers(device)
         remaining_meta = [name for name, parameter in model.named_parameters() if parameter.is_meta]
