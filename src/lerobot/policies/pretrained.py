@@ -326,7 +326,8 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         # Mapped on the CPU, each file is copied into the parameters one tensor at a time, wherever they were
         # built. Mapped on a GPU, all of it would first be copied there, beside the parameters. A loader that
-        # assigns the file's tensors as the weights, as G0.5's does, maps them on `map_location` instead.
+        # assigns the file's tensors as the weights, as G0.5's does, reads them itself and puts each on
+        # `map_location`.
         device = "cpu"
         if len(checkpoint.files) == 1:
             missing_keys, unexpected_keys = load_model_as_safetensor(
