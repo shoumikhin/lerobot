@@ -810,16 +810,12 @@ def test_a_program_check_refuses_an_output_of_another_shape_or_count():
     assert check.failures("x", (torch.ones(2, 3), torch.ones(1))) == ["x returns 2 outputs, not 1"]
 
 
-class _Twice(torch.nn.Module):
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        y = x * 2
-        return y, y
-
-
-def test_a_program_check_saves_outputs_that_share_memory(tmp_path):
-    check = ProgramCheck.measure(_Twice(), (torch.randn(4, dtype=torch.bfloat16),))
+def test_a_program_check_saves_inputs_and_outputs_that_share_memory(tmp_path):
+    y = torch.randn(4, dtype=torch.bfloat16)
+    check = ProgramCheck((y, y[1:]), (y, y[1:]), [(0.0, 0.0), (0.0, 0.0)])
     check.save(tmp_path / "check.safetensors")
     loaded = ProgramCheck.load(tmp_path / "check.safetensors", "cpu")
+    assert all(torch.equal(a, b) for a, b in zip(loaded.inputs, check.inputs, strict=True))
     assert all(torch.equal(a, b) for a, b in zip(loaded.outputs, check.outputs, strict=True))
 
 
@@ -849,6 +845,28 @@ def test_a_program_check_keeps_the_inputs_a_part_writes_into():
     check = ProgramCheck.measure(_WritesItsInput(), (x.clone(),))
     assert torch.equal(check.inputs[0], x)
     assert check.floor[0][1] < torch.finfo(torch.bfloat16).eps
+
+
+class _ReturnsItsBuffer(torch.nn.Module):
+    """A bfloat16 layer that writes its result into a float32 buffer of its own and returns that buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+        self.register_buffer("result", torch.zeros(8, 64))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.result.copy_(self.linear(x))
+
+
+def test_a_program_check_keeps_what_a_part_returned_before_its_reruns():
+    torch.manual_seed(0)
+    part, x = _ReturnsItsBuffer(), torch.randn(8, 64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = part(x).clone()
+    # The float32 rerun writes other values into the buffer.
+    check = ProgramCheck.measure(part, (x,))
+    assert torch.equal(check.outputs[0], expected)
 
 
 @pytest.mark.parametrize(

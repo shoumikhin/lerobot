@@ -170,7 +170,8 @@ class ProgramCheck:
         inputs = tuple(x.contiguous() for x in inputs)
         wide = tuple(x.float() if x.dtype in _HALF else x for x in inputs)
         with torch.no_grad():
-            outputs = _call(module, inputs)
+            # Copies, since a part may return a buffer of its own that the reruns write into.
+            outputs = tuple(x.clone() for x in _call(module, inputs))
             changes = [
                 (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
             ]
@@ -222,7 +223,8 @@ class ProgramCheck:
 
     def save(self, path: Path) -> None:
         """Write the check to `path`, for the step that runs the compiled program."""
-        # Copies, since safetensors refuses tensors that share memory, such as an output a part returns twice.
+        # Contiguous copies, since safetensors refuses a tensor that is not contiguous or shares memory with
+        # another.
         tensors = {
             f"input.{i}": x.clone(memory_format=torch.contiguous_format) for i, x in enumerate(self.inputs)
         }
