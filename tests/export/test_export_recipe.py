@@ -847,6 +847,64 @@ def test_a_program_check_keeps_the_inputs_a_part_writes_into():
     assert check.floor[0][1] < torch.finfo(torch.bfloat16).eps
 
 
+class _VariesBetweenRuns(torch.nn.Module):
+    """A layer whose result moves by up to `spread` of its size per run.
+
+    `dtype` is in one place, `held_in`: its weights, a buffer that scales their result, its input (which the
+    test makes) or its output. The rest is float32.
+    """
+
+    def __init__(self, spread: float, dtype: torch.dtype, held_in: str):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64, dtype=dtype if held_in == "weights" else torch.float32)
+        self.register_buffer("scale", torch.ones(64, dtype=dtype if held_in == "buffer" else torch.float32))
+        self.output_dtype = dtype if held_in == "output" else torch.float32
+        self.spread = spread
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.linear(x.to(self.linear.weight.dtype))
+        y = (y.to(self.scale.dtype) * self.scale).float()
+        return (y + self.spread * y.abs().max() * torch.rand_like(y)).to(self.output_dtype)
+
+
+# GPU atomic adds move a float32 output by 1e-6 and a bfloat16 one by about half a step, 4e-3; a part that
+# draws random numbers moves it by more.
+@pytest.mark.parametrize(
+    ("spread", "dtype", "held_in", "refused"),
+    [
+        (1e-6, torch.float32, "weights", False),
+        (1e-2, torch.float32, "weights", True),
+        (4e-3, torch.bfloat16, "weights", False),
+        (4e-3, torch.bfloat16, "buffer", False),
+        (4e-3, torch.bfloat16, "input", False),
+        (4e-3, torch.bfloat16, "output", False),
+        (0.1, torch.bfloat16, "weights", True),
+    ],
+)
+def test_a_program_check_takes_kernels_that_vary_between_runs_but_not_random_numbers(
+    spread, dtype, held_in, refused
+):
+    torch.manual_seed(0)
+    part = _VariesBetweenRuns(spread, dtype, held_in)
+    x = torch.randn(8, 64, dtype=dtype if held_in == "input" else torch.float32)
+    if refused:
+        with pytest.raises(ValueError, match="changes by more than rounding does when it runs again"):
+            ProgramCheck.measure(part, (x,))
+    else:
+        ProgramCheck.measure(part, (x,))
+
+
+def test_a_program_check_refuses_a_part_that_keeps_dropout_on():
+    torch.manual_seed(0)
+    part = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout(0.1)).to(torch.bfloat16)
+    x = torch.randn(8, 64, dtype=torch.bfloat16)
+    with pytest.raises(
+        ValueError, match="Output 0 of the part changes by more than rounding does when it runs"
+    ):
+        ProgramCheck.measure(part.train(), (x,))
+    ProgramCheck.measure(part.eval(), (x,))
+
+
 class _ReturnsItsBuffer(torch.nn.Module):
     """A bfloat16 layer that writes its result into a float32 buffer of its own and returns that buffer."""
 

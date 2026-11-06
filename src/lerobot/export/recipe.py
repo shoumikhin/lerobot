@@ -74,6 +74,13 @@ BFLOAT16_STEPS_TOLERANCE = 0.2
 # it. Correct LingBot-VA programs from TensorRT and ExecuTorch's CUDA backend measured up to 1.85 times; a wrong
 # attention head size, swapped keys and values, a skipped layer or a zeroed output measured 9 to 830 times.
 PROGRAM_FLOOR_FACTOR = 3.0
+# A part checked on its own must compute a floating point output again, with nothing changed, within
+# `RERUN_STEPS` rounding steps of the least precise float type it reads, holds or returns, or
+# `RERUN_TOLERANCE` of its largest value, whichever is larger. The fraction covers float32 sums in an order
+# that varies between runs: GPU atomic adds moved a float32 output by 9e-7 on an A100, 7.5 steps. It sits
+# halfway, on a log scale, between that and random numbers of 1e-2 of a part's size, which must be refused.
+RERUN_STEPS = 3
+RERUN_TOLERANCE = 1e-4
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
@@ -166,6 +173,7 @@ class ProgramCheck:
 
         `float32` runs the module in float32, by default with its own weights in float32 (see `in_float32`). A
         recipe whose part also reads a dtype elsewhere, such as from its policy, passes one that sets that too.
+        Refuses a module whose first rerun, with nothing changed, moves an output more than rounding can.
         """
         inputs = tuple(x.contiguous() for x in inputs)
         wide = tuple(x.float() if x.dtype in _HALF else x for x in inputs)
@@ -176,11 +184,29 @@ class ProgramCheck:
                 (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
             ]
             changes.append((float32 or (lambda: in_float32(module)), wide))
-            floor = [(0.0, 0.0)] * len(outputs)
+            measured = []
             for change, change_inputs in changes:
                 with change():
-                    errors = relative_errors(_call(module, change_inputs), outputs)
-                floor = [(max(a, c), max(b, d)) for (a, b), (c, d) in zip(floor, errors, strict=True)]
+                    measured.append(relative_errors(_call(module, change_inputs), outputs))
+        # The first rerun changes nothing, so it measures what kernels vary between runs, unless the part
+        # draws random numbers, which every rerun would then fold into the floor. A part may compute in
+        # bfloat16 and return float32, which then varies by bfloat16's steps.
+        step = max(_step(t) for t in (*inputs, *module.parameters(), *module.buffers(), *outputs))
+        for index, ((again, _), x) in enumerate(zip(measured[0], outputs, strict=True)):
+            # An output that holds NaN, or an integer one a rerun moves, is refused below for that reason.
+            if (
+                x.is_floating_point()
+                and again > max(RERUN_STEPS * step, RERUN_TOLERANCE)
+                and not x.isnan().any()
+            ):
+                raise ValueError(
+                    f"Output {index} of the part changes by more than rounding does when it runs again on "
+                    "the same inputs, as when it draws random numbers or keeps dropout on, so a compiled "
+                    "program cannot be checked against it."
+                )
+        floor = [(0.0, 0.0)] * len(outputs)
+        for errors in measured:
+            floor = [(max(a, c), max(b, d)) for (a, b), (c, d) in zip(floor, errors, strict=True)]
         # A compiler may also round the largest value the other way, or contract arithmetic that no rerun moved,
         # such as a multiply and an add into one, by a step.
         floor = [
