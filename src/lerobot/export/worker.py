@@ -271,7 +271,8 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
             raise
         packages = " ".join(f'"{package}"' for package in backend.packages)
         raise ImportError(
-            f"The {backend.type} backend needs: pip install {packages}. See https://huggingface.co/docs/lerobot/export."
+            f"The {backend.type} backend could not import what it needs ({error}). If it is not installed: pip "
+            f"install {packages}. See https://huggingface.co/docs/lerobot/export."
         ) from error
     return {"data": None if data is None else data.name}
 
