@@ -21,5 +21,6 @@ from . import (
     executorch_openvino,
     executorch_qnn,
     executorch_tensorrt,
+    executorch_vgf,
     executorch_xnnpack,
 )

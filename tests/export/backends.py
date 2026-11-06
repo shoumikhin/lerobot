@@ -15,7 +15,7 @@
 """What the export tests that compile with a real backend need, as one skip mark per backend.
 
 Each mark's reason names what its tests need and the installed versions. It always names ExecuTorch, and
-a CUDA GPU for a GPU backend, so the test is marked `executorch` and `gpu` whether it skips or not (see
+a CUDA GPU for a CUDA backend, so the test is marked `executorch` and `gpu` whether it skips or not (see
 `tests/conftest.py`).
 """
 
@@ -161,9 +161,26 @@ needs_executorch_qnn = pytest.mark.skipif(
 )
 
 
+# ExecuTorch asks the Vulkan driver for Arm's ML extensions, which their emulation layer adds on any Vulkan
+# device.
+EXECUTORCH_VGF = (
+    EXECUTORCH
+    and sys.platform == "linux"
+    and is_package_available("ai_ml_sdk_model_converter", "model_converter")
+    and _backend_runs("VgfBackend")
+)
+
+needs_executorch_vgf = pytest.mark.skipif(
+    not EXECUTORCH_VGF,
+    reason="needs ExecuTorch 1.6 and PyTorch 2.15 on Linux, with executorch[vgf] and a Vulkan device that "
+    f"has Arm's ML extensions or their emulation layer ({INSTALLED})",
+)
+
+
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
 # OpenVINO does not run these policies yet (pytorch/executorch#24325). QNN fails some of them (see the docs),
-# so test_export.py tests it on a small model.
+# and VGF, through Arm's emulation layer when no Arm GPU is present, runs some too slowly for the rollout
+# test, so test_export.py tests them on a small model.
 BACKENDS = {
     "executorch_xnnpack": needs_executorch,
     "executorch_cuda": needs_executorch_cuda,
