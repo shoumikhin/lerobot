@@ -491,6 +491,48 @@ def test_a_strict_load_refuses_a_peft_adapter_that_lacks_a_weight(tmp_path):
         factory.load_pretrained_policy(config, strict=True)
 
 
+def test_the_whole_policy_loads_with_torch_compile_off(tmp_path, monkeypatch):
+    config = act_config()
+    ACTPolicy(config).save_pretrained(tmp_path / "policy")
+    config.pretrained_path = tmp_path / "policy"
+    # ACT has no such field; a checkpoint of a policy that has one, such as Diffusion, can save it on.
+    config.compile_model = True
+    monkeypatch.setattr(recipe_module, "load_processors", lambda config: (None, None))
+    load, compiled = factory.load_pretrained_policy, []
+
+    def load_and_record(config, **kwargs):
+        compiled.append(config.compile_model)
+        return load(config, **kwargs)
+
+    monkeypatch.setattr(factory, "load_pretrained_policy", load_and_record)
+    recipe_module.load_policy(SimpleNamespace(policy=config, backend=SimpleNamespace(device="cpu")))
+    assert compiled == [False]
+
+
+def test_the_whole_policy_loads_with_its_peft_adapter_folded_in(tmp_path, monkeypatch):
+    peft = pytest.importorskip("peft")
+    config = act_config()
+    ACTPolicy(config).save_pretrained(tmp_path / "base")
+    lora = peft.LoraConfig(target_modules=["out_proj"])
+    adapter = peft.get_peft_model(ACTPolicy.from_pretrained(tmp_path / "base"), lora)
+    # A new LoRA adapter changes nothing; a trained one changes the weights it adapts.
+    with torch.no_grad():
+        for name, parameter in adapter.named_parameters():
+            if "lora_B" in name:
+                parameter.fill_(0.1)
+    adapter.peft_config["default"].base_model_name_or_path = str(tmp_path / "base")
+    adapter.save_pretrained(tmp_path / "adapter")
+    merged = {name: value.clone() for name, value in adapter.merge_and_unload().state_dict().items()}
+    config.use_peft, config.pretrained_path = True, tmp_path / "adapter"
+    monkeypatch.setattr(recipe_module, "load_processors", lambda config: (None, None))
+    cfg = SimpleNamespace(policy=config, backend=SimpleNamespace(device="cpu"))
+    policy, _, _ = recipe_module.load_policy(cfg)
+    assert type(policy) is ACTPolicy
+    state = policy.state_dict()
+    assert state.keys() == merged.keys()
+    assert all(torch.equal(state[name], merged[name]) for name in merged)
+
+
 def test_an_image_recorded_channels_last_keeps_its_shape():
     features = {
         IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 24, 32)),
