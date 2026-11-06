@@ -403,6 +403,28 @@ def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
         assert frame_shapes(features) == {IMAGE: (32, 32, 3), OBS_STATE: (3,)}, given
 
 
+def test_recipe_refuses_a_depth_map_the_dataset_marks():
+    depth = f"{OBS_IMAGES}.front_depth"
+    config = act_config()
+    config.input_features = {
+        **config.input_features,
+        depth: PolicyFeature(type=FeatureType.VISUAL, shape=(1, 32, 32)),
+    }
+    features = {
+        name: {"dtype": "float32", "shape": tuple(f.shape), "names": None}
+        for name, f in config.input_features.items()
+    }
+    features[IMAGE] = {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]}
+    features[depth] = {
+        "dtype": "video",
+        "shape": (32, 32, 1),
+        "names": ["height", "width", "channels"],
+        "info": {"is_depth_map": True},
+    }
+    with pytest.raises(ValueError, match=r"reads the depth maps \['observation.images.front_depth'\]"):
+        robot_features(config, SimpleNamespace(steps=[]), SimpleNamespace(features=features))
+
+
 def test_a_strict_load_refuses_a_peft_adapter_that_lacks_a_weight(tmp_path):
     peft = pytest.importorskip("peft")
     from safetensors.torch import load_file, save_file

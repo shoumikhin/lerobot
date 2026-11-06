@@ -23,7 +23,7 @@ import inspect
 import json
 import logging
 import os
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -38,7 +38,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.overrides import TorchFunctionMode
 
 from lerobot.bundle.manifest import NOISE, ActionTokens, ProgramRun
-from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig, is_depth_map
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -1004,7 +1004,16 @@ def robot_features(
             f"The dataset gives nothing the policy reads as {missing}, even after the renames its "
             f"preprocessor saved ({renames}). The dataset has {sorted(features)}."
         )
+    refuse_depth_maps(kept, metadata)
     return kept
+
+
+def refuse_depth_maps(names: Iterable[str], metadata: LeRobotDatasetMetadata) -> None:
+    """Refuse a frame whose arrays `names` include a camera the dataset marks as a depth map."""
+    # A program takes every image as uint8 and divides it by 255, while a robot sends depth in uint16 millimeters.
+    depth = sorted(name for name in names if is_depth_map(metadata.features[name]))
+    if depth:
+        raise ValueError(f"The policy reads the depth maps {depth}, which an export cannot take yet.")
 
 
 def dataset_metadata(cfg: ExportConfig) -> LeRobotDatasetMetadata | None:

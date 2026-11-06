@@ -64,6 +64,7 @@ from lerobot.export.recipe import (
     measure_action_scale,
     preprocessor_renames,
     random_frame,
+    refuse_depth_maps,
     refuse_peft_adapter,
     split_absolute_step,
     to_policy_input,
@@ -179,6 +180,8 @@ class GrootExportRecipe(ExportRecipe):
         self._images = _ImagesAndState(self.preprocessor, frame, visual, self._batch).to(self._device)
         # The robot sends only the cameras the policy reads, and its state.
         self._frame = {name: frame[name] for name in self._images.frame_names}
+        if self._metadata is not None:
+            refuse_depth_maps(self._frame, self._metadata)
         self.config = copy(config)
         self.config.input_features = {name: features[name] for name in self._frame}
         self._check_pixels()
