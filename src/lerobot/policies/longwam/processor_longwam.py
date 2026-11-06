@@ -183,6 +183,11 @@ class LongWAMActionToggle(ActionProcessorStep):
         result[..., self.dimensions] = torch.sign(1 - 2 * result[..., self.dimensions])
         return result
 
+    def without_threshold(self) -> "LongWAMActionToggle | None":
+        """Nothing, since the toggle is the threshold that `lerobot-export`'s check leaves out (see
+        `action_pipelines`), or the step itself when it toggles no dimension."""
+        return None if self.dimensions else self
+
     def get_config(self) -> dict[str, Any]:
         return {"dimensions": self.dimensions}
 
