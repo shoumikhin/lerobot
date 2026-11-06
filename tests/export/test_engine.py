@@ -203,6 +203,10 @@ def test_the_bundle_check_prints_its_usage_and_names_a_folder_that_is_no_bundle(
     monkeypatch.setattr(sys, "argv", ["lerobot-check-bundle", "--help"])
     lerobot_check_bundle.main()
     assert capsys.readouterr().out == "usage: lerobot-check-bundle <bundle folder>\n"
+    for arguments in ([], ["one", "two"]):
+        monkeypatch.setattr(sys, "argv", ["lerobot-check-bundle", *arguments])
+        with pytest.raises(SystemExit, match="usage: lerobot-check-bundle <bundle folder>"):
+            lerobot_check_bundle.main()
     monkeypatch.setattr(sys, "argv", ["lerobot-check-bundle", str(tmp_path)])
     with pytest.raises(SystemExit, match="is not a bundle: it has no export.json"):
         lerobot_check_bundle.main()
