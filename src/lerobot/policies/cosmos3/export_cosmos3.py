@@ -57,6 +57,7 @@ from lerobot.export.recipe import (
     export_task,
     measure_action_scale,
     random_frame,
+    repeated_runs,
     robot_features,
     to_policy_input,
 )
@@ -343,6 +344,7 @@ class Cosmos3ExportRecipe(ExportRecipe):
         self._timesteps, matrices = solver_coefficients(policy.model.make_scheduler)
         self._coefficients = [matrix.float() for matrix in matrices]
         self._runs: list[ProgramRun] = []
+        self._constants: dict[str, np.ndarray] = {}
         self._actions: np.ndarray | None = None
 
     def _prompt(self) -> tuple[dict[str, Tensor], SequencePlan, tuple[int, ...], tuple[int, ...]]:
@@ -403,7 +405,7 @@ class Cosmos3ExportRecipe(ExportRecipe):
         )
         with torch.no_grad():
             state = encode(*frame, noise)
-        yield self._part("encode", encode, (*frame, noise), [*frame_names, NOISE], ["state_0"])
+        yield self._part("encode", encode, (*frame, noise), [*frame_names, NOISE], ["state"])
 
         step = Cosmos3Step(self.policy, self._sequence, self._plan, self._latent_shape, self._action_shape)
         depth = self._coefficients[0].shape[0] - 1
@@ -417,28 +419,22 @@ class Cosmos3ExportRecipe(ExportRecipe):
                     example = inputs
                 state, *history = step(*inputs)
         history_names = [f"history_{j}" for j in range(depth)]
-        yield Part(
-            "step",
-            step,
-            cast(tuple[Tensor, ...], example),
-            ["state", *history_names, "timestep", "coefficients"],
-            ["next_state", *(f"next_{name}" for name in history_names)],
+        step_names = ["state", *history_names, "timestep", "coefficients"]
+        step_outputs = ["state", *history_names]
+        yield Part("step", step, cast(tuple[Tensor, ...], example), step_names, step_outputs)
+        step_constants = [
+            {"timestep": timestep.numpy(), "coefficients": coefficients.numpy()}
+            for timestep, coefficients in zip(self._timesteps, self._coefficients, strict=True)
+        ]
+        step_runs, self._constants = repeated_runs(
+            "step", step_names, step_outputs, step_constants, start=dict.fromkeys(history_names, "zeros")
         )
-        for i in range(len(self._timesteps)):
-            before = ["zeros"] * depth if i == 0 else [f"history_{j}_{i}" for j in range(depth)]
-            self._runs.append(
-                ProgramRun(
-                    f"step_{i}",
-                    "step",
-                    [f"state_{i}", *before, f"timestep_{i}", f"coefficients_{i}"],
-                    [f"state_{i + 1}", *(f"history_{j}_{i + 1}" for j in range(depth))],
-                )
-            )
+        self._runs += step_runs
 
         actions = Cosmos3Actions(self.policy, self.postprocessor, self._action_shape)
         with torch.no_grad():
             self._actions = actions(state).cpu().numpy()
-        yield self._part("actions", actions, (state,), [f"state_{len(self._timesteps)}"], ["action"])
+        yield self._part("actions", actions, (state,), ["state"], ["action"])
 
     def test_case(self) -> TestCase:
         """The random frame and noise, and the actions the parts compute for them, checked against the policy."""
@@ -459,11 +455,9 @@ class Cosmos3ExportRecipe(ExportRecipe):
     def plan(self) -> RunPlan:
         """The parts in order with the step run once per timestep, and the timesteps and coefficients."""
         size = math.prod(self._latent_shape) + math.prod(self._action_shape)
-        constants: dict[str, np.ndarray] = {"zeros": np.zeros(size, dtype=np.float32)}
-        for i, (timestep, coefficients) in enumerate(zip(self._timesteps, self._coefficients, strict=True)):
-            constants[f"timestep_{i}"] = timestep.numpy()
-            constants[f"coefficients_{i}"] = coefficients.numpy()
-        return RunPlan(runs=self._runs, constants=constants)
+        return RunPlan(
+            runs=self._runs, constants={"zeros": np.zeros(size, dtype=np.float32), **self._constants}
+        )
 
     def _part(
         self,
