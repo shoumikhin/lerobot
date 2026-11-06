@@ -224,8 +224,39 @@ class ShiftedNoiseACT(ACTPolicy):
 @pytest.mark.parametrize("in_place", [False, True])
 def test_recipe_refuses_a_policy_whose_noise_is_not_a_standard_normal(monkeypatch, in_place):
     monkeypatch.setattr(ShiftedNoiseACT, "in_place", in_place)
-    with pytest.raises(ValueError, match="another mean or spread than a standard normal"):
+    with pytest.raises(ValueError, match="computes another chunk when it is given its starting noise"):
         make(ShiftedNoiseACT)
+
+
+class ScaledDrawACT(ACTPolicy):
+    """ACT that draws a standard normal and moves it in place to around 5 with a spread of 0.5."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        if noise is None:
+            noise = torch.randn(1, self.config.chunk_size, 1).mul_(0.5).add_(5)
+        return super().predict_action_chunk(batch) + noise
+
+
+def test_recipe_refuses_a_policy_that_changes_its_standard_normal_draw():
+    with pytest.raises(ValueError, match="changes the noise it draws before using it"):
+        make(ScaledDrawACT)
+
+
+class TransformerNoiseACT(ACTPolicy):
+    """ACT that passes its starting noise through a PyTorch transformer layer, which has a fused kernel."""
+
+    def __init__(self, config, **kwargs):
+        super().__init__(config, **kwargs)
+        self.layer = torch.nn.TransformerEncoderLayer(64, 8, batch_first=True)
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        if noise is None:
+            noise = torch.randn(1, self.config.chunk_size, 64)
+        return super().predict_action_chunk(batch) + self.layer(noise)[..., :1]
+
+
+def test_recipe_takes_a_policy_whose_noise_goes_through_a_fused_kernel():
+    make(TransformerNoiseACT)
 
 
 class OneNumberNoiseACT(ACTPolicy):
@@ -268,13 +299,13 @@ def test_recipe_refuses_a_checkpoint_whose_chunk_spec_fails():
         make(NoChunkSpecACT)
 
 
-class NonFiniteACT(ACTPolicy):
-    """ACT that adds `value`, NaN or infinity, to its actions. Only the finite check catches infinity."""
+class NonFiniteACT(NoisyACT):
+    """ACT that draws a starting noise and adds `value`, NaN or infinity, to its actions."""
 
     value = float("nan")
 
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        return super().predict_action_chunk(batch) + self.value
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        return super().predict_action_chunk(batch, noise=noise) + self.value
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])

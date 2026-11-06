@@ -198,7 +198,8 @@ So any recipe can be paired with any backend. Whether a given policy compiles st
 The default recipe fits a policy that:
 
 - predicts a chunk of actions from the current frame only,
-- draws at most one random starting noise, and
+- draws at most one random starting noise,
+- computes the same chunk when it is given the standard normal draw behind that noise instead of drawing it, and
 - gives the same chunk twice for the same frame and noise.
 
 For any other policy, it stops with the reason. For example, ACT with temporal ensembling (which mixes several past chunks) cannot be exported this way.
