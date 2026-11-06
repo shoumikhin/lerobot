@@ -1149,17 +1149,47 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
 
 
 _MEMINFO = Path("/proc/meminfo")
+_CGROUP = Path("/proc/self/cgroup")
+_CGROUPS = Path("/sys/fs/cgroup")
 
 
 def _available_memory() -> int | None:
-    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere."""
+    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere.
+
+    In a container or another cgroup with a cgroup v2 memory limit, the room that limit leaves, if it is less.
+    """
     if not _MEMINFO.exists():
         return None
     for line in _MEMINFO.read_text().splitlines():
         name, value, *_ = line.split()
         if name == "MemAvailable:":
-            return int(value) * 1024
+            room = _cgroup_room()
+            return int(value) * 1024 if room is None else min(int(value) * 1024, room)
     return None
+
+
+def _cgroup_room() -> int | None:
+    """Bytes left under the tightest cgroup v2 memory limit of this process and its parents, or None.
+
+    Inactive page cache, which the cgroup counts as used and the kernel drops first, counts as room.
+    """
+    try:
+        group = next(line[3:] for line in _CGROUP.read_text().splitlines() if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return None
+    rooms = []
+    path = _CGROUPS / group.lstrip("/")
+    while path.is_relative_to(_CGROUPS):
+        try:
+            limit = (path / "memory.max").read_text().strip()
+            if limit != "max":
+                stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
+                used = int((path / "memory.current").read_text()) - int(stats.get("inactive_file", 0))
+                rooms.append(max(int(limit) - used, 0))
+        except (OSError, ValueError):
+            pass
+        path = path.parent
+    return min(rooms, default=None)
 
 
 def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
