@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import signal
@@ -51,6 +52,7 @@ from tests.export.backends import (
     needs_executorch_coreml,
     needs_executorch_cuda,
     needs_executorch_openvino,
+    needs_executorch_qnn,
     needs_executorch_tensorrt,
 )
 from tests.export.plugins import use_plugins
@@ -1097,6 +1099,74 @@ def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
     program = ExecuTorchProgram(path)
     (actual,) = program(x.numpy())
     np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+
+
+def _small_program() -> tuple[torch.nn.Module, torch.Tensor]:
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
+    return model, torch.randn(3, 4)
+
+
+def _runs_like_pytorch(config, delegate: bytes, tolerance: float, tmp_path) -> None:
+    """Compile a small model with `config`, then run it as a bundle does and compare with PyTorch."""
+    from lerobot.bundle.executorch import ExecuTorchProgram
+
+    model, x = _small_program()
+    path = tmp_path / "model.pte"
+    config.compile(torch.export.export(model, (x,)), path)
+    assert delegate in path.read_bytes()
+    program = ExecuTorchProgram(path)
+    (actual,) = program(x.numpy())
+    expected = model(x).detach().numpy()
+    np.testing.assert_allclose(program.to_numpy(actual), expected, rtol=tolerance, atol=tolerance)
+
+
+@needs_executorch_qnn
+def test_executorch_qnn_compiles_a_program_that_qnn_runs(tmp_path):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    # The NPU computes in float16.
+    _runs_like_pytorch(ExecuTorchQNNConfig(), b"QnnBackend", 1e-2, tmp_path)
+
+
+@needs_executorch
+@pytest.mark.skipif(
+    sys.platform != "linux" or platform.machine() != "x86_64",
+    reason="executorch_qnn exports only on Linux x86_64",
+)
+# QCM6490: a Hexagon v68 NPU, which does not compute in float16.
+@pytest.mark.parametrize("soc", ["SM0000", "UNKNOWN_SM", "QCM6490"])
+def test_executorch_qnn_refuses_a_chip_it_cannot_run_on_before_tracing(soc):
+    pytest.importorskip("executorch.backends.qualcomm.utils.utils")
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    with pytest.raises(ValueError, match="--backend.soc must be one of"):
+        ExecuTorchQNNConfig(soc=soc)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or platform.machine() != "x86_64",
+    reason="executorch_qnn exports only on Linux x86_64",
+)
+def test_executorch_qnn_refuses_a_machine_without_the_qnn_sdk_before_tracing(monkeypatch):
+    pytest.importorskip("executorch.backends.qualcomm.utils.utils")
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    monkeypatch.delenv("QNN_SDK_ROOT", raising=False)
+    with pytest.raises(ValueError, match="executorch_qnn needs Qualcomm's QNN SDK"):
+        ExecuTorchQNNConfig()
+
+
+@pytest.mark.parametrize(
+    ("system", "machine"), [("darwin", "arm64"), ("win32", "AMD64"), ("linux", "aarch64")]
+)
+def test_executorch_qnn_refuses_a_machine_that_has_no_qnn_compiler(system, machine, monkeypatch):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    monkeypatch.setattr(sys, "platform", system)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    with pytest.raises(ValueError, match="executorch_qnn exports only on Linux x86_64"):
+        ExecuTorchQNNConfig()
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):

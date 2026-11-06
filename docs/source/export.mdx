@@ -33,6 +33,7 @@ The extra brings ExecuTorch 1.6, the runtime that loads the compiled programs, a
 | `executorch_coreml`   | Apple Silicon Macs (CPU, GPU or Neural Engine, through Core ML) | `pip install 'lerobot[export]'`                                             |
 | `executorch_cuda`     | NVIDIA GPUs, including Jetson, without TensorRT                 | `pip install 'lerobot[export]'` on Linux                                    |
 | `executorch_tensorrt` | NVIDIA GPUs, including Jetson                                   | `pip install 'lerobot[export]'` and `torch-tensorrt[executorch]`, see below |
+| `executorch_qnn`      | Qualcomm Hexagon NPUs, simulated on an x86_64 Linux PC          | `pip install 'lerobot[export]'` and Qualcomm's QNN SDK, see below           |
 
 - The extra covers Linux (x86_64 and aarch64), Windows (x86_64) and Apple Silicon Macs with macOS 14 or newer, the platforms ExecuTorch and PyTorch 2.15 publish wheels for.
 - On Linux, ExecuTorch's wheel on PyPI is its CUDA 13.2 build, for the same CUDA as the PyTorch 2.15 on PyPI, so the extra already brings the CUDA backend. The same wheel imports and runs the CPU backends on a machine without an NVIDIA driver. For `executorch_tensorrt`, add Torch-TensorRT:
@@ -43,6 +44,7 @@ The extra brings ExecuTorch 1.6, the runtime that loads the compiled programs, a
 
   `torch-tensorrt-executorch-runtime` loads the TensorRT engines of a bundle without PyTorch. Torch-TensorRT's `executorch` extra installs it too. Torch-TensorRT is not part of LeRobot's `export` extra, because only NVIDIA machines need it. It must match your PyTorch version: Torch-TensorRT 2.15 works with PyTorch 2.15.
 
+- `executorch_qnn` builds each program for one Snapdragon chip, `--backend.soc` (`SM8650` by default). A program runs only on chips with the same Hexagon version, so pass the robot's own chip, such as `--backend.soc=QCS9100`. Chips older than Hexagon v69, such as the QCM6490, do not compute in float16 and are refused. ExecuTorch's Linux x86_64 wheel runs the programs on QNN's simulator of that chip's NPU, so you can export and check a bundle on a PC. `python -m executorch.backends.qualcomm.scripts.download_qnn_sdk --print-sdk-path` downloads Qualcomm's QNN SDK and prints its folder. Before you export or run, set `QNN_SDK_ROOT` to that folder, and put `$QNN_SDK_ROOT/lib/x86_64-linux-clang` and a folder with LLVM 14's `libc++.so.1` and `libc++abi.so.1`, which the SDK's libraries need, on `LD_LIBRARY_PATH`. The NPU computes in float16, so pass a larger `--tolerance`, such as `0.2`. A Snapdragon board needs an ExecuTorch built with QNN for its own CPU; no wheel has one.
 - With an older PyTorch, `lerobot-export` stops before it starts and prints the install command for its backend.
 - **ExecuTorch 1.6 has fixes these backends need.** `executorch_cuda` and `executorch_tensorrt` need [pytorch/executorch#24489](https://github.com/pytorch/executorch/pull/24489), which names the weights file of each program. `executorch_openvino`, and every program that keeps an input check, need [pytorch/executorch#24298](https://github.com/pytorch/executorch/pull/24298).
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
@@ -550,6 +552,7 @@ The policies missing from this table have not been tested on these backends.
 - WALL-X, for every camera size, and VLA-JEPA, for camera sizes its image processor resizes, do not compile on XNNPACK or Core ML: they resize the pixels in the program with an antialiased bicubic filter, `aten._upsample_bicubic2d_aa`, which ExecuTorch's CPU backends do not take yet. OpenVINO and MLX do not list this operation either (not run).
 - VLA-JEPA's `executorch_cuda` export stops inside PyTorch's compiler: while it tunes a kernel, it runs a gather on placeholder inputs, and the gather fails its own bounds check. With TensorRT, VLA-JEPA passes.
 - [pytorch/executorch#24325](https://github.com/pytorch/executorch/issues/24325) tracks what still keeps policies from working with OpenVINO.
+- `executorch_qnn` was tested on QNN's simulator of the SM8650, with LeRobot's tiny test policies (random weights) and `--tolerance=0.2`. Diffusion Policy, Multi-Task DiT, VQ-BeT and TD-MPC pass. ACT and SmolVLA miss that tolerance by float16 rounding. pi0, pi0.5 and pi0-FAST fail, because QNN's lowering drops an input of a program that ExecuTorch still passes, and LingBot-VA crashes QNN's compiler.
 
 ### Notes for every backend
 

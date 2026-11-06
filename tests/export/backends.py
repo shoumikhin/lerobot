@@ -19,6 +19,11 @@ versions. Its reason always names ExecuTorch, and a CUDA GPU for a GPU backend, 
 `executorch` and `gpu` whether it skips or not (see `tests/conftest.py`).
 """
 
+import ctypes
+import functools
+import os
+import platform
+import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -88,6 +93,45 @@ needs_executorch_openvino = pytest.mark.skipif(
     reason="needs ExecuTorch 1.6 and PyTorch 2.15 off a Mac, and OpenVINO: pip install openvino nncf "
     f"({INSTALLED})",
 )
+
+
+@functools.cache
+def _backends_that_run() -> tuple[str, ...]:
+    """The backends the installed ExecuTorch runs on this machine.
+
+    Asked in a new process: ExecuTorch's bindings read once, when they load, which result type they return, and
+    a test that runs a bundle with them sets it before they load.
+    """
+    code = (
+        "from executorch.runtime import Runtime; registry = Runtime.get().backend_registry; "
+        "print(*(name for name in registry.registered_backend_names if registry.is_available(name)))"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    return tuple(result.stdout.split()) if result.returncode == 0 else ()
+
+
+def _qnn_libraries_load() -> bool:
+    try:
+        ctypes.CDLL("libQnnHtp.so")
+    except OSError:
+        return False
+    return True
+
+
+# ExecuTorch's Linux x86_64 package runs QNN programs on Qualcomm's simulator of the NPU, from the SDK's libraries.
+needs_executorch_qnn = pytest.mark.skipif(
+    not (
+        EXECUTORCH
+        and sys.platform == "linux"
+        and platform.machine() == "x86_64"
+        and os.environ.get("QNN_SDK_ROOT")
+        and _qnn_libraries_load()
+        and "QnnBackend" in _backends_that_run()
+    ),
+    reason="needs ExecuTorch 1.6 and PyTorch 2.15 on Linux x86_64, with Qualcomm's QNN SDK in QNN_SDK_ROOT and "
+    f"its libraries on LD_LIBRARY_PATH ({INSTALLED})",
+)
+
 
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
 # OpenVINO does not run these policies yet (pytorch/executorch#24325).
