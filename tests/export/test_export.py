@@ -48,6 +48,7 @@ from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from tests.export.backends import (
+    EXECUTORCH_VGF,
     GPU_BACKENDS,
     needs_executorch,
     needs_executorch_coreml,
@@ -56,6 +57,7 @@ from tests.export.backends import (
     needs_executorch_qnn,
     needs_executorch_qnn_compiler,
     needs_executorch_tensorrt,
+    needs_executorch_vgf,
 )
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
@@ -1258,6 +1260,147 @@ def test_executorch_qnn_refuses_a_machine_that_has_no_qnn_compiler(system, machi
     monkeypatch.setattr(torch, "__version__", "2.14.0")
     with pytest.raises(ValueError, match="executorch_qnn exports only on Linux x86_64"):
         ExecuTorchQNNConfig()
+
+
+VGF_COMPILER = "executorch.backends.arm.vgf"
+
+
+class _VGFCompileSpec:
+    """Not ExecuTorch's VGF compile spec: its environment check runs Arm's model converter."""
+
+    def __init__(self, failure=None):
+        self.failure = failure
+
+    def validate_environment(self):
+        if self.failure:
+            raise RuntimeError(f"VGF environment validation failed: {self.failure}")
+
+
+def test_executorch_vgf_refuses_a_system_whose_executorch_has_no_vgf(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    # Refused before the PyTorch version, since installing another PyTorch would not help.
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    with pytest.raises(ValueError, match="executorch_vgf exports only on Linux"):
+        ExecuTorchVGFConfig()
+
+
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vgf_refuses_an_executorch_that_cannot_run_it(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    # Not the real runtime, so the backend is missing on any machine.
+    registry = SimpleNamespace(is_available=lambda name: False)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, VGF_COMPILER, SimpleNamespace(VgfCompileSpec=_VGFCompileSpec))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", runtime)
+    with pytest.raises(ValueError, match="executorch_vgf needs an ExecuTorch that runs VGF programs"):
+        ExecuTorchVGFConfig()
+
+
+@pytest.mark.parametrize(
+    ("module", "part"), [("executorch.runtime", "runtime"), (VGF_COMPILER, "VGF compiler")]
+)
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vgf_refuses_a_machine_whose_executorch_does_not_import(module, part, monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, VGF_COMPILER, SimpleNamespace(VgfCompileSpec=_VGFCompileSpec))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=None))
+    monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(ValueError, match=f"executorch_vgf cannot import ExecuTorch's {part}"):
+        ExecuTorchVGFConfig()
+
+
+def test_executorch_vgf_checks_the_pytorch_version_before_importing_executorch(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    monkeypatch.setitem(sys.modules, "executorch.runtime", None)
+    with pytest.raises(ValueError, match="needs PyTorch 2.15 or newer"):
+        ExecuTorchVGFConfig()
+
+
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vgf_refuses_a_machine_that_fails_executorchs_check_of_its_compiler(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    failed = SimpleNamespace(VgfCompileSpec=lambda: _VGFCompileSpec("[FAIL] MLSDK model converter"))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, VGF_COMPILER, failed)
+    monkeypatch.setitem(sys.modules, "executorch.runtime", SimpleNamespace(Runtime=None))
+    with pytest.raises(ValueError, match="executorch_vgf cannot compile here.*model converter"):
+        ExecuTorchVGFConfig()
+
+
+@pytest.mark.parametrize(("bfloat16", "tosa_spec"), [(False, "TOSA-1.0+FP"), (True, "TOSA-1.0+FP+bf16")])
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vgf_compiles_with_tosas_bf16_extension_only_when_asked(
+    bfloat16, tosa_spec, monkeypatch, tmp_path
+):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    specs = []
+
+    class VgfCompileSpec(_VGFCompileSpec):
+        def __init__(self, tosa_spec=None):
+            super().__init__()
+            self.tosa_spec = tosa_spec
+
+    def partitioner(compile_spec):
+        specs.append(compile_spec.tosa_spec)
+        raise RuntimeError("stopped after the compile spec")
+
+    registry = SimpleNamespace(is_available=lambda name: True)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    compiler = SimpleNamespace(VgfCompileSpec=VgfCompileSpec, VgfPartitioner=partitioner)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, VGF_COMPILER, compiler)
+    monkeypatch.setitem(sys.modules, "executorch.runtime", runtime)
+    config = ExecuTorchVGFConfig(bfloat16=bfloat16)
+    with pytest.raises(RuntimeError, match="stopped after the compile spec"):
+        config.compile(None, tmp_path / "model.pte")
+    assert specs == [tosa_spec]
+
+
+@needs_executorch
+@pytest.mark.skipif(EXECUTORCH_VGF, reason="this ExecuTorch compiles and runs VGF programs")
+def test_executorch_vgf_refuses_an_installed_executorch_that_cannot_export_with_it():
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    with pytest.raises(ValueError, match="^executorch_vgf "):
+        ExecuTorchVGFConfig()
+
+
+@needs_executorch_vgf
+def test_executorch_vgf_compiles_a_program_that_vulkan_runs(tmp_path):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    _runs_like_pytorch(ExecuTorchVGFConfig(), b"VgfBackend", 1e-5, tmp_path)
+
+
+@needs_executorch_vgf
+@pytest.mark.parametrize("bfloat16", [False, True])
+def test_executorch_vgf_lowers_bfloat16_parts_only_when_asked(bfloat16, tmp_path):
+    from executorch.runtime import Runtime
+
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).bfloat16()
+    x = torch.randn(3, 4, dtype=torch.bfloat16)
+    path = tmp_path / "model.pte"
+    with torch.no_grad():
+        ExecuTorchVGFConfig(bfloat16=bfloat16).compile(torch.export.export(model, (x,)), path)
+        expected = model(x)
+    assert (b"VgfBackend" in path.read_bytes()) == bfloat16
+    (actual,) = Runtime.get().load_program(path).load_method("forward").execute([x])
+    # ExecuTorch's own tensor, since the tests load ExecuTorch as a bundle does (see conftest.py).
+    torch.testing.assert_close(torch.from_dlpack(actual), expected, rtol=2e-2, atol=2e-2)
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):

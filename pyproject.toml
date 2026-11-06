@@ -296,13 +296,13 @@ praxis = ["lerobot[transformers-dep]"]
 remote = ["eclipse-zenoh>=1.9.0,<1.11.0", "msgpack>=1.1.0,<2.0.0"]
 peft = ["lerobot[transformers-dep]", "lerobot[peft-dep]"]
 # lerobot-export, and running its bundles with `lerobot-rollout --bundle.path`. ExecuTorch's wheels ship its
-# backends prebuilt (CUDA, XNNPACK and OpenVINO on Linux, and QNN on Linux x86_64; XNNPACK and OpenVINO on
-# Windows; XNNPACK, Core ML and MLX on macOS). Torch-TensorRT and OpenVINO's compiler (openvino, nncf) are
-# installed beside it instead (see docs/source/export.mdx), because only their backends need them,
-# Torch-TensorRT's TensorRT dependency is a source package on PyPI, and nncf would cap networkx for every
-# extra. ExecuTorch 1.6.0 pins torch==2.15.0, the torch this lock already holds, so uv's single lock keeps
-# 2.15.0 for every extra until a newer ExecuTorch allows another. Unlike vllm (see ``annotations``),
-# lerobot-export and bundle rollout run it in-process.
+# backends prebuilt (CUDA, XNNPACK, OpenVINO and VGF on Linux, and QNN on Linux x86_64; XNNPACK and OpenVINO
+# on Windows; XNNPACK, Core ML and MLX on macOS). Torch-TensorRT, OpenVINO's compiler (openvino, nncf) and
+# VGF's (executorch[vgf]) are installed beside it instead (see docs/source/export.mdx), because only their
+# backends need them, Torch-TensorRT's TensorRT dependency is a source package on PyPI, and nncf would cap
+# networkx for every extra. ExecuTorch 1.6.0 pins torch==2.15.0, the torch this lock already holds, so uv's
+# single lock keeps 2.15.0 for every extra until a newer ExecuTorch allows another. Unlike vllm (see
+# ``annotations``), lerobot-export and bundle rollout run it in-process.
 export = [
     "executorch>=1.6.0,<1.7.0; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64'))",
     # lerobot-export loads the policy straight onto a GPU, and transformers then needs accelerate to load the

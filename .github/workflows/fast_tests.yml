@@ -133,8 +133,9 @@ jobs:
   # This job exports tiny policies with the backends ExecuTorch runs on the CPU and checks the bundles: it installs
   # ExecuTorch with the `export` extra over the extras of those policies and runs the tests that need it (`-m executorch`,
   # see tests/conftest.py). Their GPU backends run in the GPU Export Tests job of Full Tests. The OpenVINO backend needs
-  # the openvino and nncf packages, which no job installs, the QNN backend needs Qualcomm's QNN SDK, and the Core ML and
-  # MLX backends need macOS, so no job exports policies with them.
+  # the openvino and nncf packages, which no job installs, the QNN backend needs Qualcomm's QNN SDK, the VGF backend
+  # `executorch[vgf]` and a Vulkan device, and the Core ML and MLX backends need macOS, so no job exports policies
+  # with them.
   fast-export-tests:
     permissions:
       contents: read
