@@ -81,16 +81,9 @@ def export(args: Sequence[str]) -> Path:
                 traced = _run_step(
                     work, "trace", {"step": "trace", "args": list(args), "folders": str(folders)}
                 )
-        except BaseException:
-            # A trace step that was killed could not remove the folders it made beside the output folder. It names
-            # them before it makes any, so one killed while it wrote their names made none.
-            with suppress(FileNotFoundError, ValueError):
-                _remove_made(json.loads(folders.read_text()))
-            raise
-        if traced is None:
-            # The command line asked for help, which the trace step printed.
-            raise SystemExit(0)
-        try:
+            if traced is None:
+                # The command line asked for help, which the trace step printed.
+                raise SystemExit(0)
             folder, output_dir = Path(traced["folder"]), Path(traced["output_dir"])
             # The trace step loaded these from the command line; a compile step needs the backend's.
             plugins = [
@@ -143,7 +136,11 @@ def export(args: Sequence[str]) -> Path:
                 )
             folder.rename(output_dir)
         except BaseException:
-            _remove_made(traced["folders"])
+            # One block from the trace step to the rename, so no stop falls between two cleanups. A killed trace step
+            # could not remove its folders itself. It names them before it makes any, so one killed while it wrote
+            # their names made none.
+            with suppress(FileNotFoundError, ValueError):
+                _remove_made(json.loads(folders.read_text()))
             raise
     logger.info("Wrote %s in %.0f s", output_dir, time.monotonic() - start)
     return output_dir

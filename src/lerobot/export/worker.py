@@ -109,8 +109,7 @@ def trace_step(request: dict[str, Any]) -> dict[str, Any]:
 
     The bundle goes into a new folder beside the output folder. The file `request["folders"]` names the folders
     the step makes there, and the parents of the output folder it makes. Returns the bundle folder, its manifest,
-    what is left to compile, the parts to check on their own, whose checks wait beside their traced programs, and
-    the folders it made.
+    what is left to compile, and the parts to check on their own, whose checks wait beside their traced programs.
     """
     argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
@@ -224,7 +223,6 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "output_dir": str(output_dir),
         "manifest": manifest.to_dict(),
         "traced": str(traced),
-        "folders": folders,
         "checks": checks,
         "quantize": cfg.quantize,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
