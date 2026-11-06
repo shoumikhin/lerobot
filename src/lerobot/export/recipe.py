@@ -114,7 +114,11 @@ class Part:
     check: ProgramCheck | None = None
 
     def __post_init__(self) -> None:
-        """Refuse inputs without one name each or one tensor given for two, and keep the example inputs contiguous."""
+        """Refuse a reserved name, inputs without one name each or one tensor for two; keep the inputs contiguous."""
+        if self.name == NOISE:
+            raise ValueError(
+                f"A part cannot be named {NOISE}: a CUDA bundle draws its noise with a program so named."
+            )
         if len(self.inputs) != len(self.example_inputs):
             raise ValueError(
                 f"The part {self.name} names {len(self.inputs)} inputs for {len(self.example_inputs)} example "
