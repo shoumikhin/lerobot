@@ -617,7 +617,7 @@ Two optional methods cover bigger policies:
 
 - `load` (a class method) builds the recipe from the export configuration. Override it to load each part's weights only when that part is traced.
 - `plan()` returns a `RunPlan`, which can hold:
-  - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree;
+  - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree. For a part that runs once per step, such as a denoising step, `repeated_runs` builds its runs and the constants each run reads;
   - `first_runs`: the runs of each of the first chunks after a reset, one list per chunk, for a policy whose first chunks compute in another way;
   - `constants`: named arrays the runs read, such as time values;
   - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;

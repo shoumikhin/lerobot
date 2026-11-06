@@ -516,6 +516,30 @@ class RunPlan:
             )
 
 
+def repeated_runs(
+    program: str,
+    inputs: list[str],
+    outputs: list[str],
+    steps: Sequence[dict[str, np.ndarray]],
+    start: dict[str, str] | None = None,
+) -> tuple[list[ProgramRun], dict[str, np.ndarray]]:
+    """The runs of a part that runs once per step, such as a denoising step, and the constants they read.
+
+    Run `i` reads and writes the part's own `inputs` and `outputs` names, so a value the part reads and writes
+    under one name, such as the sample `x`, passes from each run to the next. The first run reads
+    `start[name]` in place of such an input, such as the starting `noise`. Each name in `steps[i]` is a
+    constant of run `i` only, such as its timestep: the run reads it as `f"{name}_{i}"`, and the returned
+    constants hold it.
+    """
+    runs, constants = [], {}
+    for i, row in enumerate(steps):
+        names = dict(start or {}) if i == 0 else {}
+        names.update((name, f"{name}_{i}") for name in row)
+        runs.append(ProgramRun(f"{program}_{i}", program, [names.get(n, n) for n in inputs], list(outputs)))
+        constants.update({f"{name}_{i}": value for name, value in row.items()})
+    return runs, constants
+
+
 class ExportRecipe(abc.ABC):
     """Knows one kind of policy, never a compiler: turns it into parts and makes the test case.
 
