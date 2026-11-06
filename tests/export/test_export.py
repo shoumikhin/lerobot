@@ -721,16 +721,23 @@ def test_a_killed_trace_step_leaves_no_folders_behind(tmp_path, monkeypatch, cod
 
 class SavedConfig(SimpleNamespace):
     def save_pretrained(self, path: Path) -> None:
-        (path / "config.json").write_text(json.dumps(vars(self)))
+        (path / "config.json").write_text(json.dumps(vars(self), default=str))
 
 
-def test_a_bundle_keeps_no_local_path_of_the_exporter(tmp_path):
-    """A field naming a local copy of a model keeps only its folder's name; other names stay as they are."""
+def test_a_bundle_keeps_no_absolute_path(tmp_path):
+    """An absolute path keeps only its last part, also inside a list or a dict, one this machine lacks, and a
+    Windows one."""
     from lerobot.export.bundle import write_bundle
 
     (tmp_path / "SmolVLM2").mkdir()
     config = SavedConfig(
-        pretrained_path=str(tmp_path), vlm_model_name=str(tmp_path / "SmolVLM2"), tokenizer="org/model"
+        pretrained_path=str(tmp_path),
+        vlm_model_name=str(tmp_path / "SmolVLM2"),
+        tokenizer="org/model",
+        base_model_path=Path("/home/alice/models/base"),
+        dataset_paths=["/home/alice/data/one", "org/two"],
+        paths={"output": "/fsx/alice/run"},
+        windows_path="C:\\Users\\alice\\checkpoints\\last",
     )
     manifest = SimpleNamespace(
         test_case="test.safetensors", constants=None, task_tokens=None, action_tokens=None
@@ -739,7 +746,15 @@ def test_a_bundle_keeps_no_local_path_of_the_exporter(tmp_path):
     (tmp_path / "b").mkdir()
     write_bundle(SimpleNamespace(path=tmp_path / "b", manifest=manifest), case, config)
     saved = json.loads((tmp_path / "b" / POLICY_CONFIG).read_text())
-    assert saved == {"pretrained_path": None, "vlm_model_name": "SmolVLM2", "tokenizer": "org/model"}
+    assert saved == {
+        "pretrained_path": None,
+        "vlm_model_name": "SmolVLM2",
+        "tokenizer": "org/model",
+        "base_model_path": "base",
+        "dataset_paths": ["one", "org/two"],
+        "paths": {"output": "run"},
+        "windows_path": "last",
+    }
 
 
 def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(tmp_path):

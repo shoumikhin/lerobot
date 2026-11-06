@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import shutil
 from copy import copy
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from typing import Any
 
 import numpy as np
 from huggingface_hub.constants import CONFIG_NAME
@@ -80,12 +82,25 @@ def write_bundle(
         (folder / manifest.task_tokens.known_tasks).write_text(json.dumps(task_tokens.known_tasks))
     if manifest.action_tokens is not None and action_tokens is not None:
         (folder / manifest.action_tokens.tokenizer).write_text(action_tokens.tokenizer, encoding="utf-8")
-    # Without the exporter's checkpoint path or another local path, such as a local copy of a model, which can
-    # name its user. Running a bundle reads none of them; a local copy keeps only its folder's name.
+    # Without the exporter's checkpoint path or another absolute path, such as a local copy of a model or a folder
+    # of the machine that trained the policy, which can name a user. Running a bundle reads none of them.
     config = copy(config)
     config.pretrained_path = None
     for name, value in vars(config).items():
-        if isinstance(value, str | Path) and os.path.isabs(value) and os.path.exists(value):
-            setattr(config, name, type(value)(Path(value).name))
+        setattr(config, name, _without_absolute_paths(value))
     config.save_pretrained(folder)
     (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)
+
+
+def _without_absolute_paths(value: Any) -> Any:
+    """`value` with each absolute path in it, also in a list, tuple or dict, cut to its last part.
+
+    A Windows path counts too, since a checkpoint can be trained on Windows and exported elsewhere.
+    """
+    if isinstance(value, str | Path) and (os.path.isabs(value) or ntpath.isabs(value)):
+        return type(value)(PureWindowsPath(value).name)
+    if isinstance(value, list | tuple):
+        return type(value)(_without_absolute_paths(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _without_absolute_paths(item) for key, item in value.items()}
+    return value
