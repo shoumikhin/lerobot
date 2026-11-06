@@ -128,6 +128,17 @@ def test_recipe_measures_the_action_scale_at_the_width_the_postprocessor_takes()
     np.testing.assert_allclose(recipe.test_case().action_scale, [30.0, 3.0], rtol=1e-6)
 
 
+def test_a_program_that_computes_nan_actions_fails_the_tolerance():
+    class Inexact(ActionChunkRecipe):
+        exact = False
+
+    recipe = make(recipe_class=Inexact)
+    expected = recipe.test_case().actions
+    recipe._check_program(expected, expected)
+    with pytest.raises(ValueError, match="more than the tolerance"):
+        recipe._check_program(np.full_like(expected, np.nan), expected)
+
+
 def test_recipe_takes_the_tolerance_and_the_seed_it_is_given():
     states = []
     for seed in (0, 7):

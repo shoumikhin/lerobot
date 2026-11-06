@@ -785,6 +785,15 @@ def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(
         assert stat.S_IMODE((tmp_path / name).stat().st_mode) == usual, name
 
 
+def test_check_bundle_prints_its_usage_for_a_wrong_number_of_arguments(monkeypatch):
+    from lerobot.scripts import lerobot_check_bundle
+
+    for arguments in ([], ["one", "two"]):
+        monkeypatch.setattr(sys, "argv", ["lerobot-check-bundle", *arguments])
+        with pytest.raises(SystemExit, match="usage: lerobot-check-bundle <bundle folder>"):
+            lerobot_check_bundle.main()
+
+
 STOPPED_EXPORT = """
 import json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
