@@ -186,7 +186,11 @@ class ExportConfig:
     log_level: Literal["INFO", "DEBUG"] = "INFO"
 
     def __post_init__(self) -> None:
-        """Check the PyTorch version, load the policy config from `--policy.path` and pick the bundle folder."""
+        """Check the PyTorch version and the flags, load the policy config from `--policy.path`, pick the bundle folder.
+
+        The flags checked are `--quantize` (a mode the backend offers, with `--tolerance`), `--tolerance` and
+        `--max_task_tokens`.
+        """
         self.backend.check_torch()
         if self.quantize is not None and self.quantize not in self.backend.quantizations:
             offered = ", ".join(self.backend.quantizations) or "none"

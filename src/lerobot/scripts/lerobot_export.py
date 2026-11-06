@@ -35,10 +35,10 @@ does before the robot moves, and writes nothing if the actions differ from PyTor
 tolerance. A recipe may also have some parts checked on their own, each compiled program on the inputs the part
 got in PyTorch.
 
-This process never imports PyTorch. It traces the policy in one process, compiles each part in a process
-of its own and checks a part the recipe asks for in one more (see `lerobot.export.worker`), then checks the
-bundle in another (`python -m lerobot.bundle`), so each step starts with the memory the one before it used
-given back.
+This process never imports PyTorch. It traces the policy in one process, compiles each program in a process
+of its own (on a CUDA backend also the one that draws the noise), checks each part the recipe asks for in one
+more process each (see `lerobot.export.worker`), then checks the bundle in another (`python -m lerobot.bundle`),
+so each step starts with the memory the one before it used given back.
 """
 
 import json
@@ -76,7 +76,7 @@ def export(args: Sequence[str]) -> Path:
         work = Path(requests)
         folders = work / "folders.json"
         try:
-            # The trace step names its parts as it traces them, and prints only help for `--help`.
+            # The trace step logs each part's name as it traces it, and for `--help` only prints the help.
             with _heartbeat("Tracing the policy"):
                 traced = _run_step(
                     work, "trace", {"step": "trace", "args": list(args), "folders": str(folders)}

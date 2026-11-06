@@ -15,10 +15,10 @@
 """The steps of `lerobot-export` that use PyTorch, each run in a process of its own.
 
 `lerobot-export` never imports PyTorch. It runs `python -m lerobot.export.worker <request.json>` once to
-trace the policy's parts, then once per part to compile it, and once more for a part the recipe checks on its own.
-Each step ends with its process, so the memory
-it used is back with the system before the next step starts, which is what lets a large policy export on a
-small board. A request is a JSON object naming its `step` and the `result` file to write.
+trace the policy's parts, then once per program to compile it (on a CUDA backend also the program that draws
+the noise), and once more for each part the recipe checks on its own. Each step ends with its process, so the
+memory it used is back with the system before the next step starts, which is what lets a large policy export on
+a small board. A request is a JSON object naming its `step` and the `result` file to write.
 """
 
 import contextlib
@@ -140,8 +140,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         traced.mkdir(mode=0o700)
         recipe_cfg = cfg
         if cfg.quantize is not None:
-            # A recipe also holds PyTorch against PyTorch to its tolerance, which quantization does not change, so
-            # only the bundle's test case takes the --tolerance a quantized export needs.
+            # A recipe also compares its own PyTorch programs with the policy, to its tolerance. Quantization does
+            # not change those, so only the bundle's check of its test case takes the --tolerance it needs.
             recipe_cfg = copy.copy(cfg)
             recipe_cfg.tolerance = None
         recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
