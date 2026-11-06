@@ -461,9 +461,10 @@ class GrootExportRecipe(ExportRecipe):
     def _robot_features(self, config: GrootConfig) -> dict[str, PolicyFeature]:
         """The arrays the robot may send: the policy's inputs, or the dataset's observations it may read.
 
-        With a dataset, these are the observations the policy reads after the saved renames, and every camera:
-        GR00T's processor picks its cameras by the checkpoint's own camera names, not by the policy's input
-        features, which may name placeholders. The frame then keeps the cameras the processor picks.
+        With a dataset, these are the observations the policy reads after its preprocessor's renames, and
+        every camera: GR00T's processor picks its cameras by the checkpoint's own camera names, not by the
+        policy's input features, which may name placeholders. The frame then keeps the cameras the processor
+        picks.
         """
         features = dict(config.input_features or {})
         if self._metadata is None:
@@ -482,8 +483,8 @@ class GrootExportRecipe(ExportRecipe):
         )
         if missing:
             raise ValueError(
-                f"The dataset gives nothing the policy reads as {missing}, even after the renames its "
-                f"preprocessor saved ({renames}). The dataset has {sorted(dataset)}."
+                f"The dataset gives nothing the policy reads as {missing}, even after its preprocessor's "
+                f"renames ({renames}). The dataset has {sorted(dataset)}."
             )
         return kept
 

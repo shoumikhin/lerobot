@@ -160,8 +160,7 @@ class ExportConfig:
     # a bundle without task tokens runs only this task.
     task: str = ""
     # The dataset the policy was trained on. The bundle then takes the robot's frame from the dataset's
-    # observations, through the renames the preprocessor saved, and the dataset's first task when `task` is
-    # empty.
+    # observations, through the preprocessor's renames, and the dataset's first task when `task` is empty.
     dataset: DatasetConfig | None = None
     # The largest difference allowed between the compiled actions and PyTorch's on the test case, in the
     # policy's normalized action units (robot units divided by the spread of each action in the training

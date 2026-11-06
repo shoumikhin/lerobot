@@ -1009,13 +1009,15 @@ def _default_tolerance(policy: PreTrainedPolicy, bfloat16_tolerance: float) -> f
 
 
 def preprocessor_renames(preprocessor: PolicyProcessorPipeline) -> dict[str, str]:
-    """The observation renames the saved preprocessor makes, old name to new."""
-    return {
-        old: new
-        for step in preprocessor.steps
-        if isinstance(step, RenameObservationsProcessorStep)
-        for old, new in step.rename_map.items()
-    }
+    """The observation renames the saved preprocessor makes, old name to the name its last rename gives."""
+    renames: dict[str, str] = {}
+    for step in preprocessor.steps:
+        if isinstance(step, RenameObservationsProcessorStep):
+            # A later rename reads the names the earlier ones made, as the pipeline runs them.
+            renames = {old: step.rename_map.get(new, new) for old, new in renames.items()} | {
+                old: new for old, new in step.rename_map.items() if old not in renames
+            }
+    return renames
 
 
 def split_absolute_step(
@@ -1063,8 +1065,8 @@ def robot_features(
     missing = sorted(set(inputs) - {renames.get(name, name) for name in kept})
     if missing:
         raise ValueError(
-            f"The dataset gives nothing the policy reads as {missing}, even after the renames its "
-            f"preprocessor saved ({renames}). The dataset has {sorted(features)}."
+            f"The dataset gives nothing the policy reads as {missing}, even after its preprocessor's renames "
+            f"({renames}). The dataset has {sorted(features)}."
         )
     refuse_depth_maps(kept, metadata)
     return kept
