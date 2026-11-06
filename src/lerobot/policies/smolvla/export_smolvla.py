@@ -39,7 +39,14 @@ import torch
 from torch import Tensor
 
 from lerobot.bundle.manifest import NOISE, ProgramRun
-from lerobot.export.recipe import ActionChunkRecipe, Part, RunPlan, random_frame, to_policy_input
+from lerobot.export.recipe import (
+    ActionChunkRecipe,
+    Part,
+    RunPlan,
+    random_frame,
+    repeated_runs,
+    to_policy_input,
+)
 from lerobot.policies.common.export_utils import PolicyPart
 from lerobot.policies.common.vla_utils import make_att_2d_masks
 from lerobot.processor import PolicyProcessorPipeline
@@ -203,30 +210,28 @@ class SmolVLAExportRecipe(ActionChunkRecipe):
         with torch.no_grad():
             prefix = embed(*frame_inputs)
             keys_values = language_model(*prefix)
-        x_names = [NOISE, *(f"x_{i + 1}" for i in range(len(self._timesteps)))]
+        step_names = [*CACHE, "x", "timestep"]
+        step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
+        step_runs, self._constants = repeated_runs(
+            "step", step_names, ["x"], step_constants, start={"x": NOISE}
+        )
         self._runs = [
             ProgramRun("embed", "embed", frame_names, list(EMBED_OUTPUTS)),
             ProgramRun("language_model", "language_model", list(EMBED_OUTPUTS), list(CACHE[1:])),
-            *(
-                ProgramRun(f"step_{i}", "step", [*CACHE, x_names[i], f"timestep_{i}"], [x_names[i + 1]])
-                for i in range(len(self._timesteps))
-            ),
-            ProgramRun("actions", "actions", [x_names[-1]], [ACTION]),
+            *step_runs,
+            ProgramRun("actions", "actions", ["x"], [ACTION]),
         ]
         yield Part("embed", embed, tuple(frame_inputs), frame_names, list(EMBED_OUTPUTS))
         yield Part("language_model", language_model, prefix, list(EMBED_OUTPUTS), list(CACHE[1:]))
         timestep = torch.tensor(self._timesteps[:1], device=self._device)
         step_inputs = (prefix[1], *keys_values, noise_input, timestep)
-        yield Part("step", step, step_inputs, [*CACHE, "x_t", "timestep"], ["x_next"])
+        yield Part("step", step, step_inputs, step_names, ["x"])
         del prefix, keys_values
-        yield Part("actions", actions, (noise_input,), [x_names[-1]], [ACTION])
+        yield Part("actions", actions, (noise_input,), ["x"], [ACTION])
 
     def plan(self) -> RunPlan:
         """The parts in order with the step once per timestep, and the timesteps as constants."""
-        return RunPlan(
-            runs=self._runs,
-            constants={f"timestep_{i}": np.array([t], np.float32) for i, t in enumerate(self._timesteps)},
-        )
+        return RunPlan(runs=self._runs, constants=self._constants)
 
     def _run(
         self,
