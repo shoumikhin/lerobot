@@ -161,9 +161,17 @@ def test_the_dataset_is_found_where_training_finds_it(monkeypatch):
     monkeypatch.setattr(lerobot.datasets.storage, "load_dataset_metadata", load)
     monkeypatch.setattr(lerobot.datasets, "LeRobotDatasetMetadata", None)
     root = "hf://buckets/user/data"
-    dataset = SimpleNamespace(repo_id="user/data", root=root, revision="v1", repo_type="bucket")
+    dataset = SimpleNamespace(
+        repo_id="user/data", root=root, revision="v1", repo_type="bucket", streaming=False
+    )
     dataset_metadata(SimpleNamespace(dataset=dataset))
-    assert loaded == [(("user/data",), {"root": root, "revision": "v1", "repo_type": "bucket"})]
+    # Streamed, a bucket given as the root is read in bucket mode.
+    streamed = SimpleNamespace(**{**vars(dataset), "repo_type": "dataset", "streaming": True})
+    dataset_metadata(SimpleNamespace(dataset=streamed))
+    assert loaded == [
+        (("user/data",), {"root": root, "revision": "v1", "repo_type": "bucket"}),
+        (("user/data",), {"root": None, "revision": "v1", "repo_type": "bucket"}),
+    ]
 
 
 def test_recipe_asks_for_the_task_of_a_dataset_without_tasks():

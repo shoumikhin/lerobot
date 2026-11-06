@@ -1031,15 +1031,18 @@ def dataset_metadata(cfg: ExportConfig) -> LeRobotDatasetMetadata | None:
     """The metadata of the dataset `--dataset.repo_id` names, if any."""
     if cfg.dataset is None:
         return None
-    from lerobot.datasets.storage import load_dataset_metadata
+    from lerobot.datasets.storage import is_bucket_root, load_dataset_metadata
 
     dataset = cfg.dataset
     # As training loads it, so a dataset in a storage bucket or under a remote root is found too.
+    root, repo_type = dataset.root, dataset.repo_type
+    if dataset.streaming and is_bucket_root(dataset.repo_id, root):
+        root, repo_type = None, "bucket"
     return load_dataset_metadata(
         dataset.repo_id,
-        root=dataset.root,
+        root=root,
         revision=dataset.revision,
-        repo_type=cast(Literal["dataset", "bucket"], dataset.repo_type),
+        repo_type=cast(Literal["dataset", "bucket"], repo_type),
     )
 
 
