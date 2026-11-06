@@ -228,6 +228,20 @@ def test_recipe_refuses_a_policy_whose_noise_is_not_a_standard_normal(monkeypatc
         make(ShiftedNoiseACT)
 
 
+class ScaledDrawACT(ACTPolicy):
+    """ACT that draws a standard normal and moves it to around 5 with a spread of 0.5 before using it."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+        if noise is None:
+            noise = 5 + 0.5 * torch.randn(1, self.config.chunk_size, 1)
+        return super().predict_action_chunk(batch) + noise
+
+
+def test_recipe_refuses_a_policy_that_changes_its_standard_normal_draw():
+    with pytest.raises(ValueError, match="changes the noise it draws before using it"):
+        make(ScaledDrawACT)
+
+
 class OneNumberNoiseACT(ACTPolicy):
     """ACT that draws one number of noise, for each sample (`shape` (1,)) or in all (`shape` ())."""
 
