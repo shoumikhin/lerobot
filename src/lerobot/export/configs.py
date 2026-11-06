@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import abc
 import contextlib
-import importlib.metadata
 import math
 import os
 from collections.abc import Sequence
@@ -104,7 +103,9 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         """Refuse a PyTorch older than `min_torch` before anything is traced, and say how to export."""
         if self.min_torch is None:
             return
-        installed = importlib.metadata.version("torch")
+        import torch
+
+        installed = torch.__version__
         if Version(installed).release >= Version(self.min_torch).release:
             return
         message = (

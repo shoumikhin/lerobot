@@ -170,14 +170,14 @@ def test_a_backend_refuses_a_pytorch_older_than_it_needs(monkeypatch):
     TorchTestBackend().check_torch()
     # A nightly or a release candidate of the version a backend needs counts as that version.
     monkeypatch.setattr(TorchTestBackend, "min_torch", "2.15")
-    monkeypatch.setattr(
-        "lerobot.export.configs.importlib.metadata.version", lambda name: "2.15.0.dev20260901"
-    )
+    monkeypatch.setattr(torch, "__version__", "2.15.0.dev20260901")
     TorchTestBackend().check_torch()
-    monkeypatch.setattr("lerobot.export.configs.importlib.metadata.version", lambda name: "2.15.0rc1")
+    monkeypatch.setattr(torch, "__version__", "2.15.0rc1")
     TorchTestBackend().check_torch()
     monkeypatch.setattr(TorchTestBackend, "min_torch", "99.0")
-    with pytest.raises(ValueError, match="needs PyTorch 99.0 or newer to export") as refusal:
+    with pytest.raises(
+        ValueError, match="needs PyTorch 99.0 or newer to export, but PyTorch 2.15.0rc1 is installed"
+    ) as refusal:
         TorchTestBackend().check_torch()
     assert "pip install" not in str(refusal.value)
 
