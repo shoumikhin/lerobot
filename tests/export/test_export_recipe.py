@@ -494,6 +494,7 @@ def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
     if meminfo is not None:
         meminfo_file.write_text(meminfo)
     monkeypatch.setattr(recipe_module, "_MEMINFO", meminfo_file)
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "no_cgroup")
     monkeypatch.setattr(
         recipe_module.os, "sysconf", {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": pages}.__getitem__, raising=False
     )
@@ -503,6 +504,39 @@ def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
         f"Skipped the comparison with the whole pi0.5 policy: it needs about 12.3 GB, {spare}. The "
         "bundle's own check against its test case still runs." in caplog.text
     )
+
+
+def test_a_policy_too_big_for_its_container_is_skipped(tmp_path, monkeypatch, caplog):
+    """A 2 GB container on a machine with 1.8 TB available: the container's limit decides."""
+    (tmp_path / "meminfo").write_text("MemAvailable: 1800000000 kB\n")
+    (tmp_path / "cgroup").write_text("0::/user.slice/job.scope\n")
+    job = tmp_path / "cgroups" / "user.slice" / "job.scope"
+    job.mkdir(parents=True)
+    (job.parent / "memory.max").write_text("max\n")
+    (job / "memory.max").write_text("2000000000\n")
+    (job / "memory.current").write_text("600000000\n")
+    # Page cache the kernel can drop counts as room.
+    (job / "memory.stat").write_text("anon 500000000\ninactive_file 100000000\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "cgroup")
+    monkeypatch.setattr(recipe_module, "_CGROUPS", tmp_path / "cgroups")
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
+    assert "it needs about 2.0 GB, 1.5 GB available" in caplog.text
+
+
+def test_a_policy_too_big_for_host_memory_is_skipped_for_a_gpu_too(tmp_path, monkeypatch, caplog):
+    """An 80 GB GPU in a 4 GB container: the policy is built in host memory before it moves to the GPU."""
+    (tmp_path / "meminfo").write_text("MemAvailable: 4000000 kB\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "no_cgroup")
+    gpu = 80_000_000_000
+    monkeypatch.setattr(recipe_module.torch.cuda, "mem_get_info", lambda device: (gpu, gpu))
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=6_200_000_000))
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cuda"), "pi0.5")
+    assert "it needs about 6.2 GB, 4.1 GB available in host memory" in caplog.text
 
 
 def test_a_policy_is_not_compared_on_a_machine_that_does_not_say_how_much_memory_it_has(

@@ -1124,17 +1124,49 @@ def measure_action_scale(actions_at: Callable[[float], Tensor]) -> np.ndarray:
 
 
 _MEMINFO = Path("/proc/meminfo")
+_CGROUP = Path("/proc/self/cgroup")
+_CGROUPS = Path("/sys/fs/cgroup")
 
 
 def _available_memory() -> int | None:
-    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere."""
+    """Bytes Linux expects new allocations can use without swapping (page cache counts), None elsewhere.
+
+    In a container or another cgroup with a memory limit, the room that limit leaves, if it is less.
+    """
     if not _MEMINFO.exists():
         return None
     for line in _MEMINFO.read_text().splitlines():
         name, value, *_ = line.split()
         if name == "MemAvailable:":
-            return int(value) * 1024
+            room = _cgroup_room()
+            return int(value) * 1024 if room is None else min(int(value) * 1024, room)
     return None
+
+
+def _cgroup_room() -> int | None:
+    """Bytes left under the tightest cgroup v2 memory limit of this process and its parent groups, None if none.
+
+    Page cache that the kernel can drop, which the cgroup counts as used, counts as room, as in MemAvailable.
+    """
+    try:
+        group = next(line[3:] for line in _CGROUP.read_text().splitlines() if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return None
+    rooms = []
+    path = _CGROUPS / group.lstrip("/")
+    while path.is_relative_to(_CGROUPS):
+        try:
+            limit = (path / "memory.max").read_text().strip()
+            if limit != "max":
+                stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
+                used = int((path / "memory.current").read_text()) - int(stats.get("inactive_file", 0))
+                rooms.append(int(limit) - used)
+        except (OSError, ValueError):
+            pass
+        if path == _CGROUPS:
+            break
+        path = path.parent
+    return min(rooms, default=None)
 
 
 def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
@@ -1144,12 +1176,17 @@ def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) 
     the bundle's own check of its test case still runs.
     """
     size = model_file.stat().st_size
+    # Each memory the policy needs: twice its size for the activations and what the export already holds.
+    needs: list[tuple[int, int, str]] = []
     if device.type == "cuda":
-        available, measured = torch.cuda.mem_get_info(device)[0], "free"
+        needs.append((2 * size, torch.cuda.mem_get_info(device)[0], "free on the GPU"))
+        # The policy is built in host memory before it moves to the GPU.
+        if (host := _available_memory()) is not None:
+            needs.append((size, host, "available in host memory"))
     elif (linux_available := _available_memory()) is not None:
-        available, measured = linux_available, "available"
+        needs.append((2 * size, linux_available, "available"))
     elif hasattr(os, "sysconf"):
-        available, measured = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "installed"
+        needs.append((2 * size, os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "installed"))
     else:
         # Windows has neither /proc/meminfo nor os.sysconf.
         logger.warning(
@@ -1158,18 +1195,18 @@ def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) 
             policy_name,
         )
         return False
-    # Room for the activations and for what the export already holds.
-    if 2 * size <= available:
-        return True
-    logger.warning(
-        "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB %s. The bundle's "
-        "own check against its test case still runs.",
-        policy_name,
-        2 * size / 1e9,
-        available / 1e9,
-        measured,
-    )
-    return False
+    for needed, available, measured in needs:
+        if needed > available:
+            logger.warning(
+                "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB %s. The "
+                "bundle's own check against its test case still runs.",
+                policy_name,
+                needed / 1e9,
+                available / 1e9,
+                measured,
+            )
+            return False
+    return True
 
 
 def load_policy(
