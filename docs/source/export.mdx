@@ -203,6 +203,8 @@ The default recipe fits a policy that:
 
 For any other policy, it stops with the reason. For example, ACT with temporal ensembling (which mixes several past chunks) cannot be exported this way.
 
+A program takes every image as 8-bit, so its bundle cannot run a policy that reads a depth camera. Only the dataset marks which cameras are depth maps, so the export refuses such a policy only when you give its dataset with `--dataset.repo_id`. Give it whenever the policy reads a one-channel camera: LeRobot records every one-channel robot camera as a depth map.
+
 ### The bundle is the contract
 
 The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot runs the compiled programs, not the policy's Python code. Here is the manifest of the ACT bundle above. Your values, such as `action_scale`, will differ:

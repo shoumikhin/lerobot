@@ -64,6 +64,7 @@ from lerobot.export.recipe import (
     measure_action_scale,
     preprocessor_renames,
     random_frame,
+    refuse_depth_maps,
     refuse_peft_adapter,
     split_absolute_step,
     to_policy_input,
@@ -174,6 +175,12 @@ class GrootExportRecipe(ExportRecipe):
         self.task = export_task(cfg, self._metadata, "GR00T")
         features = self._robot_features(config)
         visual = {name for name, f in features.items() if f.type is FeatureType.VISUAL}
+        if self._metadata is not None:
+            # Before the preprocessor, which fails on a depth map's single channel. Its packing step picks the
+            # cameras by name.
+            renames = preprocessor_renames(self.preprocessor)
+            picked = set(pack._ordered_image_keys(dict.fromkeys(renames.get(name, name) for name in visual)))
+            refuse_depth_maps((name for name in visual if renames.get(name, name) in picked), self._metadata)
         frame = random_frame(features, self._generator)
         self._batch = self._preprocess(frame, self.task)
         self._images = _ImagesAndState(self.preprocessor, frame, visual, self._batch).to(self._device)

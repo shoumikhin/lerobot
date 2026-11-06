@@ -351,14 +351,24 @@ def _dataset_that_names_the_state_joints(root):
     return _tiny_dataset(root, JOINTS, [TASK])
 
 
-def _tiny_dataset(root, state, tasks):
-    """The metadata of a dataset of the torchvision cameras, the state under the name `state`, and `tasks`."""
+def _tiny_dataset(root, state, tasks, depth=()):
+    """The metadata of a dataset of the torchvision cameras, the state under the name `state`, and `tasks`.
+
+    The cameras `depth` are marked as depth maps.
+    """
     from lerobot.datasets import LeRobotDatasetMetadata
     from lerobot.datasets.io_utils import write_info
 
     image = {"dtype": "image", "names": ["height", "width", "channels"]}
     features = {
-        **{name: {**image, "shape": (h, w, c)} for name, (c, h, w) in MODES["torchvision"][1].items()},
+        **{
+            name: {
+                **image,
+                "shape": (h, w, 1 if name in depth else c),
+                "info": {"is_depth_map": name in depth},
+            }
+            for name, (c, h, w) in MODES["torchvision"][1].items()
+        },
         state: {"dtype": "float32", "shape": (5,), "names": None},
         ACTION: {"dtype": "float32", "shape": (5,), "names": [f"joint_{i}" for i in range(5)]},
     }
@@ -383,6 +393,31 @@ def test_export_keeps_the_dataset_tasks_that_fit_the_token_budget(checkpoint, tm
     cfg = _export_config(GrootConfig.from_pretrained(checkpoint), tmp_path, max_task_tokens=12)
     cfg.dataset = DatasetConfig(repo_id="user/tiny", root=str(root))
     assert list(GrootExportRecipe(cfg)._prompt["known_tasks"]) == [TASK]
+
+
+@pytest.mark.dataset
+def test_export_refuses_a_camera_the_dataset_marks_as_a_depth_map(checkpoint, tmp_path):
+    from lerobot.configs.default import DatasetConfig
+
+    root = tmp_path / "dataset"
+    camera = next(iter(MODES["torchvision"][1]))
+    _tiny_dataset(root, OBS_STATE, [TASK], depth=[camera])
+    cfg = _export_config(GrootConfig.from_pretrained(checkpoint), tmp_path)
+    cfg.dataset = DatasetConfig(repo_id="user/tiny", root=str(root))
+    with pytest.raises(ValueError, match=rf"reads the depth maps \['{camera}'\]"):
+        GrootExportRecipe(cfg)
+
+
+@pytest.mark.dataset
+def test_export_takes_a_depth_camera_the_checkpoint_does_not_read(checkpoint, tmp_path):
+    from lerobot.configs.default import DatasetConfig
+
+    root = tmp_path / "dataset"
+    _tiny_dataset(root, OBS_STATE, [TASK], depth=["observation.images.wrist"])
+    pack = {"groot_n1_7_pack_inputs_v1": {"video_modality_keys": ["front"]}}
+    cfg = _export_config(_with_saved_processor(checkpoint, tmp_path, pack), tmp_path)
+    cfg.dataset = DatasetConfig(repo_id="user/tiny", root=str(root))
+    assert "observation.images.wrist" not in GrootExportRecipe(cfg)._frame
 
 
 @pytest.mark.dataset
