@@ -170,7 +170,8 @@ class ProgramCheck:
         inputs = tuple(x.contiguous() for x in inputs)
         wide = tuple(x.float() if x.dtype in _HALF else x for x in inputs)
         with torch.no_grad():
-            outputs = _call(module, inputs)
+            # Copies, since a part may return a buffer of its own that the reruns write into.
+            outputs = tuple(x.clone() for x in _call(module, inputs))
             changes = [
                 (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
             ]

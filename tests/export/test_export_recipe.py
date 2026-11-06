@@ -832,6 +832,28 @@ def test_a_program_check_keeps_the_inputs_a_part_writes_into():
     assert check.floor[0][1] < torch.finfo(torch.bfloat16).eps
 
 
+class _ReturnsItsBuffer(torch.nn.Module):
+    """A bfloat16 layer that writes its result into a float32 buffer of its own and returns that buffer."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+        self.register_buffer("result", torch.zeros(8, 64))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.result.copy_(self.linear(x))
+
+
+def test_a_program_check_keeps_what_a_part_returned_before_its_reruns():
+    torch.manual_seed(0)
+    part, x = _ReturnsItsBuffer(), torch.randn(8, 64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = part(x).clone()
+    # The float32 rerun writes other values into the buffer.
+    check = ProgramCheck.measure(part, (x,))
+    assert torch.equal(check.outputs[0], expected)
+
+
 @pytest.mark.parametrize(
     ("floor", "spread"),
     [((0.01, 1.0), False), ((1.0, 0.01), True)],
