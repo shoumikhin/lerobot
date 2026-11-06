@@ -125,9 +125,9 @@ def prepare_runtime(
                 importlib.import_module(module)
             except ImportError as error:
                 raise ImportError(
-                    f"This bundle needs the Python module {module!r} to load its programs. Install it the "
-                    "way the export guide says for the backend that wrote the bundle: "
-                    "https://huggingface.co/docs/lerobot/export"
+                    f"This bundle could not import the Python module {module!r}, which loads its programs "
+                    f"({error}). If it is not installed: install it the way the export guide says for the "
+                    "backend that wrote the bundle, https://huggingface.co/docs/lerobot/export"
                 ) from error
         if runtime not in RUNTIMES:
             raise ValueError(

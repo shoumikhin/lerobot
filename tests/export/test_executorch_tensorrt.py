@@ -274,7 +274,10 @@ def test_fp8_is_refused_before_it_calibrates(monkeypatch, reason):
         monkeypatch.setitem(sys.modules, "modelopt.torch.quantization", None)
     error, match = {
         "gpu without fp8": (ValueError, "compute capability 8.9 or newer"),
-        "no modelopt": (ImportError, "pip install .nvidia-modelopt>=0.48."),
+        "no modelopt": (
+            ImportError,
+            r"Optimizer \(.*None in sys\.modules\)\. .*pip install .nvidia-modelopt>=0.48.",
+        ),
     }[reason]
     with pytest.raises(error, match=match):
         ExecuTorchTensorRTConfig().quantized(Recorded(), (torch.randn(1, 2),), "fp8")

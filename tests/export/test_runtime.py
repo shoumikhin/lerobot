@@ -94,7 +94,7 @@ def test_the_bundle_folder_is_off_the_search_path_until_the_runtime_is_ready(eve
         raise ImportError(name)
 
     monkeypatch.setattr(bundle_runtime.importlib, "import_module", fail)
-    with pytest.raises(ImportError, match="needs the Python module 'delegate'"):
+    with pytest.raises(ImportError, match=r"module 'delegate', which loads its programs \(delegate\)"):
         prepare_runtime("fake", ["delegate"], folder=tmp_path)
     assert events == [before[1:]]
     assert sys.path == before

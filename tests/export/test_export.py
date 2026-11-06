@@ -718,9 +718,11 @@ def test_the_compile_step_names_what_its_backend_needs_installed(tmp_path, monke
         "path": str(tmp_path / "out.pt2"),
         "plugins": [],
     }
-    with pytest.raises(
-        ImportError, match='The torch_test backend needs: pip install "compiler>=1.0"'
-    ) as error:
+    message = (
+        r"could not import what it needs \(No module named 'compiler'\)\. "
+        r'If it is not installed: pip install "compiler>=1.0"'
+    )
+    with pytest.raises(ImportError, match=message) as error:
         worker.compile_step(request)
     assert isinstance(error.value.__cause__, ModuleNotFoundError)
 

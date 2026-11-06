@@ -161,7 +161,7 @@ def test_the_bundle_check_imports_nothing_the_bundle_ships(tmp_path, command, sh
         timeout=300,
     )
     assert not [name for name in shipped if (tmp_path / name).exists()]
-    assert "needs the Python module 'payload'" in result.stderr
+    assert "could not import the Python module 'payload'" in result.stderr
 
 
 def test_a_bundle_loaded_inside_its_folder_runs_no_executorch_it_ships(tmp_path):

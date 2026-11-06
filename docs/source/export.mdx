@@ -569,8 +569,8 @@ The export never overwrites a bundle. Delete the old folder, or pass `--output_d
 **`The executorch_tensorrt backend needs PyTorch 2.15 or newer to export, but PyTorch 2.11.0 is installed.`**
 This environment has an older PyTorch. Install PyTorch 2.15 in it, with the command the message shows.
 
-**`The executorch_tensorrt backend needs: pip install ...`**, or at run time, **`This bundle was exported with torch_tensorrt_executorch_runtime ..., which is not installed.`** or **`This bundle needs the Python module 'torch_tensorrt_executorch_runtime' to load its programs.`**
-The backend's packages are missing on this machine. Install them as shown in [Install](#install).
+**`The executorch_tensorrt backend could not import what it needs (...). If it is not installed: pip install ...`**, or at run time, **`This bundle was exported with torch_tensorrt_executorch_runtime ..., which is not installed.`** or **`This bundle could not import the Python module 'torch_tensorrt_executorch_runtime', which loads its programs (...).`**
+The backend's packages are missing on this machine, or one of them fails to load. If they are missing, install them as shown in [Install](#install). If they are installed, the export's message and the run-time message for the module give in parentheses what fails to load, such as a shared library; fix that.
 
 **`The exported policy does not reproduce its test case (... > 2e-05). Export it again on this device.`**
 The compiled actions differ from PyTorch's by more than the tolerance. With TensorRT, this usually means the bundle was built on another GPU model: export on the board that runs it. Raise `--tolerance` only if you know the difference does not matter for your task.

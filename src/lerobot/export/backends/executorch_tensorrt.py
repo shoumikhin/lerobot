@@ -94,7 +94,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             from modelopt.torch.quantization.utils import export_torch_mode
         except ImportError as error:
             raise ImportError(
-                f"--quantize={mode} needs NVIDIA Model Optimizer: pip install 'nvidia-modelopt>=0.48'"
+                f"--quantize={mode} could not import NVIDIA Model Optimizer ({error}). If it is not "
+                "installed: pip install 'nvidia-modelopt>=0.48'"
             ) from error
         config = {**mtq.FP8_DEFAULT_CFG, "quant_cfg": [*mtq.FP8_DEFAULT_CFG["quant_cfg"], *FP8_KEPT]}
         # Calibration leaves every layer in its outermost module's mode, and a part's wrapper may be in training mode.

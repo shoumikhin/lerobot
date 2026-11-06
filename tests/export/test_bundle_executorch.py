@@ -51,12 +51,14 @@ def test_executorch_returns_its_own_results_without_changing_the_environment(tmp
     assert result.stdout.splitlines() == ["loaded with executorch", f"then {preset}"]
 
 
-def test_without_executorch_the_bundle_says_how_and_where_to_install_it(monkeypatch):
+def test_without_executorch_the_bundle_says_why_how_and_where_to_install_it(monkeypatch):
     # On a platform the export extra does not cover, installing it brings no ExecuTorch.
     monkeypatch.setitem(sys.modules, "executorch.runtime", None)
-    with pytest.raises(
-        ImportError, match=r"pip install 'lerobot\[export\]' installs on Linux .* Apple Silicon"
-    ):
+    message = (
+        r"which runs it \(.*None in sys\.modules\)\. "
+        r".*'lerobot\[export\]', on Linux .* Apple Silicon"
+    )
+    with pytest.raises(ImportError, match=message):
         executorch.prepare()
 
 
