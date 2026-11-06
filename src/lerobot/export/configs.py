@@ -49,8 +49,9 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         - **runtime** (`str`) -- The runtime that loads the program files, such as `executorch`.
         - **file_suffix** (`str`) -- The suffix of the program files, such as `.pte`.
         - **device** (`str`) -- The PyTorch device the parts are traced, compiled and checked on, such as
-          `cuda` or `cpu`. The programs run there too, except that Core ML and MLX programs traced on `cpu`
-          may run on the GPU or the Neural Engine.
+          `cuda` or `cpu`. The programs run there too, unless their compiler places the work on an
+          accelerator: Core ML, MLX and QNN programs traced on `cpu`, for example, can run on a GPU, the
+          Neural Engine or an NPU.
         - **runtime_imports** (`tuple[str, ...]`) -- Python modules the runtime imports before it loads the
           files, such as one that registers the compiler's kernels with the runtime.
         - **runtime_options** (`dict[str, dict[str, bool | int | str]]`) -- Settings the runtime applies
@@ -90,7 +91,8 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     def target(self) -> Target | None:
         """The GPU the files are built on when `device` is `cuda`, since they then run only on that kind of GPU.
 
-        `None` for files that run anywhere their runtime does.
+        `None` for every other device: files that run anywhere their runtime does, or on an accelerator the
+        bundle does not check, such as a Snapdragon chip's NPU.
         """
         if self.device != "cuda":
             return None

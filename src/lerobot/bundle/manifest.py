@@ -254,8 +254,9 @@ class BundleManifest:
             The largest difference allowed between the actions the programs compute for the test case and
             the ones PyTorch computed, in normalized units: robot units divided by `action_scale`.
         target (`Target`, *optional*):
-            The GPU the programs were built on, when they run only on that kind of GPU. `None` for programs
-            that run anywhere their runtime does.
+            The GPU the programs were built on, when they run only on that kind of GPU. `None` for every
+            other device: programs that run anywhere their runtime does, or on an accelerator the bundle does
+            not check, such as a Snapdragon chip's NPU.
         runtime_versions (`dict[str, str]`, *optional*):
             The version of each Python module the programs were built with and need to load, such as
             `executorch`, by module name.

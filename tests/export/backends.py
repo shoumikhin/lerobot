@@ -19,8 +19,11 @@ a CUDA GPU for a GPU backend, so the test is marked `executorch` and `gpu` wheth
 `tests/conftest.py`).
 """
 
+import ctypes
 import importlib
+import importlib.util
 import os
+import platform
 import subprocess
 import sys
 import warnings
@@ -122,8 +125,45 @@ needs_executorch_openvino = pytest.mark.skipif(
     f"({INSTALLED})",
 )
 
+
+def _executorch_has_qnn() -> bool:
+    """Whether ExecuTorch was built with QNN, as its Linux x86_64 package is: its QNN modules import this."""
+    try:
+        return importlib.util.find_spec("executorch.backends.qualcomm.python.PyQnnManagerAdaptor") is not None
+    except ImportError:
+        return False
+
+
+def _qnn_libraries_load() -> bool:
+    try:
+        ctypes.CDLL("libQnnHtp.so")
+    except OSError:
+        return False
+    return True
+
+
+# ExecuTorch's QNN compiler comes with its Linux x86_64 package, and with a build that turns QNN on.
+EXECUTORCH_QNN = (
+    EXECUTORCH and sys.platform == "linux" and platform.machine() == "x86_64" and _executorch_has_qnn()
+)
+
+needs_executorch_qnn_compiler = pytest.mark.skipif(
+    not EXECUTORCH_QNN,
+    reason=f"needs ExecuTorch 1.6 with QNN, as its Linux x86_64 package has, and PyTorch 2.15 ({INSTALLED})",
+)
+
+
+# ExecuTorch runs QNN programs on Qualcomm's simulator of the NPU, from the SDK's libraries.
+needs_executorch_qnn = pytest.mark.skipif(
+    not (EXECUTORCH_QNN and _qnn_libraries_load()),
+    reason="needs ExecuTorch 1.6 with QNN, as its Linux x86_64 package has, and PyTorch 2.15, with the "
+    f"libraries of Qualcomm's QNN SDK on LD_LIBRARY_PATH ({INSTALLED})",
+)
+
+
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
-# OpenVINO does not run these policies yet (pytorch/executorch#24325).
+# OpenVINO does not run these policies yet (pytorch/executorch#24325). QNN fails some of them (see the docs),
+# so test_export.py tests it on a small model.
 BACKENDS = {
     "executorch_xnnpack": needs_executorch,
     "executorch_cuda": needs_executorch_cuda,

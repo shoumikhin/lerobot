@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import signal
@@ -52,6 +53,8 @@ from tests.export.backends import (
     needs_executorch_coreml,
     needs_executorch_cuda,
     needs_executorch_openvino,
+    needs_executorch_qnn,
+    needs_executorch_qnn_compiler,
     needs_executorch_tensorrt,
 )
 from tests.export.plugins import use_plugins
@@ -1137,19 +1140,124 @@ def test_an_executorch_part_runs_at_export_the_way_a_bundle_loads_it(tmp_path):
     subprocess.run([sys.executable, "-c", RUN_PART, str(tmp_path)], check=True, timeout=300)
 
 
-@needs_executorch_openvino
-def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
+def _runs_like_pytorch(config, delegate: bytes, tolerance: float, tmp_path) -> None:
+    """Compile a small model with `config`, then run it as a bundle does and compare with PyTorch."""
     from lerobot.bundle.executorch import ExecuTorchProgram
-    from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
 
+    torch.manual_seed(0)
     model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 2)).eval()
     x = torch.randn(3, 4)
     path = tmp_path / "model.pte"
-    ExecuTorchOpenVINOConfig().compile(torch.export.export(model, (x,)), path)
-    assert b"OpenvinoBackend" in path.read_bytes()
+    config.compile(torch.export.export(model, (x,)), path)
+    assert delegate in path.read_bytes()
     program = ExecuTorchProgram(path)
     (actual,) = program(x.numpy())
-    np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
+    expected = model(x).detach().numpy()
+    np.testing.assert_allclose(program.to_numpy(actual), expected, rtol=tolerance, atol=tolerance)
+
+
+@needs_executorch_openvino
+def test_executorch_openvino_compiles_a_program_that_openvino_runs(tmp_path):
+    from lerobot.export.backends.executorch_openvino import ExecuTorchOpenVINOConfig
+
+    _runs_like_pytorch(ExecuTorchOpenVINOConfig(), b"OpenvinoBackend", 1e-5, tmp_path)
+
+
+@needs_executorch_qnn
+def test_executorch_qnn_compiles_a_program_that_qnn_runs(tmp_path):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    # The NPU computes in float16.
+    _runs_like_pytorch(ExecuTorchQNNConfig(soc="SM8650"), b"QnnBackend", 1e-2, tmp_path)
+
+
+@needs_executorch_qnn_compiler
+def test_executorch_qnn_compiles_for_the_chip_it_is_given(monkeypatch, tmp_path):
+    from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset, QnnExecuTorchHtpPrecision
+    from executorch.backends.qualcomm.utils import utils as qnn_utils
+
+    from lerobot.export.backends import executorch_qnn
+
+    chips = []
+
+    def compiler_spec(soc_model, backend_options):
+        chips.append((soc_model, backend_options.htp_options.precision))
+        raise RuntimeError("stopped after the compiler spec")
+
+    monkeypatch.setattr(qnn_utils, "generate_qnn_executorch_compiler_spec", compiler_spec)
+    # Fakes the constructor's check of the SDK's libraries: the compile stops before it needs them.
+    monkeypatch.setattr(executorch_qnn, "ctypes", SimpleNamespace(CDLL=lambda name: None))
+    x = torch.randn(3, 4)
+    program = torch.export.export(torch.nn.Linear(4, 2), (x,))
+    with pytest.raises(RuntimeError, match="stopped after the compiler spec"):
+        executorch_qnn.ExecuTorchQNNConfig(soc="QCS9100").compile(program, tmp_path / "model.pte")
+    assert chips == [(QcomChipset.QCS9100, QnnExecuTorchHtpPrecision.kHtpFp16)]
+
+
+@needs_executorch_qnn_compiler
+# No chip, a chip ExecuTorch does not know, or QCM6490: a Hexagon v68 NPU, which does not compute in float16.
+@pytest.mark.parametrize("options", [{}, {"soc": "SM0000"}, {"soc": "QCM6490"}])
+def test_executorch_qnn_refuses_a_chip_it_cannot_run_on_before_tracing(options):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    with pytest.raises(ValueError, match="--backend.soc must be one of"):
+        ExecuTorchQNNConfig(**options)
+
+
+@needs_executorch_qnn_compiler
+def test_executorch_qnn_says_why_the_qnn_libraries_do_not_load(monkeypatch):
+    from lerobot.export.backends import executorch_qnn
+
+    def missing_libcxx(name):
+        raise OSError("libc++.so.1: cannot open shared object file: No such file or directory")
+
+    monkeypatch.setattr(executorch_qnn, "ctypes", SimpleNamespace(CDLL=missing_libcxx))
+    with pytest.raises(
+        ValueError, match=r"cannot load Qualcomm's QNN libraries \(libc\+\+\.so\.1: cannot open"
+    ):
+        executorch_qnn.ExecuTorchQNNConfig(soc="SM8650")
+
+
+@pytest.fixture
+def supported_torch(monkeypatch):
+    """A PyTorch the backends take, so a test reaches the refusal it checks with any PyTorch installed."""
+    monkeypatch.setattr(torch, "__version__", "2.15.0")
+
+
+def test_executorch_qnn_checks_the_pytorch_version_before_importing_executorch(monkeypatch):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    monkeypatch.setitem(sys.modules, "executorch.backends.qualcomm.utils.utils", None)
+    with pytest.raises(ValueError, match="needs PyTorch 2.15 or newer"):
+        ExecuTorchQNNConfig(soc="SM8650")
+
+
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_qnn_refuses_an_executorch_without_its_qnn_backend(monkeypatch):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setitem(sys.modules, "executorch.backends.qualcomm.utils.utils", None)
+    with pytest.raises(ValueError, match="needs ExecuTorch with its QNN backend"):
+        ExecuTorchQNNConfig(soc="SM8650")
+
+
+@pytest.mark.parametrize(
+    ("system", "machine"), [("darwin", "arm64"), ("win32", "AMD64"), ("linux", "aarch64")]
+)
+def test_executorch_qnn_refuses_a_machine_that_has_no_qnn_compiler(system, machine, monkeypatch):
+    from lerobot.export.backends.executorch_qnn import ExecuTorchQNNConfig
+
+    monkeypatch.setattr(sys, "platform", system)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    # Refused before the PyTorch version, since installing another PyTorch would not help.
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    with pytest.raises(ValueError, match="executorch_qnn exports only on Linux x86_64"):
+        ExecuTorchQNNConfig()
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):

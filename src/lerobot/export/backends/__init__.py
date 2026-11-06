@@ -19,6 +19,7 @@ from . import (
     executorch_cuda,
     executorch_mlx,
     executorch_openvino,
+    executorch_qnn,
     executorch_tensorrt,
     executorch_xnnpack,
 )
