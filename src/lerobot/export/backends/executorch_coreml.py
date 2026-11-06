@@ -22,13 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..configs import ExportBackendConfig
-from .executorch import ExecuTorchConfig, lower
+from .executorch import COMPUTE_PRECISIONS, ExecuTorchConfig, lower
 
 if TYPE_CHECKING:
     from torch.export import ExportedProgram
 
 COMPUTE_UNITS = ("all", "cpu_only", "cpu_and_gpu", "cpu_and_ne")
-COMPUTE_PRECISIONS = ("float32", "float16")
 
 
 @ExportBackendConfig.register_subclass("executorch_coreml")

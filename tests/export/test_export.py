@@ -49,6 +49,7 @@ from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 from tests.export.backends import (
     EXECUTORCH_VGF,
+    EXECUTORCH_VULKAN,
     GPU_BACKENDS,
     needs_executorch,
     needs_executorch_coreml,
@@ -58,6 +59,7 @@ from tests.export.backends import (
     needs_executorch_qnn_compiler,
     needs_executorch_tensorrt,
     needs_executorch_vgf,
+    needs_executorch_vulkan,
 )
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
@@ -1142,8 +1144,8 @@ def test_an_executorch_part_runs_at_export_the_way_a_bundle_loads_it(tmp_path):
     subprocess.run([sys.executable, "-c", RUN_PART, str(tmp_path)], check=True, timeout=300)
 
 
-def _runs_like_pytorch(config, delegate: bytes, tolerance: float, tmp_path) -> None:
-    """Compile a small model with `config`, then run it as a bundle does and compare with PyTorch."""
+def _runs_like_pytorch(config, delegate: bytes, tolerance: float, tmp_path) -> float:
+    """Compile a small model with `config`, run it as a bundle does, and return how far it is from PyTorch."""
     from lerobot.bundle.executorch import ExecuTorchProgram
 
     torch.manual_seed(0)
@@ -1154,8 +1156,9 @@ def _runs_like_pytorch(config, delegate: bytes, tolerance: float, tmp_path) -> N
     assert delegate in path.read_bytes()
     program = ExecuTorchProgram(path)
     (actual,) = program(x.numpy())
-    expected = model(x).detach().numpy()
-    np.testing.assert_allclose(program.to_numpy(actual), expected, rtol=tolerance, atol=tolerance)
+    actual, expected = program.to_numpy(actual), model(x).detach().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+    return float(np.abs(actual - expected).max())
 
 
 @needs_executorch_openvino
@@ -1401,6 +1404,86 @@ def test_executorch_vgf_lowers_bfloat16_parts_only_when_asked(bfloat16, tmp_path
     (actual,) = Runtime.get().load_program(path).load_method("forward").execute([x])
     # ExecuTorch's own tensor, since the tests load ExecuTorch as a bundle does (see conftest.py).
     torch.testing.assert_close(torch.from_dlpack(actual), expected, rtol=2e-2, atol=2e-2)
+
+
+def test_executorch_vulkan_refuses_an_unknown_compute_precision(monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    # Refused before the PyTorch version, since installing another PyTorch would not help.
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    with pytest.raises(ValueError, match="--backend.compute_precision must be one of"):
+        ExecuTorchVulkanConfig(compute_precision="int8")
+
+
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vulkan_refuses_an_executorch_that_cannot_run_it(monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    # Not the real runtime, so the backend is missing on any machine.
+    registry = SimpleNamespace(is_available=lambda name: False)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", runtime)
+    with pytest.raises(ValueError, match="executorch_vulkan needs ExecuTorch built with its Vulkan backend"):
+        ExecuTorchVulkanConfig()
+
+
+@pytest.mark.usefixtures("supported_torch")
+def test_executorch_vulkan_refuses_a_machine_without_executorch(monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    monkeypatch.setitem(sys.modules, "executorch.runtime", None)
+    with pytest.raises(ValueError, match="executorch_vulkan cannot import ExecuTorch's runtime"):
+        ExecuTorchVulkanConfig()
+
+
+def test_executorch_vulkan_checks_the_pytorch_version_before_importing_executorch(monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    monkeypatch.setattr(torch, "__version__", "2.14.0")
+    monkeypatch.setitem(sys.modules, "executorch.runtime", None)
+    with pytest.raises(ValueError, match="needs PyTorch 2.15 or newer"):
+        ExecuTorchVulkanConfig()
+
+
+@needs_executorch
+@pytest.mark.skipif(EXECUTORCH_VULKAN, reason="this ExecuTorch runs Vulkan programs")
+def test_executorch_vulkan_refuses_an_installed_executorch_that_cannot_run_it():
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    with pytest.raises(ValueError, match="executorch_vulkan needs ExecuTorch built with its Vulkan backend"):
+        ExecuTorchVulkanConfig()
+
+
+@needs_executorch
+def test_executorch_vulkan_lowers_to_float16_only_when_asked(tmp_path, monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    # Not the real runtime: ExecuTorch's package lowers to Vulkan but cannot run the programs.
+    registry = SimpleNamespace(is_available=lambda name: True)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "executorch.runtime", runtime)
+        configs = {p: ExecuTorchVulkanConfig(compute_precision=p) for p in ("float32", "float16")}
+    program = torch.export.export(torch.nn.Linear(64, 64).eval(), (torch.randn(1, 64),))
+    compiled = {}
+    for precision, config in configs.items():
+        config.compile(program, tmp_path / f"{precision}.pte")
+        compiled[precision] = (tmp_path / f"{precision}.pte").read_bytes()
+    assert all(b"VulkanBackend" in data for data in compiled.values())
+    # The weights take most of the program, and in float16 half the bytes.
+    assert len(compiled["float16"]) < 0.75 * len(compiled["float32"])
+
+
+@needs_executorch_vulkan
+@pytest.mark.parametrize(("compute_precision", "tolerance"), [("float32", 1e-5), ("float16", 1e-2)])
+def test_executorch_vulkan_compiles_a_program_that_vulkan_runs(compute_precision, tolerance, tmp_path):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    config = ExecuTorchVulkanConfig(compute_precision=compute_precision)
+    difference = _runs_like_pytorch(config, b"VulkanBackend", tolerance, tmp_path)
+    if compute_precision == "float16":
+        # float16 rounds these values by 3.7e-4 (measured), more than a float32 program may differ by.
+        assert difference > 3e-5
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):
