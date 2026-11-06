@@ -48,7 +48,7 @@ The extra brings ExecuTorch 1.6, the runtime that loads the compiled programs, a
 - **Running a bundle never imports PyTorch.** `lerobot-rollout --bundle.path=<folder>` keeps that memory for the policy. PyTorch 2.15 is still installed, because ExecuTorch 1.6 depends on it, so run bundles from the export environment, or from one installed the same way.
 - `executorch_tensorrt` needs a Torch-TensorRT that has [pytorch/TensorRT#4953](https://github.com/pytorch/TensorRT/pull/4953), such as Torch-TensorRT 2.15. Its `fallback_pytorch_plugin_ops` setting keeps an operation out of TensorRT when TensorRT would run it with a plugin that needs PyTorch, which a bundle does not load.
 - `executorch_tensorrt` keeps one copy of each weight in host memory while TensorRT builds, instead of one for every layer that reads it transposed, with Torch-TensorRT's `deduplicate_weights` setting from [pytorch/TensorRT#4965](https://github.com/pytorch/TensorRT/pull/4965).
-- A policy that starts from a random noise, such as pi0.5, SmolVLA or GR00T, draws that noise in a small program on the GPU. pytorch/TensorRT#4953 is also what lets `executorch_tensorrt` save that program.
+- On a CUDA device, a policy that starts from a random noise, such as pi0.5, SmolVLA or GR00T, draws that noise in a small program on the GPU. pytorch/TensorRT#4953 is also what lets `executorch_tensorrt` save that program.
 - TensorRT builds an **engine** (its compiled form of the model) for one GPU model, and the engine runs only on that model. So export on the same kind of board that will run the policy.
 - `executorch_tensorrt` runs any operation TensorRT cannot take on ExecuTorch's CUDA backend, so the whole program stays on the GPU. That backend compiles code at export, so for both `executorch_tensorrt` and `executorch_cuda` the export machine needs the CUDA compiler `nvcc`. JetPack and the CUDA toolkit have it in `/usr/local/cuda/bin`. Without them, install it from PyPI and point `CUDA_HOME` at it:
 
@@ -74,7 +74,7 @@ lerobot-export \
     --backend.type=executorch_tensorrt
 ```
 
-The export runs in three steps, each in its own process:
+The export runs in three steps, in separate processes:
 
 1. It **traces** the policy: it runs the policy once and records every math operation into a graph.
 2. It **compiles** that graph for the backend.
@@ -257,7 +257,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot
 
 - `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
-- For a policy that starts from random noise, on a GPU backend the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
+- For a policy that starts from random noise, on a CUDA device (`executorch_cuda`, `executorch_tensorrt`) the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
 - The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history`, `carry` and `first_runs` are for policies that read past frames or keep values between chunks (see [Past frames](#past-frames) and [Values kept between chunks](#values-kept-between-chunks)). `task_tokens` and `action_tokens` name the files that turn a task into vectors and tokens into actions (see [Tasks](#tasks) and [Actions written as tokens](#actions-written-as-tokens)).
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too.
@@ -298,7 +298,7 @@ The `step` is one program file that runs ten times, each time with a different t
 Two things let a board with 8 GB build such a policy:
 
 - The recipe loads only the weights of the part it is tracing, then frees them.
-- Each part is compiled in a process of its own, and the memory goes back to the system when that process ends.
+- Each program is compiled in a process of its own, and the memory goes back to the system when that process ends.
 
 The pi0, pi0.5 and GR00T recipes read each part's weights from the checkpoint's `model.safetensors`, so they refuse a checkpoint that holds only a PEFT adapter. Merge the adapter into its base policy first, then export the merged folder:
 
@@ -359,7 +359,7 @@ Change the task with `--task` when you start `lerobot-rollout --bundle.path=<fol
 
 ### PyTorch at export and at run time
 
-- The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the trace and compile processes, which give their memory back when they end.
+- The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the processes that trace the policy, compile each program and check a part on its own. They give their memory back when they end.
 - `lerobot-rollout --bundle.path=<folder>` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads cameras, and a robot or runtime plugin only when the command or the bundle names a robot or runtime no loaded package has, since a plugin may import PyTorch.
 
 ## FP8 with `--quantize=fp8`

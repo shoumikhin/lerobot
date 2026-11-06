@@ -447,7 +447,8 @@ class PaliGemmaChainRecipe(ExportRecipe):
         refuse_peft_adapter(policy_config, self.policy_name)
         self._device = torch.device(cfg.backend.device)
         policy_config.device = cfg.backend.device
-        # How the policy runs, not how it trained, decides what compiles it.
+        # A checkpoint can save torch.compile on; the export traces the policy's own code and compiles it
+        # with its backend.
         policy_config.compile_model = False
         self._policy_config = policy_config
         self._model_file = Path(

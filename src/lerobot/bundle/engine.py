@@ -100,7 +100,7 @@ class BundleEngine:
         constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
         chunks = [*manifest.first_runs, manifest.runs]
-        # A GPU bundle draws its noise in a run of its own; otherwise the engine draws it on the host.
+        # The engine draws the noise on the host only if no run draws it, as one does on a CUDA device.
         self._host_noise_shape = (
             None if any(NOISE in run.outputs for runs in chunks for run in runs) else manifest.noise_shape
         )

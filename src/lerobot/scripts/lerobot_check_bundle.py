@@ -17,7 +17,7 @@
 It loads the programs and replays the test case as `lerobot-rollout` does before the robot moves, and exits
 with an error if the actions differ by more than the bundle's tolerance. Like every installed command, it does
 not look for modules in the current folder, so a .py file shipped with a bundle does not load even when the
-command starts inside the bundle's folder.
+command starts inside the bundle's folder, unless PYTHONPATH names that folder, as an empty entry does.
 """
 
 import sys

@@ -291,10 +291,10 @@ def relative_errors(outputs: Sequence[Tensor], expected: Sequence[Tensor]) -> li
     """For each output, how far it is from `expected`, as two ratios.
 
     The largest absolute difference over the largest absolute value of `expected`, and the mean absolute
-    difference over the mean absolute value. An output that is not floating point counts as infinitely far
-    unless it is equal. Where both hold the same infinity, such as an additive mask, they are equal, and the
-    infinities of `expected` count as 0 in its size. Any other infinity or NaN makes the output infinitely
-    far.
+    difference over the mean absolute value. An output of another shape than `expected` counts as infinitely
+    far. Where `expected` is not floating point, the output counts as infinitely far unless it is equal. Where
+    both hold the same infinity, such as an additive mask, they are equal, and the infinities of `expected`
+    count as 0 in its size. Any other infinity or NaN makes the output infinitely far.
     """
     errors = []
     for output, reference in zip(outputs, expected, strict=True):
@@ -605,7 +605,8 @@ class ActionChunkRecipe(ExportRecipe):
 
     **Attributes**:
         - **exact** (`bool`) -- Whether the program must compute, in PyTorch, the actions lerobot-rollout plays
-          bit for bit, both with TF32 off as the export runs. A recipe whose program computes them in another
+          bit for bit, both with TF32 off as the export runs (rollout turns TF32 on by default, which moves a
+          float32 policy's actions on a GPU a little). A recipe whose program computes them in another
           order, for example over a prompt padded to a fixed length, sets it to False, and the program is held
           to the export's tolerance instead.
     """
@@ -740,8 +741,6 @@ class ActionChunkRecipe(ExportRecipe):
         return export_task(self.cfg, self._metadata, self.policy.config.type)
 
     def _reads_task(self, frame: dict[str, np.ndarray]) -> bool:
-        # Not inference_mode: tensors the processors cache here end up in the program, and a compiler
-        # cannot take inference tensors.
         with torch.no_grad():
             first, second = (self.preprocessor(self._observation(frame, task)) for task in _PROBE_TASKS)
         return any(
@@ -1269,10 +1268,12 @@ def load_policy(
 
     config = cast(PreTrainedConfig, cfg.policy)
     config.device = cfg.backend.device
-    # How the policy runs, not how it trained, decides what compiles it.
+    # A checkpoint can save torch.compile on; the export traces the policy's own code and compiles it with
+    # its backend.
     if hasattr(config, "compile_model"):
         config.compile_model = False
-    # Built on the device, so the checkpoint is copied there once and its weights are never on the CPU as well.
+    # Built on the device, so the weights are copied there once from the checkpoint, with no second copy of
+    # the model on the CPU.
     with torch.device(cfg.backend.device):
         # Strict: a weight the checkpoint does not fill would stay random, and no later check could tell.
         policy = load_pretrained_policy(config, strict=True)

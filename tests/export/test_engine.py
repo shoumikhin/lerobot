@@ -225,7 +225,7 @@ class DrawNoise(nn.Module):
 
 
 def _draw_noise_in_a_run(bundle: Bundle, draw: nn.Module, inputs: tuple[str, ...] = ()) -> None:
-    """Make the bundle draw its noise with `draw` in a run of its own, as a GPU bundle does."""
+    """Make the bundle draw its noise with `draw` in a run of its own, as a bundle on a CUDA device does."""
     torch.export.save(torch.export.export(draw, ()), bundle.path / "noise.pt2")
     manifest = json.loads((bundle.path / MANIFEST).read_text())
     _edit(
@@ -239,7 +239,7 @@ def _draw_noise_in_a_run(bundle: Bundle, draw: nn.Module, inputs: tuple[str, ...
 
 
 def test_engine_runs_the_noise_draw_and_checks_with_the_recorded_noise(tmp_path, monkeypatch):
-    """A GPU bundle draws its noise in a run: a chunk then copies only the frame."""
+    """A bundle on a CUDA device draws its noise in a run: a chunk then copies only the frame."""
     bundle = _noisy_bundle(tmp_path / "bundle")
     _draw_noise_in_a_run(bundle, DrawNoise())
     placed = record_places(monkeypatch)
