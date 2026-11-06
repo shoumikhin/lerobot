@@ -852,26 +852,40 @@ def test_a_program_check_lets_arithmetic_that_no_rerun_moves_round_by_a_step():
 
 
 class _Masked(torch.nn.Module):
-    """A bfloat16 layer whose outputs an additive mask sets to minus infinity in places, as in attention."""
+    """A bfloat16 layer whose outputs an additive mask sets to `mask` in places, as in attention, or to the
+    smallest value of the dtype it computes in when `mask` is None."""
 
-    def __init__(self):
+    def __init__(self, mask: float | None = float("-inf")):
         super().__init__()
         self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+        self.mask = mask
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.linear(x).masked_fill(torch.arange(64) % 4 == 0, float("-inf"))
+        y = self.linear(x)
+        mask = torch.finfo(y.dtype).min if self.mask is None else self.mask
+        return y.masked_fill(torch.arange(64) % 4 == 0, mask)
 
 
-def test_a_program_check_holds_an_output_with_infinities_to_its_rounding():
+# Hugging Face's eager attention builds its mask with the smallest value of the dtype it computes in, so the
+# float32 rerun holds another one than bfloat16.
+@pytest.mark.parametrize(
+    "mask", [float("-inf"), torch.finfo(torch.bfloat16).min, None], ids=["inf", "finfo-min", "dtype-min"]
+)
+def test_a_program_check_holds_an_output_with_infinities_to_its_rounding(mask):
     torch.manual_seed(0)
-    check = ProgramCheck.measure(_Masked(), (torch.randn(8, 64, dtype=torch.bfloat16),))
+    check = ProgramCheck.measure(_Masked(mask), (torch.randn(8, 64, dtype=torch.bfloat16),))
     assert np.isfinite(check.floor).all()
     (scores,) = check.outputs
     assert check.failures("scores", (scores.clone(),)) == []
-    # The masked values stay minus infinity, and the others are far off.
+    # The masked values stay masked, and the others are far off.
     (failure,) = check.failures("scores", (scores + 100,))
     assert failure.startswith("scores output 0")
-    (failure,) = check.failures("scores", (scores.nan_to_num(neginf=0.0),))
+    (failure,) = check.failures("scores", (scores.masked_fill(torch.arange(64) % 4 == 0, 0.0),))
+    assert failure.startswith("scores output 0")
+    # One value off is too little to move the mean past rounding, so only the largest difference refuses it.
+    wrong = scores.clone()
+    wrong[0, 1] += 0.5
+    (failure,) = check.failures("scores", (wrong,))
     assert failure.startswith("scores output 0")
 
 

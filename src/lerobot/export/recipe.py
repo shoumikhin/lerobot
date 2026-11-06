@@ -274,9 +274,10 @@ def relative_errors(outputs: Sequence[Tensor], expected: Sequence[Tensor]) -> li
 
     The largest absolute difference over the largest absolute value of `expected`, and the mean absolute
     difference over the mean absolute value. An output that is not floating point counts as infinitely far
-    unless it is equal. Where both hold the same infinity, such as an additive mask, they are equal, and the
-    infinities of `expected` count as 0 in its size. Any other infinity or NaN makes the output infinitely
-    far.
+    unless it is equal. Values of `expected` at or past the largest magnitude its dtype holds, such as an additive
+    mask built with minus infinity or with the dtype's smallest value, count as 0 in its size, and an output value
+    at or past that magnitude with the same sign matches them. Any other infinity or NaN makes the output
+    infinitely far.
     """
     errors = []
     for output, reference in zip(outputs, expected, strict=True):
@@ -286,9 +287,15 @@ def relative_errors(outputs: Sequence[Tensor], expected: Sequence[Tensor]) -> li
         elif not reference.is_floating_point():
             errors.append((0.0, 0.0) if torch.equal(output, reference) else (float("inf"), float("inf")))
         else:
+            largest = torch.finfo(reference.dtype).max
             output, reference = output.double(), reference.double()
-            difference = (output - reference).abs().masked_fill(output == reference, 0)
-            magnitude = reference.abs().masked_fill(~reference.isfinite(), 0)
+            # A mask built with each dtype's own smallest value is larger in a float32 rerun than in bfloat16.
+            masked = (
+                (reference.abs() >= largest) & (output.abs() >= largest) & (output.sign() == reference.sign())
+            )
+            difference = (output - reference).abs().masked_fill((output == reference) | masked, 0)
+            # Not `>=`: a NaN must count as 0 too.
+            magnitude = reference.abs().masked_fill(~(reference.abs() < largest), 0)
             errors.append(
                 (
                     _ratio(difference.max(), magnitude.max()) if difference.numel() else 0.0,
