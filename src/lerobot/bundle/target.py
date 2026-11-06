@@ -93,7 +93,10 @@ def cuda_gpus() -> list[tuple[str, str]]:
 
 
 def check_target(target: Target | None) -> None:
-    """Refuse a bundle built for a device this machine does not have. `None` runs anywhere."""
+    """Refuse a bundle built for a device this machine does not have.
+
+    A bundle that records no device (`None`) is not checked.
+    """
     if target is None:
         return
     if target.device != "cuda":
