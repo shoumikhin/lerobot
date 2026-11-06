@@ -439,6 +439,27 @@ def test_recipe_does_not_ask_the_dataset_for_empty_camera_slots():
         assert frame_shapes(features) == {IMAGE: (32, 32, 3), OBS_STATE: (3,)}, given
 
 
+def test_recipe_follows_renames_in_the_order_the_preprocessor_makes_them():
+    from lerobot.export.recipe import preprocessor_renames
+    from lerobot.processor import RenameObservationsProcessorStep
+
+    first, middle = f"{OBS_IMAGES}.cam", f"{OBS_IMAGES}.camera"
+    steps = [
+        RenameObservationsProcessorStep(rename_map={first: middle, "observation.joints": OBS_STATE}),
+        RenameObservationsProcessorStep(rename_map={middle: IMAGE}),
+    ]
+    renames = preprocessor_renames(SimpleNamespace(steps=steps))
+    assert renames == {first: IMAGE, "observation.joints": OBS_STATE, middle: IMAGE}
+    metadata = SimpleNamespace(
+        features={
+            first: {"dtype": "video", "shape": (32, 32, 3), "names": ["height", "width", "channels"]},
+            "observation.joints": {"dtype": "float32", "shape": (3,), "names": None},
+        }
+    )
+    features = robot_features(act_config(), SimpleNamespace(steps=steps), metadata)
+    assert sorted(features) == [first, "observation.joints"]
+
+
 def test_recipe_refuses_a_depth_map_the_dataset_marks():
     depth = f"{OBS_IMAGES}.front_depth"
     config = act_config()
