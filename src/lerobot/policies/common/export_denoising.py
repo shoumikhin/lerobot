@@ -39,7 +39,7 @@ import torch
 from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, ProgramRun
-from lerobot.export.recipe import Part, RunPlan
+from lerobot.export.recipe import Part, RunPlan, repeated_runs
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import _diffusers_available, require_package
@@ -197,38 +197,29 @@ class DenoisingRecipe(HistoryChunkRecipe):
         with torch.no_grad():
             conditioning, sample = encoder(*inputs)
         frame_names = list(self._features)
-        count = len(schedule.timesteps)
-        x_names = [f"x_{i}" for i in range(count + 1)]
-        self._runs = [
-            ProgramRun("encoder", "encoder", [*frame_names, NOISE], ["conditioning", x_names[0]]),
-            *(
-                ProgramRun(
-                    f"step_{i}", "step", self._step_inputs(schedule, x_names[i], f"_{i}"), [x_names[i + 1]]
-                )
-                for i in range(count)
-            ),
-            ProgramRun("actions", "actions", [x_names[-1]], [ACTION]),
+        step_names = ["x", "conditioning", "timestep", "coefficients"]
+        step_constants = [
+            {"timestep": timestep, "coefficients": coefficients}
+            for timestep, coefficients in zip(schedule.timesteps, schedule.coefficients, strict=True)
         ]
-        yield Part("encoder", encoder, inputs, [*frame_names, NOISE], ["conditioning", x_names[0]])
+        if schedule.noise_index is not None:
+            step_names += [NOISE, "noise_index"]
+            for row, index in zip(step_constants, schedule.noise_index, strict=True):
+                row["noise_index"] = np.array([index], np.int64)
+        step_runs, self._constants = repeated_runs("step", step_names, ["x"], step_constants)
+        self._runs = [
+            ProgramRun("encoder", "encoder", [*frame_names, NOISE], ["conditioning", "x"]),
+            *step_runs,
+            ProgramRun("actions", "actions", ["x"], [ACTION]),
+        ]
+        yield Part("encoder", encoder, inputs, [*frame_names, NOISE], ["conditioning", "x"])
         step_inputs = (sample, conditioning, *self._step_values(schedule, 0, inputs[-1]))
-        yield Part("step", step, step_inputs, self._step_inputs(schedule, "x_t", ""), ["x_next"])
-        yield Part("actions", actions, (sample,), [x_names[-1]], [ACTION])
+        yield Part("step", step, step_inputs, step_names, ["x"])
+        yield Part("actions", actions, (sample,), ["x"], [ACTION])
 
     def plan(self) -> RunPlan:
         """The encoder, the step once per denoising step with its constants, and the actions."""
-        schedule = self._schedule()
-        constants: dict[str, np.ndarray] = {}
-        for i in range(len(schedule.timesteps)):
-            constants[f"timestep_{i}"] = schedule.timesteps[i]
-            constants[f"coefficients_{i}"] = schedule.coefficients[i]
-            if schedule.noise_index is not None:
-                constants[f"noise_index_{i}"] = np.array([schedule.noise_index[i]], np.int64)
-        return RunPlan(runs=self._runs, constants=constants, history=self._history())
-
-    def _step_inputs(self, schedule: Schedule, x: str, suffix: str) -> list[str]:
-        """The step's input names: the sample `x`, then the conditioning and its constants named with `suffix`."""
-        names = [x, "conditioning", f"timestep{suffix}", f"coefficients{suffix}"]
-        return [*names, NOISE, f"noise_index{suffix}"] if schedule.noise_index is not None else names
+        return RunPlan(runs=self._runs, constants=self._constants, history=self._history())
 
     def _step_values(self, schedule: Schedule, i: int, noise: Tensor) -> tuple[Tensor, ...]:
         """What run `i` of the step takes after the sample and the conditioning."""
