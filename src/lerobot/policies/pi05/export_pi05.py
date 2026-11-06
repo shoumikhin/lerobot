@@ -63,6 +63,7 @@ from lerobot.export.recipe import (
     preprocessor_renames,
     random_frame,
     refuse_peft_adapter,
+    repeated_runs,
     robot_features,
     split_absolute_step,
     to_policy_input,
@@ -482,6 +483,7 @@ class PaliGemmaChainRecipe(ExportRecipe):
         # The schedule of `euler_integrate`.
         self._timesteps = [1.0 + step * self._dt for step in range(policy_config.num_inference_steps)]
         self._runs: list[ProgramRun] = []
+        self._constants: dict[str, np.ndarray] = {}
         self._actions: np.ndarray | None = None
 
     def parts(self) -> Iterator[Part]:
@@ -546,12 +548,11 @@ class PaliGemmaChainRecipe(ExportRecipe):
             for timestep in self._timesteps:
                 x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
         step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
-        yield Part("step", step, step_inputs, [*cache_names, "x_t", "timestep"], ["x_next"])
-        x_names = [NOISE, *(f"x_{i + 1}" for i in range(len(self._timesteps)))]
-        self._runs += [
-            ProgramRun(f"step_{i}", "step", [*cache_names, x_names[i], f"timestep_{i}"], [x_names[i + 1]])
-            for i in range(len(self._timesteps))
-        ]
+        step_names = [*cache_names, "x", "timestep"]
+        yield Part("step", step, step_inputs, step_names, ["x"])
+        timesteps = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
+        step_runs, self._constants = repeated_runs("step", step_names, ["x"], timesteps, start={"x": NOISE})
+        self._runs += step_runs
         del step, step_inputs, cache, cache_inputs, step_extra
 
         actions = PI05Actions(
@@ -561,7 +562,7 @@ class PaliGemmaChainRecipe(ExportRecipe):
         )
         state = torch.from_numpy(self._frame[self._state_name]).to(self._device)
         action_inputs: tuple[Tensor, ...] = (x_t, state)
-        action_names = [x_names[-1], self._state_name]
+        action_names = ["x", self._state_name]
         if actions.mask is None:
             # A program takes only the inputs it reads.
             action_inputs, action_names = action_inputs[:1], action_names[:1]
@@ -588,10 +589,7 @@ class PaliGemmaChainRecipe(ExportRecipe):
 
     def plan(self) -> RunPlan:
         """The parts in order with the step run once per timestep, and the timesteps."""
-        return RunPlan(
-            runs=self._runs,
-            constants={f"timestep_{i}": np.array([t], np.float32) for i, t in enumerate(self._timesteps)},
-        )
+        return RunPlan(runs=self._runs, constants=self._constants)
 
     @abc.abstractmethod
     def _embed(
