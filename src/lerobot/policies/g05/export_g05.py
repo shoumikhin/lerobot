@@ -44,6 +44,7 @@ from lerobot.export.recipe import (
     export_task,
     measure_action_scale,
     random_frame,
+    repeated_runs,
     robot_features,
     to_policy_input,
 )
@@ -279,6 +280,7 @@ class G05ExportRecipe(ExportRecipe):
             timestep = timestep - self._delta
         self._sequence, self._dim_mask, self._grids = self._prompt()
         self._runs: list[ProgramRun] = []
+        self._constants: dict[str, np.ndarray] = {}
         self._actions: np.ndarray | None = None
 
     def _prompt(self) -> tuple[dict[str, Tensor], Tensor | None, dict[str, Qwen3VisionGrid]]:
@@ -356,17 +358,18 @@ class G05ExportRecipe(ExportRecipe):
             for timestep in self._timesteps:
                 x_t = step(*cache, x_t, timestep.to(self._device))
         step_inputs = (*cache, self._noise.to(self._device), self._timesteps[0].to(self._device))
-        yield Part("step", step, step_inputs, [*cache_names, "x_t", "timestep"], ["x_next"])
-        x_names = [NOISE, *(f"x_{i + 1}" for i in range(len(self._timesteps)))]
-        self._runs += [
-            ProgramRun(f"step_{i}", "step", [*cache_names, x_names[i], f"timestep_{i}"], [x_names[i + 1]])
-            for i in range(len(self._timesteps))
-        ]
+        step_names = [*cache_names, "x", "timestep"]
+        yield Part("step", step, step_inputs, step_names, ["x"])
+        step_constants = [{"timestep": t.numpy().astype(np.float32)} for t in self._timesteps]
+        step_runs, self._constants = repeated_runs(
+            "step", step_names, ["x"], step_constants, start={"x": NOISE}
+        )
+        self._runs += step_runs
 
         actions = G05Actions(self.postprocessor, self._steps)
         with torch.no_grad():
             self._actions = actions(x_t).cpu().numpy()
-        yield self._part("actions", actions, (x_t,), [x_names[-1]], ["action"])
+        yield self._part("actions", actions, (x_t,), ["x"], ["action"])
 
     def test_case(self) -> TestCase:
         """The random frame and noise, and the actions the parts compute for them, checked against the policy."""
@@ -386,10 +389,7 @@ class G05ExportRecipe(ExportRecipe):
 
     def plan(self) -> RunPlan:
         """The parts in order with the step run once per timestep, and the timesteps."""
-        return RunPlan(
-            runs=self._runs,
-            constants={f"timestep_{i}": t.numpy().astype(np.float32) for i, t in enumerate(self._timesteps)},
-        )
+        return RunPlan(runs=self._runs, constants=self._constants)
 
     def _part(
         self,
