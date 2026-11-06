@@ -146,6 +146,12 @@ needs_executorch_vgf = pytest.mark.skipif(
 )
 
 
+# ExecuTorch's packages compile Vulkan programs but cannot run them: that needs ExecuTorch built with Vulkan.
+needs_executorch_vulkan = pytest.mark.skipif(
+    not (EXECUTORCH and "VulkanBackend" in _backends_that_run()),
+    reason=f"needs ExecuTorch 1.6 built with Vulkan, PyTorch 2.15 and a Vulkan device ({INSTALLED})",
+)
+
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
 # OpenVINO does not run these policies yet (pytorch/executorch#24325).
 BACKENDS = {

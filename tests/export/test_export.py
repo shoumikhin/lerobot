@@ -55,6 +55,7 @@ from tests.export.backends import (
     needs_executorch_qnn,
     needs_executorch_tensorrt,
     needs_executorch_vgf,
+    needs_executorch_vulkan,
 )
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
@@ -1195,6 +1196,24 @@ def test_executorch_vgf_compiles_a_program_that_vulkan_runs(tmp_path):
     from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
 
     _runs_like_pytorch(ExecuTorchVGFConfig(), b"VgfBackend", 1e-5, tmp_path)
+
+
+def test_executorch_vulkan_refuses_an_executorch_that_cannot_run_it(monkeypatch):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    # Not the real runtime: its bindings read once, when they load, which result type they return.
+    registry = SimpleNamespace(is_available=lambda name: False)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    monkeypatch.setitem(sys.modules, "executorch.runtime", runtime)
+    with pytest.raises(ValueError, match="executorch_vulkan needs ExecuTorch built with its Vulkan backend"):
+        ExecuTorchVulkanConfig()
+
+
+@needs_executorch_vulkan
+def test_executorch_vulkan_compiles_a_program_that_vulkan_runs(tmp_path):
+    from lerobot.export.backends.executorch_vulkan import ExecuTorchVulkanConfig
+
+    _runs_like_pytorch(ExecuTorchVulkanConfig(), b"VulkanBackend", 1e-5, tmp_path)
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):
