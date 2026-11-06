@@ -104,6 +104,20 @@ class TwoNoisesACT(ACTPolicy):
         return super().predict_action_chunk(batch) + torch.randn(1, 4, 1) + torch.randn(1, 4, 1)
 
 
+def test_a_part_run_once_per_step_passes_its_value_on_and_reads_each_steps_constants():
+    from lerobot.bundle.manifest import ProgramRun
+    from lerobot.export.recipe import repeated_runs
+
+    steps = [{"timestep": np.array([1.0], np.float32)}, {"timestep": np.array([0.5], np.float32)}]
+    runs, constants = repeated_runs("step", ["cache", "x", "timestep"], ["x"], steps, start={"x": "noise"})
+    assert runs == [
+        ProgramRun("step_0", "step", ["cache", "noise", "timestep_0"], ["x"]),
+        ProgramRun("step_1", "step", ["cache", "x", "timestep_1"], ["x"]),
+    ]
+    assert list(constants) == ["timestep_0", "timestep_1"]
+    np.testing.assert_array_equal(constants["timestep_1"], [0.5])
+
+
 def test_recipe_measures_the_action_scale_from_the_postprocessor():
     np.testing.assert_allclose(make().test_case().action_scale, [30.0, 3.0, 0.3], rtol=1e-6)
 
