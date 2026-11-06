@@ -35,3 +35,22 @@ def test_the_install_command_names_the_package_of_each_module_a_bundle_imports(n
     backend = BACKENDS[name]
     installed = {Requirement(package).name for package in backend.packages}
     assert {module.replace("_", "-") for module in backend.runtime_imports} <= installed
+
+
+def test_a_pytorch_without_installed_metadata_still_gets_the_version_refusal(monkeypatch):
+    """A PyTorch built from source and used where it was built has no metadata, but has a version."""
+    import importlib.metadata
+
+    import torch
+
+    def no_metadata(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    # XNNPACK, since its config builds on every platform.
+    backend = BACKENDS["executorch_xnnpack"]
+    monkeypatch.setattr(importlib.metadata, "version", no_metadata)
+    monkeypatch.setattr(torch, "__version__", "2.7.0")
+    with pytest.raises(
+        ValueError, match="needs PyTorch .* or newer to export, but PyTorch 2.7.0 is installed"
+    ):
+        backend().check_torch()

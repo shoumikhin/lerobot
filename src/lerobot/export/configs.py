@@ -104,7 +104,13 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         """Refuse a PyTorch older than `min_torch` before anything is traced, and say how to export."""
         if self.min_torch is None:
             return
-        installed = importlib.metadata.version("torch")
+        try:
+            installed = importlib.metadata.version("torch")
+        except importlib.metadata.PackageNotFoundError:
+            # A PyTorch built from source and used where it was built has no installed metadata.
+            import torch
+
+            installed = torch.__version__
         if Version(installed).release >= Version(self.min_torch).release:
             return
         message = (
