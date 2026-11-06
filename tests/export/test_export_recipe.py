@@ -207,6 +207,13 @@ def test_a_part_refuses_one_tensor_for_two_inputs():
     Part("p", torch.nn.Identity(), tuple(torch.zeros(2, 2).unbind(0)), ["a", "b"], ["y"])
 
 
+def test_a_part_refuses_inputs_without_one_name_each():
+    from lerobot.export.recipe import Part
+
+    with pytest.raises(ValueError, match=r"different number of input names \(1\) and example inputs \(2\)"):
+        Part("p", torch.nn.Identity(), (torch.zeros(2), torch.ones(2)), ["a"], ["y"])
+
+
 def test_recipe_asks_the_policy_for_its_noise_shape():
     recipe = make(NoisyACT)
     assert recipe.test_case().noise.shape == (4, 5)
