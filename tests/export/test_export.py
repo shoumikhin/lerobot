@@ -799,12 +799,18 @@ def test_a_bundle_keeps_no_absolute_path(tmp_path):
     }
 
 
-def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(tmp_path):
-    """safetensors writes an array's memory in order, and its save_file makes files only the owner reads."""
+def test_a_bundle_keeps_arrays_that_are_not_contiguous_or_0d_in_files_others_can_read(tmp_path):
+    """safetensors writes an array's memory in order, and its save_file makes files only the owner reads.
+
+    A 0-d array keeps its shape.
+    """
     from lerobot.export.bundle import write_bundle
 
-    frame = {OBS_STATE: np.arange(6, dtype=np.float32).reshape(2, 3).T}
-    constants = {"table": np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]}
+    frame = {OBS_STATE: np.arange(6, dtype=np.float32).reshape(2, 3).T, "scalar": np.array(0.5, np.float32)}
+    constants = {
+        "table": np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2],
+        "step": np.array(3, np.int64),
+    }
     manifest = SimpleNamespace(
         test_case="test.safetensors", constants="constants.safetensors", task_tokens=None, action_tokens=None
     )
@@ -813,6 +819,8 @@ def test_a_bundle_keeps_arrays_that_are_not_contiguous_in_files_others_can_read(
     write_bundle(SimpleNamespace(path=tmp_path, manifest=manifest), case, config, constants)
     np.testing.assert_array_equal(load_file(tmp_path / "test.safetensors")[OBS_STATE], frame[OBS_STATE])
     np.testing.assert_array_equal(load_file(tmp_path / "constants.safetensors")["table"], constants["table"])
+    assert load_file(tmp_path / "test.safetensors")["scalar"].shape == ()
+    assert load_file(tmp_path / "constants.safetensors")["step"].shape == ()
     (tmp_path / "new").touch()
     usual = stat.S_IMODE((tmp_path / "new").stat().st_mode)
     for name in ("test.safetensors", "constants.safetensors"):
