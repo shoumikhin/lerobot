@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import json
-import os
+import posixpath
 import shutil
 from copy import copy
-from pathlib import Path
+from pathlib import PureWindowsPath
+from typing import Any
 
 import numpy as np
 from huggingface_hub.constants import CONFIG_NAME
@@ -80,12 +81,28 @@ def write_bundle(
         (folder / manifest.task_tokens.known_tasks).write_text(json.dumps(task_tokens.known_tasks))
     if manifest.action_tokens is not None and action_tokens is not None:
         (folder / manifest.action_tokens.tokenizer).write_text(action_tokens.tokenizer, encoding="utf-8")
-    # Without the exporter's checkpoint path or another local path, such as a local copy of a model, which can
-    # name its user. Running a bundle reads none of them; a local copy keeps only its folder's name.
+    # Without the exporter's checkpoint path, and with each other absolute path, such as a model's local copy
+    # or a folder of the machine that trained the policy, cut to its last part, since the folders above it can
+    # name a user. Running a bundle reads none of them.
+    # Cut in the saved file, which also holds the configs a config nests, such as a backbone's.
     config = copy(config)
     config.pretrained_path = None
-    for name, value in vars(config).items():
-        if isinstance(value, str | Path) and os.path.isabs(value) and os.path.exists(value):
-            setattr(config, name, type(value)(Path(value).name))
     config.save_pretrained(folder)
-    (folder / CONFIG_NAME).rename(folder / POLICY_CONFIG)
+    saved = json.loads((folder / CONFIG_NAME).read_text())
+    (folder / POLICY_CONFIG).write_text(json.dumps(_without_absolute_paths(saved), indent=4))
+    (folder / CONFIG_NAME).unlink()
+
+
+def _without_absolute_paths(value: Any) -> Any:
+    """`value`, read from JSON, with each string that is an absolute path, at any depth, cut to its last part.
+
+    A path of either system counts, since a checkpoint can be trained on one and exported on the other.
+    """
+    # A root, not `ntpath.isabs`, whose answer for a Windows path without a drive changed in Python 3.13.
+    if isinstance(value, str) and (posixpath.isabs(value) or PureWindowsPath(value).root):
+        return PureWindowsPath(value).name
+    if isinstance(value, list):
+        return [_without_absolute_paths(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _without_absolute_paths(item) for key, item in value.items()}
+    return value
