@@ -176,11 +176,23 @@ class ProgramCheck:
                 (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
             ]
             changes.append((float32 or (lambda: in_float32(module)), wide))
-            floor = [(0.0, 0.0)] * len(outputs)
+            measured = []
             for change, change_inputs in changes:
                 with change():
-                    errors = relative_errors(_call(module, change_inputs), outputs)
-                floor = [(max(a, c), max(b, d)) for (a, b), (c, d) in zip(floor, errors, strict=True)]
+                    measured.append(relative_errors(_call(module, change_inputs), outputs))
+        # The first rerun changes nothing, so it measures what kernels vary between runs: a few rounding steps at
+        # most, unless the part draws random numbers, which every rerun would then fold into the floor.
+        for index, ((again, _), x) in enumerate(zip(measured[0], outputs, strict=True)):
+            # An output that holds NaN is refused below, for that reason.
+            if again > PROGRAM_FLOOR_FACTOR * _step(x) and not x.isnan().any():
+                raise ValueError(
+                    f"Output {index} of the part changes by more than rounding does when it runs again on the "
+                    "same inputs, as when it draws random numbers or keeps dropout on, so a compiled program "
+                    "cannot be checked against it."
+                )
+        floor = [(0.0, 0.0)] * len(outputs)
+        for errors in measured:
+            floor = [(max(a, c), max(b, d)) for (a, b), (c, d) in zip(floor, errors, strict=True)]
         # A compiler may also round the largest value the other way, or contract arithmetic that no rerun moved,
         # such as a multiply and an add into one, by a step.
         floor = [

@@ -832,6 +832,17 @@ def test_a_program_check_keeps_the_inputs_a_part_writes_into():
     assert check.floor[0][1] < torch.finfo(torch.bfloat16).eps
 
 
+def test_a_program_check_refuses_a_part_that_keeps_dropout_on():
+    torch.manual_seed(0)
+    part = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout(0.1)).to(torch.bfloat16)
+    x = torch.randn(8, 64, dtype=torch.bfloat16)
+    with pytest.raises(
+        ValueError, match="Output 0 of the part changes by more than rounding does when it runs"
+    ):
+        ProgramCheck.measure(part.train(), (x,))
+    ProgramCheck.measure(part.eval(), (x,))
+
+
 class _ReturnsItsBuffer(torch.nn.Module):
     """A bfloat16 layer that writes its result into a float32 buffer of its own and returns that buffer."""
 
