@@ -114,10 +114,15 @@ class Part:
     check: ProgramCheck | None = None
 
     def __post_init__(self) -> None:
-        """Refuse one tensor given for two inputs, and keep the example inputs contiguous as a bundle passes them."""
+        """Refuse inputs without one name each or one tensor given for two, and keep the example inputs contiguous."""
+        if len(self.inputs) != len(self.example_inputs):
+            raise ValueError(
+                f"The part {self.name} names {len(self.inputs)} inputs for {len(self.example_inputs)} example "
+                "inputs: give each input one name."
+            )
         # torch.export traces two inputs given the same tensor as one, so the program reads the last for both.
         names: dict[int, str] = {}
-        for name, x in zip(self.inputs, self.example_inputs, strict=False):
+        for name, x in zip(self.inputs, self.example_inputs, strict=True):
             if id(x) in names:
                 raise ValueError(
                     f"The part {self.name} gives one tensor for its inputs {names[id(x)]} and {name}: give each "
