@@ -22,5 +22,6 @@ from . import (
     executorch_qnn,
     executorch_tensorrt,
     executorch_vgf,
+    executorch_vulkan,
     executorch_xnnpack,
 )

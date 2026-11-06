@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from torch.export import ExportedProgram
 
 EXPORT_EXTRA = "lerobot[export]"
+COMPUTE_PRECISIONS = ("float32", "float16")
 
 
 @dataclass

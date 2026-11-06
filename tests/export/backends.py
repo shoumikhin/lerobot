@@ -177,10 +177,18 @@ needs_executorch_vgf = pytest.mark.skipif(
 )
 
 
+# ExecuTorch's packages compile Vulkan programs but cannot run them: that needs ExecuTorch built with Vulkan.
+EXECUTORCH_VULKAN = EXECUTORCH and _backend_runs("VulkanBackend")
+
+needs_executorch_vulkan = pytest.mark.skipif(
+    not EXECUTORCH_VULKAN,
+    reason=f"needs ExecuTorch 1.6 built with Vulkan, PyTorch 2.15 and a Vulkan device ({INSTALLED})",
+)
+
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
-# OpenVINO does not run these policies yet (pytorch/executorch#24325). QNN fails some of them (see the docs),
-# and VGF, through Arm's emulation layer when no Arm GPU is present, runs some too slowly for the rollout
-# test, so test_export.py tests them on a small model.
+# OpenVINO does not run these policies yet (pytorch/executorch#24325). QNN and Vulkan fail some of them (see
+# the docs), and VGF, through Arm's emulation layer when no Arm GPU is present, runs some too slowly for the
+# rollout test, so test_export.py tests the three on a small model.
 BACKENDS = {
     "executorch_xnnpack": needs_executorch,
     "executorch_cuda": needs_executorch_cuda,
