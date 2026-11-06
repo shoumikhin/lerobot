@@ -54,6 +54,7 @@ from tests.export.backends import (
     needs_executorch_openvino,
     needs_executorch_qnn,
     needs_executorch_tensorrt,
+    needs_executorch_vgf,
 )
 from tests.export.plugins import use_plugins
 from tests.export.tiny_act import IMAGE, save_checkpoint
@@ -1167,6 +1168,33 @@ def test_executorch_qnn_refuses_a_machine_that_has_no_qnn_compiler(system, machi
     monkeypatch.setattr(platform, "machine", lambda: machine)
     with pytest.raises(ValueError, match="executorch_qnn exports only on Linux x86_64"):
         ExecuTorchQNNConfig()
+
+
+def test_executorch_vgf_refuses_a_system_whose_executorch_has_no_vgf(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(ValueError, match="executorch_vgf exports only on Linux"):
+        ExecuTorchVGFConfig()
+
+
+def test_executorch_vgf_refuses_an_executorch_that_cannot_run_it(monkeypatch):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    # Not the real runtime: its bindings read once, when they load, which result type they return.
+    registry = SimpleNamespace(is_available=lambda name: False)
+    runtime = SimpleNamespace(Runtime=SimpleNamespace(get=lambda: SimpleNamespace(backend_registry=registry)))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, "executorch.runtime", runtime)
+    with pytest.raises(ValueError, match="executorch_vgf needs a Vulkan device"):
+        ExecuTorchVGFConfig()
+
+
+@needs_executorch_vgf
+def test_executorch_vgf_compiles_a_program_that_vulkan_runs(tmp_path):
+    from lerobot.export.backends.executorch_vgf import ExecuTorchVGFConfig
+
+    _runs_like_pytorch(ExecuTorchVGFConfig(), b"VgfBackend", 1e-5, tmp_path)
 
 
 def test_executorch_openvino_is_refused_before_tracing_on_a_mac(monkeypatch):

@@ -133,6 +133,19 @@ needs_executorch_qnn = pytest.mark.skipif(
 )
 
 
+# ExecuTorch asks the Vulkan driver for Arm's ML extensions, which their emulation layer adds on any Vulkan device.
+needs_executorch_vgf = pytest.mark.skipif(
+    not (
+        EXECUTORCH
+        and sys.platform == "linux"
+        and is_package_available("ai_ml_sdk_model_converter", "model_converter")
+        and "VgfBackend" in _backends_that_run()
+    ),
+    reason="needs ExecuTorch 1.6 and PyTorch 2.15 on Linux, with executorch[vgf] and a Vulkan device that has "
+    f"Arm's ML extensions or their emulation layer ({INSTALLED})",
+)
+
+
 # The mark of each backend the end-to-end tests export with. Core ML and MLX export only on a Mac, and
 # OpenVINO does not run these policies yet (pytorch/executorch#24325).
 BACKENDS = {
