@@ -65,14 +65,15 @@ def write_bundle(
     case = {**test_case.frame, ACTION: test_case.actions}
     if test_case.noise is not None:
         case[NOISE] = test_case.noise
-    # safetensors writes an array's memory in order, which scrambles a non-contiguous one. Its save_file makes
-    # files only their owner can read, so the bytes are written here, and another user can run the bundle.
+    # safetensors writes an array's memory in order, which scrambles a non-contiguous one; not ascontiguousarray,
+    # which makes a 0-d array 1-d. Its save_file makes files only their owner can read, so the bytes are written
+    # here, and another user can run the bundle.
     (folder / manifest.test_case).write_bytes(
-        save({name: np.ascontiguousarray(value) for name, value in case.items()})
+        save({name: np.asarray(value, order="C") for name, value in case.items()})
     )
     if manifest.constants is not None:
         (folder / manifest.constants).write_bytes(
-            save({name: np.ascontiguousarray(value) for name, value in (constants or {}).items()})
+            save({name: np.asarray(value, order="C") for name, value in (constants or {}).items()})
         )
     if manifest.task_tokens is not None and task_tokens is not None:
         shutil.copyfile(task_tokens.tokenizer, folder / manifest.task_tokens.tokenizer)
