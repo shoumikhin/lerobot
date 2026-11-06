@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export recipes for the policies that read past frames: diffusion, Multi-Task DiT and VQ-BeT.
+"""Export recipes for the policies that read past frames: diffusion, Multi-Task DiT, VQ-BeT and Long-WAM.
 
 These policies keep their past frames in queues that `select_action` fills on every control tick. A bundle
 keeps them instead (`RunPlan.history`), so its programs take each key of the frame as its last frames, stacked

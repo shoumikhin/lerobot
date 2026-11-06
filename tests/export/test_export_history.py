@@ -23,6 +23,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -44,6 +45,7 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGE, OBS_STATE
 from lerobot.utils.import_utils import is_package_available
 from tests.export import (
     tiny_lingbot_va,
+    tiny_longwam,
     tiny_multi_task_dit,
     tiny_pi0_fast,
     torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
@@ -254,6 +256,32 @@ def lingbot_va_programs_hold_one_copy_of_their_weights(
     assert sizes["encode_first"] == sizes["encode_start"] == sizes["encode_next"] == encoder
 
 
+def longwam_program_holds_no_weight_it_does_not_run(
+    policy: torch.nn.Module, bundle: Bundle, played: np.ndarray
+) -> None:
+    if bundle.manifest.backend != "torch_test":
+        # The weights are read from the test backend's PyTorch programs.
+        return
+    (files,) = bundle.manifest.programs.values()
+    program = torch.export.load(bundle.path / files.file)
+    # A tensor a program holds as a plain attribute is a constant, outside its state dict.
+    held = [
+        *program.state_dict.values(),
+        *(t for t in program.constants.values() if isinstance(t, torch.Tensor)),
+    ]
+    run = ("dit", "vae.encoder", "vae.quant_conv", "proprio_encoder")
+    ran = {id(p) for name in run for p in policy.get_submodule(name).parameters()}
+    # A weight that holds one value, such as a norm's, matches any other of its shape.
+    varied = [p for p in policy.parameters() if p.unique().numel() > 1]
+    unused = [p for p in varied if id(p) not in ran]
+    # The text encoder, the VAE's decoder and its post_quant_conv.
+    assert unused
+    # A weight it runs is found where the others are looked for.
+    assert any(torch.equal(t, p) for p in varied if id(p) in ran for t in held if t.shape == p.shape)
+    for p in unused:
+        assert not any(t.shape == p.shape and torch.equal(t, p) for t in held)
+
+
 @dataclass
 class Checkpoint:
     """A tiny checkpoint that `save` writes into a folder, and how its bundle plays.
@@ -349,6 +377,27 @@ CHECKPOINTS = {
         ticks=48,
         reset_at=36,
         check=lingbot_va_programs_hold_one_copy_of_their_weights,
+        marks=(DIFFUSERS, TRANSFORMERS),
+    ),
+    # Past the 17 frames it keeps, then a reset mid-chunk.
+    "longwam": Checkpoint(
+        tiny_longwam.save_checkpoint,
+        ("torch_test", "executorch_xnnpack"),
+        task=tiny_longwam.TASK,
+        ticks=40,
+        reset_at=25,
+        check=longwam_program_holds_no_weight_it_does_not_run,
+        programs=["model"],
+        marks=(DIFFUSERS, TRANSFORMERS),
+    ),
+    # Long-WAM's other denoising, which denoises the future video beside the actions.
+    "longwam_cod": Checkpoint(
+        lambda path: tiny_longwam.save_checkpoint(path, denoising="cod", imagine_sigma=0.0),
+        ("torch_test", "executorch_xnnpack"),
+        task=tiny_longwam.TASK,
+        ticks=40,
+        reset_at=25,
+        programs=["model"],
         marks=(DIFFUSERS, TRANSFORMERS),
     ),
 }
@@ -637,3 +686,11 @@ def test_the_program_holds_uint8_only_in_its_inputs(tmp_path, monkeypatch):
     uint8 = [node.op for node in graph.nodes if getattr(node.meta.get("val"), "dtype", None) == torch.uint8]
     # The camera's frames the program takes in, and no tensor it computes.
     assert uint8 == ["placeholder"]
+
+
+def test_a_long_wam_that_draws_new_noise_for_each_chunk_is_refused_before_its_weights_load():
+    from lerobot.policies.longwam.configuration_longwam import LongWAMConfig
+    from lerobot.policies.longwam.export_longwam import LongWAMExportRecipe
+
+    with pytest.raises(ValueError, match="inference_seed is null"):
+        LongWAMExportRecipe.load(SimpleNamespace(policy=LongWAMConfig(inference_seed=None)))
