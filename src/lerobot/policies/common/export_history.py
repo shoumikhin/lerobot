@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Export recipes for the policies that read their last `n_obs_steps` frames: diffusion, Multi-Task DiT, VQ-BeT.
+"""Export recipes for the policies that read past frames: diffusion, Multi-Task DiT and VQ-BeT.
 
 These policies keep their past frames in queues that `select_action` fills on every control tick. A bundle
-keeps them instead (`RunPlan.history`), so its programs take each key of the frame as its last `n_obs_steps`
-frames, stacked oldest first.
+keeps them instead (`RunPlan.history`), so its programs take each key of the frame as its last frames, stacked
+oldest first, as many as the recipe's `_history()` names.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 
 class HistoryChunkRecipe(ActionChunkRecipe):
-    """The default recipe's frame, task and checks, for a policy that reads its last `n_obs_steps` frames.
+    """The default recipe's frame, task and checks, for a policy that reads its past frames.
 
     The test case replays a few control ticks: at least two, so that their order counts, and fewer than the frames
     the policy keeps when it keeps more than two, so that the first frame stands in for the missing ones. Its actions are the policy's
@@ -88,6 +88,11 @@ class HistoryChunkRecipe(ActionChunkRecipe):
         return RunPlan(history=self._history())
 
     def _history(self) -> dict[str, int]:
+        """How many frames of each key the bundle keeps: `n_obs_steps` of every key.
+
+        A recipe that keeps another number of some key cannot build its parts with `HistoryBatch`, which
+        stacks the same number of every key.
+        """
         return dict.fromkeys(self._features, self.policy.config.n_obs_steps)
 
     def _random_ticks(self) -> list[dict[str, np.ndarray]]:
@@ -97,11 +102,12 @@ class HistoryChunkRecipe(ActionChunkRecipe):
         ]
 
     def _history_inputs(self, ticks: dict[str, np.ndarray], noise: np.ndarray | None) -> tuple[Tensor, ...]:
-        """What the programs take after `ticks`: each key's last frames, the first standing in for any not seen
-        yet, then the noise."""
-        size = self.policy.config.n_obs_steps
+        """What the programs take after `ticks`: each key's last frames, as many as `_history` keeps, the
+        first standing in for any not seen yet, then the noise."""
+        history = self._history()
         inputs = []
-        for value in ticks.values():
+        for name, value in ticks.items():
+            size = history[name]
             frames = [value[0]] * max(size - len(value), 0) + list(value[-size:])
             inputs.append(torch.from_numpy(np.stack(frames)).to(self._device))
         if noise is not None:
@@ -171,7 +177,7 @@ class HistoryChunkRecipe(ActionChunkRecipe):
 
     @abc.abstractmethod
     def parts(self) -> Iterator[Part]:
-        """Yield the parts, which take each key of the frame as its last `n_obs_steps` frames."""
+        """Yield the parts, which take each key of the frame as its last frames, as `_history` counts them."""
 
 
 class HistoryBatch(nn.Module):
