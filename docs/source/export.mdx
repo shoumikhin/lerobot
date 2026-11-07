@@ -313,7 +313,7 @@ for processor in make_pre_post_processors(config, pretrained_path=adapter):
     processor.save_pretrained(merged)
 ```
 
-The export also compares the chain's actions with the whole policy's own, which needs twice the policy's weights in memory. On a board that does not have that memory, such as an 8 GB board for pi0.5, the export skips that comparison and logs a line saying so. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
+The export also compares the chain's actions with the whole policy's own, which needs three times the size of the policy's checkpoint in memory. On a board that does not have that memory, such as an 8 GB board for pi0.5, the export skips that comparison and logs a line saying so. The bundle is then still compared with PyTorch running the same parts, but not with the whole policy.
 
 ### Actions written as tokens
 

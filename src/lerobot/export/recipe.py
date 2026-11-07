@@ -1193,14 +1193,20 @@ def _cgroup_room() -> int | None:
 
 
 def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) -> bool:
-    """Whether the whole policy fits in `device`'s memory beside the export, to check the test case against it.
+    """Whether the whole policy fits in memory beside the export, to check the test case against it.
 
-    When it does not, or the machine does not say how much memory it has, logs that the comparison is skipped;
-    the bundle's own check of its test case still runs.
+    It needs three times its checkpoint's size in the host's memory and, on a CUDA device, in the GPU's free
+    memory too; a CUDA device whose host does not say how much memory it has is checked on the GPU alone.
+    When it does not fit, or a CPU machine does not say how much memory it has, logs that the comparison is
+    skipped; the bundle's own check of its test case still runs.
     """
     size = model_file.stat().st_size
     if device.type == "cuda":
-        available, measured = torch.cuda.mem_get_info(device)[0], "free"
+        available, measured = torch.cuda.mem_get_info(device)[0], "free on the GPU"
+        # pi0.5 builds the whole policy in host memory when its checkpoint does not fill every weight, and a
+        # Jetson's GPU uses the host's memory.
+        if (host := _available_memory()) is not None and host < available:
+            available, measured = host, "available on the host"
     elif (linux_available := _available_memory()) is not None:
         available, measured = linux_available, "available"
     elif hasattr(os, "sysconf"):
@@ -1213,14 +1219,15 @@ def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str) 
             policy_name,
         )
         return False
-    # Room for the activations and for what the export already holds.
-    if 2 * size <= available:
+    # Loading peaks at 2.45 times the checkpoint's size: pi0.5 builds its policy in float32 and then loads a
+    # bfloat16 checkpoint into it (measured). The rest is room for the activations.
+    if 3 * size <= available:
         return True
     logger.warning(
         "Skipped the comparison with the whole %s policy: it needs about %.1f GB, %.1f GB %s. The bundle's "
         "own check against its test case still runs.",
         policy_name,
-        2 * size / 1e9,
+        3 * size / 1e9,
         available / 1e9,
         measured,
     )

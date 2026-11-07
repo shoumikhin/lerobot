@@ -497,8 +497,8 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
     [
         # 64 GB installed, of which Linux counts 6.1 GB available.
         ("MemTotal:       62500000 kB\nMemAvailable:    5957032 kB\n", 15_625_000, "6.1 GB available"),
-        # More than the checkpoint, but not twice as much.
-        ("MemTotal:       62500000 kB\nMemAvailable:    8789063 kB\n", 15_625_000, "9.0 GB available"),
+        # More than twice the checkpoint, but not three times.
+        ("MemTotal:       62500000 kB\nMemAvailable:   14648438 kB\n", 15_625_000, "15.0 GB available"),
         # No /proc/meminfo, as on macOS: 6.1 GB installed.
         (None, 1_489_258, "6.1 GB installed"),
     ],
@@ -506,9 +506,9 @@ def test_an_image_recorded_channels_last_keeps_its_shape():
 def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
     tmp_path, monkeypatch, caplog, meminfo, pages, spare
 ):
-    """A 6.15 GB checkpoint on a machine with less than twice that much memory to spare."""
+    """A 6 GB checkpoint on a machine with less than three times that much memory to spare."""
     # Only the checkpoint's size is read, so no file that big is made.
-    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=6_150_000_000))
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=6_000_000_000))
     meminfo_file = tmp_path / "meminfo"
     if meminfo is not None:
         meminfo_file.write_text(meminfo)
@@ -520,7 +520,7 @@ def test_a_policy_too_big_to_compare_is_skipped_with_a_log_line(
     with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
         assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
     assert (
-        f"Skipped the comparison with the whole pi0.5 policy: it needs about 12.3 GB, {spare}. The "
+        f"Skipped the comparison with the whole pi0.5 policy: it needs about 18.0 GB, {spare}. The "
         "bundle's own check against its test case still runs." in caplog.text
     )
 
@@ -547,7 +547,26 @@ def test_a_policy_too_big_for_its_container_is_skipped(
     model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
     with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
         assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5")
-    assert f"it needs about 2.0 GB, {available} available" in caplog.text
+    assert f"it needs about 3.0 GB, {available} available" in caplog.text
+
+
+def test_a_policy_too_big_for_host_memory_is_skipped_on_a_gpu(tmp_path, monkeypatch, caplog):
+    """A 3 GB container on a GPU with 60 GB free: the whole policy passes through host memory too."""
+    (tmp_path / "meminfo").write_text("MemAvailable: 1800000000 kB\n")
+    (tmp_path / "cgroup").write_text("0::/job.scope\n")
+    job = tmp_path / "cgroups" / "job.scope"
+    job.mkdir(parents=True)
+    (job / "memory.max").write_text("3000000000\n")
+    (job / "memory.current").write_text("500000000\n")
+    (job / "memory.stat").write_text("anon 500000000\ninactive_file 0\n")
+    monkeypatch.setattr(recipe_module, "_MEMINFO", tmp_path / "meminfo")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "cgroup")
+    monkeypatch.setattr(recipe_module, "_CGROUPS", tmp_path / "cgroups")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (60_000_000_000, 80_000_000_000))
+    model_file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1_000_000_000))
+    with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
+        assert not recipe_module.whole_policy_fits(model_file, torch.device("cuda"), "pi0.5")
+    assert "it needs about 3.0 GB, 2.5 GB available on the host" in caplog.text
 
 
 def test_a_policy_is_not_compared_on_a_machine_that_does_not_say_how_much_memory_it_has(
