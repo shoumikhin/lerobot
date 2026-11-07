@@ -1076,6 +1076,25 @@ def test_executorch_xnnpack_takes_the_linear_layers_of_a_bfloat16_program(tmp_pa
     torch.testing.assert_close(torch.from_dlpack(actual), expected, rtol=2e-2, atol=2e-2)
 
 
+@needs_executorch
+def test_executorch_xnnpack_resizes_long_wam_frames_to_the_same_pixels(tmp_path):
+    from lerobot.bundle.executorch import ExecuTorchProgram
+    from lerobot.export.backends.executorch_xnnpack import ExecuTorchXNNPACKConfig
+    from lerobot.policies.longwam.processor_longwam import _pil_bilinear_resize
+
+    class Resize(torch.nn.Module):
+        def forward(self, image):
+            return _pil_bilinear_resize(image, 16, 16)
+
+    generator = torch.Generator().manual_seed(0)
+    image = torch.randint(0, 256, (2, 3, 20, 28), dtype=torch.uint8, generator=generator)
+    path = tmp_path / "resize.pte"
+    ExecuTorchXNNPACKConfig().compile(torch.export.export(Resize(), (image,)), path)
+    program = ExecuTorchProgram(path)
+    (actual,) = program(image.numpy())
+    np.testing.assert_array_equal(program.to_numpy(actual), Resize()(image).numpy())
+
+
 EXPORT_WITHOUT_TORCH = """
 import sys
 import tempfile
