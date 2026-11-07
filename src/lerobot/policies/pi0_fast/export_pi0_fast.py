@@ -58,6 +58,7 @@ from lerobot.export.recipe import (
     RunPlan,
     preprocessor_renames,
     random_frame,
+    repeated_runs,
     to_policy_input,
 )
 from lerobot.processor import (
@@ -288,22 +289,14 @@ class PI0FastExportRecipe(ActionChunkRecipe):
 
     def plan(self) -> RunPlan:
         """The prefill, the step once per token after the first, the actions, the step indices, and the decoding."""
-        steps = range(1, self._max_decoding_steps)
+        step_constants = [{"step": np.array([t], np.int64)} for t in range(1, self._max_decoding_steps)]
+        step_runs, constants = repeated_runs("step", STEP_INPUTS, STEP_OUTPUTS, step_constants)
         runs = [
             ProgramRun("prefill", "prefill", list(self._features), PREFILL_OUTPUTS),
-            *(
-                ProgramRun(
-                    f"step_{t}", "step", [GENERATED_TOKENS, f"step_{t}", *STEP_INPUTS[2:]], STEP_OUTPUTS
-                )
-                for t in steps
-            ),
+            *step_runs,
             ProgramRun("actions", "actions", [DECODED_ACTIONS, *self._state_names], [ACTION]),
         ]
-        return RunPlan(
-            runs=runs,
-            constants={f"step_{t}": np.array([t], np.int64) for t in steps},
-            action_tokens=self._action_tokens,
-        )
+        return RunPlan(runs=runs, constants=constants, action_tokens=self._action_tokens)
 
     def _decoding(self, policy: PI0FastPolicy) -> ActionTokenData:
         """The FAST tokenizer and how the policy reads its answer, as `detokenize_actions` does."""
