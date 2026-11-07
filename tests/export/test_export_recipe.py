@@ -151,7 +151,9 @@ def test_recipe_keeps_a_task_given_even_when_a_tokenizer_cuts_it_short():
     assert make().task is None
 
 
+@pytest.mark.dataset
 def test_the_dataset_is_found_where_training_finds_it(monkeypatch):
+    pytest.importorskip("datasets")
     import lerobot.datasets
     import lerobot.datasets.storage
     from lerobot.export.recipe import dataset_metadata
