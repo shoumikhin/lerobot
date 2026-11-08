@@ -44,9 +44,9 @@ def _installed(package: str) -> str:
 def _backend_runs(name: str) -> bool:
     """Whether the installed ExecuTorch says its backend `name` is available on this machine.
 
-    Asked in a new process: ExecuTorch's bindings read once, when they load, which result type they return,
-    and a test that runs a bundle with them sets it before they load. The new process asks for ExecuTorch's
-    own tensors, so it does not load PyTorch.
+    Asked in a new process: this module loads before conftest.py calls `prepare()`, and ExecuTorch's bindings
+    read their result type once, when they load. The new process asks for ExecuTorch's own tensors, so it does
+    not load PyTorch.
     """
     code = (
         "from executorch.runtime import Runtime; "

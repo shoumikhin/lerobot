@@ -892,11 +892,9 @@ def test_export_names_the_signal_that_killed_the_check(checkpoint, tmp_path, mon
 def test_a_gpu_bundle_draws_its_noise_on_the_gpu(checkpoint, tmp_path, monkeypatch):
     """ACT exported to start from a noise: each chunk copies only the robot's frame to the GPU, and only the
     actions back."""
-    from lerobot.bundle.executorch import ExecuTorchProgram, prepare
-
-    # Before ExecuTorch loads: it reads the setting prepare() makes only once, when it loads.
-    prepare()
     from executorch.runtime import ExecuTorchResult
+
+    from lerobot.bundle.executorch import ExecuTorchProgram
 
     use_plugins(monkeypatch, "noise_recipe")
     run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", backend="executorch_cuda")
@@ -1026,7 +1024,8 @@ def test_executorch_xnnpack_takes_the_linear_layers_of_a_bfloat16_program(tmp_pa
         expected = model(x)
     assert not [op for op in ops if "executorch_call_delegate" not in op and "getitem" not in op], ops
     (actual,) = Runtime.get().load_program(path).load_method("forward").execute([x])
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # ExecuTorch's own tensor, since the tests load ExecuTorch as a bundle does (see conftest.py).
+    torch.testing.assert_close(torch.from_dlpack(actual), expected, rtol=2e-2, atol=2e-2)
 
 
 EXPORT_WITHOUT_TORCH = """
@@ -1038,8 +1037,8 @@ export([*sys.argv[2:], f"--output_dir={tempfile.mkdtemp(dir=sys.argv[1])}/b"])
 """
 
 
-# In a process of its own: ExecuTorch's bindings take their result type when they first load, and a bundle
-# loaded later in this process needs ExecuTorch's own.
+# In a process of its own: the backend returns PyTorch's tensors only from an ExecuTorch loaded without
+# `prepare()`, which conftest.py calls in this process.
 RUN_PART = """
 import sys
 from pathlib import Path
