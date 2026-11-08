@@ -14,11 +14,12 @@
 
 """What the export tests that compile with a real backend need, as one skip mark per backend.
 
-A released ExecuTorch can lack a fix that a backend needs, so each mark names the fix and the installed
-versions. Its reason always names ExecuTorch, and a CUDA GPU for a GPU backend, so the test is marked
-`executorch` and `gpu` whether it skips or not (see `tests/conftest.py`).
+Each mark's reason names what its tests need and the installed versions. It always names ExecuTorch, and
+a CUDA GPU for a GPU backend, so the test is marked `executorch` and `gpu` whether it skips or not (see
+`tests/conftest.py`).
 """
 
+import importlib
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -36,19 +37,18 @@ def _installed(package: str) -> str:
         return "none"
 
 
-# A package that cannot be imported, as an ExecuTorch built without CUDA, skips the tests that need it.
-def _cuda_backend_names_its_weights() -> bool:
-    from lerobot.export.backends.executorch import cuda_backend_names_its_weights
-
+# ExecuTorch's CUDA compiler imports Triton, which PyTorch's builds for Windows and for the CPU lack.
+def _cuda_compiler_imports() -> bool:
     try:
-        return cuda_backend_names_its_weights()
+        importlib.import_module("executorch.backends.cuda.cuda_partitioner")
     except ImportError:
         return False
+    return True
 
 
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
-EXECUTORCH_CUDA = EXECUTORCH and torch.cuda.is_available() and _cuda_backend_names_its_weights()
+EXECUTORCH_CUDA = EXECUTORCH and torch.cuda.is_available() and _cuda_compiler_imports()
 EXECUTORCH_TENSORRT = (
     EXECUTORCH_CUDA
     and is_package_available("torch_tensorrt")
@@ -63,14 +63,12 @@ needs_executorch = pytest.mark.skipif(
     not EXECUTORCH, reason=f"needs ExecuTorch 1.6 and PyTorch 2.15 ({INSTALLED})"
 )
 needs_executorch_cuda = pytest.mark.skipif(
-    not EXECUTORCH_CUDA,
-    reason="needs a CUDA GPU and an ExecuTorch whose CUDA backend names each part's weights file "
-    f"(pytorch/executorch#24314) ({INSTALLED})",
+    not EXECUTORCH_CUDA, reason=f"needs a CUDA GPU, ExecuTorch 1.6 and Triton ({INSTALLED})"
 )
 needs_executorch_tensorrt = pytest.mark.skipif(
     not EXECUTORCH_TENSORRT,
-    reason="needs a CUDA GPU, an ExecuTorch with pytorch/executorch#24314, Torch-TensorRT and "
-    f"torch-tensorrt-executorch-runtime ({INSTALLED})",
+    reason="needs a CUDA GPU, ExecuTorch 1.6, Triton, Torch-TensorRT and torch-tensorrt-executorch-runtime "
+    f"({INSTALLED})",
 )
 # ExecuTorch installs coremltools only on the Pythons coremltools supports.
 needs_executorch_coreml = pytest.mark.skipif(

@@ -182,18 +182,20 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(
     )
 
 
-def test_an_executorch_that_cannot_save_the_part_is_refused_before_tensorrt_builds(monkeypatch, tmp_path):
+def test_an_executorch_whose_cuda_backend_does_not_import_is_refused_before_tensorrt_builds(
+    monkeypatch, tmp_path
+):
     from lerobot.export.backends import executorch_tensorrt
 
     def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
         raise ReachedCompileError
 
     def refuse(name):
-        raise ValueError("pytorch/executorch#24314")
+        raise ImportError("no CUDA backend")
 
     use_fake_tensorrt(monkeypatch, compile)
     monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", refuse)
-    with pytest.raises(ValueError, match="24314"):
+    with pytest.raises(ImportError, match="no CUDA backend"):
         executorch_tensorrt.ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
 
 

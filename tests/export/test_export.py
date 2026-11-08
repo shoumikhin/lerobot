@@ -278,19 +278,17 @@ def test_executorch_coreml_is_refused_before_tracing_off_a_mac(monkeypatch, plat
 
 
 SKIP_MARKS = """
+import sys
+
 import torch
 
 import lerobot.utils.import_utils
-from lerobot.export.backends import executorch
 
-
-def broken():
-    raise ImportError("a broken install")
-
-
+torch.__version__ = "2.15.0"
 torch.cuda.is_available = lambda: True
 lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
-executorch.cuda_backend_names_its_weights = broken
+# ExecuTorch's CUDA compiler does not import, as without Triton.
+sys.modules["executorch.backends.cuda.cuda_partitioner"] = None
 
 from tests.export import backends
 
@@ -298,9 +296,9 @@ assert not backends.EXECUTORCH_CUDA
 """
 
 
-def test_the_cuda_skip_mark_skips_when_the_cuda_backend_cannot_be_imported():
-    """On a machine with a GPU, the marks probe ExecuTorch's CUDA backend when the test modules load, so a probe
-    that raises would fail the collection of every test that imports them."""
+def test_the_cuda_skip_mark_skips_when_the_cuda_compiler_cannot_be_imported():
+    """On a machine with a GPU, the marks import ExecuTorch's CUDA compiler as they load, so an import that
+    fails must skip the CUDA tests, not stop the tests from loading."""
     subprocess.run([sys.executable, "-c", SKIP_MARKS], check=True, timeout=300)
 
 
@@ -923,21 +921,6 @@ def test_executorch_coreml_compiles_a_program_that_core_ml_runs(tmp_path):
     program = ExecuTorchProgram(path)
     (actual,) = program(x.numpy())
     np.testing.assert_allclose(program.to_numpy(actual), model(x).detach().numpy(), rtol=1e-5, atol=1e-5)
-
-
-@needs_executorch
-def test_an_executorch_whose_cuda_backend_cannot_name_weights_files_is_refused(monkeypatch):
-    # ExecuTorch's CUDA backend imports Triton, which comes with PyTorch's CUDA builds and not its CPU builds.
-    # The test needs no GPU, so its skip reason names none: tests/conftest.py fails a skip that names one in a
-    # test not marked `gpu`.
-    pytest.importorskip(
-        "executorch.backends.cuda.cuda_partitioner", reason="needs Triton, which a CPU build of PyTorch lacks"
-    )
-    from lerobot.export.backends import executorch
-
-    monkeypatch.setattr(executorch, "cuda_backend_names_its_weights", lambda: False)
-    with pytest.raises(ValueError, match="pytorch/executorch#24314"):
-        executorch.cuda_partitioner("part")
 
 
 class MaskedPositions(torch.nn.Module):

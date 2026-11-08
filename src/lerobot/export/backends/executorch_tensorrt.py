@@ -118,7 +118,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         """
         import torch_tensorrt
 
-        # Before TensorRT builds anything, so an ExecuTorch that cannot save the part is refused at once.
+        # Before TensorRT builds, so ExecuTorch's CUDA backend, which needs Triton, fails at once without it.
         partitioner = cuda_partitioner(path.stem)
         options = {
             "min_block_size": 1,
