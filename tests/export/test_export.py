@@ -278,7 +278,9 @@ def test_executorch_coreml_is_refused_before_tracing_off_a_mac(monkeypatch, plat
 
 
 SKIP_MARKS = """
+import subprocess
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -287,8 +289,9 @@ import lerobot.utils.import_utils
 torch.__version__ = "2.15.0"
 torch.cuda.is_available = lambda: True
 lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
-# ExecuTorch's CUDA compiler does not import, as without Triton.
+# ExecuTorch's CUDA compiler does not import, as without Triton, though ExecuTorch says its CUDA backend runs.
 sys.modules["executorch.backends.cuda.cuda_partitioner"] = None
+subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="True", stderr="")
 
 from tests.export import backends
 
@@ -300,6 +303,42 @@ def test_the_cuda_skip_mark_skips_when_the_cuda_compiler_cannot_be_imported():
     """On a machine with a GPU, the marks import ExecuTorch's CUDA compiler as they load, so an import that
     fails must skip the CUDA tests, not stop the tests from loading."""
     subprocess.run([sys.executable, "-c", SKIP_MARKS], check=True, timeout=300)
+
+
+FAILED_PROBE = """
+import subprocess
+import sys
+from types import ModuleType, SimpleNamespace
+
+import torch
+
+import lerobot.utils.import_utils
+
+torch.__version__ = "2.15.0"
+torch.cuda.is_available = lambda: True
+lerobot.utils.import_utils.is_package_available = lambda *args, **kwargs: True
+sys.modules["executorch.backends.cuda.cuda_partitioner"] = ModuleType("cuda_partitioner")
+# The process that asks ExecuTorch fails, as in a broken install, even though it printed "True".
+subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="True", stderr="broken")
+
+from tests.export import backends
+
+assert not backends.EXECUTORCH_CUDA
+"""
+
+
+def test_the_cuda_skip_mark_skips_when_executorch_cannot_say_whether_cuda_runs():
+    """On a machine with a GPU, a probe process that fails is not trusted, even when it printed "True"."""
+    subprocess.run([sys.executable, "-c", FAILED_PROBE], check=True, timeout=300)
+
+
+@needs_executorch
+def test_the_backend_probe_says_which_backends_run():
+    """Every ExecuTorch package runs XNNPACK programs; a probe that never says yes skips the GPU tests."""
+    from tests.export import backends
+
+    assert backends._backend_runs("XnnpackBackend")
+    assert not backends._backend_runs("NoSuchBackend")
 
 
 def test_export_refuses_a_checkpoint_that_leaves_a_weight_unfilled(checkpoint, tmp_path, capfd):

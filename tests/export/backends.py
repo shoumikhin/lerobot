@@ -20,13 +20,17 @@ a CUDA GPU for a GPU backend, so the test is marked `executorch` and `gpu` wheth
 """
 
 import importlib
+import os
+import subprocess
 import sys
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 
 import pytest
 import torch
 from packaging.version import Version
 
+from lerobot.bundle.executorch import TENSOR_OUTPUT
 from lerobot.utils.import_utils import is_package_available
 
 
@@ -35,6 +39,34 @@ def _installed(package: str) -> str:
         return version(package)
     except PackageNotFoundError:
         return "none"
+
+
+def _backend_runs(name: str) -> bool:
+    """Whether the installed ExecuTorch says its backend `name` is available on this machine.
+
+    Asked in a new process: ExecuTorch's bindings read once, when they load, which result type they return,
+    and a test that runs a bundle with them sets it before they load. The new process asks for ExecuTorch's
+    own tensors, so it does not load PyTorch.
+    """
+    code = (
+        "from executorch.runtime import Runtime; "
+        f"print(Runtime.get().backend_registry.is_available({name!r}))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-P", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, TENSOR_OUTPUT: "executorch"},
+        )
+    except subprocess.TimeoutExpired:
+        warnings.warn(f"ExecuTorch did not say within 60 s whether {name} is available.", stacklevel=2)
+        return False
+    if result.returncode:
+        warnings.warn(f"ExecuTorch could not say whether {name} is available:\n{result.stderr}", stacklevel=2)
+        return False
+    return result.stdout.strip() == "True"
 
 
 # ExecuTorch's CUDA compiler imports Triton, which PyTorch's builds for Windows and for the CPU lack.
@@ -48,7 +80,10 @@ def _cuda_compiler_imports() -> bool:
 
 # ExecuTorch 1.6 reads programs traced by PyTorch 2.15 or newer.
 EXECUTORCH = is_package_available("executorch") and Version(torch.__version__).release >= (2, 15)
-EXECUTORCH_CUDA = EXECUTORCH and torch.cuda.is_available() and _cuda_compiler_imports()
+# ExecuTorch's CPU build, from PyTorch's CPU index, has the CUDA backend's compiler but not its runtime.
+EXECUTORCH_CUDA = (
+    EXECUTORCH and torch.cuda.is_available() and _cuda_compiler_imports() and _backend_runs("CudaBackend")
+)
 EXECUTORCH_TENSORRT = (
     EXECUTORCH_CUDA
     and is_package_available("torch_tensorrt")
@@ -63,12 +98,12 @@ needs_executorch = pytest.mark.skipif(
     not EXECUTORCH, reason=f"needs ExecuTorch 1.6 and PyTorch 2.15 ({INSTALLED})"
 )
 needs_executorch_cuda = pytest.mark.skipif(
-    not EXECUTORCH_CUDA, reason=f"needs a CUDA GPU, ExecuTorch 1.6 and Triton ({INSTALLED})"
+    not EXECUTORCH_CUDA, reason=f"needs a CUDA GPU, ExecuTorch 1.6 built with CUDA and Triton ({INSTALLED})"
 )
 needs_executorch_tensorrt = pytest.mark.skipif(
     not EXECUTORCH_TENSORRT,
-    reason="needs a CUDA GPU, ExecuTorch 1.6, Triton, Torch-TensorRT and torch-tensorrt-executorch-runtime "
-    f"({INSTALLED})",
+    reason="needs a CUDA GPU, ExecuTorch 1.6 built with CUDA, Triton, Torch-TensorRT and "
+    f"torch-tensorrt-executorch-runtime ({INSTALLED})",
 )
 # ExecuTorch installs coremltools only on the Pythons coremltools supports.
 needs_executorch_coreml = pytest.mark.skipif(
