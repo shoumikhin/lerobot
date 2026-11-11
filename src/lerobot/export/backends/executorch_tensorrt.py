@@ -108,7 +108,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
 
-        Returns the weights file of the CUDA backend's part, if it has one.
+        It empties in place the weights that only its TensorRT engines read, so neither `program` nor a module
+        that shares its weights can run afterwards. Returns the weights file of the CUDA backend's part, if it
+        has one.
         """
         import torch_tensorrt
 
@@ -129,6 +131,10 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # One host copy of each weight, and of its transpose, instead of one per layer that reads it
             # (pytorch/TensorRT#4965).
             "deduplicate_weights": True,
+            # Frees each weight once the last engine that reads it is built (pytorch/TensorRT#4853), so the
+            # build does not hold the weights and the engines at once. A weight that a part left to the CUDA
+            # backend reads stays, since Torch-TensorRT frees only what no graph outside TensorRT reads.
+            "release_weights_after_build": True,
         }
         args, _ = program.example_inputs
         engine = torch_tensorrt.dynamo.compile(program, arg_inputs=args, **options)

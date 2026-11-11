@@ -132,9 +132,10 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program`, one part traced by `torch.export`, into the program file `path`.
 
-        `program.example_inputs` holds the inputs it was traced with, on the backend's device. Returns a
-        second file written beside `path` that the runtime loads with the program, such as its weights, or
-        `None`.
+        `program.example_inputs` holds the inputs it was traced with, on the backend's device. A backend that
+        empties the weights of `program` in place, which empties them in any module that shares them, says so
+        in its own `compile`. Returns a second file written beside `path` that the runtime loads with the
+        program, such as its weights, or `None`.
         """
 
     def run(self, path: Path, data: Path | None, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
