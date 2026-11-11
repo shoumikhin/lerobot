@@ -26,7 +26,7 @@ import torch
 
 from lerobot.optim.optimizers import PraxisAdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
-from lerobot.policies.praxis.praxis_core.layers import MoEFeedForward
+from lerobot.policies.praxis.praxis_core.layers import MoEFeedForward, _expert_swiglu, _routed_chunk
 from lerobot.policies.praxis.praxis_core.robot_io import contiguous_chunk_geometry, pose8_to_10d
 from lerobot.policies.praxis.praxis_core.single_arm import tile_clip
 from lerobot.policies.praxis.praxis_core.train.data import (
@@ -224,6 +224,72 @@ def test_backward_trains_the_weights_and_update_moves_the_router_biases() -> Non
     assert all(
         torch.equal(layer.expert_bias, b + m) for layer, b, m in zip(layers, before, moved, strict=True)
     )
+
+
+def test_moe_matches_a_per_token_reference_forward_and_backward() -> None:
+    # Each token's output is its shared expert plus its top-k experts, each scaled by its normalized gate and the
+    # routing scale. The sort-based dispatch, run here over three token chunks, must give the same values and
+    # gradients as this direct sum.
+    # top_k = 8 puts two slots in each of the four accumulators of the sum, and the routing bias changes the
+    # picked experts but not their gates.
+    generator = torch.Generator().manual_seed(0)
+    num_tokens, dim, top_k = 12, 16, 8
+    moe = MoEFeedForward(dim=dim, hidden=8, num_experts=16, top_k=top_k, dispatch_chunk_size=5)
+    for p in [*moe.parameters(), moe.expert_bias]:
+        torch.nn.init.normal_(p, std=0.3, generator=generator)
+    x = torch.randn(num_tokens, dim, generator=generator).requires_grad_()
+    out = moe(x)
+
+    scores = torch.sigmoid(x @ moe.router.weight.T)
+    top = torch.topk(scores.detach() + moe.expert_bias, top_k, dim=-1).indices
+    gate = scores.gather(-1, top)
+    gate = gate / gate.sum(-1, keepdim=True)
+    rows = []
+    for t in range(num_tokens):
+        row = moe.shared(x[t : t + 1])[0]
+        for k in range(top_k):
+            g, u = (x[t] @ moe.routed.gate_up_weight[top[t, k]]).chunk(2)
+            expert = (torch.nn.functional.silu(g) * u) @ moe.routed.down_weight[top[t, k]]
+            row = row + moe.routed_scaling_factor * gate[t, k] * expert
+        rows.append(row)
+    ref = torch.stack(rows)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    grad = torch.randn(out.shape, generator=generator)
+    params = [x, moe.router.weight, moe.routed.gate_up_weight, moe.routed.down_weight]
+    got = torch.autograd.grad(out, params, grad)
+    want = torch.autograd.grad(ref, params, grad)
+    for a, b in zip(got, want, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+
+
+def test_moe_chunk_gives_the_bits_of_the_sort_order_gate_read() -> None:
+    # The original chunk gathered the scale in sort order and read it by row: sorted_scale[rows_of_token[t, k]].
+    # The chunk now reads the gate in token order. In bfloat16 both must give the same bits.
+    generator = torch.Generator().manual_seed(0)
+    num_tokens, dim, hidden, num_experts, top_k = 12, 16, 8, 16, 8
+    x = torch.randn(num_tokens, dim, generator=generator).to(torch.bfloat16)
+    top_idx = torch.stack(
+        [torch.randperm(num_experts, generator=generator)[:top_k] for _ in range(num_tokens)]
+    )
+    gate = torch.rand(num_tokens, top_k, generator=generator).to(torch.bfloat16)
+    gate_up_w = (0.3 * torch.randn(num_experts, dim, 2 * hidden, generator=generator)).to(torch.bfloat16)
+    down_w = (0.3 * torch.randn(num_experts, hidden, dim, generator=generator)).to(torch.bfloat16)
+    out = _routed_chunk(x, top_idx, gate, gate_up_w, down_w, 2.5)
+
+    order = top_idx.reshape(-1).sort(stable=True).indices
+    offsets = torch.bincount(top_idx.reshape(-1), minlength=num_experts).cumsum(0).to(torch.int32)
+    hidden_rows = _expert_swiglu(torch._grouped_mm(x[order // top_k], gate_up_w, offsets))
+    rows = torch._grouped_mm(hidden_rows, down_w, offsets)
+    sorted_scale = gate.reshape(-1)[order].float() * 2.5
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(order.numel())
+    rows_of_token = inverse.view(num_tokens, top_k)
+    acc = [torch.zeros(num_tokens, dim) for _ in range(4)]
+    for slot in range(top_k):
+        r = rows_of_token[:, slot]
+        acc[slot % 4] = acc[slot % 4] + rows[r].float() * sorted_scale[r, None]
+    assert torch.equal(out, ((acc[0] + acc[1]) + acc[2]) + acc[3])
 
 
 def test_activation_checkpointing_gives_the_same_loss_and_gradients() -> None:

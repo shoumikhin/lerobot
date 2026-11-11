@@ -520,11 +520,11 @@ class _PermuteRows(torch.autograd.Function):
         return grad[inverse], None, None
 
 
-def _dispatch_rows(top_idx: Tensor, gate: Tensor, num_experts: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def _dispatch_rows(top_idx: Tensor, num_experts: int) -> tuple[Tensor, Tensor, Tensor]:
     """Sort the (token, expert) rows of one chunk by expert.
 
-    Returns the sort order, the token and the gate of each sorted row and the
-    int32 end offsets of the expert groups.
+    Returns the sort order, the token of each sorted row and the int32 end
+    offsets of the expert groups.
     """
     num_tokens, top_k = top_idx.shape
     device = top_idx.device
@@ -534,11 +534,11 @@ def _dispatch_rows(top_idx: Tensor, gate: Tensor, num_experts: int) -> tuple[Ten
     counts = torch.zeros(num_experts, device=device, dtype=torch.int64)
     counts.scatter_add_(0, experts.long(), torch.ones_like(experts, dtype=torch.int64))
     offsets = counts.cumsum(dim=0).to(torch.int32)
-    return order, tokens[order], gate.reshape(-1)[order], offsets
+    return order, tokens[order], offsets
 
 
 def _sum_rows_of_tokens(rows: Tensor, rows_of_token: Tensor, scale: Tensor) -> Tensor:
-    """``out[t] = sum_k rows[r] * scale[r]`` with ``r = rows_of_token[t, k]``.
+    """``out[t] = sum_k rows[r] * scale[t, k]`` with ``r = rows_of_token[t, k]``.
 
     The sum runs in float32 with four interleaved accumulators: slot ``s``
     goes to accumulator ``s % 4``, then ``((a0 + a1) + a2) + a3``. This is the
@@ -548,7 +548,7 @@ def _sum_rows_of_tokens(rows: Tensor, rows_of_token: Tensor, scale: Tensor) -> T
     acc = [torch.zeros(num_tokens, rows.size(1), device=rows.device, dtype=torch.float32) for _ in range(4)]
     for slot in range(top_k):
         r = rows_of_token[:, slot]
-        acc[slot % 4] = acc[slot % 4] + rows[r].float() * scale[r].unsqueeze(-1)
+        acc[slot % 4] = acc[slot % 4] + rows[r].float() * scale[:, slot].unsqueeze(-1)
     return ((acc[0] + acc[1]) + acc[2]) + acc[3]
 
 
@@ -562,13 +562,15 @@ def _routed_chunk(
 ) -> Tensor:
     """Float32 scaled routed sum of one token chunk (see ``MoEFeedForward``)."""
     num_tokens, top_k = top_idx.shape
-    order, sorted_tokens, sorted_gate, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
+    order, sorted_tokens, offsets = _dispatch_rows(top_idx, gate_up_w.shape[0])
     rows = x[sorted_tokens].to(gate_up_w.dtype)
     gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
     out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
-    scale = sorted_gate.to(torch.float32) * scaling
+    # LeRobot change: the gate is read in token order. The original gathered it in sort
+    # order and read it back through `inverse`, which gives the same values.
+    scale = gate.to(torch.float32) * scaling
     return _sum_rows_of_tokens(out, inverse.view(num_tokens, top_k), scale)
 
 
@@ -588,10 +590,10 @@ def _routed_chunk_backward(
     the weight dtype).
     """
     num_tokens, top_k = top_idx.shape
-    order, sorted_tokens, sorted_gate, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
+    order, sorted_tokens, offsets = _dispatch_rows(top_idx, gate_up_w.shape[0])
     rows = x[sorted_tokens].to(gate_up_w.dtype)
     gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
-    scale = sorted_gate.to(torch.float32) * scaling
+    scale = gate.reshape(-1)[order].to(torch.float32) * scaling
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
     grad_rows_out = grad_out[sorted_tokens]
@@ -610,7 +612,7 @@ def _routed_chunk_backward(
     grad_gate_up_w = torch._grouped_mm(rows.t(), grad_gate_up, offsets)
     grad_rows_in = torch._grouped_mm(grad_gate_up, gate_up_w.transpose(1, 2), offsets)
     del grad_gate_up
-    ones = torch.ones(order.numel(), device=x.device, dtype=torch.float32)
+    ones = torch.ones(num_tokens, top_k, device=x.device, dtype=torch.float32)
     grad_x = _sum_rows_of_tokens(grad_rows_in, inverse.view(num_tokens, top_k), ones)
     routed = grad_scale * scaling if scaling != 1.0 else grad_scale
     grad_flat = torch.empty_like(routed)
