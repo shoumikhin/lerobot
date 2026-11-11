@@ -534,6 +534,40 @@ are the only modules besides the counter that `full_training_modules` accepts) a
 trunk stays frozen; the praxis recipe's head-only warm-up steps and head learning-rate scale are not
 ported.
 
+## Export
+
+`lerobot-export` compiles a checkpoint into a bundle that `lerobot-rollout --bundle.path` runs without
+PyTorch, with Torch-TensorRT's ExecuTorch backend (see [Compiled Policies](./export) for its install and
+the GPUs it ran on). The DROID checkpoint is the one compiled so far; the bimanual YAM one has run only as a
+tiny model in tests.
+
+```bash
+lerobot-export --policy.path=runwayml/praxis-1-droid-lerobot --backend.type=executorch_tensorrt \
+  --task="put the marker in the cup" --output_dir=outputs/praxis_bundle
+lerobot-rollout --bundle.path=outputs/praxis_bundle --robot.type=<your robot> --fps=15
+```
+
+The bundle is a chain of small programs that runs the sampler of one chunk: the autoencoder's encoder on
+the executed chunk's camera frames, then for each Euler step the encoder tower and the action expert (for
+the task and the blank caption), the decoder tower and the step, and last the actions in robot units. The
+last step runs no decoder: its video moves no action, as in Runway's own server. The bundle keeps the last
+22 camera frames and states, so the next chunk is conditioned on the executed one, as in the policy.
+
+- The bundle runs the window the released checkpoints run: one executed chunk of context
+  (`max_context_chunks=1`), with every action of a chunk played before the next one
+  (`n_action_steps=24`). The export refuses other settings.
+- The task and the blank caption are encoded at export, so a bundle runs the task it was exported for.
+  The bundle holds neither the text encoder nor the autoencoder's decoder.
+- The programs run dense attention, and the PyTorch ops of the two custom Triton kernels
+  (`layers.set_custom_kernels`), and tile the camera frames on the GPU. The values are the policy's, with
+  other rounding. The export checks the bundle's actions against the policy's own over its first
+  three chunks after a reset. With the released bfloat16 weights it allows 1.0 of the actions'
+  spread: the 27B mixture of experts amplifies rounding over those chunks so much that a correct
+  bundle played actions up to 0.82 away, so the export also checks the `velocity` and `decoder`
+  programs on their own. Float32 weights get the default tolerance.
+- Each chunk draws new noise on the GPU, so the bundle samples like the policy, not the same samples as
+  its `seed`.
+
 ## Known limits
 
 - Two rigs: the single-arm DROID checkpoint (`embodiment: single_arm`) and the bimanual YAM one

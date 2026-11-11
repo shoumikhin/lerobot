@@ -170,13 +170,16 @@ class FakeAutoencoder:
     ``encode`` maps ``(1, 3, T, H, W)`` frames in [0, 255] to a bf16 policy latent
     ``(1, 192, 1 + (T - 1) // 4, H // 32, W // 32)``: the first frame alone, then
     every 4 frames, pooled in space and repeated over the channels with a fixed
-    per-channel scale, so different inputs give different latents.
+    per-channel scale, so different inputs give different latents. ``encode_eager``,
+    the plain PyTorch path of the real one, is ``encode``. Its ``encoder`` and
+    ``conv1``, the modules the real one encodes with, hold no weights.
     """
 
     def __init__(self) -> None:
         self.scale = torch.linspace(0.5, 1.5, LATENT_CHANNELS).view(1, -1, 1, 1, 1)
         # the training objective reads the device of the real autoencoder's buffers
         self.latent_mean = torch.zeros(LATENT_CHANNELS)
+        self.encoder, self.conv1 = torch.nn.Identity(), torch.nn.Identity()
 
     def to(self, device) -> FakeAutoencoder:
         return self
@@ -190,6 +193,8 @@ class FakeAutoencoder:
         pooled = torch.nn.functional.avg_pool2d(pooled.flatten(1, 2), 32).view(1, 3, -1, h // 32, w // 32)
         latent = pooled.repeat(1, LATENT_CHANNELS // 3, 1, 1, 1) * self.scale
         return (latent * 2 - 1).to(torch.bfloat16)
+
+    encode_eager = encode
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
