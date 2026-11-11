@@ -165,9 +165,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
                 )
         options.update(compile_options or {})
         args, _ = program.example_inputs
-        # compile_and_save (pytorch/TensorRT#4863, in Torch-TensorRT 2.15) writes each engine to a file in the
-        # temporary directory as soon as it is built, and streams the files into the program, so no engine is held
-        # in memory while it is saved.
+        # compile_and_save (pytorch/TensorRT#4863, which LeRobot needs from Torch-TensorRT 2.15.1) writes each engine
+        # to a file in the temporary directory as soon as it is built, and streams the files into the program, so no
+        # engine is held in memory while it is saved.
         compile_and_save(
             program,
             str(path),
