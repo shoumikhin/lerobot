@@ -109,14 +109,18 @@ class ReachedCompileError(Exception):
 
 
 def use_fake_tensorrt(monkeypatch, compile, save=None):
-    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile` and whose `save` is `save`, the
-    CUDA partitioner of a part by its name, and the GPU memory config by a string."""
+    """Replace Torch-TensorRT by a module whose only function, `compile_and_save`, runs `compile` and then
+    `save` on what it returns, the CUDA partitioner of a part by its name, and the GPU memory config by a string."""
     from lerobot.export.backends import executorch_tensorrt
+
+    def compile_and_save(program, file_path, *, output_format, arg_inputs, save_options, **options):
+        engine = compile(program, arg_inputs, **options)
+        if save is not None:
+            save(engine, file_path, output_format=output_format, **save_options)
 
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
-    module.dynamo = types.SimpleNamespace(compile=compile)
-    module.save = save
+    module.compile_and_save = compile_and_save
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
     monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: f"partitioner of {name}")
     monkeypatch.setattr(executorch_tensorrt, "gpu_memory_config", lambda: "GPU memory")
@@ -163,6 +167,16 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
             "backend_config": "GPU memory",
         },
     )
+
+
+def test_a_torch_tensorrt_without_compile_and_save_raises_an_import_error(monkeypatch, tmp_path):
+    """The compile step turns an ImportError into its install hint."""
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    use_fake_tensorrt(monkeypatch, lambda program, arg_inputs, **options: "engine")
+    monkeypatch.delattr(sys.modules["torch_tensorrt"], "compile_and_save")
+    with pytest.raises(ImportError, match="compile_and_save"):
+        ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "model.pte")
 
 
 def test_an_executorch_whose_cuda_backend_does_not_import_is_refused_before_tensorrt_builds(

@@ -121,7 +121,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         that shares its weights can run afterwards. Returns the weights file of the CUDA backend's part, if it
         has one.
         """
-        import torch_tensorrt
+        from torch_tensorrt import compile_and_save
 
         # Before TensorRT builds, so ExecuTorch's CUDA backend, which needs Triton, fails at once without it.
         partitioner = cuda_partitioner(path.stem)
@@ -146,17 +146,23 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
         args, _ = program.example_inputs
-        engine = torch_tensorrt.dynamo.compile(program, arg_inputs=args, **options)
-        torch_tensorrt.save(
-            engine,
+        # compile_and_save (pytorch/TensorRT#4863, in Torch-TensorRT 2.15) writes each engine to a file in the
+        # temporary directory as soon as it is built, and streams the files into the program, so no engine is held
+        # in memory while it is saved.
+        compile_and_save(
+            program,
             str(path),
             output_format="executorch",
-            # Tracing the compiled module again would drop the engines it holds.
-            retrace=False,
-            use_cuda_graphs=True,
-            # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
-            partitioners=[partitioner],
-            backend_config=gpu_memory_config(),
+            arg_inputs=args,
+            save_options={
+                # Tracing the compiled module again would drop the engines it holds.
+                "retrace": False,
+                "use_cuda_graphs": True,
+                # Takes what TensorRT left, so no operator falls back to a CPU kernel between GPU parts.
+                "partitioners": [partitioner],
+                "backend_config": gpu_memory_config(),
+            },
+            **options,
         )
         data = path.with_suffix(".ptd")
         return data if data.exists() else None
