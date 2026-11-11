@@ -108,22 +108,6 @@ class ReachedCompileError(Exception):
     pass
 
 
-@pytest.mark.parametrize(("size", "expected"), [(None, {}), (1 << 20, {"workspace_size": 1 << 20})])
-def test_compile_gets_the_workspace_size_only_when_it_is_set(monkeypatch, tmp_path, size, expected):
-    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
-
-    seen = {}
-
-    def compile(program, arg_inputs, *, fallback_pytorch_plugin_ops, **options):
-        seen.update({key: value for key, value in options.items() if key == "workspace_size"})
-        raise ReachedCompileError
-
-    use_fake_tensorrt(monkeypatch, compile)
-    with pytest.raises(ReachedCompileError):
-        ExecuTorchTensorRTConfig(workspace_size=size).compile(linear_program(), tmp_path / "model.pte")
-    assert seen == expected
-
-
 def use_fake_tensorrt(monkeypatch, compile, save=None):
     """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile` and whose `save` is `save`, the
     CUDA partitioner of a part by its name, and the GPU memory config by a string."""
@@ -142,7 +126,8 @@ def linear_program():
     return torch.export.export(nn.Linear(2, 2), (torch.randn(1, 2),))
 
 
-@pytest.mark.parametrize("changed", [{}, {"deduplicate_weights": False}])
+# A workspace size goes to Torch-TensorRT only when it is set.
+@pytest.mark.parametrize("changed", [{}, {"deduplicate_weights": False}, {"workspace_size": 1 << 20}])
 def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatch, tmp_path, changed):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
@@ -164,6 +149,7 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
         "offload_module_to_cpu": True,
         "disable_tf32": True,
         "deduplicate_weights": True,
+        "release_weights_after_build": True,
         **changed,
     }
     assert seen["save"] == (

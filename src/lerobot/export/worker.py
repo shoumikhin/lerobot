@@ -267,7 +267,8 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
     try:
         # Lowering needs no autograd, and some of ExecuTorch's passes fail when it records them (complex views).
         with torch.no_grad():
-            # The trace step of this export wrote the program.
+            # The trace step of this export wrote the program. It is passed without a name here, so that
+            # `compile` holds its only reference and can free it once it no longer needs it.
             data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
     except ImportError as error:
         if not backend.packages:

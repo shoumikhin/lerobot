@@ -25,6 +25,7 @@ import signal
 import stat
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -660,6 +661,20 @@ def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     worker.main()
     assert seen == [(False, False, False)]
+
+
+def test_the_compile_step_leaves_the_backend_the_only_reference_to_the_program(tmp_path, monkeypatch):
+    """A backend frees the traced program, and with it the part's weights, once it no longer needs it."""
+    freed = []
+
+    def compile(self, program, path):
+        reference = weakref.ref(program)
+        del program
+        freed.append(reference() is None)
+
+    monkeypatch.setattr(TorchTestBackend, "compile", compile)
+    compile_part(tmp_path, None)
+    assert freed == [True]
 
 
 def compile_part(tmp_path, quantize):

@@ -117,7 +117,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
 
-        Returns the weights file of the CUDA backend's part, if it has one.
+        It empties in place the weights that only its TensorRT engines read, so neither `program` nor a module
+        that shares its weights can run afterwards. Returns the weights file of the CUDA backend's part, if it
+        has one.
         """
         import torch_tensorrt
 
@@ -136,6 +138,10 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
             "deduplicate_weights": self.deduplicate_weights,
+            # Frees each weight once the last engine that reads it is built (pytorch/TensorRT#4853), so the
+            # build does not hold the weights and the engines at once. A weight that a part left to the CUDA
+            # backend reads stays, since Torch-TensorRT frees only what no graph outside TensorRT reads.
+            "release_weights_after_build": True,
         }
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
