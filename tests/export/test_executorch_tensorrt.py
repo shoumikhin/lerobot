@@ -109,14 +109,18 @@ class ReachedCompileError(Exception):
 
 
 def use_fake_tensorrt(monkeypatch, compile, save=None):
-    """Replace Torch-TensorRT by a module whose `dynamo.compile` is `compile` and whose `save` is `save`, the
-    CUDA partitioner of a part by its name, and the GPU memory config by a string."""
+    """Replace Torch-TensorRT by a module whose only function, `compile_and_save`, runs `compile` and then
+    `save` on what it returns, the CUDA partitioner of a part by its name, and the GPU memory config by a string."""
     from lerobot.export.backends import executorch_tensorrt
+
+    def compile_and_save(program, file_path, *, output_format, arg_inputs, save_options, **options):
+        engine = compile(program, arg_inputs, **options)
+        if save is not None:
+            save(engine, file_path, output_format=output_format, **save_options)
 
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
-    module.dynamo = types.SimpleNamespace(compile=compile)
-    module.save = save
+    module.compile_and_save = compile_and_save
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
     monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: f"partitioner of {name}")
     monkeypatch.setattr(executorch_tensorrt, "gpu_memory_config", lambda: "GPU memory")
