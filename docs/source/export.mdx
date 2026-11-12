@@ -199,6 +199,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
       "outputs": ["action"]
     }
   ],
+  "first_runs": [],
   "constants": null,
   "task_tokens": null,
   "action_tokens": null,
@@ -227,7 +228,7 @@ The bundle holds everything needed to run the policy, and nothing else. The robo
 - `programs` lists each compiled program file once, by name, with the data file the runtime loads beside it, if any.
 - `runs` run in order, each naming its program, so one program can run several times. They pass values to each other **by name**. An input can be a key of the robot's frame (such as `observation.state`), `noise`, a named constant, or an output of an earlier run. The last run outputs `action`.
 - For a policy that starts from random noise, on a CUDA device (`executorch_cuda`, `executorch_tensorrt`) the first run takes no inputs and draws `noise` on the GPU, so a chunk copies only the robot's frame there. ExecuTorch 1.6 cannot seed that draw, so it cannot be replayed exactly. Replays and debugging use noise from the host, through the same `noise` input, as the built-in check does.
-- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history` and `carry` are for policies that read past frames or keep values between chunks (see [Past frames](#past-frames) and [Values kept between chunks](#values-kept-between-chunks)). `task_tokens` and `action_tokens` name the files that turn a task into vectors and tokens into actions (see [Tasks](#tasks) and [Actions written as tokens](#actions-written-as-tokens)).
+- The other keys are empty or `null` for a policy like ACT, which predicts each chunk from the current frame alone and takes no task at run time. `history`, `carry` and `first_runs` are for policies that read past frames or keep values between chunks (see [Past frames](#past-frames) and [Values kept between chunks](#values-kept-between-chunks)). `task_tokens` and `action_tokens` name the files that turn a task into vectors and tokens into actions (see [Tasks](#tasks) and [Actions written as tokens](#actions-written-as-tokens)).
 - `runtime_imports` are Python modules to import before the programs load, such as the one that adds TensorRT to ExecuTorch.
 - `runtime_options` are settings the runtime applies before the programs load, chosen by the backend. Here all the TensorRT engines share one scratch buffer for their activations, since they run one after another. The settings hold for the rest of the process, so a bundle loaded later in the same process runs with them too. Engines that share the buffer take turns on the GPU, even when two bundles run on two threads, because the TensorRT delegate makes each wait for the one before ([pytorch/TensorRT#4739](https://github.com/pytorch/TensorRT/pull/4739), in Torch-TensorRT 2.15). Load such bundles one at a time, since loading one changes an environment variable and the module search path of the process while it runs.
 - `action_scale` is the spread of each action in the training data, in robot units. The checks use it.
@@ -237,12 +238,13 @@ A version of LeRobot refuses a bundle whose format or keys it does not know, and
 
 ### Built-in checks
 
-The export makes a random test frame and records the actions PyTorch computes for it. Then:
+The export makes a random test frame and records the actions PyTorch computes for it. On a frame where two choices nearly tie, such as two gripper commands, rounding alone can pick either, so a correct program and a wrong one play equally different actions there. So the export first moves the frame's numbers and the noise by one rounding step, 16 times, and takes the next random frame if the actions move by more than the tolerance, up to 8 frames. Then:
 
 - **At export**, the finished bundle replays the test frame in a fresh process, the same way `lerobot-check-bundle` does. If the actions differ too much from PyTorch's, nothing is written.
+- **Part by part**, for a recipe that asks for it, each compiled program runs at export on the inputs its part got in PyTorch, and its outputs may differ from the part's by at most 3 times what rounding alone moves them: other attention kernels and matmul settings, the part in float32, and one rounding step of the largest value. A floating point output that none of these moves, such as a copy, may differ by one rounding step; integers must match exactly. A long chain of bfloat16 programs can amplify rounding until correct and broken programs play equally different actions, but one program on its own cannot. The check is for bfloat16 and float16 programs; a float32 program has no wider rerun to measure its rounding against. A part whose outputs move, when it simply runs again, by more than 3 rounding steps of the least precise float type it reads, holds or returns, and by more than 1e-4 of their largest value, such as one that draws random numbers or keeps dropout on, is refused.
 - **At load**, `lerobot-check-bundle` replays the test frame again. Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module gets a warning, unless it is in `exact_runtime_modules`), if its programs read a value that nothing gives, or if its manifest names a file outside the bundle folder.
 
-The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. GR00T keeps its linear layers in bfloat16 unless `--policy.use_bf16=false`, so it uses 0.075 by default even with float32 weights. In bfloat16, a recipe whose policy runs ten denoising steps, such as pi0.5's, uses 0.2: the steps amplify rounding, as measured on pi0.5's test frame. That catches only large errors: a recipe that swapped two cameras would move pi0.5's actions by about 0.03 there, so check a change to a recipe in float32, where the tolerance is 2e-05. Change the tolerance with `--tolerance`.
+The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 or float16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. GR00T keeps its linear layers in bfloat16 unless `--policy.use_bf16=false`, so it uses 0.075 by default even with float32 weights. In bfloat16, a recipe whose policy runs ten denoising steps, such as pi0.5's, uses 0.2: the steps amplify rounding, as measured on pi0.5's test frame. That catches only large errors: a recipe that swapped two cameras would move pi0.5's actions by about 0.03 there, so check a change to a recipe in float32, where the tolerance is 2e-05. Change the tolerance with `--tolerance`.
 
 <Tip>
 
@@ -312,6 +314,8 @@ Some policies keep a value from one chunk to the next, such as a planner that st
 
 TD-MPC is such a planner. It plans each chunk by refining a guess over a few rounds, and starts that guess from where its previous plan ended, or from zeros after a reset. Its random numbers come from the bundle's `noise`, like those of the policies above.
 
+Some policies also compute their first chunks after a reset in another way, such as one that builds a cache from its first frames. Their bundle lists the runs of those chunks under `first_runs`, one list per chunk, and later chunks run `runs`. A value that the first chunk writes, in its own type and on its own device, is listed under `carry` without a shape, so it never starts from zeros. The test case of such a bundle plays a few chunks from a reset tick by tick, as a robot would, and holds the action played at each tick, so the check covers every chunk.
+
 ### Tasks
 
 A vision-language-action policy reads a task such as "pick up the cube". To read it, the policy first splits the text into **tokens** (word pieces) with its **tokenizer**, and looks up a vector for each token in its **embedding table**. A compiled program cannot run a tokenizer, so a bundle handles the task in one of two ways:
@@ -323,7 +327,7 @@ For an any-task bundle, the task's prompt must fit in `--max_task_tokens`. The p
 
 ### PyTorch at export and at run time
 
-- The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the processes that trace the policy, compile each program and check the bundle. They give their memory back when they end.
+- The `lerobot-export` command itself never imports PyTorch. The PyTorch work happens in the processes that trace the policy, compile each program and check a part on its own. They give their memory back when they end.
 - `lerobot-check-bundle` loads the compiled programs and never imports PyTorch. Of the installed plugins it loads a runtime plugin only when the bundle names a runtime no loaded package has, since a plugin may import PyTorch.
 
 ## Run pi0.5 and GR00T on a Jetson Orin Nano
@@ -509,11 +513,12 @@ Two optional methods cover bigger policies:
 - `load` (a class method) builds the recipe from the export configuration. Override it to load each part's weights only when that part is traced.
 - `plan()` returns a `RunPlan`, which can hold:
   - `runs`: the list of runs (`ProgramRun`, each naming the part it runs as its program), for a part that runs more than once. Record them in `parts()` as you yield the parts, so the two cannot disagree. For a part that runs once per step, such as a denoising step, `repeated_runs` builds its runs and the constants each run reads;
+  - `first_runs`: the runs of each of the first chunks after a reset, one list per chunk, for a policy whose first chunks compute in another way;
   - `constants`: named arrays the runs read, such as time values;
   - `task_tokens`: a `TaskTokenData`, for a bundle that runs any task;
   - `action_tokens`: an `ActionTokenData`, for a policy that writes its actions as tokens, which the bundle turns into actions with NumPy;
   - `history`: how many past frames of each frame key the programs take;
-  - `carry`: the values the runs pass from one chunk to the next, with their shapes.
+  - `carry`: the values the runs pass from one chunk to the next, with their shapes, or no shape for a value the first chunk writes.
 
 `policies/pi05/export_pi05.py`, `policies/groot/export_groot.py` and `policies/smolvla/export_smolvla.py` are full examples of a chain. `policies/diffusion/export_diffusion.py` shows a recipe that reads past frames, `policies/tdmpc/export_tdmpc.py` one that carries a value between chunks, `policies/pi0_fast/export_pi0_fast.py` one that writes its actions as tokens, and `policies/gaussian_actor/export_gaussian_actor.py` a small change to the default recipe.
 
