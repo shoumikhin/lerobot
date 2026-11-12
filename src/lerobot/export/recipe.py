@@ -84,6 +84,13 @@ PROGRAM_FLOOR_FACTOR = 3.0
 # halfway, on a log scale, between that and random numbers of 1e-2 of a part's size, which must be refused.
 RERUN_STEPS = 3
 RERUN_TOLERANCE = 1e-4
+# The test case takes the first random frame whose actions PyTorch plays again within the tolerance after the frame's
+# floating point values and the noise move by one rounding step, up or down at random, `TEST_FRAME_TRIES` times. On a
+# frame where two choices nearly tie, rounding alone picks one or the other: EVO1's gripper on one LIBERO frame moved
+# its bfloat16 actions by 1.5 on 7 of 32 such steps, as much as a broken program moves them, so no compiled copy
+# could be checked there. 16 tries miss such a frame about 2 times in 100.
+TEST_FRAME_DRAWS = 8
+TEST_FRAME_TRIES = 16
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
@@ -572,6 +579,61 @@ def repeated_runs(
     return runs, constants
 
 
+def stable_frame(
+    draw: Callable[[int], tuple[dict[str, np.ndarray], np.ndarray | None, np.ndarray]],
+    predict: Callable[[dict[str, np.ndarray], np.ndarray | None], np.ndarray],
+    action_scale: Callable[[], np.ndarray],
+    step: float,
+    generator: torch.Generator,
+    tolerance: float,
+    default_tolerance: float,
+    policy_name: str,
+) -> tuple[dict[str, np.ndarray], np.ndarray | None, np.ndarray, np.ndarray]:
+    """The first random frame on which rounding alone keeps the actions, with its noise, actions and scale.
+
+    It tries up to `TEST_FRAME_DRAWS` frames. `draw(i)` gives the `i`th frame, its noise and the actions
+    `predict` computes for them, the first being the frame the caller already holds. The frame's floating point
+    values and the noise move up or down by `step` of themselves, at random from `generator`, `TEST_FRAME_TRIES`
+    times, and the actions must stay within `tolerance` in the units of `action_scale()`, or within
+    `default_tolerance`, the export's default for the policy's dtype, when that is larger.
+    """
+    # One bfloat16 rounding step of the inputs moved a tiny GR00T's actions by 0.006 to 0.019 (measured), more than
+    # a tighter --tolerance its chain still meets, so the search never asks for less than the dtype's default.
+    tolerance = max(tolerance, default_tolerance)
+
+    def move(x: np.ndarray) -> np.ndarray:
+        if not np.issubdtype(x.dtype, np.floating):
+            return x
+        signs = torch.randint(0, 2, x.shape, generator=generator).numpy() * 2 - 1
+        return (x + signs * step * np.abs(x)).astype(x.dtype)
+
+    for index in range(TEST_FRAME_DRAWS):
+        frame, noise, actions = draw(index)
+        scale = action_scale()
+        difference = 0.0
+        for _ in range(TEST_FRAME_TRIES):
+            moved = predict(
+                {name: move(x) for name, x in frame.items()}, None if noise is None else move(noise)
+            )
+            difference = max(difference, float((np.abs(moved - actions) / scale).max()))
+            if difference > tolerance:
+                break
+        else:
+            return frame, noise, actions, scale
+        logger.info(
+            "Random frame %d plays actions %.3g away once its inputs move by one rounding step, more than the "
+            "tolerance %g: taking the next one",
+            index,
+            difference,
+            tolerance,
+        )
+    raise ValueError(
+        f"On each of {TEST_FRAME_DRAWS} random frames, this {policy_name} policy plays other actions once its "
+        f"inputs move by one rounding step, by more than the tolerance {tolerance}, so a compiled copy cannot be "
+        "checked against it. Give a larger --tolerance."
+    )
+
+
 class ExportRecipe(abc.ABC):
     """Knows one kind of policy, never a compiler: turns it into parts and makes the test case.
 
@@ -872,26 +934,62 @@ class ActionChunkRecipe(ExportRecipe):
             ) from error
 
     def _make_case(self, frame: dict[str, np.ndarray]) -> TestCase:
-        """The test case of `frame`: a random noise, if the policy takes one, and the actions PyTorch computes.
+        """The test case: a frame, a random noise if the policy takes one, and the actions PyTorch computes.
 
-        It also sets `_held_noise` and `_noise_shape`, which `parts` and `_random_noise` read, so an override
-        sets them too.
+        The frame is `frame`, or the first next random frame on which one rounding step of the inputs, tried
+        `TEST_FRAME_TRIES` times, moves the actions by no more than the tolerance. It also sets `_held_noise` and
+        `_noise_shape`, which `parts` and `_random_noise` read, so an override that keeps those sets them too.
         """
         self._held_noise = self._seeded_noise()
         self._noise_shape = None if self._held_noise is not None else self._sampled_noise_shape(frame)
-        noise = self._random_noise()
-        actions = self._reference(frame, noise)
-        if not np.isfinite(actions).all():
-            raise ValueError(
-                f"This {self.policy.config.type} policy computes actions that are not finite for a random frame, "
-                "so a compiled copy cannot be checked against it."
+        floats = [p.dtype for p in self.policy.parameters() if p.is_floating_point()]
+        step = max(float(torch.finfo(dtype).eps) for dtype in floats or [torch.float32])
+        pipelines = action_pipelines(self.postprocessor)
+        # The actions the checks compare: without the thresholds, if the postprocessor has any.
+        checked = (
+            self._reference
+            if len(pipelines) == 1
+            else functools.partial(self._reference, postprocess=pipelines[-1])
+        )
+
+        def draw(index: int) -> tuple[dict[str, np.ndarray], np.ndarray | None, np.ndarray]:
+            drawn = random_frame(self._features, self._generator) if index else frame
+            noise = self._random_noise()
+            actions = checked(drawn, noise)
+            if not np.isfinite(actions).all():
+                raise ValueError(
+                    f"This {self.policy.config.type} policy computes actions that are not finite for a random "
+                    "frame, so a compiled copy cannot be checked against it."
+                )
+            # PyTorch may round a rerun otherwise, as a part's rerun may in `ProgramCheck.measure`: in bfloat16 on
+            # an A100, LingBot-VLA v2 came back 0.0035 apart (relative) in 5 of about 390 calls, where
+            # `RERUN_STEPS` steps allow 0.023.
+            ((again, _),) = relative_errors(
+                [torch.from_numpy(checked(drawn, noise))], [torch.from_numpy(actions)]
             )
-        if not np.array_equal(actions, self._reference(frame, noise)):
-            raise ValueError(
-                f"This {self.policy.config.type} policy computes another chunk from the same frame and noise "
-                "each time, so a compiled copy cannot be checked against it."
-            )
-        return TestCase(frame, noise, actions, self._action_scale(self._predicted_width))
+            if not again <= max(RERUN_STEPS * step, RERUN_TOLERANCE):
+                raise ValueError(
+                    f"This {self.policy.config.type} policy computes another chunk from the same frame and noise "
+                    "each time, so a compiled copy cannot be checked against it."
+                )
+            return drawn, noise, actions
+
+        frame, noise, actions, scale = stable_frame(
+            draw,
+            checked,
+            lambda: self._action_scale(self._predicted_width),
+            step,
+            self._generator,
+            self.tolerance,
+            _default_tolerance(self.policy, self.bfloat16_tolerance),
+            self.policy.config.type,
+        )
+        return with_continuous_actions(
+            TestCase(frame, noise, actions if len(pipelines) == 1 else self._reference(frame, noise), scale),
+            functools.partial(self._reference, frame, noise),
+            self.postprocessor,
+            self.tolerance,
+        )
 
     def _action_scale(self, width: int) -> np.ndarray:
         return measure_action_scale(

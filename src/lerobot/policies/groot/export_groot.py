@@ -71,6 +71,7 @@ from lerobot.export.recipe import (
     random_frame,
     refuse_depth_maps,
     refuse_peft_adapter,
+    stable_frame,
     to_policy_input,
     whole_policy_fits,
 )
@@ -222,6 +223,56 @@ class GrootExportRecipe(ChainRecipe):
         self._actions: np.ndarray | None = None
         self._continuous_actions: np.ndarray | None = None
         self._actions_mask: np.ndarray | None = None
+        self._policy_continuous: np.ndarray | None = None
+        self._take_a_stable_frame(features, torch.bfloat16 if bfloat16 else torch.float32, default_tolerance)
+
+    def _take_a_stable_frame(
+        self, features: dict[str, PolicyFeature], dtype: torch.dtype, default_tolerance: float
+    ) -> None:
+        """Take the first random frame and noise on which rounding alone keeps the policy's actions.
+
+        As `ActionChunkRecipe` takes its test frame: where the policy's own actions change sharply, such as a
+        LIBERO gripper closing within a chunk step, rounding alone moves them, so even correct parts land as far
+        from the policy as broken ones. The inputs move by one rounding step of `dtype`, the type the policy
+        computes in. When the whole policy does not fit in memory, the first frame stays.
+        """
+        if not whole_policy_fits(self._model_file(), self._device, self.policy_name):
+            return
+        frame, noise, self._policy_continuous = self._stable_frame(features, dtype, default_tolerance)
+        # The whole policy is gone once `_stable_frame` returns.
+        _free_memory()
+        if frame is not self._frame:
+            self._batch = self._preprocess(frame, self.task)
+            self._frame, self._noise = frame, torch.from_numpy(noise)
+            self._check_pixels()
+
+    def _stable_frame(
+        self, features: dict[str, PolicyFeature], dtype: torch.dtype, default_tolerance: float
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """`stable_frame` on the whole policy's actions without the thresholds, from the test frame on."""
+        policy, preprocessor, postprocessor = load_policy(self.cfg)
+        predict = partial(self._predict, policy, preprocessor, action_pipelines(postprocessor)[-1])
+
+        def draw(index: int) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+            if index:
+                drawn = random_frame(features, self._generator)
+                frame = {name: drawn[name] for name in self._images.frame_names}
+                noise = torch.randn(self._noise.shape, generator=self._generator).numpy()
+            else:
+                frame, noise = self._frame, self._noise.numpy()
+            return frame, noise, predict(frame, noise)
+
+        frame, noise, actions, _ = stable_frame(
+            draw,
+            predict,
+            self._action_scale,
+            float(torch.finfo(dtype).eps),
+            self._generator,
+            self.tolerance,
+            default_tolerance,
+            self.policy_name,
+        )
+        return frame, cast(np.ndarray, noise), actions
 
     def parts(self) -> Iterator[Part]:
         """The chain's parts, each run in PyTorch to make the next part's inputs, one in memory at a time.
@@ -649,29 +700,34 @@ class GrootExportRecipe(ChainRecipe):
             )
 
     def _policy_actions(self, case: TestCase) -> np.ndarray | None:
-        """The policy's own actions for the test case on the program's pixels, without the postprocessor's
-        thresholds, when the whole policy fits in memory."""
-        if not whole_policy_fits(self._model_file(), self._device, self.policy_name):
-            return None
-        policy, preprocessor, postprocessor = load_policy(self.cfg)
-        observation = prepare_observation_for_inference(dict(case.frame), self._device, self.task)
-        noise = torch.from_numpy(case.noise).to(self._device)[None]
-        inputs = tuple(
-            torch.from_numpy(case.frame[name]).to(self._device) for name in self._images.frame_names
-        )
+        """The policy's own actions for the test frame without the postprocessor's thresholds, as the stable-frame
+        search computed them, or None when the whole policy does not fit in memory."""
+        return self._policy_continuous
+
+    def _predict(
+        self,
+        policy: GrootPolicy,
+        preprocessor: PolicyProcessorPipeline,
+        postprocess: PolicyProcessorPipeline,
+        frame: dict[str, np.ndarray],
+        noise: np.ndarray,
+    ) -> np.ndarray:
+        """The policy's own `predict_action_chunk` for `frame` and `noise` on the program's pixels, through
+        `postprocess`.
+
+        The program's resize sums in another order than the processor's, which rounds a few values to the next
+        level; `_check_pixels` holds it to `PIXEL_TOLERANCE`. On the program's pixels the policy and the parts
+        compute the same, so the comparison measures the parts alone.
+        """
+        observation = prepare_observation_for_inference(dict(frame), self._device, self.task)
+        inputs = tuple(torch.from_numpy(frame[name]).to(self._device) for name in self._images.frame_names)
         with torch.no_grad():
             batch = preprocessor(observation)
-            # The program's resize sums in another order than the processor's, which rounds a few values to the
-            # next level; `_check_pixels` holds it to `PIXEL_TOLERANCE`. On the program's pixels the policy and
-            # the parts compute the same, so the comparison measures the parts alone.
             pixels, _ = self._images(*inputs)
             batch["pixel_values"] = pixels.to(batch["pixel_values"].dtype)
-            output = policy.predict_action_chunk(batch, noise=noise)
+            output = policy.predict_action_chunk(batch, noise=torch.from_numpy(noise).to(self._device)[None])
             chunk = transition_to_policy_action(policy_output_to_transition(output))[:, : self._steps]
-            expected = action_pipelines(postprocessor)[-1](chunk)[0].float().cpu().numpy()
-        del policy
-        _free_memory()
-        return expected
+            return postprocess(chunk)[0].float().cpu().numpy()
 
     def _model_file(self) -> Path:
         from transformers.utils import cached_file

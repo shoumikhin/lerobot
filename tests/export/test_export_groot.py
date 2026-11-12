@@ -266,14 +266,47 @@ def test_export_refuses_parts_that_compute_other_actions_than_the_policy(
 ):
     from lerobot.policies.groot.modeling_groot import GrootPolicy
 
-    recipe = GrootExportRecipe(_export_config(GrootConfig.from_pretrained(checkpoint), tmp_path))
-    list(recipe.parts())
     predict = GrootPolicy.predict_action_chunk
     monkeypatch.setattr(
         GrootPolicy, "predict_action_chunk", lambda *args, **kwargs: predict(*args, **kwargs) + shift
     )
+    # The policy's actions come from the stable-frame search, which runs when the recipe is built.
+    recipe = GrootExportRecipe(_export_config(GrootConfig.from_pretrained(checkpoint), tmp_path))
+    list(recipe.parts())
     with pytest.raises(ValueError, match="compute other actions than GR00T's predict_action_chunk"):
         recipe.test_case()
+
+
+def tie_on_the_first_states(monkeypatch, frames: int = 1) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Make GR00T's actions flip sign when the state comes within 1 percent of one of the first `frames` states it
+    saw, without being equal: like a LIBERO gripper that closes right there. Returns those states and the state of
+    every call."""
+    from lerobot.policies.groot.modeling_groot import GrootPolicy
+
+    predict = GrootPolicy.predict_action_chunk
+    states: list[torch.Tensor] = []
+    calls: list[torch.Tensor] = []
+
+    def tied(self, batch, **kwargs):
+        actions = predict(self, batch, **kwargs)
+        state = batch["state"].clone()
+        calls.append(state)
+        near = any(not torch.equal(state, s) and torch.allclose(state, s, rtol=0.01) for s in states)
+        if not near and len(states) < frames and not any(torch.equal(state, s) for s in states):
+            states.append(state)
+        return -actions if near else actions
+
+    monkeypatch.setattr(GrootPolicy, "predict_action_chunk", tied)
+    return states, calls
+
+
+def test_the_test_case_skips_a_frame_where_rounding_moves_the_actions(checkpoint, tmp_path, monkeypatch):
+    states, calls = tie_on_the_first_states(monkeypatch)
+    recipe = GrootExportRecipe(_export_config(GrootConfig.from_pretrained(checkpoint), tmp_path))
+    list(recipe.parts())
+    recipe.test_case()
+    # The search ends on a frame away from the tie: its last call reads a state far from the tied one.
+    assert not torch.allclose(calls[-1], states[0], rtol=0.01)
 
 
 def test_the_check_against_the_policy_reads_the_programs_pixels(checkpoint, tmp_path, monkeypatch):
