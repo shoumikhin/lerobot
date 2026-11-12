@@ -344,6 +344,19 @@ def test_recipe_refuses_a_policy_that_computes_another_chunk_each_time():
         make(UniformDrawACT)
 
 
+class RerunRoundingACT(ACTPolicy):
+    """ACT whose every other chunk rounds about 8 float32 steps the other way, as a kernel may between runs."""
+
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        self.calls = getattr(self, "calls", 0) + 1
+        actions = super().predict_action_chunk(batch)
+        return actions * (1 + 1e-6) if self.calls % 2 else actions
+
+
+def test_recipe_takes_a_policy_whose_rerun_differs_by_rounding():
+    make(RerunRoundingACT)
+
+
 class NoChunkSpecACT(ACTPolicy):
     def chunk_inference_spec(self):
         raise ValueError("n_action_steps is larger than chunk_size")
@@ -368,6 +381,36 @@ def test_recipe_refuses_a_policy_whose_actions_are_not_finite(monkeypatch, value
     monkeypatch.setattr(NonFiniteACT, "value", value)
     with pytest.raises(ValueError, match="computes actions that are not finite"):
         make(NonFiniteACT)
+
+
+def tie_on_the_first_state(monkeypatch, frames: int = 1) -> list[np.ndarray]:
+    """Make the actions jump by 10 when the state comes within 1 percent of one of the first `frames` states the
+    policy computed, without being equal: like two gripper commands that nearly tie there. Returns those states."""
+    reference = ActionChunkRecipe._reference
+    states: list[np.ndarray] = []
+
+    def tied(self, frame, noise):
+        actions = reference(self, frame, noise)
+        state = frame[OBS_STATE]
+        near = any(not np.array_equal(state, s) and np.allclose(state, s, rtol=0.01) for s in states)
+        if not near and len(states) < frames and not any(np.array_equal(state, s) for s in states):
+            states.append(state.copy())
+        return actions + 10.0 * near
+
+    monkeypatch.setattr(ActionChunkRecipe, "_reference", tied)
+    return states
+
+
+def test_the_test_case_skips_a_frame_where_rounding_moves_the_actions(monkeypatch):
+    states = tie_on_the_first_state(monkeypatch)
+    case = make(NoisyACT).test_case()
+    assert not np.array_equal(case.frame[OBS_STATE], states[0])
+
+
+def test_recipe_refuses_a_policy_that_ties_on_every_frame(monkeypatch):
+    tie_on_the_first_state(monkeypatch, frames=recipe_module.TEST_FRAME_DRAWS)
+    with pytest.raises(ValueError, match="plays other actions once its inputs move by one rounding step"):
+        make(NoisyACT)
 
 
 def test_replayed_draws_read_the_noise_in_order():

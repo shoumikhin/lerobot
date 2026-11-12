@@ -81,6 +81,13 @@ PROGRAM_FLOOR_FACTOR = 3.0
 # halfway, on a log scale, between that and random numbers of 1e-2 of a part's size, which must be refused.
 RERUN_STEPS = 3
 RERUN_TOLERANCE = 1e-4
+# The test case takes the first random frame whose actions PyTorch plays again within the tolerance after the frame's
+# floating point values and the noise move by one rounding step, up or down at random, `TEST_FRAME_TRIES` times. On a
+# frame where two choices nearly tie, rounding alone picks one or the other: EVO1's gripper on one LIBERO frame moved
+# its bfloat16 actions by 1.5 on 7 of 32 such steps, as much as a broken program moves them, so no compiled copy
+# could be checked there. 16 tries miss such a frame about 2 times in 100.
+TEST_FRAME_DRAWS = 8
+TEST_FRAME_TRIES = 16
 # A random test image blends a coarse grid of random colors (rows, columns), so it changes smoothly like a
 # camera image. On independent random pixels a vision-language policy's bfloat16 actions differ more between
 # two correct compilations, so the check would measure noise.
@@ -804,26 +811,71 @@ class ActionChunkRecipe(ExportRecipe):
             ) from error
 
     def _make_case(self, frame: dict[str, np.ndarray]) -> TestCase:
-        """The test case of `frame`: a random noise, if the policy takes one, and the actions PyTorch computes.
+        """The test case: a frame, a random noise if the policy takes one, and the actions PyTorch computes.
 
-        It also sets `_held_noise` and `_noise_shape`, which `parts` and `_random_noise` read, so an override
-        sets them too.
+        The frame is `frame`, or the first next random frame on which one rounding step of the inputs, tried
+        `TEST_FRAME_TRIES` times, moves the actions by no more than the tolerance. It also sets `_held_noise` and
+        `_noise_shape`, which `parts` and `_random_noise` read, so an override sets them too.
         """
         self._held_noise = self._seeded_noise()
         self._noise_shape = None if self._held_noise is not None else self._sampled_noise_shape(frame)
-        noise = self._random_noise()
-        actions = self._reference(frame, noise)
-        if not np.isfinite(actions).all():
-            raise ValueError(
-                f"This {self.policy.config.type} policy computes actions that are not finite for a random frame, "
-                "so a compiled copy cannot be checked against it."
+        floats = [p.dtype for p in self.policy.parameters() if p.is_floating_point()]
+        step = max(float(torch.finfo(dtype).eps) for dtype in floats or [torch.float32])
+        for draw in range(TEST_FRAME_DRAWS):
+            if draw:
+                frame = random_frame(self._features, self._generator)
+            noise = self._random_noise()
+            actions = self._reference(frame, noise)
+            if not np.isfinite(actions).all():
+                raise ValueError(
+                    f"This {self.policy.config.type} policy computes actions that are not finite for a random "
+                    "frame, so a compiled copy cannot be checked against it."
+                )
+            # PyTorch may round a rerun otherwise, as a part's rerun may in `ProgramCheck.measure`: in bfloat16 on
+            # an A100, LingBot-VLA v2 came back 0.0035 apart (relative) in 5 of about 390 calls, where
+            # `RERUN_STEPS` steps allow 0.023.
+            ((again, _),) = relative_errors(
+                [torch.from_numpy(self._reference(frame, noise))], [torch.from_numpy(actions)]
             )
-        if not np.array_equal(actions, self._reference(frame, noise)):
-            raise ValueError(
-                f"This {self.policy.config.type} policy computes another chunk from the same frame and noise "
-                "each time, so a compiled copy cannot be checked against it."
+            if not again <= max(RERUN_STEPS * step, RERUN_TOLERANCE):
+                raise ValueError(
+                    f"This {self.policy.config.type} policy computes another chunk from the same frame and noise "
+                    "each time, so a compiled copy cannot be checked against it."
+                )
+            scale = self._action_scale(self._predicted_width)
+            difference = 0.0
+            for _ in range(TEST_FRAME_TRIES):
+                moved = self._reference(*self._moved(frame, noise, step))
+                difference = max(difference, float((np.abs(moved - actions) / scale).max()))
+                if difference > self.tolerance:
+                    break
+            else:
+                return TestCase(frame, noise, actions, scale)
+            logger.info(
+                "Random frame %d plays actions %.3g away once its inputs move by one rounding step, more than the "
+                "tolerance %g: taking the next one",
+                draw,
+                difference,
+                self.tolerance,
             )
-        return TestCase(frame, noise, actions, self._action_scale(self._predicted_width))
+        raise ValueError(
+            f"On each of {TEST_FRAME_DRAWS} random frames, this {self.policy.config.type} policy plays other actions "
+            f"once its inputs move by one rounding step, by more than the tolerance {self.tolerance}, so a compiled "
+            "copy cannot be checked against it. Give a larger --tolerance."
+        )
+
+    def _moved(
+        self, frame: dict[str, np.ndarray], noise: np.ndarray | None, step: float
+    ) -> tuple[dict[str, np.ndarray], np.ndarray | None]:
+        """`frame`'s floating point values and `noise`, each moved up or down by `step` of itself, at random."""
+
+        def move(x: np.ndarray | None) -> np.ndarray | None:
+            if x is None or not np.issubdtype(x.dtype, np.floating):
+                return x
+            signs = torch.randint(0, 2, x.shape, generator=self._generator).numpy() * 2 - 1
+            return (x + signs * step * np.abs(x)).astype(x.dtype)
+
+        return {name: move(x) for name, x in frame.items()}, move(noise)
 
     def _action_scale(self, width: int) -> np.ndarray:
         return measure_action_scale(
