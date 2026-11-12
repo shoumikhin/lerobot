@@ -118,6 +118,10 @@ class Part:
         check (`ProgramCheck`, *optional*):
             What the compiled program must compute on its own, checked at export before the bundle's test
             case.
+        compile_options (`dict[str, Any]`, *optional*):
+            Settings of the backend's compiler for this program, on top of the backend's own, such as
+            Torch-TensorRT's `grouped_mm_kernel`. Values JSON can hold. Only `executorch_tensorrt` reads them, and
+            the other backends' `compile` takes none, so a recipe sets them only for that backend.
     """
 
     name: str
@@ -126,9 +130,10 @@ class Part:
     inputs: list[str]
     outputs: list[str]
     check: ProgramCheck | None = None
+    compile_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Refuse a reserved name, inputs without one name each or one tensor given for two.
+        """Refuse a reserved name, inputs without one name each, one tensor given for two, or options JSON cannot hold.
 
         Keeps the example inputs contiguous.
         """
@@ -150,6 +155,13 @@ class Part:
                     "its own, or the traced program reads one of them for both."
                 )
             names[id(x)] = name
+        # The trace step hands the options to the compile step, in another process, as JSON.
+        try:
+            json.dumps(self.compile_options)
+        except TypeError as error:
+            raise ValueError(
+                f"The compile options of the part {self.name} must be values JSON can hold: {error}"
+            ) from error
         # A traced program keeps its example inputs' memory layout, and a bundle passes every input contiguous.
         self.example_inputs = tuple(x.contiguous() for x in self.example_inputs)
 

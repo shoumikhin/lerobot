@@ -123,6 +123,14 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
             message += f" Install it in this environment:\n\n    pip install {pins}\n\nThen export again."
         raise ValueError(f"{message} See https://huggingface.co/docs/lerobot/export.")
 
+    def install_error(self, error: ImportError) -> ImportError:
+        """The `ImportError` that names what to install to export with this backend, for `error`."""
+        packages = " ".join(f'"{package}"' for package in self.packages)
+        return ImportError(
+            f"The {self.type} backend could not import what it needs ({error}). If it is not installed: "
+            f"pip install {packages}. See https://huggingface.co/docs/lerobot/export."
+        )
+
     def quantized(
         self, module: nn.Module, example_inputs: tuple[Tensor, ...], mode: str
     ) -> contextlib.AbstractContextManager:
@@ -136,6 +144,10 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
     @abc.abstractmethod
     def compile(self, program: ExportedProgram, path: Path) -> Path | None:
         """Compile `program`, one part traced by `torch.export`, into the program file `path`.
+
+        For a part with `Part.compile_options`, the compile step also passes them, as the keyword argument
+        `compile_options`. Only `executorch_tensorrt` takes it, so a backend whose compiler takes no settings
+        from a recipe keeps this signature.
 
         `program.example_inputs` holds the inputs it was traced with, on the backend's device. The export's
         compile step passes its only reference to `program`, so a backend may free it once it no longer needs

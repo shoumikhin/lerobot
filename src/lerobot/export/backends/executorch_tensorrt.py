@@ -17,12 +17,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..configs import ExportBackendConfig
 from .executorch import EXPORT_EXTRA, ExecuTorchConfig, cuda_partitioner, gpu_memory_config
@@ -114,13 +115,18 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         logger.info("Quantized the weights of %d layers in %s", len(quantized), mode)
         return export_torch_mode()
 
-    def compile(self, program: ExportedProgram, path: Path) -> Path | None:
+    def compile(
+        self, program: ExportedProgram, path: Path, compile_options: Mapping[str, Any] | None = None
+    ) -> Path | None:
         """Compile `program` with Torch-TensorRT and save it as an ExecuTorch program.
 
         It empties in place the weights that only its TensorRT engines read, so neither `program` nor a module
-        that shares its weights can run afterwards. Returns the weights file of the CUDA backend's part, if it
-        has one.
+        that shares its weights can run afterwards. `compile_options` are Torch-TensorRT settings, added to the
+        backend's own. One that the installed Torch-TensorRT does not have, or that the backend already sets,
+        from its own settings or the `--backend` flags, is refused. Returns the weights file of the CUDA backend's
+        part, if it has one.
         """
+        import torch_tensorrt
         from torch_tensorrt import compile_and_save
 
         # Before TensorRT builds, so ExecuTorch's CUDA backend, which needs Triton, fails at once without it.
@@ -145,6 +151,19 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         }
         if self.workspace_size is not None:
             options["workspace_size"] = self.workspace_size
+        for name in compile_options or {}:
+            # A recipe's setting must not silently replace the user's flags or what an ExecuTorch program needs.
+            if name in options or name in ("output_format", "arg_inputs", "save_options"):
+                raise ValueError(
+                    f"The compile options of {path.stem} set {name}, which the {self.type} backend already "
+                    "passes to Torch-TensorRT."
+                )
+            if not torch_tensorrt_has_setting(name):
+                raise ValueError(
+                    f"Torch-TensorRT {torch_tensorrt.__version__} has no setting {name}, which the compile "
+                    f"options of {path.stem} set, and it would ignore it without a word."
+                )
+        options.update(compile_options or {})
         args, _ = program.example_inputs
         # compile_and_save (pytorch/TensorRT#4863, in Torch-TensorRT 2.15) writes each engine to a file in the
         # temporary directory as soon as it is built, and streams the files into the program, so no engine is held
@@ -166,6 +185,16 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         )
         data = path.with_suffix(".ptd")
         return data if data.exists() else None
+
+
+def torch_tensorrt_has_setting(name: str) -> bool:
+    """Whether the installed Torch-TensorRT's compiler has the setting `name`.
+
+    Torch-TensorRT ignores a setting it does not have without a word, so a recipe that needs a newer one asks first.
+    """
+    from torch_tensorrt.dynamo import CompilationSettings
+
+    return name in {field.name for field in dataclasses.fields(CompilationSettings)}
 
 
 @contextlib.contextmanager

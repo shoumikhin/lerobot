@@ -14,6 +14,10 @@
 
 """Praxis-1's export recipe: what it refuses to export, its bundle, and the check of its parts."""
 
+import dataclasses
+import json
+import sys
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,11 +25,14 @@ import pytest
 import torch
 
 from lerobot.bundle.manifest import NOISE, Bundle
-from lerobot.export import recipe as export_recipe
+from lerobot.export import recipe as export_recipe, worker
+from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 from lerobot.policies.praxis import export_praxis
 from lerobot.policies.praxis.export_praxis import PraxisExportRecipe
 from lerobot.policies.praxis.praxis_core import layers as praxis_layers
 from lerobot.policies.praxis.praxis_core.vae import Autoencoder
+from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION
 from tests.export import (
@@ -33,6 +40,7 @@ from tests.export import (
     torch_backend,  # noqa: F401  # registers torch_test for the in-process trace step
 )
 from tests.export.plugins import use_plugins
+from tests.export.torch_backend import TorchTestBackend
 from tests.policies.praxis.tiny_model import tiny_lerobot_config
 
 
@@ -53,6 +61,94 @@ def test_export_refuses_what_it_does_not_run(monkeypatch, config, message):
     monkeypatch.setattr(export_recipe, "load_policy", load_policy)
     with pytest.raises(ValueError, match=message):
         PraxisExportRecipe.load(SimpleNamespace(policy=config))
+
+
+def use_fake_torch_tensorrt(monkeypatch, *settings):
+    """Replace Torch-TensorRT by a release whose compiler has only the settings `settings`."""
+    module = types.ModuleType("torch_tensorrt")
+    module.__version__ = "2.15.0"
+    dynamo = types.ModuleType("torch_tensorrt.dynamo")
+    dynamo.CompilationSettings = dataclasses.make_dataclass(
+        "CompilationSettings", [(s, bool) for s in settings]
+    )
+    module.dynamo = dynamo
+    monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+    monkeypatch.setitem(sys.modules, "torch_tensorrt.dynamo", dynamo)
+
+
+class LoadedPolicyError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("backend", "settings", "refusal"),
+    [
+        (
+            ExecuTorchTensorRTConfig(),
+            ["workspace_size"],
+            (
+                ValueError,
+                r"Torch-TensorRT 2\.15\.0 has no grouped_mm_kernel .*TensorRT#5021, in Torch-TensorRT 2\.15\.1",
+            ),
+        ),
+        (ExecuTorchTensorRTConfig(), None, (ImportError, r"pip install .*torch_tensorrt\[executorch\]")),
+        (ExecuTorchTensorRTConfig(), ["workspace_size", "grouped_mm_kernel"], None),
+        (ExecuTorchCUDAConfig(), ["workspace_size"], None),
+    ],
+    ids=["tensorrt_without_the_setting", "no_tensorrt", "tensorrt_with_the_setting", "cuda"],
+)
+def test_export_refuses_a_torch_tensorrt_that_leaves_the_experts_to_pytorch(
+    monkeypatch, backend, settings, refusal
+):
+    """Torch-TensorRT ignores a setting it does not have, so the recipe asks before any weight loads."""
+    if settings is None:
+        monkeypatch.setitem(sys.modules, "torch_tensorrt", None)
+    else:
+        use_fake_torch_tensorrt(monkeypatch, *settings)
+
+    def load_policy(cfg):
+        raise LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=backend)
+    error, match = refusal or (LoadedPolicyError, None)
+    with pytest.raises(error, match=match):
+        PraxisExportRecipe.load(cfg)
+
+
+def test_the_compile_options_of_velocity_and_decoder_reach_only_their_programs(tmp_path, monkeypatch):
+    """Through the trace and compile steps of an export, with the test backend standing in for TensorRT."""
+    tiny_praxis.save_checkpoint(tmp_path / "checkpoint")
+    tiny_praxis.use_tiny_praxis(monkeypatch)
+    use_plugins(monkeypatch, "torch_backend")
+    compile, seen = TorchTestBackend.compile, {}
+
+    def compile_and_record(self, program, path, **options):
+        seen[path.stem] = options
+        return compile(self, program, path)
+
+    def run_step_in_this_process(work, name, request):
+        # Through JSON, as between processes.
+        return json.loads(json.dumps(worker.STEPS[request["step"]](json.loads(json.dumps(request)))))
+
+    monkeypatch.setattr(TorchTestBackend, "compile", compile_and_record)
+    monkeypatch.setattr(export_praxis, "ExecuTorchTensorRTConfig", TorchTestBackend)
+    monkeypatch.setattr(export_praxis, "_check_torch_tensorrt", lambda backend: None)
+    monkeypatch.setattr(lerobot_export, "_run_step", run_step_in_this_process)
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    export(
+        [
+            "--backend.type=torch_test",
+            f"--policy.path={tmp_path / 'checkpoint'}",
+            f"--output_dir={tmp_path / 'bundle'}",
+            f"--task={tiny_praxis.TASK}",
+        ]
+    )
+    moe = {"compile_options": {"grouped_mm_kernel": True}}
+    assert seen == {
+        name: moe if name in ("velocity", "decoder") else {}
+        for name in ("encode", "start", "velocity", "decoder", "step", "actions", "actions_first")
+    }
 
 
 @pytest.mark.parametrize("bimanual", [False, True], ids=["single_arm", "bimanual"])
@@ -199,6 +295,28 @@ def test_velocity_and_decoder_are_checked_on_their_own_in_bfloat16(tmp_path, mon
         if part.check is not None:
             assert part.check.failures(part.name, part.check.outputs) == []
             assert part.check.failures(part.name, [torch.zeros_like(x) for x in part.check.outputs])
+
+
+@pytest.mark.parametrize(
+    "backend", [ExecuTorchTensorRTConfig(), ExecuTorchCUDAConfig()], ids=["tensorrt", "cuda"]
+)
+def test_the_parts_with_mixture_of_experts_layers_ask_for_tensorrts_grouped_matrix_multiply(
+    tmp_path, monkeypatch, backend
+):
+    """Only with TensorRT, since only `executorch_tensorrt` reads compile options."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    recipe.cfg.backend = backend
+    parts = list(recipe.parts())
+    moe = {
+        part.name
+        for part in parts
+        if any(isinstance(module, praxis_layers.MoEFeedForward) for module in part.module.modules())
+    }
+    assert moe == {"velocity", "decoder"}
+    tensorrt = isinstance(backend, ExecuTorchTensorRTConfig)
+    assert {part.name: part.compile_options for part in parts} == {
+        part.name: {"grouped_mm_kernel": True} if tensorrt and part.name in moe else {} for part in parts
+    }
 
 
 def test_every_chunk_reads_the_noise_and_the_kept_frames(tmp_path, monkeypatch):

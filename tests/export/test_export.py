@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -670,21 +671,24 @@ def test_the_compile_step_runs_without_autograd_and_tf32(tmp_path, monkeypatch):
     assert seen == [(False, False, False)]
 
 
-def test_the_compile_step_leaves_the_backend_the_only_reference_to_the_program(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compile_options", [None, {"setting": True}], ids=["no_options", "options"])
+def test_the_compile_step_leaves_the_backend_the_only_reference_to_the_program(
+    tmp_path, monkeypatch, compile_options
+):
     """A backend frees the traced program, and with it the part's weights, once it no longer needs it."""
     freed = []
 
-    def compile(self, program, path):
+    def compile(self, program, path, **options):
         reference = weakref.ref(program)
         del program
         freed.append(reference() is None)
 
     monkeypatch.setattr(TorchTestBackend, "compile", compile)
-    compile_part(tmp_path, None)
+    compile_part(tmp_path, None, compile_options)
     assert freed == [True]
 
 
-def compile_part(tmp_path, quantize):
+def compile_part(tmp_path, quantize, compile_options=None):
     with torch.no_grad():
         program = torch.export.export(torch.nn.Linear(2, 2), (torch.zeros(1, 2),))
     torch.export.save(program, tmp_path / "part.pt2")
@@ -695,6 +699,7 @@ def compile_part(tmp_path, quantize):
             "path": str(tmp_path / "out.pt2"),
             "plugins": [],
             "quantize": quantize,
+            "compile_options": compile_options,
         }
     )
 
@@ -727,6 +732,50 @@ def test_the_noise_program_draws_another_standard_normal_noise_each_run():
     first, second = program(), program()
     assert first.shape == (4000,) and not torch.equal(first, second)
     assert abs(first.mean()) < 0.1 and abs(first.std() - 1) < 0.1
+
+
+def run_export_in_this_process(monkeypatch, *args: str) -> None:
+    """Export with every step in the test's process, so that its patches reach them."""
+
+    def run_step_in_this_process(work, name, request):
+        # Through JSON, as between processes.
+        return json.loads(json.dumps(worker.STEPS[request["step"]](json.loads(json.dumps(request)))))
+
+    monkeypatch.setattr(lerobot_export, "_run_step", run_step_in_this_process)
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    run_export(*args)
+
+
+def test_each_parts_compile_options_reach_the_backend_that_compiles_it(checkpoint, tmp_path, monkeypatch):
+    """From the recipe's part, through the trace step and the compile step's request, to a backend that takes
+    them."""
+    load, compile = ExportRecipe.load.__func__, TorchTestBackend.compile
+    seen = {}
+
+    def load_with_options(cls, cfg):
+        recipe = load(cls, cfg)
+        parts = recipe.parts
+        recipe.parts = lambda: (replace(part, compile_options={"setting": part.name}) for part in parts())
+        return recipe
+
+    def compile_and_record(self, program, path, compile_options=None):
+        seen[path.stem] = compile_options
+        return compile(self, program, path)
+
+    monkeypatch.setattr(ExportRecipe, "load", classmethod(load_with_options))
+    monkeypatch.setattr(TorchTestBackend, "compile", compile_and_record)
+    run_export_in_this_process(monkeypatch, f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    assert seen == {"model": {"setting": "model"}}
+
+
+def test_a_backend_whose_compile_takes_no_compile_options_exports_parts_without_them(
+    checkpoint, tmp_path, monkeypatch
+):
+    """A backend written before parts had compile options keeps working."""
+    compile = TorchTestBackend.compile
+    monkeypatch.setattr(TorchTestBackend, "compile", lambda self, program, path: compile(self, program, path))
+    run_export_in_this_process(monkeypatch, f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    assert list(Bundle.read(tmp_path / "b").manifest.programs) == ["model"]
 
 
 def test_the_compile_step_names_what_its_backend_needs_installed(tmp_path, monkeypatch):

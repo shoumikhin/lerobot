@@ -110,8 +110,8 @@ def trace_step(request: dict[str, Any]) -> dict[str, Any]:
 
     The bundle goes into a new folder beside the output folder. The file `request["folders"]` names the
     folders the step makes there, and the parents of the output folder it makes. Returns the bundle folder,
-    its manifest, what is left to compile, and the parts to check on their own, whose checks wait beside their
-    traced programs.
+    its manifest, what is left to compile with the compile options of its parts, and the parts to check on their
+    own, whose checks wait beside their traced programs.
     """
     argv = sys.argv
     # `--help` and parsing errors name the command the user ran.
@@ -150,6 +150,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         programs: dict[str, ProgramFiles] = {}
         runs: list[ProgramRun] = []
         checks: list[str] = []
+        compile_options: dict[str, dict[str, Any]] = {}
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
@@ -163,6 +164,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             if part.check is not None:
                 part.check.save(traced / f"{part.name}.check.safetensors")
                 checks.append(part.name)
+            if part.compile_options:
+                compile_options[part.name] = part.compile_options
             programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
             del part, program
@@ -227,6 +230,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "manifest": manifest.to_dict(),
         "traced": str(traced),
         "checks": checks,
+        "compile_options": compile_options,
         "quantize": cfg.quantize,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
         "log_level": cfg.log_level,
@@ -247,6 +251,9 @@ def _quantized(cfg: ExportConfig, part: Part) -> contextlib.AbstractContextManag
 
 def compile_step(request: dict[str, Any]) -> dict[str, Any]:
     """Compile the saved program `request["program"]` with `request["backend"]` into `request["path"]`.
+
+    `request["compile_options"]` holds the part's compile options, if it has any. Only then are they passed, so a
+    backend whose `compile` takes none keeps working.
 
     Returns the name of the data file the backend wrote beside it, if any.
     """
@@ -269,15 +276,20 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
         with torch.no_grad():
             # The trace step of this export wrote the program. It is passed without a name here, so that
             # `compile` holds its only reference and can free it once it no longer needs it.
-            data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
+            # Two plain calls, since a call that unpacks `**` keyword arguments holds the program in its tuple of
+            # arguments until `compile` returns.
+            if options := request.get("compile_options"):
+                data = backend.compile(
+                    torch.export.load(request["program"]),  # nosec B614
+                    path,
+                    compile_options=options,
+                )
+            else:
+                data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
     except ImportError as error:
         if not backend.packages:
             raise
-        packages = " ".join(f'"{package}"' for package in backend.packages)
-        raise ImportError(
-            f"The {backend.type} backend could not import what it needs ({error}). If it is not installed: "
-            f"pip install {packages}. See https://huggingface.co/docs/lerobot/export."
-        ) from error
+        raise backend.install_error(error) from error
     return {"data": None if data is None else data.name}
 
 

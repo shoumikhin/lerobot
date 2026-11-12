@@ -14,6 +14,7 @@
 
 """The executorch_tensorrt backend: TensorRT takes what it can, and ExecuTorch's CUDA backend the rest."""
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -108,9 +109,10 @@ class ReachedCompileError(Exception):
     pass
 
 
-def use_fake_tensorrt(monkeypatch, compile, save=None):
+def use_fake_tensorrt(monkeypatch, compile, save=None, settings=()):
     """Replace Torch-TensorRT by a module whose only function, `compile_and_save`, runs `compile` and then
-    `save` on what it returns, the CUDA partitioner of a part by its name, and the GPU memory config by a string."""
+    `save` on what it returns, and whose compiler has only the settings `settings`. Replace the CUDA partitioner
+    of a part by its name, and the GPU memory config by a string."""
     from lerobot.export.backends import executorch_tensorrt
 
     def compile_and_save(program, file_path, *, output_format, arg_inputs, save_options, **options):
@@ -121,7 +123,12 @@ def use_fake_tensorrt(monkeypatch, compile, save=None):
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "0.0"
     module.compile_and_save = compile_and_save
+    module.dynamo = types.ModuleType("torch_tensorrt.dynamo")
+    module.dynamo.CompilationSettings = dataclasses.make_dataclass(
+        "CompilationSettings", [(name, bool) for name in settings]
+    )
     monkeypatch.setitem(sys.modules, "torch_tensorrt", module)
+    monkeypatch.setitem(sys.modules, "torch_tensorrt.dynamo", module.dynamo)
     monkeypatch.setattr(executorch_tensorrt, "cuda_partitioner", lambda name: f"partitioner of {name}")
     monkeypatch.setattr(executorch_tensorrt, "gpu_memory_config", lambda: "GPU memory")
 
@@ -167,6 +174,64 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
             "backend_config": "GPU memory",
         },
     )
+
+
+def test_a_parts_compile_options_go_to_torch_tensorrt_with_the_backends_own(monkeypatch, tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    seen = {}
+    use_fake_tensorrt(
+        monkeypatch,
+        lambda program, arg_inputs, **options: seen.update(options),
+        settings=["grouped_mm_kernel"],
+    )
+    compile_options = {"grouped_mm_kernel": True}
+    ExecuTorchTensorRTConfig().compile(
+        linear_program(), tmp_path / "model.pte", compile_options=compile_options
+    )
+    assert seen["grouped_mm_kernel"] is True and seen["fallback_pytorch_plugin_ops"] is True
+
+
+# The user's flags, the backend's own settings and the arguments of its call are not a recipe's to change.
+@pytest.mark.parametrize(
+    ("changed", "name"),
+    [
+        ({"workspace_size": 1 << 20}, "workspace_size"),
+        ({}, "deduplicate_weights"),
+        ({}, "min_block_size"),
+        ({}, "output_format"),
+    ],
+)
+def test_compile_options_that_the_backend_already_sets_are_refused(monkeypatch, tmp_path, changed, name):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    built = []
+    settings = ["workspace_size", "deduplicate_weights", "min_block_size"]
+    use_fake_tensorrt(
+        monkeypatch, lambda program, arg_inputs, **options: built.append(options), settings=settings
+    )
+    with pytest.raises(
+        ValueError, match=f"options of model set {name}, which the executorch_tensorrt backend already"
+    ):
+        ExecuTorchTensorRTConfig(**changed).compile(
+            linear_program(), tmp_path / "model.pte", compile_options={name: 1}
+        )
+    assert not built
+
+
+def test_a_compile_option_the_installed_torch_tensorrt_does_not_have_is_refused(monkeypatch, tmp_path):
+    """Torch-TensorRT ignores a setting it does not have without a word."""
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    built = []
+    use_fake_tensorrt(monkeypatch, lambda program, arg_inputs, **options: built.append(options))
+    with pytest.raises(
+        ValueError, match=r"Torch-TensorRT 0\.0 has no setting grouped_mm_kernel, .* options of model"
+    ):
+        ExecuTorchTensorRTConfig().compile(
+            linear_program(), tmp_path / "model.pte", compile_options={"grouped_mm_kernel": True}
+        )
+    assert not built
 
 
 def test_a_torch_tensorrt_without_compile_and_save_raises_an_import_error(monkeypatch, tmp_path):

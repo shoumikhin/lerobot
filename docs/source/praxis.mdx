@@ -553,6 +553,9 @@ the task and the blank caption), the decoder tower and the step, and last the ac
 last step runs no decoder: its video moves no action, as in Runway's own server. The bundle keeps the last
 22 camera frames and states, so the next chunk is conditioned on the executed one, as in the policy.
 
+- With `executorch_tensorrt`, the export needs a Torch-TensorRT with the `grouped_mm_kernel` setting
+  ([pytorch/TensorRT#5021](https://github.com/pytorch/TensorRT/pull/5021)), which runs the mixture-of-experts
+  layers inside TensorRT, and refuses one without it before any weight loads.
 - The bundle runs the window the released checkpoints run: one executed chunk of context
   (`max_context_chunks=1`), with every action of a chunk played before the next one
   (`n_action_steps=24`). The export refuses other settings.

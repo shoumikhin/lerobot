@@ -56,6 +56,7 @@ import torch
 from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, ProgramRun
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig, torch_tensorrt_has_setting
 from lerobot.export.recipe import (
     ActionChunkRecipe,
     Part,
@@ -96,6 +97,11 @@ CHUNKS = 3
 
 ANCHOR, CLEAN, PROPRIO = "anchor", "clean", "proprio"
 VIDEO, ACTIONS = "video_sample", "action_sample"
+
+# The parts that hold the towers' mixture-of-experts layers.
+MOE_PARTS = ("velocity", "decoder")
+# The Torch-TensorRT setting that runs the grouped matrix multiplies of those layers inside TensorRT.
+GROUPED_MM_KERNEL = "grouped_mm_kernel"
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +468,23 @@ def _check_config(config: PraxisConfig) -> None:
         )
 
 
+def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
+    """Refuse a Torch-TensorRT that cannot run the mixture-of-experts layers in TensorRT, or none at all.
+
+    Such a Torch-TensorRT ignores `grouped_mm_kernel` without a word and leaves each such layer to PyTorch.
+    """
+    try:
+        import torch_tensorrt
+    except ImportError as error:
+        raise backend.install_error(error) from error
+    if not torch_tensorrt_has_setting(GROUPED_MM_KERNEL):
+        raise ValueError(
+            f"Torch-TensorRT {torch_tensorrt.__version__} has no {GROUPED_MM_KERNEL} setting, which Praxis-1 needs "
+            "to run its mixture-of-experts layers inside TensorRT (pytorch/TensorRT#5021, in Torch-TensorRT "
+            "2.15.1)."
+        )
+
+
 class PraxisExportRecipe(ActionChunkRecipe):
     """Praxis-1 as small programs that run its sampler for one chunk: see this module's documentation.
 
@@ -484,6 +507,8 @@ class PraxisExportRecipe(ActionChunkRecipe):
     def load(cls, cfg: ExportConfig) -> PraxisExportRecipe:
         """Refuse a setting this recipe cannot export before any weight loads, then load the policy."""
         _check_config(cast("PraxisConfig", cfg.policy))
+        if isinstance(cfg.backend, ExecuTorchTensorRTConfig):
+            _check_torch_tensorrt(cfg.backend)
         return cast(PraxisExportRecipe, super().load(cfg))
 
     def __init__(
@@ -644,6 +669,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     )
             runs = {run.program: run for chunk in self._chunk_runs() for run in chunk}
             checked = self.policy.model.dtype in (torch.bfloat16, torch.float16)
+            tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
             for name, module in modules.items():
                 check = None
                 # The other parts compute in float32 and float64, or under an autocast of their own like the
@@ -654,7 +680,12 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     # kernels and matmul settings already move their outputs by 1 to 48 percent of their largest
                     # value, and correct TensorRT programs stayed within 1.8 times that.
                     check = ProgramCheck.measure(module, examples[name], with_float32=False)
-                yield Part(name, module, examples[name], runs[name].inputs, runs[name].outputs, check)
+                # Torch-TensorRT runs the grouped matrix multiplies of mixture-of-experts layers only with this
+                # setting. Without it each such layer stays in PyTorch and splits the program around it.
+                options = {GROUPED_MM_KERNEL: True} if tensorrt and name in MOE_PARTS else {}
+                yield Part(
+                    name, module, examples[name], runs[name].inputs, runs[name].outputs, check, options
+                )
 
     @contextlib.contextmanager
     def _plain_pytorch(self) -> Iterator[None]:
