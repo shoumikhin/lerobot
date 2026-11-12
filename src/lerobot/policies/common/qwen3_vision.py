@@ -32,8 +32,10 @@ from .input_checks import check_input
 from .qwen_vision import FixedImageGrid, replay_vision_block
 
 if TYPE_CHECKING or _transformers_available:
+    from transformers.masking_utils import create_causal_mask
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLModel,
+        Qwen3VLTextModel,
         Qwen3VLVisionModel,
         apply_rotary_pos_emb_vision,
         eager_attention_forward,
@@ -43,7 +45,9 @@ if TYPE_CHECKING or _transformers_available:
         get_vision_position_ids,
     )
 else:
+    create_causal_mask = None
     Qwen3VLModel = None
+    Qwen3VLTextModel = None
     Qwen3VLVisionModel = None
     apply_rotary_pos_emb_vision = None
     eager_attention_forward = None
@@ -114,6 +118,24 @@ def qwen3_vision_forward(
     return visual.merger(hidden_states), deepstack_features
 
 
+def qwen3_vl_image_embeds(
+    model: "Qwen3VLModel",
+    inputs_embeds: Tensor,
+    pixel_values: Tensor,
+    image_grid_thw: Tensor,
+    grid: Qwen3VisionGrid,
+    image_mask: Tensor,
+) -> tuple[Tensor, list[Tensor]]:
+    """`inputs_embeds` with the image features at the image tokens, and the DeepStack features, as
+    `qwen3_vl_forward` hands them to the text model. `image_mask` is True at the image placeholder tokens."""
+    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, image_grid_thw, grid)
+    check_input(image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match.")
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
+    )
+    return inputs_embeds, deepstack_features
+
+
 def qwen3_vl_forward(
     model: "Qwen3VLModel",
     inputs_embeds: Tensor,
@@ -139,10 +161,8 @@ def qwen3_vl_forward(
             "The model holds rope deltas from a call with input_ids, which the stock forward would add to the "
             "positions; pass position_ids."
         )
-    image_embeds, deepstack_features = qwen3_vision_forward(model.visual, pixel_values, image_grid_thw, grid)
-    check_input(image_mask.sum() == image_embeds.shape[0], "Image features and image tokens do not match.")
-    inputs_embeds = inputs_embeds.masked_scatter(
-        image_mask[..., None].expand_as(inputs_embeds), image_embeds.to(inputs_embeds.dtype)
+    inputs_embeds, deepstack_features = qwen3_vl_image_embeds(
+        model, inputs_embeds, pixel_values, image_grid_thw, grid, image_mask
     )
     return model.language_model(
         inputs_embeds=inputs_embeds,
@@ -151,3 +171,48 @@ def qwen3_vl_forward(
         visual_pos_masks=image_mask,
         deepstack_visual_embeds=deepstack_features,
     ).last_hidden_state
+
+
+def qwen3_text_layers(
+    model: "Qwen3VLTextModel",
+    hidden_states: Tensor,
+    attention_mask: Tensor | None,
+    image_mask: Tensor,
+    deepstack_features: list[Tensor],
+    layers: range,
+    position_ids: Tensor | None = None,
+) -> Tensor:
+    """The hidden states after `layers` of `model.forward`, the text model of a Qwen3-VL model, without its final
+    norm, so that a chain of programs can run the text model a few layers at a time.
+
+    `hidden_states` are the inputs of the first layer in `layers`. `deepstack_features` are the DeepStack features
+    of `qwen3_vl_image_embeds`, of which each layer adds its own; a range past them can pass none. `position_ids`
+    are as in `qwen3_vl_forward`, None for 0, 1, 2, ...
+    """
+    if position_ids is None:
+        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+        position_ids = position_ids.view(1, 1, -1).expand(4, hidden_states.shape[0], -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+    text_position_ids = None
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids, position_ids = position_ids[0], position_ids[1:]
+    mask = create_causal_mask(
+        config=model.config,
+        inputs_embeds=hidden_states,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=text_position_ids,
+    )
+    position_embeddings = model.rotary_emb(hidden_states, position_ids)
+    for index in layers:
+        hidden_states = model.layers[index](
+            hidden_states,
+            attention_mask=mask,
+            position_ids=text_position_ids,
+            past_key_values=None,
+            position_embeddings=position_embeddings,
+        )
+        if index < len(deepstack_features):
+            hidden_states = model._deepstack_process(hidden_states, image_mask, deepstack_features[index])
+    return hidden_states

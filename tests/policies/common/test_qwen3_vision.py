@@ -27,9 +27,12 @@ from transformers import Qwen3VLModel  # noqa: E402
 
 from lerobot.policies.common.qwen3_vision import (  # noqa: E402
     Qwen3VisionGrid,
+    qwen3_text_layers,
     qwen3_vision_forward,
     qwen3_vl_forward,
+    qwen3_vl_image_embeds,
 )
+from lerobot.policies.common.qwen_vision import qwen_image_rope_index  # noqa: E402
 from tests.policies.common.fixed_grid_checks import data_dependent_nodes, save_and_load  # noqa: E402
 from tests.policies.common.qwen3_vl_helpers import (  # noqa: E402
     IMAGE_TOKEN_ID,
@@ -112,6 +115,33 @@ def test_qwen3_vl_forward_matches_stock_model(model):
             with pytest.raises(RuntimeError, match="Runtime assertion failed"):
                 lowered.module()(inputs_embeds, attention_mask, pixel_values, changed, image_mask)
     assert data_dependent_nodes(program) == STOCK_DEEPSTACK_NODES
+
+
+@pytest.mark.parametrize("rope_positions", [False, True])
+def test_text_layers_in_ranges_match_qwen3_vl_forward(model, rope_positions):
+    # A chain of programs runs the text model a few layers at a time; the DeepStack layer sits in the first range.
+    input_ids, attention_mask, pixel_values, grid_thw = _inputs(model)
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    grid = Qwen3VisionGrid.build(model.visual, grid_thw)
+    image_mask = input_ids == IMAGE_TOKEN_ID
+    position_ids = None
+    if rope_positions:
+        merge = model.visual.spatial_merge_size
+        position_ids = qwen_image_rope_index(input_ids, attention_mask, grid.grid_thw, merge, IMAGE_TOKEN_ID)
+    text = model.language_model
+    with torch.no_grad():
+        expected = qwen3_vl_forward(
+            model, inputs_embeds, attention_mask, pixel_values, grid_thw, grid, image_mask, position_ids
+        )
+        hidden, deepstack = qwen3_vl_image_embeds(
+            model, inputs_embeds, pixel_values, grid_thw, grid, image_mask
+        )
+        for layers, features in ((range(0, 1), deepstack), (range(1, len(text.layers)), [])):
+            hidden = qwen3_text_layers(
+                text, hidden, attention_mask, image_mask, features, layers, position_ids
+            )
+        actual = text.norm(hidden)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_qwen3_vl_forward_rejects_a_wrong_image_token_count(model):
