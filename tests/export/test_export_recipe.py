@@ -1035,6 +1035,25 @@ def test_a_program_check_gives_the_part_back_in_its_own_dtype():
     assert {parameter.dtype for parameter in part.parameters()} == {torch.bfloat16}
 
 
+class _HalfOnly(torch.nn.Module):
+    """A bfloat16 layer that cannot take float32 inputs, as a part whose float32 copy does not fit."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(64, 64).to(torch.bfloat16)
+
+    def forward(self, x: Tensor) -> Tensor:
+        assert x.dtype == torch.bfloat16
+        return self.linear(x)
+
+
+def test_a_program_check_can_leave_the_float32_run_out():
+    torch.manual_seed(0)
+    check = ProgramCheck.measure(_HalfOnly(), (torch.randn(8, 64, dtype=torch.bfloat16),), with_float32=False)
+    assert check.failures("part", check.outputs) == []
+    assert check.failures("part", [check.outputs[0] + check.outputs[0].abs().max()])
+
+
 class _WritesItsInput(torch.nn.Module):
     """A bfloat16 layer that first writes into its input, as a part that updates a cache does."""
 

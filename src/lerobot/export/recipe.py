@@ -187,12 +187,17 @@ class ProgramCheck:
         module: nn.Module,
         inputs: Sequence[Tensor],
         float32: Callable[[], contextlib.AbstractContextManager] | None = None,
+        *,
+        with_float32: bool = True,
     ) -> ProgramCheck:
         """Run `module` on `inputs`, then again with each change that only rounds otherwise, and keep the floor.
 
         `float32` runs the module in float32, by default with its own weights in float32 (see `in_float32`). A
         recipe whose part also reads a dtype elsewhere, such as from its policy, passes one that sets that too.
-        Refuses a module whose first rerun, with nothing changed, moves an output more than rounding can.
+        `with_float32=False` leaves the float32 run out, for a part whose float32 copy does not fit beside the
+        policy. Only on CUDA do the other changes, other attention kernels and matmul settings, still measure its
+        floor; elsewhere only the attention kernel changes, which moves no part without attention. Refuses a
+        module whose first rerun, with nothing changed, moves an output more than rounding can.
         """
         inputs = tuple(x.contiguous() for x in inputs)
         wide = tuple(x.float() if x.dtype in _HALF else x for x in inputs)
@@ -202,7 +207,8 @@ class ProgramCheck:
             changes = [
                 (change, inputs) for change in [contextlib.nullcontext, *_rounding_changes(outputs[0].device)]
             ]
-            changes.append((float32 or (lambda: in_float32(module)), wide))
+            if with_float32:
+                changes.append((float32 or (lambda: in_float32(module)), wide))
             measured = []
             for change, change_inputs in changes:
                 with change():
