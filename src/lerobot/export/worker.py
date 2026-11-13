@@ -151,6 +151,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         runs: list[ProgramRun] = []
         checks: list[str] = []
         compile_options: dict[str, dict[str, Any]] = {}
+        operator_modules: dict[str, list[str]] = {}
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
@@ -166,6 +167,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
                 checks.append(part.name)
             if part.compile_options:
                 compile_options[part.name] = part.compile_options
+            if part.operator_modules:
+                operator_modules[part.name] = list(part.operator_modules)
             programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
             runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
             del part, program
@@ -231,6 +234,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "traced": str(traced),
         "checks": checks,
         "compile_options": compile_options,
+        "operator_modules": operator_modules,
         "quantize": cfg.quantize,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
         "log_level": cfg.log_level,
@@ -259,6 +263,8 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
     """
     for plugin in request["plugins"]:
         load_plugin(plugin)
+    for module in request.get("operator_modules", []):
+        importlib.import_module(module)
     backend = draccus.decode(ExportBackendConfig, request["backend"])
     path = Path(request["path"])
     quantize = request.get("quantize")

@@ -103,6 +103,7 @@ def export(args: Sequence[str]) -> Path:
                     "program": str(Path(traced["traced"]) / f"{name}.pt2"),
                     "path": str(folder / files.file),
                     "compile_options": traced["compile_options"].get(name, {}),
+                    "operator_modules": traced["operator_modules"].get(name, []),
                     "plugins": plugins,
                     "quantize": traced["quantize"],
                     "log_level": traced["log_level"],

@@ -122,6 +122,9 @@ class Part:
             Settings of the backend's compiler for this program, on top of the backend's own, such as
             Torch-TensorRT's `grouped_mm_kernel`. Values JSON can hold. Only `executorch_tensorrt` reads them, and
             the other backends' `compile` takes none, so a recipe sets them only for that backend.
+        operator_modules (`tuple[str, ...]`, *optional*):
+            The modules that register the custom operators `module` traces to. The compile step, in another
+            process, imports them before it loads the traced program.
     """
 
     name: str
@@ -131,6 +134,7 @@ class Part:
     outputs: list[str]
     check: ProgramCheck | None = None
     compile_options: dict[str, Any] = field(default_factory=dict)
+    operator_modules: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse a reserved name, inputs without one name each, one tensor given for two, or options JSON cannot hold.

@@ -768,6 +768,36 @@ def test_each_parts_compile_options_reach_the_backend_that_compiles_it(checkpoin
     assert seen == {"model": {"setting": "model"}}
 
 
+def test_each_parts_operator_modules_are_imported_before_its_compile_step_loads_it(
+    checkpoint, tmp_path, monkeypatch
+):
+    """A program that holds a custom operator loads only where a module registered it, and the compile step runs
+    in a process of its own."""
+    load = ExportRecipe.load.__func__
+
+    def load_with_operators(cls, cfg):
+        recipe = load(cls, cfg)
+        parts = recipe.parts
+        recipe.parts = lambda: (
+            replace(part, operator_modules=(f"registers_{part.name}",)) for part in parts()
+        )
+        return recipe
+
+    order = []
+    import_module, export_load = worker.importlib.import_module, torch.export.load
+
+    def record_import(name):
+        if not name.startswith("registers_"):
+            return import_module(name)
+        order.append(f"import {name}")
+
+    monkeypatch.setattr(worker.importlib, "import_module", record_import)
+    monkeypatch.setattr(torch.export, "load", lambda path: order.append(f"load {path}") or export_load(path))
+    monkeypatch.setattr(ExportRecipe, "load", classmethod(load_with_operators))
+    run_export_in_this_process(monkeypatch, f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    assert [line.split("/")[-1] for line in order] == ["import registers_model", "model.pt2"]
+
+
 def test_a_backend_whose_compile_takes_no_compile_options_exports_parts_without_them(
     checkpoint, tmp_path, monkeypatch
 ):
