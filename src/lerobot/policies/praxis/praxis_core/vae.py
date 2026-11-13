@@ -271,9 +271,15 @@ class Resample(nn.Module):
             assert caches is not None
             x = self._upsample_time(x, caches)
         b, c, t, h, w = x.shape
-        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-        x = self.resample(x)
-        x = x.view(b, t, *x.shape[1:]).permute(0, 2, 1, 3, 4)
+        if caches is None and self.mode in ("downsample2d", "downsample3d"):
+            # In one pass, the frames' 2D convolution runs as one 3D convolution. A compiler then keeps the clip's
+            # layout, where folding the frames into the batch made TensorRT copy the clip before and after.
+            conv = self.resample[1]
+            x = F.conv3d(F.pad(x, (0, 1, 0, 1)), conv.weight.unsqueeze(2), conv.bias, (1, *conv.stride))
+        else:
+            x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+            x = self.resample(x)
+            x = x.view(b, t, *x.shape[1:]).permute(0, 2, 1, 3, 4)
         if self.mode == "downsample3d":
             if caches is None:
                 # Streamed, the first chunk's frame passes as is, and each later chunk convolves the last frame of
