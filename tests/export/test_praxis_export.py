@@ -116,7 +116,7 @@ def test_export_refuses_a_torch_tensorrt_that_leaves_the_experts_to_pytorch(
         PraxisExportRecipe.load(cfg)
 
 
-def test_the_compile_options_of_velocity_and_decoder_reach_only_their_programs(tmp_path, monkeypatch):
+def test_the_compile_options_of_sample_reach_only_its_program(tmp_path, monkeypatch):
     """Through the trace and compile steps of an export, with the test backend standing in for TensorRT."""
     tiny_praxis.save_checkpoint(tmp_path / "checkpoint")
     tiny_praxis.use_tiny_praxis(monkeypatch)
@@ -146,8 +146,8 @@ def test_the_compile_options_of_velocity_and_decoder_reach_only_their_programs(t
     )
     moe = {"compile_options": {"grouped_mm_kernel": True}}
     assert seen == {
-        name: moe if name in ("velocity", "decoder") else {}
-        for name in ("encode", "start", "velocity", "decoder", "step", "actions", "actions_first")
+        name: moe if name == "sample" else {}
+        for name in ("encode", "start", "sample", "actions", "actions_first")
     }
 
 
@@ -165,17 +165,9 @@ def test_bundle_plays_the_policys_first_chunks(tmp_path, monkeypatch, bimanual):
         ]
     )
     manifest = Bundle.read(tmp_path / "bundle").manifest
-    assert sorted(manifest.programs) == [
-        "actions",
-        "actions_first",
-        "decoder",
-        "encode",
-        "start",
-        "step",
-        "velocity",
-    ]
-    assert [run.program for run in manifest.first_runs[0]][-1] == "actions_first"
-    assert [run.program for run in manifest.runs].count("velocity") == 2
+    assert sorted(manifest.programs) == ["actions", "actions_first", "encode", "sample", "start"]
+    assert [run.program for run in manifest.first_runs[0]] == ["encode", "start", "sample", "actions_first"]
+    assert [run.program for run in manifest.runs] == ["encode", "start", "sample", "actions"]
     assert set(manifest.history.values()) == {22}
     assert manifest.task == tiny_praxis.TASK
 
@@ -221,8 +213,46 @@ def test_the_test_case_holds_three_chunks_of_actions_and_noise(tmp_path, monkeyp
 def test_parts_play_the_policys_actions_with_other_sampler_settings(tmp_path, monkeypatch, settings):
     """The parts must play the policy's actions over the test case, which `parts` checks before it yields them."""
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, **settings)
-    names = [part.name for part in recipe.parts()]
-    assert ("decoder" in names) == (settings.get("num_steps", 2) > 1)
+    parts = {part.name: part for part in recipe.parts()}
+    assert list(parts) == ["encode", "start", "sample", "actions_first", "actions"]
+    assert hasattr(parts["sample"].module, "decoder") == (settings.get("num_steps", 2) > 1)
+
+
+@pytest.mark.parametrize(
+    ("settings", "passes"), [({}, 3), ({"cfg_scale": 2.0}, 4)], ids=["actions_unguided", "actions_guided"]
+)
+def test_the_last_step_runs_only_the_passes_whose_action_velocities_it_combines(
+    tmp_path, monkeypatch, settings, passes
+):
+    """Two steps with a guided video: the first runs the encoder tower for both texts, and the last, whose video
+    moves no action, runs it for the blank caption only when the actions are guided too."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, **settings)
+    sample = next(part for part in recipe.parts() if part.name == "sample")
+    encoder, calls = sample.module.encoder, []
+    forward = encoder.forward_chunk_causal
+    monkeypatch.setattr(
+        encoder,
+        "forward_chunk_causal",
+        lambda *args, **kwargs: calls.append(args) or forward(*args, **kwargs),
+    )
+    with torch.no_grad():
+        sample.module(*sample.example_inputs)
+    assert len(calls) == passes
+
+
+def test_sample_returns_what_its_decoder_tower_moves(tmp_path, monkeypatch):
+    """The actions reach the decoder tower only through the last step's encoder pass, which can hide a broken
+    decoder from the check of `sample` on its own, so the program also returns the latents the last step reads."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    sample = next(part for part in recipe.parts() if part.name == "sample")
+    with torch.no_grad():
+        outputs = sample.module(*sample.example_inputs)
+        decoder = sample.module.decoder
+        forward = decoder.forward_chunk_causal
+        monkeypatch.setattr(decoder, "forward_chunk_causal", lambda *args: torch.zeros_like(forward(*args)))
+        broken = sample.module(*sample.example_inputs)
+    assert sample.outputs[0] == export_praxis.VIDEO
+    assert not torch.equal(broken[0], outputs[0])
 
 
 def test_the_rehearsal_draws_other_noise_than_the_test_case(tmp_path, monkeypatch):
@@ -302,12 +332,12 @@ def test_export_refuses_parts_that_play_other_actions_than_the_policy(tmp_path, 
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_velocity_and_decoder_are_checked_on_their_own_in_bfloat16(tmp_path, monkeypatch, dtype):
+def test_sample_is_checked_on_its_own_in_bfloat16(tmp_path, monkeypatch, dtype):
     """In bfloat16 the test case's chunks amplify rounding so much that it cannot tell a correct program from a
-    broken one, so `velocity` and `decoder` are checked on their own. No rerun measures the other parts' rounding."""
+    broken one, so `sample` is checked on its own. No rerun measures the other parts' rounding."""
     parts = list(make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype).parts())
     checked = {part.name for part in parts if part.check is not None}
-    assert checked == ({"velocity", "decoder"} if dtype == torch.bfloat16 else set())
+    assert checked == ({"sample"} if dtype == torch.bfloat16 else set())
     for part in parts:
         if part.check is not None:
             assert part.check.failures(part.name, part.check.outputs) == []
@@ -329,7 +359,7 @@ def test_the_parts_with_mixture_of_experts_layers_ask_for_tensorrts_grouped_matr
         for part in parts
         if any(isinstance(module, praxis_layers.MoEFeedForward) for module in part.module.modules())
     }
-    assert moe == {"velocity", "decoder"}
+    assert moe == {"sample"}
     tensorrt = isinstance(backend, ExecuTorchTensorRTConfig)
     assert {part.name: part.compile_options for part in parts} == {
         part.name: {"grouped_mm_kernel": True} if tensorrt and part.name in moe else {} for part in parts

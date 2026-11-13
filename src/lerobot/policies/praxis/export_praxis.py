@@ -26,12 +26,14 @@ One chunk runs as these programs, which pass their values to each other by name:
 
     encode                        the kept frames and states -> the anchor latent, the clean latents, the proprio
     start                         the noise -> the starting video latents and actions of both chunks
-    velocity, decoder, step       each step but the last: the velocities, one Euler step
-    velocity, actions             the last step, and the actions in robot units
+    sample                        the Euler steps but the last update: the latents, actions, last velocities
+    actions                       the last update, and the actions in robot units
 
-`velocity` runs the encoder tower and the action expert for the task's text and for the blank caption of the
-unguided pass, so the bundle holds the tower's weights once: the two texts have different numbers of tokens.
-`decoder` runs the decoder tower for one of them. The last step's video moves no action, so it runs no decoder.
+`sample` runs the Euler steps in one program, up to the last update, which `actions` takes. Each step runs the
+encoder tower for the task's text and, with guidance, for the blank caption of the unguided pass, the action
+expert on each pass whose actions the step combines, and the decoder tower on each pass whose video it
+combines. The last step's video moves no action, so it runs no decoder, and only the passes whose action
+velocities it combines: without guidance of the actions, only the task's text.
 
 The first chunk after a reset has no executed chunk: the policy denoises a window of one chunk. That chunk is
 the first chunk of the two-chunk window, which reads neither the clean latents nor the second chunk, so every
@@ -99,7 +101,7 @@ ANCHOR, CLEAN, PROPRIO = "anchor", "clean", "proprio"
 VIDEO, ACTIONS = "video_sample", "action_sample"
 
 # The parts that hold the towers' mixture-of-experts layers.
-MOE_PARTS = ("velocity", "decoder")
+MOE_PARTS = ("sample",)
 # The Torch-TensorRT setting that runs the grouped matrix multiplies of those layers inside TensorRT.
 GROUPED_MM_KERNEL = "grouped_mm_kernel"
 
@@ -304,91 +306,90 @@ class _Start(nn.Module):
         return video.view(self.video_shape), actions.view(self.action_shape)
 
 
-class _Velocity(nn.Module):
-    """The window's latents and actions in; the encoder's output of each pass, and the action velocity of each
-    pass whose actions the step combines, out.
-
-    It runs `velocity` of `PraxisModel.sample_window_joint` without the decoder: the encoder tower and the action
-    expert on its taps, for the task's text and, with guidance, for the blank caption. Without guidance of the
-    actions, the sampler takes the guided pass's action velocity as it is, so the blank caption's pass runs no
-    expert. The texts are fixed with the task, so the program holds them.
-    """
-
-    def __init__(self, model: PraxisModel, texts: list[Tensor], action_passes: int):
-        super().__init__()
-        self.encoder = model.backbone.encoder
-        self.expert = model.action_expert
-        self.action_passes = action_passes
-        self.register_buffer("text", texts[0])
-        self.register_buffer("text_uncond", texts[1] if len(texts) > 1 else None)
-
-    def forward(
-        self, anchor: Tensor, clean: Tensor, video: Tensor, actions: Tensor, proprio: Tensor, time: Tensor
-    ) -> tuple[Tensor, ...]:
-        dtype = self.encoder.registers.dtype
-        chunks = proprio.shape[1]
-        anchor, clean, video = anchor.to(dtype), clean.to(dtype), video.to(dtype)
-        outputs = []
-        texts = [self.text] if self.text_uncond is None else [self.text, self.text_uncond]
-        for i, text in enumerate(texts):
-            cond, taps = self.encoder.forward_chunk_causal(
-                text, anchor, clean, video, time.to(dtype).expand(1, chunks)
-            )
-            outputs.append(cond)
-            if i >= self.action_passes:
-                continue
-            velocity = run_expert_on_taps_k(
-                self.expert,
-                taps.taps,
-                taps.embeddings,
-                taps.rope_ids,
-                global_spans=taps.global_spans,
-                noised_span=taps.noised_span,
-                clean_span=taps.clean_span,
-                n_chunks=chunks,
-                frames_per_chunk=taps.frames_per_chunk,
-                tokens_per_frame=taps.tokens_per_frame,
-                noised_actions=actions[None],
-                action_t_per_chunk=time.expand(1, chunks),
-                proprio_per_chunk=proprio,
-            )
-            outputs.append(velocity.float()[0])
-        return tuple(outputs)
-
-
-class _Decoder(nn.Module):
-    """The window's latents, one pass's encoder output and the time in; that pass's video velocity out."""
-
-    def __init__(self, model: PraxisModel):
-        super().__init__()
-        self.decoder = model.backbone.decoder
-
-    def forward(self, video: Tensor, cond: Tensor, time: Tensor) -> Tensor:
-        dtype = self.decoder.registers.dtype
-        timesteps = time.to(dtype).expand(1, WINDOW_CHUNKS)
-        return self.decoder.forward_chunk_causal(video.to(dtype), cond, timesteps).float()
-
-
 def _guided(velocities: list[Tensor], scale: float) -> Tensor:
     """The guided velocity of the guided pass and, if any, the unguided one, as the sampler combines them."""
     return velocities[0] if len(velocities) == 1 else guidance_combine(velocities[0], velocities[1], scale)
 
 
-class _Step(nn.Module):
-    """The latents, the actions, their velocities of each pass and the step in; the latents and actions after
-    one Euler step out."""
+class _Sample(nn.Module):
+    """The window's latents, actions and proprio and the time grid in; the latents and the actions before the
+    last Euler step, and the action velocity of each pass the last step combines, out.
 
-    def __init__(self, video_passes: int, video_scale: float, action_scale: float):
+    It runs `PraxisModel.sample_window_joint` up to its last update: on each step the encoder tower for the task's
+    text and, with guidance, for the blank caption, and the action expert on the taps of each pass whose actions
+    the step combines; on every step but the last, the decoder tower for each pass whose video the step combines,
+    and the Euler step. Without guidance of the actions, the sampler takes the guided pass's action velocity as it
+    is, so the blank caption's pass runs no expert. The last step runs only the passes whose action velocities it
+    combines. The texts are fixed with the task, so the program holds them.
+
+    The latents the last step reads move no action after it, but they are the only output the decoder tower
+    reaches directly, so the check of the program on its own (`ProgramCheck`) sees that tower through them.
+    """
+
+    def __init__(
+        self,
+        model: PraxisModel,
+        texts: list[Tensor],
+        steps: int,
+        video_passes: int,
+        video_scale: float,
+        action_passes: int,
+        action_scale: float,
+    ):
         super().__init__()
-        self.video_passes = video_passes
-        self.video_scale = video_scale
-        self.action_scale = action_scale
+        self.encoder = model.backbone.encoder
+        self.expert = model.action_expert
+        if steps > 1:
+            self.decoder = model.backbone.decoder
+        self.steps = steps
+        self.video_passes, self.video_scale = video_passes, video_scale
+        self.action_passes, self.action_scale = action_passes, action_scale
+        self.register_buffer("text", texts[0])
+        self.register_buffer("text_uncond", texts[1] if len(texts) > 1 else None)
 
-    def forward(self, video: Tensor, actions: Tensor, *inputs: Tensor) -> tuple[Tensor, Tensor]:
-        *velocities, step = inputs
-        video_velocity = _guided(velocities[: self.video_passes], self.video_scale)
-        action_velocity = _guided(velocities[self.video_passes :], self.action_scale)
-        return video + step * video_velocity, actions + step * action_velocity
+    def forward(
+        self, anchor: Tensor, clean: Tensor, video: Tensor, actions: Tensor, proprio: Tensor, *grid: Tensor
+    ) -> tuple[Tensor, ...]:
+        times, step_sizes = grid[: self.steps], grid[self.steps :]
+        dtype = self.encoder.registers.dtype
+        chunks = proprio.shape[1]
+        anchor, clean = anchor.to(dtype), clean.to(dtype)
+        texts = [self.text] if self.text_uncond is None else [self.text, self.text_uncond]
+        for i, time in enumerate(times):
+            last = i == self.steps - 1
+            noised, timesteps = video.to(dtype), time.to(dtype).expand(1, chunks)
+            conds, action_velocities = [], []
+            for p, text in enumerate(texts[: self.action_passes] if last else texts):
+                cond, taps = self.encoder.forward_chunk_causal(text, anchor, clean, noised, timesteps)
+                if not last:
+                    conds.append(cond)
+                if p >= self.action_passes:
+                    continue
+                velocity = run_expert_on_taps_k(
+                    self.expert,
+                    taps.taps,
+                    taps.embeddings,
+                    taps.rope_ids,
+                    global_spans=taps.global_spans,
+                    noised_span=taps.noised_span,
+                    clean_span=taps.clean_span,
+                    n_chunks=chunks,
+                    frames_per_chunk=taps.frames_per_chunk,
+                    tokens_per_frame=taps.tokens_per_frame,
+                    noised_actions=actions[None],
+                    action_t_per_chunk=time.expand(1, chunks),
+                    proprio_per_chunk=proprio,
+                )
+                action_velocities.append(velocity.float()[0])
+            if last:
+                break
+            video_velocities = [
+                self.decoder.forward_chunk_causal(noised, cond, timesteps).float()
+                for cond in conds[: self.video_passes]
+            ]
+            video = video + step_sizes[i] * _guided(video_velocities, self.video_scale)
+            actions = actions + step_sizes[i] * _guided(action_velocities, self.action_scale)
+        return video, actions, *action_velocities
 
 
 class _Actions(nn.Module):
@@ -492,15 +493,17 @@ class PraxisExportRecipe(ActionChunkRecipe):
     The test case plays the first chunks of an episode from a reset, tick by tick, with the policy's own
     `select_action` as `lerobot-rollout` calls it, and the noise the policy draws for each chunk. Before the parts
     are traced, they are run the way the bundle runs them, on the test case and on other random frames and noise,
-    and must play the same actions within the tolerance. In bfloat16 and float16, the `velocity` and `decoder`
-    programs are also checked on their own (`ProgramCheck`).
+    and must play the same actions within the tolerance. In bfloat16 and float16, the `sample` program is also
+    checked on its own (`ProgramCheck`).
     """
 
-    # In bfloat16, the 27B mixture of experts amplifies rounding over the test case's 3 chunks: on one test case,
-    # eager PyTorch fed inputs moved by one rounding step played actions up to 0.55 away, and a correct TensorRT
-    # bundle 0.62 (0.82 on another). A bundle whose encoder tower skipped a block or swapped its keys and values
-    # moved them by about 1.0, so `velocity` and `decoder` are also checked on their own, and the test case only
-    # catches a bundle that runs its parts far wrong: zeroed velocities moved the actions by 3.9 and swapped cameras by 1.6.
+    # In bfloat16, the 27B mixture of experts amplifies rounding over the test case's 3 chunks. Measured with the
+    # steps as separate programs: on one test case, eager PyTorch fed inputs moved by one rounding step played
+    # actions up to 0.55 away, and a correct TensorRT bundle 0.62 (0.82 on another), while a bundle whose encoder
+    # tower skipped a block or swapped its keys and values moved them by about 1.0. So `sample` is also checked on
+    # its own: on the DROID checkpoint, a zeroed decoder or a skipped block of either tower moved an output of it
+    # by 3.2 to 26 times what rounding does, where the check allows 3. The test case only catches a bundle that
+    # runs its parts far wrong: zeroed velocities moved the actions by 3.9 and swapped cameras by 1.6.
     bfloat16_tolerance = 1.0
     policy: PraxisPolicy
 
@@ -675,11 +678,12 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 check = None
                 # The other parts compute in float32 and float64, or under an autocast of their own like the
                 # autoencoder of `encode`, so no rerun measures how a compiler may round them otherwise.
-                if checked and name in ("velocity", "decoder"):
-                    # No float32 rerun: beside the policy, `velocity` in float32 needs 38 GB more, more than
-                    # an 80 GB GPU has, and `decoder` 16 GB more, more than Thor has free while it exports. Other
-                    # kernels and matmul settings already move their outputs by 1 to 48 percent of their largest
-                    # value, and correct TensorRT programs stayed within 1.8 times that.
+                if checked and name == "sample":
+                    # No float32 rerun: beside the policy, `sample` in float32 needs the float32 copies of its
+                    # towers, 38 GB more for the encoder and the action expert and 16 GB for the decoder, more
+                    # than an 80 GB GPU has. On the DROID checkpoint, other kernels and matmul settings moved its
+                    # outputs, the latents, the actions and the last action velocity, by up to 3.5, 0.24 and 4.6
+                    # percent of their largest value, and a correct TensorRT program stayed within 1.5 times that.
                     check = ProgramCheck.measure(module, examples[name], with_float32=False)
                 # Torch-TensorRT runs the grouped matrix multiplies of mixture-of-experts layers only with this
                 # setting. Without it each such layer stays in PyTorch and splits the program around it.
@@ -729,11 +733,16 @@ class PraxisExportRecipe(ActionChunkRecipe):
         modules: dict[str, nn.Module] = {
             "encode": _Encode(policy, self._executed),
             "start": _Start(self._video_shape, self._action_shape),
-            "velocity": _Velocity(policy.model, self._texts, action_passes),
+            "sample": _Sample(
+                policy.model,
+                self._texts,
+                settings.num_steps,
+                video_passes,
+                settings.cfg_video_scale,
+                action_passes,
+                settings.cfg_scale,
+            ),
         }
-        if settings.num_steps > 1:
-            modules["decoder"] = _Decoder(policy.model)
-            modules["step"] = _Step(video_passes, settings.cfg_video_scale, settings.cfg_scale)
         modules["actions_first"] = _Actions(policy, first=True)
         modules["actions"] = _Actions(policy, first=False)
         # The policy's modules are there already; this moves the tables the parts made.
@@ -752,27 +761,20 @@ class PraxisExportRecipe(ActionChunkRecipe):
     def _chunk_runs(self) -> tuple[list[ProgramRun], list[ProgramRun]]:
         """The runs of the first chunk after a reset and of every later one."""
         settings = self.policy.sampler_settings
-        video_passes, action_passes = self._passes()
-        conds = ["cond", "cond_uncond"]
-        video_velocities = ["video_velocity", "video_velocity_uncond"][:video_passes]
+        _, action_passes = self._passes()
         action_velocities = ["action_velocity", "action_velocity_uncond"][:action_passes]
-        velocity_outputs = ["cond", "action_velocity", "cond_uncond", "action_velocity_uncond"]
-        velocity_outputs = velocity_outputs[: len(self._texts) + action_passes]
+        last = settings.num_steps - 1
+        grid = [f"time_{i}" for i in range(settings.num_steps)] + [f"step_{i}" for i in range(last)]
         runs = [
             ProgramRun("encode", "encode", [*self._cameras, self._state], [ANCHOR, CLEAN, PROPRIO]),
             ProgramRun("start", "start", [NOISE], [VIDEO, ACTIONS]),
+            ProgramRun(
+                "sample",
+                "sample",
+                [ANCHOR, CLEAN, VIDEO, ACTIONS, PROPRIO, *grid],
+                [VIDEO, ACTIONS, *action_velocities],
+            ),
         ]
-        last = settings.num_steps - 1
-        for i in range(settings.num_steps):
-            inputs = [ANCHOR, CLEAN, VIDEO, ACTIONS, PROPRIO, f"time_{i}"]
-            runs.append(ProgramRun(f"velocity_{i}", "velocity", inputs, velocity_outputs))
-            if i == last:
-                break
-            for cond, velocity in zip(conds, video_velocities, strict=False):
-                name = f"decoder_{i}" if cond == "cond" else f"decoder_uncond_{i}"
-                runs.append(ProgramRun(name, "decoder", [VIDEO, cond, f"time_{i}"], [velocity]))
-            step_inputs = [VIDEO, ACTIONS, *video_velocities, *action_velocities, f"step_{i}"]
-            runs.append(ProgramRun(f"step_{i}", "step", step_inputs, [VIDEO, ACTIONS]))
         finish = [ACTIONS, *action_velocities, f"step_{last}", self._state]
         return (
             [*runs, ProgramRun("actions", "actions_first", finish, [ACTION])],
