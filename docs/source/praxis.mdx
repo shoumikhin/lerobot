@@ -548,10 +548,12 @@ lerobot-rollout --bundle.path=outputs/praxis_bundle --robot.type=<your robot> --
 ```
 
 The bundle is a chain of small programs that runs the sampler of one chunk: the autoencoder's encoder on
-the executed chunk's camera frames, then for each Euler step the encoder tower and the action expert (for
-the task and the blank caption), the decoder tower and the step, and last the actions in robot units. The
-last step runs no decoder: its video moves no action, as in Runway's own server. The bundle keeps the last
-22 camera frames and states, so the next chunk is conditioned on the executed one, as in the policy.
+the executed chunk's camera frames, then one program that runs the Euler steps up to the last update, and
+last a program that takes that update and gives the actions in robot units. Each step runs the encoder
+tower for the task and, with guidance, for the blank caption, the action expert, the decoder tower and
+the step. The last step runs no decoder: its video moves no action, as in Runway's own server. The bundle
+keeps the last 22 camera frames and states, so the next chunk is conditioned on the executed one, as in
+the policy.
 
 - With `executorch_tensorrt`, the export needs a Torch-TensorRT with the `grouped_mm_kernel` setting
   ([pytorch/TensorRT#5021](https://github.com/pytorch/TensorRT/pull/5021)), which runs the mixture-of-experts
@@ -565,9 +567,9 @@ last step runs no decoder: its video moves no action, as in Runway's own server.
   (`layers.set_custom_kernels`), and tile the camera frames on the GPU. The values are the policy's, with
   other rounding. The export checks the bundle's actions against the policy's own over its first
   three chunks after a reset. With the released bfloat16 weights it allows 1.0 of the actions'
-  spread: the 27B mixture of experts amplifies rounding over those chunks so much that a correct
-  bundle played actions up to 0.82 away, so the export also checks the `velocity` and `decoder`
-  programs on their own. Float32 weights get the default tolerance.
+  spread: the 27B mixture of experts amplifies rounding over those chunks so much that the actions of a
+  correct bundle can be far from the policy's, so the export also checks the `sample` program on its own.
+  Float32 weights get the default tolerance.
 - Each chunk draws new noise on the GPU, so the bundle samples like the policy, not the same samples as
   its `seed`.
 
