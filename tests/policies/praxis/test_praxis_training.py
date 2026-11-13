@@ -420,3 +420,37 @@ def test_local_flat_follows_the_fsdp_and_hsdp_placements() -> None:
             _local_flat(distribute_tensor(full, mesh_1d, [Shard(1)]))
     finally:
         dist.destroy_process_group()
+
+
+def test_set_top_k_sum_runs_the_top_k_sum_of_each_dispatch_chunk() -> None:
+    """An export gives the top-k sum to its compiler as one operation, with the arguments of
+    `_sum_rows_of_tokens`."""
+    from lerobot.policies.praxis.praxis_core import layers as praxis_layers
+
+    torch.manual_seed(0)
+    moe = MoEFeedForward(dim=16, hidden=8, num_experts=4, top_k=2, dispatch_chunk_size=5)
+    for parameter in moe.parameters():
+        torch.nn.init.normal_(parameter)
+    x = torch.randn(7, 16)
+    calls = []
+
+    def top_k_sum(rows, rows_of_token, scale):
+        calls.append(tuple(rows_of_token.shape))
+        return praxis_layers._sum_rows_of_tokens(rows, rows_of_token, scale)
+
+    def zeros(rows, rows_of_token, scale):
+        return rows.new_zeros(rows_of_token.shape[0], rows.shape[1], dtype=torch.float32)
+
+    with torch.no_grad():
+        expected = moe(x)
+        try:
+            praxis_layers.set_top_k_sum(top_k_sum)
+            routed = moe(x)
+            praxis_layers.set_top_k_sum(zeros)
+            zeroed = moe(x)
+        finally:
+            praxis_layers.set_top_k_sum(None)
+        assert torch.equal(routed, expected)
+        assert calls == [(5, 2), (2, 2)]
+        assert torch.equal(zeroed, moe.shared(x))
+        assert torch.equal(moe(x), expected)

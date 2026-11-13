@@ -104,6 +104,8 @@ VIDEO, ACTIONS = "video_sample", "action_sample"
 MOE_PARTS = ("sample",)
 # The Torch-TensorRT setting that runs the grouped matrix multiplies of those layers inside TensorRT.
 GROUPED_MM_KERNEL = "grouped_mm_kernel"
+# The module that registers the TensorRT plugin of their top-k sum.
+TOP_K_SUM_MODULE = "lerobot.policies.praxis.export_top_k_sum"
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +484,10 @@ def _check_config(config: PraxisConfig) -> None:
 def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
     """Refuse a Torch-TensorRT that cannot run the mixture-of-experts layers in TensorRT, or none at all.
 
-    Such a Torch-TensorRT ignores `grouped_mm_kernel` without a word and leaves each such layer to PyTorch.
+    Such a Torch-TensorRT ignores `grouped_mm_kernel` without a word and leaves each such layer to PyTorch. Warn if
+    it has no `torch_tensorrt.kernels.triton_op`: the export then cannot make the plugin of their top-k sum
+    (`export_top_k_sum`) and keeps the PyTorch sum, which TensorRT fuses with the next block's norm into a slower
+    kernel.
     """
     try:
         import torch_tensorrt
@@ -494,6 +499,21 @@ def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
             "to run its mixture-of-experts layers inside TensorRT (pytorch/TensorRT#5021, in Torch-TensorRT "
             "2.15.1)."
         )
+    if getattr(getattr(torch_tensorrt, "kernels", None), "triton_op", None) is None:
+        logger.warning(
+            "Torch-TensorRT %s has no torch_tensorrt.kernels.triton_op (pytorch/TensorRT#4435, in Torch-TensorRT "
+            "2.15), so the top-k sum of Praxis-1's mixture-of-experts layers (with dispatch_chunk_size set, as in "
+            "the released checkpoints) stays in PyTorch, which is slower: TensorRT fuses it with the next block's "
+            "norm into a slower kernel.",
+            torch_tensorrt.__version__,
+        )
+
+
+def _top_k_sum_plugin() -> praxis_layers.TopKSum | None:
+    """The top-k sum of the mixture-of-experts layers as one TensorRT plugin (`export_top_k_sum`), if there is one."""
+    from . import export_top_k_sum
+
+    return export_top_k_sum.TOP_K_SUM
 
 
 class PraxisExportRecipe(ActionChunkRecipe):
@@ -697,9 +717,26 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 # Torch-TensorRT runs the grouped matrix multiplies of mixture-of-experts layers only with this
                 # setting. Without it each such layer stays in PyTorch and splits the program around it.
                 options = {GROUPED_MM_KERNEL: True} if tensorrt and name in MOE_PARTS else {}
+                operators = (TOP_K_SUM_MODULE,) if self._top_k_sum() and name in MOE_PARTS else ()
                 yield Part(
-                    name, module, examples[name], runs[name].inputs, runs[name].outputs, check, options
+                    name,
+                    module,
+                    examples[name],
+                    runs[name].inputs,
+                    runs[name].outputs,
+                    check,
+                    options,
+                    operators,
                 )
+
+    def _top_k_sum(self) -> praxis_layers.TopKSum | None:
+        """The TensorRT plugin of the top-k sum, for TensorRT in bfloat16, the plugin's input dtype."""
+        if (
+            isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+            and self.policy.model.dtype == torch.bfloat16
+        ):
+            return _top_k_sum_plugin()
+        return None
 
     @contextlib.contextmanager
     def _plain_pytorch(self) -> Iterator[None]:
@@ -716,10 +753,12 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_flex_attention_mode("split")
         kernels = praxis_layers.custom_kernels_enabled()
         praxis_layers.set_custom_kernels(False)
+        praxis_layers.set_top_k_sum(self._top_k_sum())
         try:
             yield
         finally:
             praxis_layers.set_custom_kernels(kernels)
+            praxis_layers.set_top_k_sum(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)
 

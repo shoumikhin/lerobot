@@ -16,6 +16,7 @@
 
 import dataclasses
 import json
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -63,10 +64,12 @@ def test_export_refuses_what_it_does_not_run(monkeypatch, config, message):
         PraxisExportRecipe.load(SimpleNamespace(policy=config))
 
 
-def use_fake_torch_tensorrt(monkeypatch, *settings):
-    """Replace Torch-TensorRT by a release whose compiler has only the settings `settings`."""
+def use_fake_torch_tensorrt(monkeypatch, *settings, kernels=("triton_op",)):
+    """Replace Torch-TensorRT by a release whose compiler has only the settings `settings`, and whose
+    `torch_tensorrt.kernels` has only the functions `kernels`."""
     module = types.ModuleType("torch_tensorrt")
     module.__version__ = "2.15.0"
+    module.kernels = SimpleNamespace(**{name: lambda *args, **kwargs: None for name in kernels})
     dynamo = types.ModuleType("torch_tensorrt.dynamo")
     dynamo.CompilationSettings = dataclasses.make_dataclass(
         "CompilationSettings", [(s, bool) for s in settings]
@@ -114,6 +117,22 @@ def test_export_refuses_a_torch_tensorrt_that_leaves_the_experts_to_pytorch(
     error, match = refusal or (LoadedPolicyError, None)
     with pytest.raises(error, match=match):
         PraxisExportRecipe.load(cfg)
+
+
+@pytest.mark.parametrize("kernels", [("triton_op",), ()], ids=["with_triton_op", "without_triton_op"])
+def test_export_says_when_its_torch_tensorrt_cannot_make_the_top_k_sum_plugin(monkeypatch, caplog, kernels):
+    """Without it, the export keeps the PyTorch top-k sum, which TensorRT runs slower."""
+    use_fake_torch_tensorrt(monkeypatch, "workspace_size", "grouped_mm_kernel", kernels=kernels)
+
+    def load_policy(cfg):
+        raise LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchTensorRTConfig())
+    with caplog.at_level(logging.WARNING, logger=export_praxis.__name__), pytest.raises(LoadedPolicyError):
+        PraxisExportRecipe.load(cfg)
+    warned = "2.15.0 has no torch_tensorrt.kernels.triton_op (pytorch/TensorRT#4435" in caplog.text
+    assert warned == (not kernels)
 
 
 def test_the_compile_options_of_sample_reach_only_its_program(tmp_path, monkeypatch):
@@ -390,3 +409,73 @@ def test_every_chunk_reads_the_noise_and_the_kept_frames(tmp_path, monkeypatch):
         assert runs[1].inputs == [NOISE]
         assert runs[-1].outputs == [ACTION]
         assert runs[0].inputs == [*recipe._cameras, recipe._state]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_with_tensorrt_in_bfloat16_the_parts_trace_the_top_k_sum_as_one_plugin(tmp_path, monkeypatch, dtype):
+    """Written in PyTorch, TensorRT fuses the top-k sum with the next block's norm into one slow kernel."""
+    sum_rows_of_tokens = praxis_layers._sum_rows_of_tokens
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: sum_rows_of_tokens)
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    seen = []
+    routed = praxis_layers._routed_chunk_group
+
+    def routed_chunk(*args):
+        seen.append(praxis_layers._TOP_K_SUM)
+        return routed(*args)
+
+    monkeypatch.setattr(praxis_layers, "_routed_chunk_group", routed_chunk)
+    parts = list(recipe.parts())
+    bfloat16 = dtype == torch.bfloat16
+    # The policy's own runs, outside the parts, keep the PyTorch sum.
+    assert set(seen) <= {None, sum_rows_of_tokens}
+    assert (sum_rows_of_tokens in seen) == bfloat16
+    assert praxis_layers._TOP_K_SUM is None
+    # The compile step registers the plugin's operator before it loads the program.
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: (export_praxis.TOP_K_SUM_MODULE,) if bfloat16 and part.name == "sample" else ()
+        for part in parts
+    }
+
+
+def _need_triton_op():
+    """Skip without a Torch-TensorRT that makes TensorRT plugins of Triton kernels; return the module otherwise."""
+    torch_tensorrt = pytest.importorskip("torch_tensorrt")
+    if getattr(getattr(torch_tensorrt, "kernels", None), "triton_op", None) is None:
+        pytest.skip(
+            f"Torch-TensorRT {torch_tensorrt.__version__} makes no TensorRT plugin of a Triton kernel"
+        )
+    return torch_tensorrt
+
+
+def _assert_runs_in_tensorrt(compiled):
+    """The compiled module is TensorRT engines only, and at least one."""
+    children = [name for name, _ in compiled.named_children()]
+    assert children and all(name.startswith("_run_on_acc") for name in children), children
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
+@pytest.mark.parametrize("top_k", [8, 6])
+def test_the_top_k_sum_plugin_sums_as_pytorch_does_inside_tensorrt(top_k):
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_top_k_sum import TOP_K_SUM
+
+    assert TOP_K_SUM is not None
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # A width that is no multiple of the plugin's block.
+    tokens, width = 37, 2100
+    rows = torch.randn(tokens * top_k, width, device="cuda", generator=generator).to(torch.bfloat16)
+    rows_of_token = torch.randperm(tokens * top_k, device="cuda", generator=generator).view(tokens, top_k)
+    scale = torch.rand(tokens, top_k, device="cuda", generator=generator)
+
+    class TopKSum(torch.nn.Module):
+        def forward(self, rows, rows_of_token, scale):
+            return TOP_K_SUM(rows, rows_of_token, scale)
+
+    inputs = [rows, rows_of_token, scale]
+    program = torch.export.export(TopKSum(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1, disable_tf32=True)
+    _assert_runs_in_tensorrt(compiled)
+    expected = praxis_layers._sum_rows_of_tokens(rows, rows_of_token, scale)
+    torch.testing.assert_close(compiled(*inputs), expected, rtol=1e-5, atol=1e-5)

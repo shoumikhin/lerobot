@@ -728,6 +728,21 @@ def _sum_rows_of_tokens(rows: Tensor, rows_of_token: Tensor, scale: Tensor) -> T
     return ((acc[0] + acc[1]) + acc[2]) + acc[3]
 
 
+TopKSum = Callable[[Tensor, Tensor, Tensor], Tensor]
+_TOP_K_SUM: TopKSum | None = None
+
+
+def set_top_k_sum(fn: TopKSum | None) -> None:
+    """Run the forward top-k sum of the chunked expert dispatch with ``fn`` (LeRobot addition).
+
+    ``fn`` takes the arguments of ``_sum_rows_of_tokens`` and returns its values. An export uses it to give the
+    sum to its compiler as one operation. None restores ``_sum_rows_of_tokens``. ``_routed_chunk_group`` reads the
+    module attribute at call time.
+    """
+    global _TOP_K_SUM
+    _TOP_K_SUM = fn
+
+
 def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
@@ -752,11 +767,12 @@ def _routed_chunk_group(
     out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
+    top_k_sum = _TOP_K_SUM or _sum_rows_of_tokens
     sums = []
     rows_of_tokens = inverse.split([n * top_k for n in sizes])
     for rows_of_token, chunk_gate in zip(rows_of_tokens, gate.split(list(sizes)), strict=True):
         scale = chunk_gate.to(torch.float32) * scaling
-        sums.append(_sum_rows_of_tokens(out, rows_of_token.view(chunk_gate.shape), scale))
+        sums.append(top_k_sum(out, rows_of_token.view(chunk_gate.shape), scale))
     return sums
 
 
