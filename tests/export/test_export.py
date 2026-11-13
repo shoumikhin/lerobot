@@ -829,6 +829,20 @@ def test_the_compile_step_leaves_the_backend_the_only_reference_to_the_program(
     assert freed == [True]
 
 
+def test_the_compile_step_removes_the_traced_part_before_the_backend_writes_its_program(
+    tmp_path, monkeypatch
+):
+    """A traced part holds the part's weights, so it is off the disk before the compiled program is written."""
+    traced = []
+    monkeypatch.setattr(
+        TorchTestBackend,
+        "compile",
+        lambda self, program, path, **options: traced.append((tmp_path / "part.pt2").exists()),
+    )
+    compile_part(tmp_path, None)
+    assert traced == [False]
+
+
 def compile_part(tmp_path, quantize, compile_options=None):
     with torch.no_grad():
         program = torch.export.export(torch.nn.Linear(2, 2), (torch.zeros(1, 2),))

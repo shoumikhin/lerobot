@@ -355,6 +355,8 @@ def _quantized(cfg: ExportConfig, part: Part) -> contextlib.AbstractContextManag
 def compile_step(request: dict[str, Any]) -> dict[str, Any]:
     """Compile the saved program `request["program"]` with `request["backend"]` into `request["path"]`.
 
+    Removes the saved program once it is loaded, since nothing reads it again.
+
     `request["compile_options"]` holds the part's compile options, if it has any. Only then are they passed, so a
     backend whose `compile` takes none keeps working.
 
@@ -384,18 +386,25 @@ def compile_step(request: dict[str, Any]) -> dict[str, Any]:
             # Two plain calls, since a call that unpacks `**` keyword arguments holds the program in its tuple of
             # arguments until `compile` returns.
             if options := request.get("compile_options"):
-                data = backend.compile(
-                    torch.export.load(request["program"]),  # nosec B614
-                    path,
-                    compile_options=options,
-                )
+                data = backend.compile(_load_traced(Path(request["program"])), path, compile_options=options)
             else:
-                data = backend.compile(torch.export.load(request["program"]), path)  # nosec B614
+                data = backend.compile(_load_traced(Path(request["program"])), path)
     except ImportError as error:
         if not backend.packages:
             raise
         raise backend.install_error(error) from error
     return {"data": None if data is None else data.name}
+
+
+def _load_traced(path: Path) -> torch.export.ExportedProgram:
+    """Load the program the trace step saved at `path`, and remove its file.
+
+    The file holds the part's weights, as large as the program the backend writes from it, so removing it first
+    keeps the two off the disk at once: the largest part of a large policy needs that much less free disk.
+    """
+    program = torch.export.load(path)  # nosec B614
+    path.unlink()
+    return program
 
 
 def check_step(request: dict[str, Any]) -> dict[str, Any]:
