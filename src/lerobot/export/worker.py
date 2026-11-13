@@ -62,7 +62,7 @@ from lerobot.utils.robot_utils import MOTOR_CHANNEL_SUFFIXES
 from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
-from .recipe import PROGRAM_FLOOR_FACTOR, Part, ProgramCheck
+from .recipe import PROGRAM_FLOOR_FACTOR, ExportRecipe, Part, ProgramCheck
 
 # By name: run with `python -m`, this module is `__main__`, which is not a LeRobot logger.
 logger = logging.getLogger("lerobot.export.worker")
@@ -143,13 +143,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
         folder.mkdir()
         traced.mkdir(mode=0o700)
-        recipe_cfg = cfg
-        if cfg.quantize is not None:
-            # The recipe compares its parts with the policy as it does without --quantize, so only the
-            # bundle's check of its test case takes the --tolerance.
-            recipe_cfg = copy.copy(cfg)
-            recipe_cfg.tolerance = None
-        recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
+        recipe_class = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy))
+        recipe = recipe_class.load(_recipe_config(cfg, recipe_class))
         programs: dict[str, ProgramFiles] = {}
         runs: list[ProgramRun] = []
         checks: list[str] = []
@@ -171,7 +166,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
                 ]
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
             # default, and its Dynamo cannot run some policies' Python, such as ACT's.
-            with torch.no_grad(), _quantized(cfg, part):
+            with torch.no_grad(), _quantized(cfg, part, recipe):
                 program = torch.export.export(part.module, part.example_inputs, strict=False)
                 # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
                 # flat_apply that Transformers' vmap attention masks trace to.
@@ -258,7 +253,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "weights": weight_dtypes,
         "compile_options": compile_options,
         "operator_modules": operator_modules,
-        "quantize": cfg.quantize,
+        # A recipe that quantized its own modules traced no operators of the backend's quantization.
+        "quantize": None if cfg.quantize in recipe.quantizations else cfg.quantize,
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
         "log_level": cfg.log_level,
     }
@@ -340,9 +336,23 @@ def _reading_weights(runs: list[ProgramRun], weight_inputs: dict[str, list[str]]
     ]
 
 
-def _quantized(cfg: ExportConfig, part: Part) -> contextlib.AbstractContextManager:
-    """Quantize `part` as `--quantize` asks, and return the context to trace it in."""
-    if cfg.quantize is None:
+def _recipe_config(cfg: ExportConfig, recipe_class: type[ExportRecipe]) -> ExportConfig:
+    """`cfg` as the recipe loads with it.
+
+    The backend quantizes a part only when it traces it, after the recipe compared the unquantized part with the
+    policy, so for such a quantization only the bundle's check of its test case takes `--tolerance`. A recipe that
+    quantizes its own parts compares them quantized, so its comparison takes `--tolerance` too.
+    """
+    if cfg.quantize is None or cfg.quantize in recipe_class.quantizations:
+        return cfg
+    recipe_cfg = copy.copy(cfg)
+    recipe_cfg.tolerance = None
+    return recipe_cfg
+
+
+def _quantized(cfg: ExportConfig, part: Part, recipe: ExportRecipe) -> contextlib.AbstractContextManager:
+    """Quantize `part` as `--quantize` asks, unless the recipe did, and return the context to trace it in."""
+    if cfg.quantize is None or cfg.quantize in recipe.quantizations:
         return contextlib.nullcontext()
     if part.check is not None:
         raise ValueError(

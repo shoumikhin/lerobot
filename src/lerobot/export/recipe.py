@@ -99,6 +99,7 @@ _RANDOM_NORMAL = {torch.randn, torch.randn_like, torch.normal, Tensor.normal_}
 _MULTINOMIAL = {torch.multinomial, Tensor.multinomial}
 _RANDOM_INTEGERS = {torch.randint}
 _HALF = (torch.bfloat16, torch.float16)
+_FLOAT8 = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @dataclass
@@ -232,8 +233,10 @@ class ProgramCheck:
                     measured.append(relative_errors(_call(module, change_inputs), outputs))
         # The first rerun changes nothing, so it measures what kernels vary between runs, unless the part
         # draws random numbers, which every rerun would then fold into the floor. A part may compute in
-        # bfloat16 and return float32, which then varies by bfloat16's steps.
-        step = max(_step(t) for t in (*inputs, *module.parameters(), *module.buffers(), *outputs))
+        # bfloat16 and return float32, which then varies by bfloat16's steps. Float8 tensors, such as quantized
+        # weights, are storage: a part computes with them in its wider dtypes, so they set no step.
+        tensors = (*inputs, *module.parameters(), *module.buffers(), *outputs)
+        step = max(_step(t) for t in tensors if t.dtype not in _FLOAT8)
         for index, ((again, _), x) in enumerate(zip(measured[0], outputs, strict=True)):
             # An output that holds NaN, or an integer one a rerun moves, is refused below for that reason.
             if (
@@ -651,9 +654,13 @@ class ExportRecipe(abc.ABC):
         - **bfloat16_tolerance** (`float`) -- The default tolerance of a bfloat16 or float16 checkpoint. A
           recipe whose policy runs ten bfloat16 denoising steps, which amplify rounding, raises it to
           `BFLOAT16_STEPS_TOLERANCE`.
+        - **quantizations** (`tuple[str, ...]`) -- The `--quantize` modes the recipe applies to its own modules
+          before it checks its parts, so that its checks measure the quantized parts. The backend then
+          quantizes nothing at trace time.
     """
 
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE
+    quantizations: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
     def load(cls, cfg: ExportConfig) -> ExportRecipe:

@@ -1136,6 +1136,25 @@ def test_a_program_check_takes_kernels_that_vary_between_runs_but_not_random_num
         ProgramCheck.measure(part, (x,))
 
 
+class _HoldsFloat8(torch.nn.Module):
+    """A float32 part with float8 weights, such as quantized ones, that draws random numbers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("weight", torch.randn(64, 64).to(torch.float8_e4m3fn))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = x @ self.weight.float()
+        return y + 1e-2 * y.abs().max() * torch.rand_like(y)
+
+
+def test_float8_weights_set_no_rounding_step_for_the_rerun():
+    """Float8 weights are storage the part computes with in float32, so its rerun is held to float32's steps."""
+    torch.manual_seed(0)
+    with pytest.raises(ValueError, match="changes by more than rounding does when it runs again"):
+        ProgramCheck.measure(_HoldsFloat8(), (torch.randn(8, 64),))
+
+
 def test_a_program_check_refuses_a_part_that_keeps_dropout_on():
     torch.manual_seed(0)
     part = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout(0.1)).to(torch.bfloat16)

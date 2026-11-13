@@ -405,7 +405,36 @@ def test_a_part_checked_on_its_own_is_refused_quantization():
     check = ProgramCheck((x,), (linear(x),), [(0.0, 0.0)])
     cfg = SimpleNamespace(quantize="fp8", policy=SimpleNamespace(type="tiny"), backend=None)
     with pytest.raises(ValueError, match="checks its model program to within what rounding moves it"):
-        worker._quantized(cfg, Part("model", linear, (x,), ["x"], ["y"], check))
+        worker._quantized(
+            cfg, Part("model", linear, (x,), ["x"], ["y"], check), SimpleNamespace(quantizations=())
+        )
+
+
+def test_a_recipe_that_quantizes_its_own_parts_compares_them_within_the_tolerance():
+    """Its parts are quantized when it compares them with the policy, so `--tolerance` bounds that comparison. A
+    backend quantizes after the recipe's comparison, which then keeps the recipe's own tolerance."""
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(quantize="fp8", tolerance=2.0)
+    assert worker._recipe_config(cfg, SimpleNamespace(quantizations=("fp8",))).tolerance == 2.0
+    assert worker._recipe_config(cfg, SimpleNamespace(quantizations=())).tolerance is None
+    assert cfg.tolerance == 2.0
+
+
+def test_a_recipe_that_quantizes_its_own_parts_gets_no_backend_quantization():
+    """Its parts were quantized before they were checked, so a checked part is not refused, and the backend,
+    here None, is not asked to quantize them again."""
+    from types import SimpleNamespace
+
+    from lerobot.export.recipe import Part, ProgramCheck
+
+    linear = torch.nn.Linear(2, 2)
+    x = torch.zeros(1, 2)
+    check = ProgramCheck((x,), (linear(x),), [(0.0, 0.0)])
+    cfg = SimpleNamespace(quantize="fp8", policy=SimpleNamespace(type="tiny"), backend=None)
+    part = Part("model", linear, (x,), ["x"], ["y"], check)
+    with worker._quantized(cfg, part, SimpleNamespace(quantizations=("fp8",))):
+        pass
 
 
 @pytest.mark.parametrize(("option", "value"), [("compute_units", "tpu"), ("compute_precision", "int8")])
