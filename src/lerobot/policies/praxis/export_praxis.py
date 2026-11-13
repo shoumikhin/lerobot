@@ -247,9 +247,10 @@ class _Encode(nn.Module):
     """The kept camera frames and states in; the anchor latent, the clean latents and the proprio out.
 
     The executed chunk is the first `executed` kept frames, which the session encodes as the clean latents,
-    after the first of them alone as the anchor. Each frame becomes its tiles as the preprocessor makes them,
-    side by side in the order of the cameras. The proprio is the normalized pose at the first kept frame and at
-    the current one, the last.
+    after the first of them alone as the anchor. The autoencoder is causal and encodes the first frame alone,
+    so the first clean latent is that anchor latent. Each frame becomes its tiles as the preprocessor makes
+    them, side by side in the order of the cameras. The proprio is the normalized pose at the first kept frame
+    and at the current one, the last.
 
     Args:
         policy (`PraxisPolicy`):
@@ -284,8 +285,8 @@ class _Encode(nn.Module):
                 for view in frames
             ]
         clip = torch.cat(tiles, dim=-1).float().permute(1, 0, 2, 3).unsqueeze(0)
-        anchor = self.vae.encode_eager(clip[:, :, :1])
         clean = self.vae.encode_eager(clip)
+        anchor = clean[:, :, :1].contiguous()
         poses = _session_poses(torch.stack([states[0], states[-1]]), self.arms)
         return anchor, clean, _proprio(poses, self.mean, self.std)[None]
 

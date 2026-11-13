@@ -263,6 +263,23 @@ def test_encode_tiles_the_frames_as_the_policy_does(tmp_path, monkeypatch):
     assert (encode.aspect_tol, encode.antialias) == (policy.variant.aspect_tol, policy.variant.antialias)
 
 
+def test_encode_takes_the_anchor_latent_from_the_clean_latents(tmp_path, monkeypatch):
+    """The autoencoder encodes the first frame alone, so one encode of the frames also gives the anchor."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    case = recipe.test_case()
+    vae, clips = recipe.policy.vae, []
+    encode_eager = vae.encode_eager
+    monkeypatch.setattr(vae, "encode_eager", lambda clip: clips.append(clip) or encode_eager(clip))
+    kept = recipe._executed + 1
+    inputs = [torch.from_numpy(case.frame[name][:kept]) for name in [*recipe._cameras, recipe._state]]
+    with torch.no_grad():
+        anchor, clean, _ = export_praxis._Encode(recipe.policy, recipe._executed)(*inputs)
+        expected = encode_eager(clips[0][:, :, :1])
+    assert len(clips) == 1
+    assert clean.shape[2] > 1
+    assert torch.equal(anchor, expected)
+
+
 def test_the_bundle_config_leaves_out_a_local_frozen_modules_folder(tmp_path, monkeypatch):
     # The tiny checkpoint has no text encoder to name: a folder there would load a tokenizer step.
     frozen = str(tmp_path / "frozen")
