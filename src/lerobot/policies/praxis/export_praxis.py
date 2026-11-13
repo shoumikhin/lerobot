@@ -360,12 +360,15 @@ class _Sample(nn.Module):
         chunks = proprio.shape[1]
         anchor, clean = anchor.to(dtype), clean.to(dtype)
         texts = [self.text] if self.text_uncond is None else [self.text, self.text_uncond]
+        contexts = [praxis_layers.ContextCache() for _ in texts]
         for i, time in enumerate(times):
             last = i == self.steps - 1
             noised, timesteps = video.to(dtype), time.to(dtype).expand(1, chunks)
             conds, action_velocities = [], []
-            step_texts = texts[: self.action_passes] if last else texts
-            encoded = self.encoder.forward_chunk_causal_pair(step_texts, anchor, clean, noised, timesteps)
+            n = self.action_passes if last else len(texts)
+            encoded = self.encoder.forward_chunk_causal_pair(
+                texts[:n], anchor, clean, noised, timesteps, contexts=contexts[:n]
+            )
             for p, (cond, taps) in enumerate(encoded):
                 if not last:
                     conds.append(cond)

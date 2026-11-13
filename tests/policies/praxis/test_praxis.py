@@ -966,3 +966,42 @@ def test_the_encoder_runs_both_captions_through_one_pass_of_the_routed_experts(
     for (cond, taps), (cond_paired, taps_paired) in zip(alone, paired, strict=True):
         assert torch.equal(cond, cond_paired)
         assert all(torch.equal(a, b) for a, b in zip(taps.taps, taps_paired.taps, strict=True))
+
+
+def test_the_encoder_context_cache_runs_only_the_noised_tokens_after_the_first_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a context cache per text, the later calls of a window run the core on the noised tokens alone and
+    give the outputs and the taps of the whole sequence (float32: the forms differ only in the last bits)."""
+    encoder = make_tiny_policy(seed=6, dtype=torch.float32).model.backbone.encoder
+    generator = torch.Generator().manual_seed(0)
+    texts = [torch.randn(1, n, TEXT_DIM, generator=generator) for n in (3, 1)]
+    anchor, clean = (torch.randn(1, 192, frames, 1, 4, generator=generator) for frames in (1, 3))
+    noised = [torch.randn(1, 192, 6, 1, 4, generator=generator) for _ in range(3)]
+    steps = [(video, torch.rand(1, 2, generator=generator)) for video in noised]
+    rows: list[list[int]] = []
+    forward_pair = encoder.core.forward_pair
+
+    def counted(xs, *args, **kwargs):
+        rows.append([x.size(1) for x in xs])
+        return forward_pair(xs, *args, **kwargs)
+
+    monkeypatch.setattr(encoder.core, "forward_pair", counted)
+    saved = praxis_layers.flex_attention_mode()
+    try:
+        praxis_layers.set_flex_attention_mode("split")
+        contexts = [praxis_layers.ContextCache() for _ in texts]
+        with torch.no_grad():
+            for video, timesteps in steps:
+                whole = encoder.forward_chunk_causal_pair(texts, anchor, clean, video, timesteps)
+                cached = encoder.forward_chunk_causal_pair(
+                    texts, anchor, clean, video, timesteps, contexts=contexts
+                )
+                for (cond, taps), (cond_cached, taps_cached) in zip(whole, cached, strict=True):
+                    torch.testing.assert_close(cond_cached, cond)
+                    for tap, tap_cached in zip(taps.taps, taps_cached.taps, strict=True):
+                        torch.testing.assert_close(tap_cached, tap)
+    finally:
+        praxis_layers.set_flex_attention_mode(saved)
+    noised_tokens = 6 * 1 * 4
+    assert rows[1::2] == [rows[0], [noised_tokens] * 2, [noised_tokens] * 2]

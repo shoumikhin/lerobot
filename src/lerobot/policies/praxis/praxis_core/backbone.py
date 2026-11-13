@@ -40,6 +40,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from lerobot.policies.praxis.praxis_core.layers import (
     Attention,
     AttentionBlocks,
+    ContextCache,
     Transformer,
     flex_attention_mode,
     modulate as layer_modulate,
@@ -621,12 +622,19 @@ class EncoderTower(nn.Module):
         noised: Tensor,
         timesteps: Tensor,
         rope_shifts: tuple[int, int, int] = (0, 0, 0),
+        contexts: Sequence[ContextCache] | None = None,
     ) -> list[tuple[Tensor, TapFeatures]]:
         """``forward_chunk_causal`` for each text of ``texts``, such as the guided and the unguided pass.
 
         With more than one text, the core runs the texts block by block (``Transformer.forward_pair``), so
         each mixture-of-experts block reads its routed experts' weights once for all texts. Every output has
         the bits of its text run alone.
+
+        ``contexts`` holds a ``ContextCache`` per text for the calls of one window, whose anchor, clean chunks
+        and texts stay the same. No other token attends the noised chunks, so after the first call the core
+        runs only the noised tokens and takes the other tokens' keys, values, outputs and taps from the cache.
+        The noised tokens' own mask comes from the masks' runs, so outside the split flex attention every
+        call runs the whole sequence.
         """
         kk = int(timesteps.shape[1])
         frames, height, width = (int(d) for d in noised.shape[2:])
@@ -679,12 +687,30 @@ class EncoderTower(nn.Module):
             mask = self._tf_masks.get(slots, chunk, True, x.device, _full_blocks(self.core))
             inputs.append((x, positions, mask, n_text))
 
-        if len(inputs) == 1:
-            x, positions, mask, _ = inputs[0]
-            outs = [self.core(x, positions, None, mask, self.tap_blocks)]
+        core_inputs = [(x, positions, mask) for x, positions, mask, _ in inputs]
+        if not isinstance(inputs[0][2], AttentionBlocks):
+            contexts = None
+        if contexts is not None:
+            core_inputs = [
+                self._context_rows(context, x, positions, mask, n_reg + n_anchor + n_text, n_noised)
+                for context, (x, positions, mask, n_text) in zip(contexts, inputs, strict=True)
+            ]
+        if len(core_inputs) == 1:
+            x, positions, mask = core_inputs[0]
+            context = None if contexts is None else contexts[0]
+            outs = [self.core(x, positions, None, mask, self.tap_blocks, context)]
         else:
-            xs, positions_list, masks, _ = zip(*inputs, strict=True)
-            outs = self.core.forward_pair(xs, positions_list, [None] * len(xs), masks, self.tap_blocks)
+            xs, positions_list, masks = zip(*core_inputs, strict=True)
+            outs = self.core.forward_pair(
+                xs, positions_list, [None] * len(xs), masks, self.tap_blocks, contexts
+            )
+        if contexts is not None:
+            for p, (context, (_, _, _, n_text)) in enumerate(zip(contexts, inputs, strict=True)):
+                out, taps = outs[p]
+                taps = [context.whole(self, f"tap{i}", tap, 1) for i, tap in enumerate(taps)]
+                outs[p] = (context.whole(self, "out", out, 1), taps)
+                n_global = n_reg + n_anchor + n_text
+                context.rows = (n_global, n_global + n_noised)
 
         results = []
         for (x, positions, _, n_text), (out, taps) in zip(inputs, outs, strict=True):
@@ -721,6 +747,25 @@ class EncoderTower(nn.Module):
             )
             results.append((cond, features))
         return results
+
+    @staticmethod
+    def _context_rows(
+        context: ContextCache,
+        x: Tensor,
+        positions: Tensor,
+        mask: AttentionBlocks,
+        start: int,
+        length: int,
+    ) -> tuple[Tensor, Tensor, AttentionBlocks]:
+        """The core's input with ``context``: the whole sequence on the first call, the noised rows later."""
+        end = start + length
+        if mask.attended_from_outside(start, end):
+            raise ValueError("Other tokens attend the noised chunks, so the context changes with them")
+        if context.rows is None:
+            return x, positions, mask
+        if context.rows != (start, end):
+            raise ValueError(f"The context cache holds rows {context.rows}, not {(start, end)}")
+        return x[:, start:end], positions[:, start:end], mask.rows(start, end)
 
 
 class DecoderTower(nn.Module):

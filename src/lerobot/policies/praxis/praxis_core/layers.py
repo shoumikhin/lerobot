@@ -125,6 +125,52 @@ class AttentionBlocks:
         ki = torch.arange(keys, device=device)[None, :]
         return cls.from_mask(block_mask.mask_mod(None, None, qi, ki))
 
+    def rows(self, start: int, end: int) -> AttentionBlocks:
+        """The runs of the query rows ``start:end`` alone, numbered from ``start``. The keys stay the same."""
+        runs = []
+        for row_start, row_end, ranges in self.runs:
+            row_start, row_end = max(row_start, start), min(row_end, end)
+            if row_start < row_end:
+                runs.append((row_start - start, row_end - start, ranges))
+        return AttentionBlocks(tuple(runs))
+
+    def attended_from_outside(self, start: int, end: int) -> bool:
+        """Whether a query row outside ``start:end`` attends a key inside it."""
+        return any(
+            begin < end and stop > start
+            for row_start, row_end, ranges in self.runs
+            if row_start < start or row_end > end
+            for begin, stop in ranges
+        )
+
+
+class ContextCache:
+    """The context rows' share of a tower's calls, kept from a call over the whole sequence (LeRobot addition).
+
+    When no other row attends the rows ``start:end`` of a sequence and only those rows change from call to
+    call, as the encoder's noised chunks over the Euler steps, the other rows (the context) have the same
+    keys, values and outputs on every call. The first call runs the whole sequence, and ``whole`` keeps what
+    it is given. The tower then sets ``rows``, and later calls run only the rows ``start:end``: each attention
+    layer computes their keys and values and takes the context's from the cache (the original implementation's
+    encoder context reuse).
+    """
+
+    def __init__(self) -> None:
+        self.rows: tuple[int, int] | None = None
+        self._kept: dict[tuple[object, str], Tensor] = {}
+
+    def whole(self, owner: object, name: str, t: Tensor, dim: int) -> Tensor:
+        """``t`` over the whole sequence along ``dim``: as it is before ``rows`` is set, which keeps it under
+        ``(owner, name)``, and afterwards the kept tensor with its rows ``start:end`` replaced by ``t``."""
+        key = (owner, name)
+        if self.rows is None:
+            self._kept[key] = t
+            return t
+        start, end = self.rows
+        kept = self._kept[key]
+        after = kept.narrow(dim, end, kept.size(dim) - end)
+        return torch.cat([kept.narrow(dim, 0, start), t, after], dim=dim)
+
 
 def _key_slices(t: Tensor, ranges: KeyRanges) -> Tensor:
     if len(ranges) == 1:
@@ -473,8 +519,13 @@ class Attention(nn.Module):
         self._kernel_options = {"BACKEND": "FLASH"} if backend == "flash" else None
 
     def forward(
-        self, x: Tensor, rope: Tensor | None, block_mask: BlockMask | AttentionBlocks | None
+        self,
+        x: Tensor,
+        rope: Tensor | None,
+        block_mask: BlockMask | AttentionBlocks | None,
+        context: ContextCache | None = None,
     ) -> Tensor:
+        """With ``context``, the keys and values of the whole sequence come through ``ContextCache.whole``."""
         b, s, _ = x.shape
         d = self.head_dim
         q, k, v = self.in_proj(x)
@@ -487,6 +538,8 @@ class Attention(nn.Module):
             q, k = apply_rope(q, k, rope)
         q = self.q_norm(q)
         k = self.k_norm(k)
+        if context is not None:
+            k, v = context.whole(self, "k", k, 2), context.whole(self, "v", v, 2)
         out = _compiled_flex_attention(  # ty: ignore[no-matching-overload]
             q,
             k,
@@ -1100,8 +1153,9 @@ class TransformerBlock(nn.Module):
         rope: Tensor | None,
         block_mask: BlockMask | AttentionBlocks | None = None,
         modulation: Modulation | None = None,
+        context: ContextCache | None = None,
     ) -> Tensor:
-        x = self._attend(x, rope, block_mask, modulation)
+        x = self._attend(x, rope, block_mask, modulation, context)
         return x + self.ffn(self.ln_out(x) * self.s)
 
     def forward_pair(
@@ -1110,10 +1164,11 @@ class TransformerBlock(nn.Module):
         ropes: Sequence[Tensor | None],
         block_masks: Sequence[BlockMask | AttentionBlocks | None],
         modulations: Sequence[Modulation | None],
+        contexts: Sequence[ContextCache | None],
     ) -> list[Tensor]:
         """``forward`` of each input, with one pass of a mixture of experts' routed experts for all inputs
         (``MoEFeedForward.forward_pair``)."""
-        xs = [self._attend(*args) for args in zip(xs, ropes, block_masks, modulations, strict=True)]
+        xs = [self._attend(*args) for args in zip(xs, ropes, block_masks, modulations, contexts, strict=True)]
         ffn_in = [self.ln_out(x) * self.s for x in xs]
         if isinstance(self.ffn, MoEFeedForward):
             ys = self.ffn.forward_pair(ffn_in)
@@ -1127,13 +1182,14 @@ class TransformerBlock(nn.Module):
         rope: Tensor | None,
         block_mask: BlockMask | AttentionBlocks | None,
         modulation: Modulation | None,
+        context: ContextCache | None,
     ) -> Tensor:
         """The modulation, if any, and the attention half of the block."""
         if modulation is not None:
             modulator, x_mod, dtype = modulation
             shift, scale = modulator(x_mod).chunk(2, dim=-1)
             x = modulate(x, shift, 1 + scale, dtype=dtype)
-        return x + self.mha(self.ln_in(x) * self.s, rope, block_mask)
+        return x + self.mha(self.ln_in(x) * self.s, rope, block_mask, context)
 
 
 class Transformer(nn.Module):
@@ -1208,13 +1264,14 @@ class Transformer(nn.Module):
         rope: Tensor,
         x_mod: Tensor | None = None,
         block_mask: BlockMask | AttentionBlocks | None = None,
+        context: ContextCache | None = None,
     ) -> Tensor:
         """Run block ``i``, with its modulation first when the stack has one."""
         if self.modulators is None:
-            return self.blocks[i](x, rope, block_mask)
+            return self.blocks[i](x, rope, block_mask, context=context)
         assert x_mod is not None, "a modulated stack needs x_mod"
         modulation = (self.modulators[i], x_mod, self.modulation_dtype)
-        return self.blocks[i](x, rope, block_mask, modulation)
+        return self.blocks[i](x, rope, block_mask, modulation, context)
 
     def forward(
         self,
@@ -1223,16 +1280,18 @@ class Transformer(nn.Module):
         x_mod: Tensor | None = None,
         block_mask: BlockMask | AttentionBlocks | None = None,
         tap_blocks: Sequence[int] = (),
+        context: ContextCache | None = None,
     ) -> tuple[Tensor, list[Tensor]]:
         """Map ``x`` (B, N, C) to (B, N, C) and return the taps.
 
         ``rope_idx`` is (B, N) int64. The taps are the outputs of the blocks in
-        ``tap_blocks``, in the order of ``tap_blocks``.
+        ``tap_blocks``, in the order of ``tap_blocks``. ``context`` goes to every
+        attention layer (``Attention.forward``).
         """
         rope = self.rope_table(rope_idx, x.size(-2))
         taps: dict[int, Tensor] = {}
         for i in range(len(self.blocks)):
-            x = self.block_forward(i, x, rope, x_mod, block_mask)
+            x = self.block_forward(i, x, rope, x_mod, block_mask, context)
             if i in tap_blocks:
                 taps[i] = x
         return x, [taps[i] for i in tap_blocks]
@@ -1244,10 +1303,12 @@ class Transformer(nn.Module):
         x_mods: Sequence[Tensor | None],
         block_masks: Sequence[BlockMask | AttentionBlocks | None],
         tap_blocks: Sequence[int] = (),
+        contexts: Sequence[ContextCache | None] | None = None,
     ) -> list[tuple[Tensor, list[Tensor]]]:
         """``forward`` of each input, block by block, so each mixture-of-experts block reads its routed
         experts' weights once for all inputs (``TransformerBlock.forward_pair``)."""
         ropes = [self.rope_table(rope_idx, x.size(-2)) for rope_idx, x in zip(rope_idxs, xs, strict=True)]
+        contexts = [None] * len(xs) if contexts is None else contexts
         taps: list[dict[int, Tensor]] = [{} for _ in xs]
         for i, block in enumerate(self.blocks):
             if self.modulators is None:
@@ -1255,7 +1316,7 @@ class Transformer(nn.Module):
             else:
                 assert all(x_mod is not None for x_mod in x_mods), "a modulated stack needs x_mod"
                 modulations = [(self.modulators[i], x_mod, self.modulation_dtype) for x_mod in x_mods]
-            xs = block.forward_pair(xs, ropes, block_masks, modulations)
+            xs = block.forward_pair(xs, ropes, block_masks, modulations, contexts)
             if i in tap_blocks:
                 for tap, x in zip(taps, xs, strict=True):
                     tap[i] = x
