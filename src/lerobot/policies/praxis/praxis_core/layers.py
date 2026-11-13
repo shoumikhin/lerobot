@@ -743,6 +743,20 @@ def set_top_k_sum(fn: TopKSum | None) -> None:
     _TOP_K_SUM = fn
 
 
+TakeRows = Callable[[Tensor, Tensor], Tensor]
+_TAKE_ROWS: TakeRows | None = None
+
+
+def set_take_rows(fn: TakeRows | None) -> None:
+    """Gather the input rows of the chunked expert dispatch in expert order with ``fn`` (LeRobot addition).
+
+    ``fn(x, index)`` returns ``x[index]``. An export uses it to give the gather to its compiler as one
+    operation. None restores ``x[index]``. ``_routed_chunk_group`` reads the module attribute at call time.
+    """
+    global _TAKE_ROWS
+    _TAKE_ROWS = fn
+
+
 def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
@@ -762,8 +776,8 @@ def _routed_chunk_group(
     """
     top_k = top_idx.shape[1]
     order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
-    rows = x[sorted_tokens].to(gate_up_w.dtype)
-    gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
+    rows = x[sorted_tokens] if _TAKE_ROWS is None else _TAKE_ROWS(x, sorted_tokens)
+    gate_up = torch._grouped_mm(rows.to(gate_up_w.dtype), gate_up_w, offsets)
     out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)

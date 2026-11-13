@@ -106,6 +106,8 @@ MOE_PARTS = ("sample",)
 GROUPED_MM_KERNEL = "grouped_mm_kernel"
 # The module that registers the TensorRT plugin of their top-k sum.
 TOP_K_SUM_MODULE = "lerobot.policies.praxis.export_top_k_sum"
+# The module that registers the TensorRT plugin of their row gather.
+TAKE_ROWS_MODULE = "lerobot.policies.praxis.export_take_rows"
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +487,9 @@ def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
     """Refuse a Torch-TensorRT that cannot run the mixture-of-experts layers in TensorRT, or none at all.
 
     Such a Torch-TensorRT ignores `grouped_mm_kernel` without a word and leaves each such layer to PyTorch. Warn if
-    it has no `torch_tensorrt.kernels.triton_op`: the export then cannot make the plugin of their top-k sum
-    (`export_top_k_sum`) and keeps the PyTorch sum, which TensorRT fuses with the next block's norm into a slower
-    kernel.
+    it has no `torch_tensorrt.kernels.triton_op`: the export then cannot make the plugins of their top-k sum
+    (`export_top_k_sum`) and row gather (`export_take_rows`) and keeps both in PyTorch, where TensorRT
+    fuses the sum with the next block's norm into a slower kernel and runs the gather slower than the plugin.
     """
     try:
         import torch_tensorrt
@@ -502,9 +504,9 @@ def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
     if getattr(getattr(torch_tensorrt, "kernels", None), "triton_op", None) is None:
         logger.warning(
             "Torch-TensorRT %s has no torch_tensorrt.kernels.triton_op (pytorch/TensorRT#4435, in Torch-TensorRT "
-            "2.15), so the top-k sum of Praxis-1's mixture-of-experts layers (with dispatch_chunk_size set, as in "
-            "the released checkpoints) stays in PyTorch, which is slower: TensorRT fuses it with the next block's "
-            "norm into a slower kernel.",
+            "2.15), so the top-k sum and the row gather of Praxis-1's mixture-of-experts layers (with "
+            "dispatch_chunk_size set, as in the released checkpoints) stay in PyTorch, which is slower than their "
+            "plugins.",
             torch_tensorrt.__version__,
         )
 
@@ -514,6 +516,13 @@ def _top_k_sum_plugin() -> praxis_layers.TopKSum | None:
     from . import export_top_k_sum
 
     return export_top_k_sum.TOP_K_SUM
+
+
+def _take_rows_plugin() -> praxis_layers.TakeRows | None:
+    """The mixture-of-experts row gather as one TensorRT plugin (`export_take_rows`), if there is one."""
+    from . import export_take_rows
+
+    return export_take_rows.TAKE_ROWS
 
 
 class PraxisExportRecipe(ActionChunkRecipe):
@@ -717,7 +726,8 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 # Torch-TensorRT runs the grouped matrix multiplies of mixture-of-experts layers only with this
                 # setting. Without it each such layer stays in PyTorch and splits the program around it.
                 options = {GROUPED_MM_KERNEL: True} if tensorrt and name in MOE_PARTS else {}
-                operators = (TOP_K_SUM_MODULE,) if self._top_k_sum() and name in MOE_PARTS else ()
+                plugins = (TOP_K_SUM_MODULE, self._top_k_sum()), (TAKE_ROWS_MODULE, self._take_rows())
+                operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 yield Part(
                     name,
                     module,
@@ -738,6 +748,11 @@ class PraxisExportRecipe(ActionChunkRecipe):
             return _top_k_sum_plugin()
         return None
 
+    def _take_rows(self) -> praxis_layers.TakeRows | None:
+        """The TensorRT plugin of the row gather, for TensorRT in bfloat16, the plugin's input dtype."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        return _take_rows_plugin() if tensorrt and self.policy.model.dtype == torch.bfloat16 else None
+
     @contextlib.contextmanager
     def _plain_pytorch(self) -> Iterator[None]:
         """The policy running only operations `torch.export` records: split attention, no custom kernels.
@@ -754,11 +769,13 @@ class PraxisExportRecipe(ActionChunkRecipe):
         kernels = praxis_layers.custom_kernels_enabled()
         praxis_layers.set_custom_kernels(False)
         praxis_layers.set_top_k_sum(self._top_k_sum())
+        praxis_layers.set_take_rows(self._take_rows())
         try:
             yield
         finally:
             praxis_layers.set_custom_kernels(kernels)
             praxis_layers.set_top_k_sum(None)
+            praxis_layers.set_take_rows(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)
 

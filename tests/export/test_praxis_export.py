@@ -416,6 +416,7 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_top_k_sum_as_one_plugin(t
     """Written in PyTorch, TensorRT fuses the top-k sum with the next block's norm into one slow kernel."""
     sum_rows_of_tokens = praxis_layers._sum_rows_of_tokens
     monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: sum_rows_of_tokens)
+    monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: None)
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
     recipe.cfg.backend = ExecuTorchTensorRTConfig()
     seen = []
@@ -435,6 +436,38 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_top_k_sum_as_one_plugin(t
     # The compile step registers the plugin's operator before it loads the program.
     assert {part.name: part.operator_modules for part in parts} == {
         part.name: (export_praxis.TOP_K_SUM_MODULE,) if bfloat16 and part.name == "sample" else ()
+        for part in parts
+    }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_with_tensorrt_in_bfloat16_the_parts_trace_the_row_gather_as_one_plugin(tmp_path, monkeypatch, dtype):
+    """Written in PyTorch, TensorRT runs the gather of the rows in expert order slower than the plugin."""
+
+    def take_rows(x, index):
+        return x[index]
+
+    monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: take_rows)
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    seen = []
+    routed = praxis_layers._routed_chunk_group
+
+    def routed_chunk(*args):
+        seen.append(praxis_layers._TAKE_ROWS)
+        return routed(*args)
+
+    monkeypatch.setattr(praxis_layers, "_routed_chunk_group", routed_chunk)
+    parts = list(recipe.parts())
+    bfloat16 = dtype == torch.bfloat16
+    # The policy's own runs, outside the parts, keep the PyTorch gather.
+    assert set(seen) <= {None, take_rows}
+    assert (take_rows in seen) == bfloat16
+    assert praxis_layers._TAKE_ROWS is None
+    # The compile step registers the plugin's operator before it loads the program.
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: (export_praxis.TAKE_ROWS_MODULE,) if bfloat16 and part.name == "sample" else ()
         for part in parts
     }
 
@@ -479,3 +512,27 @@ def test_the_top_k_sum_plugin_sums_as_pytorch_does_inside_tensorrt(top_k):
     _assert_runs_in_tensorrt(compiled)
     expected = praxis_layers._sum_rows_of_tokens(rows, rows_of_token, scale)
     torch.testing.assert_close(compiled(*inputs), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
+def test_the_row_gather_plugin_gathers_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_take_rows import TAKE_ROWS
+
+    assert TAKE_ROWS is not None
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # A width that is no multiple of the plugin's block, and each token's row taken top_k times.
+    tokens, top_k, width = 37, 8, 2100
+    x = torch.randn(tokens, width, device="cuda", generator=generator).to(torch.bfloat16)
+    index = torch.arange(tokens, device="cuda").repeat_interleave(top_k)
+    index = index[torch.randperm(index.numel(), device="cuda", generator=generator)]
+
+    class TakeRows(torch.nn.Module):
+        def forward(self, x, index):
+            return TAKE_ROWS(x, index)
+
+    inputs = [x, index]
+    program = torch.export.export(TakeRows(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
+    _assert_runs_in_tensorrt(compiled)
+    assert torch.equal(compiled(*inputs), x[index])
