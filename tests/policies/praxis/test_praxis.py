@@ -794,6 +794,25 @@ def test_to_another_device_selects_its_attention_kernels() -> None:
     assert all(t._tf_masks.block_size == block for t in towers)
 
 
+def test_a_causal_convolution_pads_in_the_autocast_dtype_with_the_same_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under autocast the padding runs in the convolution's own dtype, half the bytes of float32, and since the
+    zeros it adds are exact, the output has the bits of padding in float32."""
+    generator = torch.Generator().manual_seed(0)
+    conv = vae.CausalConv3d(4, 6, kernel_size=3, padding=1)
+    x = torch.randn(1, 4, 3, 5, 7, generator=generator)
+    pad, padded = torch.nn.functional.pad, []
+    monkeypatch.setattr(
+        vae.F, "pad", lambda t, *args, **kwargs: padded.append(t.dtype) or pad(t, *args, **kwargs)
+    )
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = conv(x)
+        reference = torch.nn.Conv3d.forward(conv, pad(x, list(conv._pad)))
+    assert padded == [torch.bfloat16]
+    assert out.dtype == torch.bfloat16 and torch.equal(out, reference)
+
+
 def test_vae_encoder_takes_the_whole_clip_in_one_pass() -> None:
     """The encoder is causal, so the whole clip in one pass gives the latents of the chunk-by-chunk stream."""
     torch.manual_seed(0)

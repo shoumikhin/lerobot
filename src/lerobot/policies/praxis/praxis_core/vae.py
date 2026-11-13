@@ -83,6 +83,9 @@ class CausalConv3d(nn.Conv3d):
         if cache is not None and pad[4] > 0:
             x = torch.cat([cache.to(x.device), x], dim=2)
             pad[4] -= cache.shape[2]
+        if torch.is_autocast_enabled(x.device.type):
+            # The convolution reads the autocast dtype anyway. Padding in it copies half the bytes of float32.
+            x = x.to(torch.get_autocast_dtype(x.device.type))
         return super().forward(F.pad(x, pad))
 
 
