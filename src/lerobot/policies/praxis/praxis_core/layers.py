@@ -591,6 +591,28 @@ class SwiGLUFeedForward(nn.Sequential):
         super().__init__(SwiGLU(dim, hidden), nn.Linear(hidden, dim, bias=False))
 
 
+FLOAT8_MAX = 448.0
+
+
+@dataclass(frozen=True)
+class Float8Bank:
+    """An expert weight bank in float8 e4m3 with a float32 scale per expert and output column (LeRobot addition).
+
+    ``data`` (E, K, N) is column-major, as ``torch._scaled_grouped_mm`` takes it: ``data[e, :, n]`` is the
+    column ``w[e, :, n] / scale[e, n]`` rounded to float8, so that ``w`` is about ``data * scale[:, None]``.
+    """
+
+    data: Tensor
+    scale: Tensor
+
+
+def _float8_bank(w: Tensor) -> tuple[Tensor, Tensor]:
+    """The column-major float8 bank and the float32 scales of a bank ``w`` (E, K, N): see ``Float8Bank``."""
+    columns = w.detach().transpose(1, 2).float()
+    scale = columns.abs().amax(dim=2).clamp(min=torch.finfo(torch.float32).tiny) / FLOAT8_MAX
+    return (columns / scale[:, :, None]).to(torch.float8_e4m3fn).contiguous().transpose(1, 2), scale
+
+
 class RoutedExperts(nn.Module):
     """Expert weight banks, expert-first: gate|up (E, C, 2H), down (E, H, C)."""
 
@@ -598,6 +620,27 @@ class RoutedExperts(nn.Module):
         super().__init__()
         self.gate_up_weight = nn.Parameter(torch.empty(num_experts, dim, 2 * hidden))
         self.down_weight = nn.Parameter(torch.empty(num_experts, hidden, dim))
+
+    def to_float8(self) -> None:
+        """Keep the banks in float8 e4m3, with a float32 scale per expert and output column (LeRobot addition).
+
+        The banks become buffers of the same names (see ``Float8Bank``), with their scales in ``gate_up_scale``
+        and ``down_scale``. The experts then round each input row to float8 too, with a float32 scale per row,
+        and multiply on float8 tensor cores (``_float8_experts``). For an export: it cannot be undone.
+        """
+        for name in ("gate_up_weight", "down_weight"):
+            data, scale = _float8_bank(getattr(self, name))
+            delattr(self, name)
+            self.register_buffer(name, data)
+            self.register_buffer(name.replace("_weight", "_scale"), scale)
+
+    def banks(self) -> tuple[Tensor, Tensor] | tuple[Float8Bank, Float8Bank]:
+        """The gate|up and down banks, as ``Float8Bank`` after ``to_float8``."""
+        if self.gate_up_weight.dtype != torch.float8_e4m3fn:
+            return self.gate_up_weight, self.down_weight
+        return Float8Bank(self.gate_up_weight, self.gate_up_scale), Float8Bank(
+            self.down_weight, self.down_scale
+        )
 
 
 class SharedExpert(nn.Module):
@@ -775,17 +818,71 @@ def set_expert_gate_up(fn: ExpertGateUp | None) -> None:
     _EXPERT_GATE_UP = fn
 
 
+Float8Rows = Callable[[Tensor, Tensor | None], tuple[Tensor, Tensor]]
+_FLOAT8_ROWS: Float8Rows | None = None
+
+
+def set_float8_rows(fn: Float8Rows | None) -> None:
+    """Round the bfloat16 input rows of float8 experts to float8 with ``fn`` (LeRobot addition).
+
+    ``fn(x, index)`` returns ``_float8_rows(x, index)``. An export uses it to give the gather and the rounding
+    to its compiler as one operation. None restores ``_float8_rows``. ``_float8_experts`` reads the module
+    attribute at call time.
+    """
+    global _FLOAT8_ROWS
+    _FLOAT8_ROWS = fn
+
+
+def _float8_rows(x: Tensor, index: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    """The rows ``x[index]`` (all of ``x`` without ``index``) in float8 e4m3, with a float32 scale per row: the
+    row's largest magnitude over ``FLOAT8_MAX``."""
+    rows = (x if index is None else x[index]).float()
+    scale = rows.abs().amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny) / FLOAT8_MAX
+    return (rows / scale[:, None]).to(torch.float8_e4m3fn), scale
+
+
+def _float8_grouped_mm(
+    rows: Tensor, rows_scale: Tensor, bank: Float8Bank, offsets: Tensor, dtype: torch.dtype
+) -> Tensor:
+    """The grouped GEMM of float8 rows with a float8 bank, both scales applied to the float32 sums.
+
+    On CUDA in bfloat16 this is ``torch._scaled_grouped_mm``. Otherwise, as on the CPU or in the float32 rerun of
+    an export's check, it multiplies the same scaled float8 values in float32 and rounds the result to ``dtype``.
+    """
+    if rows.is_cuda and dtype == torch.bfloat16:
+        return torch._scaled_grouped_mm(
+            rows, bank.data, rows_scale, bank.scale, offs=offsets, out_dtype=torch.bfloat16
+        )
+    a = rows.float() * rows_scale[:, None]
+    b = bank.data.float() * bank.scale[:, None, :]
+    return torch._grouped_mm(a, b, offsets).to(dtype)
+
+
+def _float8_experts(
+    x: Tensor, index: Tensor, gate_up: Float8Bank, down: Float8Bank, offsets: Tensor
+) -> Tensor:
+    """``down(swiglu(gate_up(x[index])))`` of each row with its expert's float8 banks (LeRobot addition).
+
+    The input of each grouped GEMM is rounded to float8 per row (``_float8_rows``).
+    """
+    to_float8 = _FLOAT8_ROWS if _FLOAT8_ROWS is not None and x.dtype == torch.bfloat16 else _float8_rows
+    rows, rows_scale = to_float8(x, index)
+    hidden = _expert_swiglu(_float8_grouped_mm(rows, rows_scale, gate_up, offsets, x.dtype))
+    hidden, hidden_scale = to_float8(hidden, None)
+    return _float8_grouped_mm(hidden, hidden_scale, down, offsets, x.dtype)
+
+
 def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
     gate: Tensor,
     sizes: Sequence[int],
-    gate_up_w: Tensor,
-    down_w: Tensor,
+    gate_up_w: Tensor | Float8Bank,
+    down_w: Tensor | Float8Bank,
     scaling: float,
 ) -> list[Tensor]:
     """Float32 scaled routed sum of each token chunk of ``x`` (see ``MoEFeedForward``). The chunks follow each
-    other in ``x``, with ``sizes`` tokens each.
+    other in ``x``, with ``sizes`` tokens each. Float8 banks run in float8 (``_float8_experts``).
 
     The rows of all chunks are sorted by expert together (inside an expert, the rows of the first chunk
     first), so the two grouped GEMMs read each expert's weights once for all chunks. Each output row of a
@@ -793,13 +890,19 @@ def _routed_chunk_group(
     bits of its chunk run alone.
     """
     top_k = top_idx.shape[1]
-    order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
-    if _EXPERT_GATE_UP is None:
-        rows = x[sorted_tokens] if _TAKE_ROWS is None else _TAKE_ROWS(x, sorted_tokens)
-        hidden = _expert_swiglu(torch._grouped_mm(rows.to(gate_up_w.dtype), gate_up_w, offsets))
+    if isinstance(gate_up_w, Float8Bank):
+        assert isinstance(down_w, Float8Bank)
+        order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.data.shape[0])
+        out = _float8_experts(x, sorted_tokens, gate_up_w, down_w, offsets)
     else:
-        hidden = _EXPERT_GATE_UP(x, sorted_tokens, gate_up_w, offsets)
-    out = torch._grouped_mm(hidden, down_w, offsets)
+        assert isinstance(down_w, Tensor)
+        order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
+        if _EXPERT_GATE_UP is None:
+            rows = x[sorted_tokens] if _TAKE_ROWS is None else _TAKE_ROWS(x, sorted_tokens)
+            hidden = _expert_swiglu(torch._grouped_mm(rows.to(gate_up_w.dtype), gate_up_w, offsets))
+        else:
+            hidden = _EXPERT_GATE_UP(x, sorted_tokens, gate_up_w, offsets)
+        out = torch._grouped_mm(hidden, down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
     top_k_sum = _TOP_K_SUM or _sum_rows_of_tokens
@@ -936,8 +1039,8 @@ def _routed_chunks(
     x: Tensor,
     top_idx: Tensor,
     gate: Tensor,
-    gate_up_w: Tensor,
-    down_w: Tensor,
+    gate_up_w: Tensor | Float8Bank,
+    down_w: Tensor | Float8Bank,
     scaling: float,
     step: int,
 ) -> Tensor:
@@ -950,8 +1053,8 @@ def _routed_chunks_group(
     top_idx: Tensor,
     gate: Tensor,
     lengths: Sequence[int],
-    gate_up_w: Tensor,
-    down_w: Tensor,
+    gate_up_w: Tensor | Float8Bank,
+    down_w: Tensor | Float8Bank,
     scaling: float,
     step: int,
 ) -> list[Tensor]:
@@ -1064,13 +1167,14 @@ class MoEFeedForward(nn.Module):
             for rows in zip(logits.split(lengths), top_idx.split(lengths), strict=True):
                 self.routing_hook(self, *rows)
         shared = [self.shared(x_flat) for x_flat in flats]
+        gate_up_w, down_w = self.routed.banks()
         routed = _routed_chunks_group(
             torch.cat(flats),
             top_idx,
             gate,
             lengths,
-            self.routed.gate_up_weight,
-            self.routed.down_weight,
+            gate_up_w,
+            down_w,
             float(self.routed_scaling_factor),
             int(self.dispatch_chunk_size),
         )
@@ -1109,12 +1213,23 @@ class MoEFeedForward(nn.Module):
         backward of the original training code.
         """
         assert self.dispatch_chunk_size is not None
+        gate_up_w, down_w = self.routed.banks()
+        if isinstance(gate_up_w, Float8Bank):
+            return _routed_chunks(
+                x,
+                top_idx,
+                gate,
+                gate_up_w,
+                down_w,
+                float(self.routed_scaling_factor),
+                self.dispatch_chunk_size,
+            )
         args = (
             x,
             top_idx,
             gate,
-            self.routed.gate_up_weight,
-            self.routed.down_weight,
+            gate_up_w,
+            down_w,
             float(self.routed_scaling_factor),
             int(self.dispatch_chunk_size),
         )
@@ -1132,6 +1247,8 @@ class MoEFeedForward(nn.Module):
     def _routed_forward(self, x: Tensor, top_idx: Tensor, gate: Tensor) -> Tensor:
         """Sort the (token, expert) rows by expert, run two grouped GEMMs,
         scale each row by its gate, undo the sort and sum over ``top_k``."""
+        if self.routed.gate_up_weight.dtype == torch.float8_e4m3fn:
+            raise ValueError("Float8 expert banks run only with a dispatch_chunk_size.")
         num_tokens, c = x.shape
         device = x.device
         experts = top_idx.reshape(-1)

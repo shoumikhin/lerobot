@@ -1258,3 +1258,43 @@ def test_the_decoder_modulators_map_one_row_per_conditioning_token(
     up = cond[:, :, :, None, :, None, :].expand(1, frames, height, ph, width, pw, dim).reshape(1, -1, dim)
     full = torch.cat([torch.zeros(1, n_reg, dim, dtype=cond.dtype, device=device), up], dim=1)
     assert torch.equal(x_mods[0].expand(x_mods[0].rows), full)
+
+
+def test_float8_experts_multiply_rows_and_banks_rounded_to_float8() -> None:
+    """`RoutedExperts.to_float8` keeps column-major float8 banks with a scale per expert and output column, whose
+    largest magnitude is 448, and each grouped GEMM then multiplies rows rounded the same way, per row."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    generator = torch.Generator().manual_seed(0)
+    x = _randn(generator, 1, 90, 64)
+    banks = [ffn.routed.gate_up_weight.detach().clone(), ffn.routed.down_weight.detach().clone()]
+    with torch.no_grad():
+        unquantized = ffn(x)
+        ffn.routed.to_float8()
+        quantized = ffn(x)
+    gate_up, down = ffn.routed.banks()
+    for bank, weight in zip((gate_up, down), banks, strict=True):
+        assert bank.data.dtype == torch.float8_e4m3fn and bank.data.transpose(1, 2).is_contiguous()
+        assert torch.equal(
+            bank.data.float().abs().amax(dim=1), torch.full_like(bank.scale, praxis_layers.FLOAT8_MAX)
+        )
+        dequantized = bank.data.float() * bank.scale[:, None]
+        assert (dequantized - weight.float()).norm() / weight.float().norm() < 0.05
+
+    def rounded(rows: torch.Tensor) -> torch.Tensor:
+        scale = rows.float().abs().amax(dim=1, keepdim=True) / praxis_layers.FLOAT8_MAX
+        return (rows.float() / scale).to(torch.float8_e4m3fn).float() * scale
+
+    rows = _randn(generator, 24, 64)
+    index = torch.randperm(24, generator=generator)[:20]
+    offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.data.shape[0] - 4), dtype=torch.int32)
+    expected = []
+    for e, (start, end) in enumerate(zip([0, *offsets[:-1].tolist()], offsets.tolist(), strict=True)):
+        hidden = rounded(rows[index[start:end]]) @ (gate_up.data[e].float() * gate_up.scale[e])
+        gate, up = hidden.to(torch.bfloat16).chunk(2, dim=-1)
+        hidden = (torch.nn.functional.silu(gate) * up).float()
+        expected.append(rounded(hidden) @ (down.data[e].float() * down.scale[e]))
+    out = praxis_layers._float8_experts(rows, index, gate_up, down, offsets)
+    torch.testing.assert_close(out, torch.cat(expected).to(torch.bfloat16), rtol=2**-7, atol=1e-6)
+    # The float8 experts ran, and moved the layer by about what float8 rounding does.
+    assert not torch.equal(quantized, unquantized)
+    assert (quantized - unquantized).float().norm() / unquantized.float().norm() < 0.1

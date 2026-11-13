@@ -120,6 +120,8 @@ TAKE_ROWS_MODULE = "lerobot.policies.praxis.export_take_rows"
 EXPERT_GATE_UP_MODULE = "lerobot.policies.praxis.export_expert_gate_up"
 # The module that registers the TensorRT plugins of the autoencoder's norm steps and patch averages.
 AUTOENCODER_KERNELS_MODULE = "lerobot.policies.praxis.export_autoencoder_kernels"
+# The module that registers the TensorRT plugins of the float8 rounding of the experts' rows (--quantize=fp8).
+FLOAT8_ROWS_MODULE = "lerobot.policies.praxis.export_float8_rows"
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +566,13 @@ def _top_k_sum_plugin() -> praxis_layers.TopKSum | None:
     return export_top_k_sum.TOP_K_SUM
 
 
+def _float8_rows_plugin() -> praxis_layers.Float8Rows | None:
+    """The float8 rounding of the experts' rows as TensorRT plugins (`export_float8_rows`), if there are such."""
+    from . import export_float8_rows
+
+    return export_float8_rows.FLOAT8_ROWS
+
+
 def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     """The mixture-of-experts row gather as one TensorRT plugin (`export_take_rows`), if there is one."""
     from . import export_take_rows
@@ -605,6 +614,10 @@ class PraxisExportRecipe(ActionChunkRecipe):
     # by 3.2 to 26 times what rounding does, where the check allows 3. The test case only catches a bundle that
     # runs its parts far wrong: zeroed velocities moved the actions by 3.9 and swapped cameras by 1.6.
     bfloat16_tolerance = 1.0
+    # `--quantize=fp8` keeps the towers' routed experts in float8 (`RoutedExperts.to_float8`), the largest share of
+    # the work, and everything else in the checkpoint's dtype. The parts are quantized before they are checked,
+    # so `sample` is still checked on its own: its compiled program against its own float8 experts in PyTorch.
+    quantizations = ("fp8",)
     policy: PraxisPolicy
 
     @classmethod
@@ -613,6 +626,9 @@ class PraxisExportRecipe(ActionChunkRecipe):
         _check_config(cast("PraxisConfig", cfg.policy))
         if isinstance(cfg.backend, ExecuTorchTensorRTConfig):
             _check_torch_tensorrt(cfg.backend)
+        if cfg.quantize == "fp8" and torch.cuda.get_device_capability() != (9, 0):
+            # torch._scaled_grouped_mm, the float8 experts' PyTorch side, runs on Hopper GPUs.
+            raise ValueError("Praxis-1's --quantize=fp8 runs its float8 experts on a Hopper GPU (sm_90).")
         return cast(PraxisExportRecipe, super().load(cfg))
 
     def __init__(
@@ -749,6 +765,11 @@ class PraxisExportRecipe(ActionChunkRecipe):
         seed = self.policy.config.seed + CHUNKS
         noise = self._noise(seed)
         expected = self._rollout(ticks, seed)
+        if self.cfg.quantize == "fp8":
+            # After the policy played the test case and the ticks, which the parts are checked against.
+            for layer in self.policy.modules():
+                if isinstance(layer, praxis_layers.RoutedExperts):
+                    layer.to_float8()
         stacked = {name: np.stack([tick[name] for tick in ticks]) for name in self._features}
         assert self._case.noise is not None
         with self._plain_pytorch():
@@ -792,6 +813,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     (TOP_K_SUM_MODULE, self._top_k_sum()),
                     (TAKE_ROWS_MODULE, self._take_rows()),
                     (EXPERT_GATE_UP_MODULE, self._expert_gate_up()),
+                    (FLOAT8_ROWS_MODULE, self._float8_rows()),
                 )
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 if self._autoencoder_kernels() and name == "encode":
@@ -826,6 +848,14 @@ class PraxisExportRecipe(ActionChunkRecipe):
         tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
         return _expert_gate_up_plugin() if tensorrt and self.policy.model.dtype == torch.bfloat16 else None
 
+    def _float8_rows(self) -> praxis_layers.Float8Rows | None:
+        """The TensorRT plugins of the float8 rounding of the experts' rows, for TensorRT in bfloat16 with
+        `--quantize=fp8`."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        if tensorrt and self.cfg.quantize == "fp8" and self.policy.model.dtype == torch.bfloat16:
+            return _float8_rows_plugin()
+        return None
+
     def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
         """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
         if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
@@ -850,6 +880,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_top_k_sum(self._top_k_sum())
         praxis_layers.set_take_rows(self._take_rows())
         praxis_layers.set_expert_gate_up(self._expert_gate_up())
+        praxis_layers.set_float8_rows(self._float8_rows())
         praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
@@ -858,6 +889,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             praxis_layers.set_top_k_sum(None)
             praxis_layers.set_take_rows(None)
             praxis_layers.set_expert_gate_up(None)
+            praxis_layers.set_float8_rows(None)
             praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)

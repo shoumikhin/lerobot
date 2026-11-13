@@ -113,7 +113,7 @@ def test_export_refuses_a_torch_tensorrt_that_leaves_the_experts_to_pytorch(
         raise LoadedPolicyError
 
     monkeypatch.setattr(export_recipe, "load_policy", load_policy)
-    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=backend)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=backend, quantize=None)
     error, match = refusal or (LoadedPolicyError, None)
     with pytest.raises(error, match=match):
         PraxisExportRecipe.load(cfg)
@@ -128,7 +128,7 @@ def test_export_says_when_its_torch_tensorrt_cannot_make_the_top_k_sum_plugin(mo
         raise LoadedPolicyError
 
     monkeypatch.setattr(export_recipe, "load_policy", load_policy)
-    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchTensorRTConfig())
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchTensorRTConfig(), quantize=None)
     with caplog.at_level(logging.WARNING, logger=export_praxis.__name__), pytest.raises(LoadedPolicyError):
         PraxisExportRecipe.load(cfg)
     warned = "2.15.0 has no torch_tensorrt.kernels.triton_op (pytorch/TensorRT#4435" in caplog.text
@@ -203,7 +203,12 @@ def make_recipe(path, monkeypatch, **overrides) -> PraxisExportRecipe:
     policy = PraxisPolicy.from_pretrained(path, config=config).eval()
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(path))
     cfg = SimpleNamespace(
-        backend=SimpleNamespace(device="cpu"), seed=0, dataset=None, task=tiny_praxis.TASK, tolerance=None
+        backend=SimpleNamespace(device="cpu"),
+        seed=0,
+        dataset=None,
+        task=tiny_praxis.TASK,
+        tolerance=None,
+        quantize=None,
     )
     return PraxisExportRecipe(policy, preprocessor, postprocessor, cfg)
 
