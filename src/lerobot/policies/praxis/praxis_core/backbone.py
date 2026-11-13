@@ -37,7 +37,13 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 
-from lerobot.policies.praxis.praxis_core.layers import Attention, Transformer, modulate as layer_modulate
+from lerobot.policies.praxis.praxis_core.layers import (
+    Attention,
+    AttentionBlocks,
+    Transformer,
+    flex_attention_mode,
+    modulate as layer_modulate,
+)
 
 ROW_STRIDE = 360
 FRAME_STRIDE = 129_600
@@ -500,12 +506,16 @@ def teacher_forcing_mask(
 
 
 class _TeacherForcingMaskCache:
-    """Small LRU cache of teacher-forcing masks, keyed by the slot layout."""
+    """Small LRU cache of teacher-forcing masks, keyed by the slot layout.
+
+    With the split flex attention (``set_flex_attention_mode("split")``) the entries are the masks'
+    ``AttentionBlocks``.
+    """
 
     def __init__(self, block_size: int, max_entries: int = 64) -> None:
         self.block_size = block_size
         self.max_entries = max_entries
-        self._entries: OrderedDict[tuple, BlockMask] = OrderedDict()
+        self._entries: OrderedDict[tuple, BlockMask | AttentionBlocks] = OrderedDict()
 
     def get(
         self,
@@ -514,7 +524,8 @@ class _TeacherForcingMaskCache:
         clean_past: bool,
         device: torch.device,
         full_blocks: bool,
-    ) -> BlockMask:
+    ) -> BlockMask | AttentionBlocks:
+        split = flex_attention_mode() == "split"
         key = (
             tuple(tuple(s) for s in slots),
             chunk_size,
@@ -522,10 +533,13 @@ class _TeacherForcingMaskCache:
             self.block_size,
             str(device),
             full_blocks,
+            split,
         )
         mask = self._entries.pop(key, None)
         if mask is None:
             mask = teacher_forcing_mask(slots, chunk_size, clean_past, self.block_size, device, full_blocks)
+            if split:
+                mask = AttentionBlocks.from_block_mask(mask)
         self._entries[key] = mask
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)

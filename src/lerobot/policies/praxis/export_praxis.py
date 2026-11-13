@@ -696,15 +696,17 @@ class PraxisExportRecipe(ActionChunkRecipe):
 
     @contextlib.contextmanager
     def _plain_pytorch(self) -> Iterator[None]:
-        """The policy running only operations `torch.export` records: dense attention, no custom kernels.
+        """The policy running only operations `torch.export` records: split attention, no custom kernels.
 
-        The flex attention's masks and the custom Triton kernels are not PyTorch operations. The dense attention
-        evaluates the same masks on every pair of tokens. The masks of the backbone come from the eager runs of the
-        parts before they are traced, so the programs read them as constants.
+        The flex attention's masks and the custom Triton kernels are not PyTorch operations. The split attention
+        runs each run of query rows of a mask over its key ranges, without a mask: a dense mask would make the
+        compiler compute every pair of tokens, about twice the work. The masks' runs come from the eager runs of the
+        parts before they are traced, so the programs read them as constant slices.
         """
         config = self.policy.config
         backend, config.attention_backend = config.attention_backend, "eager"
         self.policy._apply_attention_backend(self._device)
+        praxis_layers.set_flex_attention_mode("split")
         kernels = praxis_layers.custom_kernels_enabled()
         praxis_layers.set_custom_kernels(False)
         try:

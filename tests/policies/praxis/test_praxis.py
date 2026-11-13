@@ -37,7 +37,8 @@ from lerobot.policies.praxis.configuration_praxis import (
     PraxisConfig,
 )
 from lerobot.policies.praxis.modeling_praxis import OBS_SCENE_SEED, PraxisPolicy
-from lerobot.policies.praxis.praxis_core import vae
+from lerobot.policies.praxis.praxis_core import layers as praxis_layers, vae
+from lerobot.policies.praxis.praxis_core.backbone import teacher_forcing_mask
 from lerobot.policies.praxis.praxis_core.checkpoint import save_checkpoint, verify_checksums
 from lerobot.policies.praxis.processor_praxis import droid7_to_pose8, pose8_to_droid7, pose12_grip_to_droid7
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -829,3 +830,54 @@ def test_vae_encoder_takes_the_whole_clip_in_one_pass() -> None:
             )
         whole = encoder(clip, None)
     torch.testing.assert_close(whole, torch.cat(chunks, dim=2))
+
+
+@pytest.mark.parametrize(
+    ("slots", "clean_past", "runs"),
+    [
+        # Encoder: 2 global slots, 2 noised chunks of 2 frames, the clean chunk.
+        ([("global", 1, 3), ("global", 1, 5), ("noised", 4, 6), ("clean", 2, 6)], True, 4),
+        # Decoder: registers and 2 noised chunks.
+        ([("global", 1, 2), ("noised", 4, 6)], False, 3),
+    ],
+)
+def test_split_attention_is_the_attention_of_the_dense_mask(
+    slots: list[tuple[str, int, int]], clean_past: bool, runs: int
+) -> None:
+    """The split attention covers exactly the pairs of the mask, and computes the dense masked attention."""
+    n = sum(frames * tokens for _, frames, tokens in slots)
+    mask = teacher_forcing_mask(slots, 2, clean_past, 128, torch.device("cpu"), False)
+    dense = mask.mask_mod(None, None, torch.arange(n)[:, None], torch.arange(n)[None, :])
+    blocks = praxis_layers.AttentionBlocks.from_block_mask(mask)
+    covered = torch.zeros(n, n, dtype=torch.bool)
+    for start, end, ranges in blocks.runs:
+        for begin, stop in ranges:
+            covered[start:end, begin:stop] = True
+    assert torch.equal(covered, dense)
+    assert len(blocks.runs) == runs
+    generator = torch.Generator().manual_seed(0)
+    q, k, v = (torch.randn(2, h, n, 8, generator=generator, dtype=torch.float64) for h in (4, 2, 2))
+    expected = praxis_layers._dense_flex_attention(q, k, v, mask, enable_gqa=True)
+    torch.testing.assert_close(
+        praxis_layers._split_flex_attention(q, k, v, blocks, enable_gqa=True), expected
+    )
+
+
+def test_split_attention_plays_the_actions_of_the_dense_attention() -> None:
+    """The towers take the masks' runs in the split mode and play the dense mode's actions (float32, so that
+    the two reduction orders differ only in the last bits)."""
+    played = {}
+    saved = praxis_layers.flex_attention_mode()
+    try:
+        for mode in ("dense", "split"):
+            policy = make_tiny_policy(seed=6, dtype=torch.float32)
+            praxis_layers.set_flex_attention_mode(mode)
+            policy.reset()
+            played[mode] = policy.select_action(fake_observation(0))
+            masks = list(policy.model.backbone.encoder._tf_masks._entries.values())
+            assert masks and all(
+                isinstance(m, praxis_layers.AttentionBlocks) == (mode == "split") for m in masks
+            )
+    finally:
+        praxis_layers.set_flex_attention_mode(saved)
+    torch.testing.assert_close(played["split"], played["dense"])

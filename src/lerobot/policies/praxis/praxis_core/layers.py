@@ -26,6 +26,7 @@ of the expert outputs (``_PermuteRows``) and the chunked expert dispatch
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -89,19 +90,119 @@ def _dense_flex_attention(
     return torch.nan_to_num(out) if mask is not None else out
 
 
-FlexAttentionMode = Literal["compiled", "eager", "dense"]
+KeyRanges = tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class AttentionBlocks:
+    """A mask as runs of query rows that attend the same few contiguous key ranges (LeRobot addition).
+
+    ``runs`` holds ``(row_start, row_end, key_ranges)`` for every run of equal mask rows, in row order.
+    The chunk-causal masks of the towers have a few such runs, so their attention is a few unmasked
+    attentions over slices of the keys (``_split_flex_attention``).
+    """
+
+    runs: tuple[tuple[int, int, KeyRanges], ...]
+
+    @classmethod
+    def from_mask(cls, mask: Tensor) -> AttentionBlocks:
+        """The runs of a dense ``(queries, keys)`` bool mask."""
+        mask = mask.cpu()
+        changes = (mask[1:] != mask[:-1]).any(dim=1).nonzero().flatten() + 1
+        starts = [0, *changes.tolist()]
+        runs = []
+        for start, end in zip(starts, [*starts[1:], mask.shape[0]], strict=True):
+            edges = torch.diff(F.pad(mask[start].to(torch.int8), (1, 1))).nonzero().flatten().tolist()
+            runs.append((start, end, tuple(zip(edges[::2], edges[1::2], strict=True))))
+        return cls(tuple(runs))
+
+    @classmethod
+    def from_block_mask(cls, block_mask: BlockMask) -> AttentionBlocks:
+        """The runs of the block mask's ``mask_mod`` over all (query, key) pairs."""
+        queries, keys = block_mask.seq_lengths
+        device = block_mask.kv_num_blocks.device
+        qi = torch.arange(queries, device=device)[:, None]
+        ki = torch.arange(keys, device=device)[None, :]
+        return cls.from_mask(block_mask.mask_mod(None, None, qi, ki))
+
+
+def _key_slices(t: Tensor, ranges: KeyRanges) -> Tensor:
+    if len(ranges) == 1:
+        return t[:, :, ranges[0][0] : ranges[0][1]]
+    return torch.cat([t[:, :, start:end] for start, end in ranges], dim=2)
+
+
+def _split_flex_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    block_mask: AttentionBlocks | BlockMask | None = None,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    kernel_options: dict[str, object] | None = None,
+) -> Tensor:
+    """The attention of ``_dense_flex_attention`` as unmasked SDPAs over the mask's runs (LeRobot addition).
+
+    A dense masked SDPA computes every (query, key) pair, also the masked ones: about twice the work
+    on the towers' masks. Here each run of rows attends only its key ranges, and runs of the same
+    shape go through one SDPA as a batch. Masked keys add nothing to the softmax, so this is the same
+    attention in another reduction order. A ``BlockMask`` falls back to the dense form.
+    """
+    if not isinstance(block_mask, AttentionBlocks):
+        return _dense_flex_attention(q, k, v, block_mask, scale, enable_gqa, kernel_options)
+    groups: dict[tuple[int, int], list[tuple[int, KeyRanges]]] = {}
+    for start, end, ranges in block_mask.runs:
+        size = sum(stop - begin for begin, stop in ranges)
+        groups.setdefault((end - start, size), []).append((start, ranges))
+    batch = q.shape[0]
+    pieces: dict[int, Tensor] = {}
+    for (rows, size), members in groups.items():
+        if size == 0:
+            # Rows without a key give zeros, as in flex attention.
+            for start, _ in members:
+                pieces[start] = q.new_zeros(*q.shape[:2], rows, v.shape[-1])
+            continue
+        out = F.scaled_dot_product_attention(
+            torch.cat([q[:, :, start : start + rows] for start, _ in members]),
+            torch.cat([_key_slices(k, ranges) for _, ranges in members]),
+            torch.cat([_key_slices(v, ranges) for _, ranges in members]),
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+        for (start, _), piece in zip(members, out.split(batch), strict=True):
+            pieces[start] = piece
+    return torch.cat([pieces[start] for start in sorted(pieces)], dim=2)
+
+
+FlexAttentionMode = Literal["compiled", "eager", "dense", "split"]
+_FLEX_ATTENTION_MODE: FlexAttentionMode = "compiled"
 
 
 def set_flex_attention_mode(mode: FlexAttentionMode) -> None:
-    """Select the flex attention of the backbone: compiled (default), eager, or the dense SDPA form.
+    """Select the flex attention of the backbone: compiled (default), eager, the dense SDPA form, or
+    the split SDPA form.
 
     The compiled CPU kernel fails to build for some chunk-causal masks, and the eager kernel has
-    no CPU backward; CPU runs (tests, CPU-only hosts) select ``"dense"``. All three compute the
-    same attention. ``Attention.forward`` reads the module attribute at call time.
+    no CPU backward; CPU runs (tests, CPU-only hosts) select ``"dense"``. ``"split"`` runs the dense
+    form without a mask, a few SDPAs over the runs of the mask (``_split_flex_attention``), for
+    compilers that see only PyTorch operations. The towers then pass ``AttentionBlocks`` for their
+    masks. All four compute the same attention. ``Attention.forward`` reads the module attribute at
+    call time.
     """
-    global _compiled_flex_attention
-    options = {"compiled": _FLEX_ATTENTION_COMPILED, "eager": flex_attention, "dense": _dense_flex_attention}
+    global _compiled_flex_attention, _FLEX_ATTENTION_MODE
+    options = {
+        "compiled": _FLEX_ATTENTION_COMPILED,
+        "eager": flex_attention,
+        "dense": _dense_flex_attention,
+        "split": _split_flex_attention,
+    }
     _compiled_flex_attention = options[mode]
+    _FLEX_ATTENTION_MODE = mode
+
+
+def flex_attention_mode() -> FlexAttentionMode:
+    """The flex attention of the backbone (see ``set_flex_attention_mode``)."""
+    return _FLEX_ATTENTION_MODE
 
 
 def set_flex_attention_compiled(compiled: bool) -> None:
@@ -371,7 +472,9 @@ class Attention(nn.Module):
         self.backend = backend
         self._kernel_options = {"BACKEND": "FLASH"} if backend == "flash" else None
 
-    def forward(self, x: Tensor, rope: Tensor | None, block_mask: BlockMask | None) -> Tensor:
+    def forward(
+        self, x: Tensor, rope: Tensor | None, block_mask: BlockMask | AttentionBlocks | None
+    ) -> Tensor:
         b, s, _ = x.shape
         d = self.head_dim
         q, k, v = self.in_proj(x)
@@ -912,7 +1015,7 @@ class TransformerBlock(nn.Module):
         self,
         x: Tensor,
         rope: Tensor | None,
-        block_mask: BlockMask | None = None,
+        block_mask: BlockMask | AttentionBlocks | None = None,
         modulation: Modulation | None = None,
     ) -> Tensor:
         if modulation is not None:
@@ -995,7 +1098,7 @@ class Transformer(nn.Module):
         x: Tensor,
         rope: Tensor,
         x_mod: Tensor | None = None,
-        block_mask: BlockMask | None = None,
+        block_mask: BlockMask | AttentionBlocks | None = None,
     ) -> Tensor:
         """Run block ``i``, with its modulation first when the stack has one."""
         if self.modulators is None:
@@ -1009,7 +1112,7 @@ class Transformer(nn.Module):
         x: Tensor,
         rope_idx: Tensor,
         x_mod: Tensor | None = None,
-        block_mask: BlockMask | None = None,
+        block_mask: BlockMask | AttentionBlocks | None = None,
         tap_blocks: Sequence[int] = (),
     ) -> tuple[Tensor, list[Tensor]]:
         """Map ``x`` (B, N, C) to (B, N, C) and return the taps.
