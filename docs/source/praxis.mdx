@@ -571,6 +571,11 @@ the policy.
   spread: the 27B mixture of experts amplifies rounding over those chunks so much that the actions of a
   correct bundle can be far from the policy's, so the export also checks the `sample` program on its own.
   Float32 weights get the default tolerance.
+- Some steps run as TensorRT plugins made from Triton kernels. All of them need the `executorch_tensorrt`
+  backend, a CUDA GPU at export, and a Torch-TensorRT with `torch_tensorrt.kernels.triton_op`. The
+  mixture-of-experts layers' top-k sum and row gather also need bfloat16 weights and `dispatch_chunk_size` set
+  (the released checkpoints set both). The autoencoder's norm steps and patch averages need nothing more.
+  Without `triton_op`, the export warns and keeps these steps in PyTorch, which is slower.
 - Each chunk draws new noise on the GPU, so the bundle samples like the policy, not the same samples as
   its `seed`.
 

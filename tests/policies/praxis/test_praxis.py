@@ -833,6 +833,51 @@ def test_vae_encoder_takes_the_whole_clip_in_one_pass() -> None:
     torch.testing.assert_close(whole, torch.cat(chunks, dim=2))
 
 
+def test_set_autoencoder_kernels_runs_each_norm_step_and_patch_average_of_the_encoder() -> None:
+    """An export gives each norm and SiLU step and each patch average of the encoder to its compiler as one
+    operation."""
+    torch.manual_seed(0)
+    encoder = vae.Encoder(dim=8, z_dim=8).double().eval()
+    for parameter in encoder.parameters():
+        torch.nn.init.normal_(parameter, std=0.3)
+    clip = torch.randn(1, 12, 9, 32, 32, dtype=torch.float64)
+    calls = []
+
+    def norm_silu(x, gamma):
+        calls.append(("norm", x.shape[1]))
+        return torch.nn.functional.silu(
+            torch.nn.functional.normalize(x, dim=1) * x.shape[1] ** 0.5 * gamma + 0.0
+        )
+
+    def avg_down(x, factor_t):
+        calls.append(("average", factor_t))
+        b, c, t, h, w = x.shape
+        patches = x.view(b, c, t // factor_t, factor_t, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 7, 2, 4, 6)
+        return patches.reshape(b, c * factor_t, 4, t // factor_t, h // 2, w // 2).mean(2)
+
+    def run(kernels):
+        try:
+            vae.set_autoencoder_kernels(kernels)
+            return encoder(clip, None)
+        finally:
+            vae.set_autoencoder_kernels(None)
+
+    with torch.no_grad():
+        expected = encoder(clip, None)
+        torch.testing.assert_close(run(vae.AutoencoderKernels(norm_silu, avg_down)), expected)
+        # 4 norms in each down block and in the middle, 1 in the head, and the average of each down block that
+        # halves the pixels: with 2 time taps where it also halves the frames.
+        norms = [8] * 5 + [16] * 4 + [32] * 12
+        assert sorted(calls) == sorted(
+            [*(("norm", c) for c in norms), ("average", 1), ("average", 2), ("average", 2)]
+        )
+        no_norms = run(vae.AutoencoderKernels(lambda x, gamma: torch.zeros_like(x), avg_down))
+        no_averages = run(vae.AutoencoderKernels(norm_silu, lambda x, factor_t: avg_down(x, factor_t) * 0))
+        assert not torch.allclose(no_norms, expected)
+        assert not torch.allclose(no_averages, expected)
+        torch.testing.assert_close(encoder(clip, None), expected)
+
+
 @pytest.mark.parametrize(
     ("slots", "clean_past", "runs"),
     [

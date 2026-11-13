@@ -29,9 +29,9 @@ from lerobot.bundle.manifest import NOISE, Bundle
 from lerobot.export import recipe as export_recipe, worker
 from lerobot.export.backends.executorch_cuda import ExecuTorchCUDAConfig
 from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
-from lerobot.policies.praxis import export_praxis
+from lerobot.policies.praxis import export_autoencoder_kernels, export_praxis
 from lerobot.policies.praxis.export_praxis import PraxisExportRecipe
-from lerobot.policies.praxis.praxis_core import layers as praxis_layers
+from lerobot.policies.praxis.praxis_core import layers as praxis_layers, vae as praxis_vae
 from lerobot.policies.praxis.praxis_core.vae import Autoencoder
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
@@ -417,6 +417,7 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_top_k_sum_as_one_plugin(t
     sum_rows_of_tokens = praxis_layers._sum_rows_of_tokens
     monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: sum_rows_of_tokens)
     monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
     recipe.cfg.backend = ExecuTorchTensorRTConfig()
     seen = []
@@ -449,6 +450,7 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_row_gather_as_one_plugin(
 
     monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: take_rows)
     monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
     recipe.cfg.backend = ExecuTorchTensorRTConfig()
     seen = []
@@ -536,3 +538,81 @@ def test_the_row_gather_plugin_gathers_as_pytorch_does_inside_tensorrt():
     compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
     _assert_runs_in_tensorrt(compiled)
     assert torch.equal(compiled(*inputs), x[index])
+
+
+@pytest.mark.parametrize("tensorrt", [True, False], ids=["tensorrt", "test_backend"])
+def test_with_tensorrt_encode_traces_the_autoencoders_norm_steps_and_averages_as_plugins(
+    tmp_path, monkeypatch, tensorrt
+):
+    """Written in PyTorch, TensorRT runs each norm step of the autoencoder as about five kernels."""
+    kernels = praxis_vae.AutoencoderKernels(lambda x, gamma: x, lambda x, factor_t: x)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: kernels)
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    if tensorrt:
+        recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    seen = []
+    encode_eager = recipe.policy.vae.encode_eager
+
+    def encode(*args, **kwargs):
+        seen.append(praxis_vae._KERNELS)
+        return encode_eager(*args, **kwargs)
+
+    monkeypatch.setattr(recipe.policy.vae, "encode_eager", encode)
+    parts = list(recipe.parts())
+    assert seen
+    assert set(seen) == ({kernels} if tensorrt else {None})
+    assert praxis_vae._KERNELS is None
+    # The compile step registers the plugins' operators before it loads the program.
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: (export_praxis.AUTOENCODER_KERNELS_MODULE,) if tensorrt and part.name == "encode" else ()
+        for part in parts
+    }
+
+
+@pytest.mark.parametrize("factor_t", [1, 2])
+def test_the_autoencoder_plugins_pytorch_sides_compute_what_the_encoders_modules_do(factor_t):
+    """So the export's checks run the values the encoder computes."""
+    generator = torch.Generator().manual_seed(0)
+    channels = 24
+    x = torch.randn(1, channels, 2 * 3, 8, 12, generator=generator).to(torch.float16)
+    norm = praxis_vae.RMSNorm(channels, images=False)
+    torch.nn.init.normal_(norm.gamma, generator=generator)
+    norm = norm.to(torch.bfloat16)
+    expected = torch.nn.functional.silu(norm(x.float())).to(torch.float16)
+    gamma = norm.gamma.reshape(-1).float()
+    assert torch.equal(export_autoencoder_kernels.norm_silu_reference(x, gamma), expected)
+    patches = x.reshape(1, channels, 6 // factor_t, factor_t, 4, 2, 6, 2)
+    average = praxis_vae.AvgDown3D(channels, channels * factor_t, factor_t, 2)
+    assert torch.equal(export_autoencoder_kernels.avg_down_reference(patches), average(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugins run on CUDA")
+def test_the_autoencoder_plugins_compute_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    kernels = export_autoencoder_kernels.AUTOENCODER_KERNELS
+    assert kernels is not None
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # Channels and positions that are no multiple of the norm kernel's tile.
+    x = torch.randn(2, 40, 3, 6, 10, device="cuda", generator=generator).to(torch.float16) * 4
+    gamma = torch.rand(40, device="cuda", generator=generator) + 0.5
+
+    class Steps(torch.nn.Module):
+        def forward(self, x, gamma):
+            return (
+                kernels.norm_silu(x, gamma),
+                kernels.avg_down(x[:, :, 1:], 1),
+                kernels.avg_down(x[:, :, 1:], 2),
+            )
+
+    inputs = [x, gamma]
+    program = torch.export.export(Steps(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1, disable_tf32=True)
+    _assert_runs_in_tensorrt(compiled)
+    norm_silu, average, average_2 = compiled(*inputs)
+    torch.testing.assert_close(
+        norm_silu, export_autoencoder_kernels.norm_silu_reference(x, gamma), rtol=2e-3, atol=2e-3
+    )
+    for result, factor_t in ((average, 1), (average_2, 2)):
+        expected = praxis_vae.AvgDown3D(40, 40 * factor_t, factor_t, 2)(x[:, :, 1:])
+        torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-3)

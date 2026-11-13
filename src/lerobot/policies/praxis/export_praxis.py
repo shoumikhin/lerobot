@@ -77,7 +77,7 @@ from lerobot.processor import (
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .modeling_praxis import _praxis_numerics
-from .praxis_core import bimanual, layers as praxis_layers, single_arm
+from .praxis_core import bimanual, layers as praxis_layers, single_arm, vae as praxis_vae
 from .praxis_core.action_expert import run_expert_on_taps_k
 from .praxis_core.robot_io import FRAMES_PER_TOKEN, contiguous_chunk_geometry, text_encoder_prompt
 from .praxis_core.sampler import ACTION_SALT, VIDEO_SALT, guidance_combine, seeded_normal, window_time_grid
@@ -108,6 +108,8 @@ GROUPED_MM_KERNEL = "grouped_mm_kernel"
 TOP_K_SUM_MODULE = "lerobot.policies.praxis.export_top_k_sum"
 # The module that registers the TensorRT plugin of their row gather.
 TAKE_ROWS_MODULE = "lerobot.policies.praxis.export_take_rows"
+# The module that registers the TensorRT plugins of the autoencoder's norm steps and patch averages.
+AUTOENCODER_KERNELS_MODULE = "lerobot.policies.praxis.export_autoencoder_kernels"
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +490,9 @@ def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
 
     Such a Torch-TensorRT ignores `grouped_mm_kernel` without a word and leaves each such layer to PyTorch. Warn if
     it has no `torch_tensorrt.kernels.triton_op`: the export then cannot make the plugins of their top-k sum
-    (`export_top_k_sum`) and row gather (`export_take_rows`) and keeps both in PyTorch, where TensorRT
-    fuses the sum with the next block's norm into a slower kernel and runs the gather slower than the plugin.
+    (`export_top_k_sum`) and row gather (`export_take_rows`), nor those of the autoencoder's norm steps and
+    patch averages (`export_autoencoder_kernels`), and keeps all of them in PyTorch, which is slower (TensorRT fuses
+    the sum with the next block's norm into a slower kernel, and runs each norm step as several kernels).
     """
     try:
         import torch_tensorrt
@@ -505,8 +508,8 @@ def _check_torch_tensorrt(backend: ExecuTorchTensorRTConfig) -> None:
         logger.warning(
             "Torch-TensorRT %s has no torch_tensorrt.kernels.triton_op (pytorch/TensorRT#4435, in Torch-TensorRT "
             "2.15), so the top-k sum and the row gather of Praxis-1's mixture-of-experts layers (with "
-            "dispatch_chunk_size set, as in the released checkpoints) stay in PyTorch, which is slower than their "
-            "plugins.",
+            "dispatch_chunk_size set, as in the released checkpoints) and the norm steps and patch averages of its "
+            "autoencoder stay in PyTorch, which is slower than their plugins.",
             torch_tensorrt.__version__,
         )
 
@@ -523,6 +526,14 @@ def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     from . import export_take_rows
 
     return export_take_rows.TAKE_ROWS
+
+
+def _autoencoder_kernel_plugins() -> praxis_vae.AutoencoderKernels | None:
+    """The autoencoder's norm steps and patch averages as TensorRT plugins (`export_autoencoder_kernels`), if there
+    are such."""
+    from . import export_autoencoder_kernels
+
+    return export_autoencoder_kernels.AUTOENCODER_KERNELS
 
 
 class PraxisExportRecipe(ActionChunkRecipe):
@@ -728,6 +739,8 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 options = {GROUPED_MM_KERNEL: True} if tensorrt and name in MOE_PARTS else {}
                 plugins = (TOP_K_SUM_MODULE, self._top_k_sum()), (TAKE_ROWS_MODULE, self._take_rows())
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
+                if self._autoencoder_kernels() and name == "encode":
+                    operators = (*operators, AUTOENCODER_KERNELS_MODULE)
                 yield Part(
                     name,
                     module,
@@ -753,6 +766,12 @@ class PraxisExportRecipe(ActionChunkRecipe):
         tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
         return _take_rows_plugin() if tensorrt and self.policy.model.dtype == torch.bfloat16 else None
 
+    def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
+        """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
+        if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
+            return _autoencoder_kernel_plugins()
+        return None
+
     @contextlib.contextmanager
     def _plain_pytorch(self) -> Iterator[None]:
         """The policy running only operations `torch.export` records: split attention, no custom kernels.
@@ -770,12 +789,14 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_custom_kernels(False)
         praxis_layers.set_top_k_sum(self._top_k_sum())
         praxis_layers.set_take_rows(self._take_rows())
+        praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
         finally:
             praxis_layers.set_custom_kernels(kernels)
             praxis_layers.set_top_k_sum(None)
             praxis_layers.set_take_rows(None)
+            praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)
 

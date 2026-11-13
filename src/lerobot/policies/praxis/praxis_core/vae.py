@@ -31,7 +31,9 @@ of the original implementation.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -103,6 +105,39 @@ class RMSNorm(nn.Module):
         return F.normalize(x, dim=1) * self.scale * self.gamma + 0.0
 
 
+class AutoencoderKernels(NamedTuple):
+    """Other implementations of two steps of the autoencoder (LeRobot addition), see ``set_autoencoder_kernels``.
+
+    ``norm_silu(x, gamma)`` returns ``silu(RMSNorm(x))`` for the norm's ``gamma``, in the autocast dtype of the
+    convolution that reads it. ``avg_down(x, factor_t)`` returns ``AvgDown3D`` of ``x`` with 2x2 spatial patches,
+    ``factor_t`` time taps and as many output channels as ``factor_t`` times its input channels. Both take and
+    return ``(B, C, T, H, W)`` tensors.
+    """
+
+    norm_silu: Callable[[Tensor, Tensor], Tensor]
+    avg_down: Callable[[Tensor, int], Tensor]
+
+
+_KERNELS: AutoencoderKernels | None = None
+
+
+def set_autoencoder_kernels(kernels: AutoencoderKernels | None) -> None:
+    """Run the residual blocks' and the encoder head's norm and SiLU steps, and the encoder's patch averages, with
+    ``kernels`` (LeRobot addition).
+
+    An export uses it to give each such step to its compiler as one operation. None restores the PyTorch modules.
+    The modules read the module attribute at call time.
+    """
+    global _KERNELS
+    _KERNELS = kernels
+
+
+def _norm_silu(norm: RMSNorm, x: Tensor) -> Tensor:
+    if _KERNELS is not None:
+        return _KERNELS.norm_silu(x, norm.gamma)
+    return F.silu(norm(x))
+
+
 def _time_cache(x: Tensor, cache: Tensor | None) -> Tensor:
     """Return the last ``CACHE_T`` frames of ``x`` as the next causal context.
 
@@ -158,8 +193,9 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: Tensor, caches: Caches | None) -> Tensor:
         h = self.shortcut(x)
-        for layer in self.residual:
-            x = _conv_with_cache(layer, x, caches) if isinstance(layer, CausalConv3d) else layer(x)
+        r = self.residual
+        x = _conv_with_cache(r[2], _norm_silu(r[0], x), caches)  # ty: ignore[invalid-argument-type]
+        x = _conv_with_cache(r[6], r[5](_norm_silu(r[3], x)), caches)  # ty: ignore[invalid-argument-type]
         return x + h
 
 
@@ -272,6 +308,8 @@ class AvgDown3D(nn.Module):
         ft, fs = self.factor_t, self.factor_s
         pad_t = (ft - x.shape[2] % ft) % ft
         x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+        if _KERNELS is not None and fs == 2 and self.out_dim == self.in_dim * ft:
+            return _KERNELS.avg_down(x, ft)
         b, c, t, h, w = x.shape
         x = x.view(b, c, t // ft, ft, h // fs, fs, w // fs, fs)
         x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
@@ -379,7 +417,7 @@ class Encoder(nn.Module):
             x = layer(x, caches)
         for layer in self.middle:
             x = layer(x, caches) if isinstance(layer, ResidualBlock) else layer(x)
-        x = self.head[1](self.head[0](x))
+        x = _norm_silu(self.head[0], x)  # ty: ignore[invalid-argument-type]
         return _conv_with_cache(self.head[2], x, caches)
 
 
