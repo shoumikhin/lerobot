@@ -299,7 +299,9 @@ def test_encode_takes_the_anchor_latent_from_the_clean_latents(tmp_path, monkeyp
     case = recipe.test_case()
     vae, clips = recipe.policy.vae, []
     encode_eager = vae.encode_eager
-    monkeypatch.setattr(vae, "encode_eager", lambda clip: clips.append(clip) or encode_eager(clip))
+    monkeypatch.setattr(
+        vae, "encode_eager", lambda clip, **kwargs: clips.append(clip) or encode_eager(clip, **kwargs)
+    )
     kept = recipe._executed + 1
     inputs = [torch.from_numpy(case.frame[name][:kept]) for name in [*recipe._cameras, recipe._state]]
     with torch.no_grad():
@@ -364,6 +366,21 @@ def test_the_parts_with_mixture_of_experts_layers_ask_for_tensorrts_grouped_matr
     assert {part.name: part.compile_options for part in parts} == {
         part.name: {"grouped_mm_kernel": True} if tensorrt and part.name in moe else {} for part in parts
     }
+
+
+def test_the_encode_part_encodes_the_executed_chunk_in_one_pass(tmp_path, monkeypatch):
+    """Chunk by chunk, TensorRT spends about as long carrying each chunk's causal context as on the convolutions."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    encode = next(part for part in recipe.parts() if part.name == "encode")
+    encode_eager, calls = recipe.policy.vae.encode_eager, []
+    monkeypatch.setattr(
+        recipe.policy.vae,
+        "encode_eager",
+        lambda *args, **kwargs: calls.append(kwargs) or encode_eager(*args, **kwargs),
+    )
+    with torch.no_grad():
+        encode.module(*encode.example_inputs)
+    assert calls == [{"streamed": False}]
 
 
 def test_every_chunk_reads_the_noise_and_the_kept_frames(tmp_path, monkeypatch):

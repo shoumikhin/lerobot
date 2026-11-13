@@ -287,7 +287,9 @@ class _Encode(nn.Module):
                 for view in frames
             ]
         clip = torch.cat(tiles, dim=-1).float().permute(1, 0, 2, 3).unsqueeze(0)
-        clean = self.vae.encode_eager(clip)
+        # In one pass: chunk by chunk, TensorRT spent about as long carrying each chunk's causal context over to
+        # the next, in slices and copies, as on the convolutions.
+        clean = self.vae.encode_eager(clip, streamed=False)
         anchor = clean[:, :, :1].contiguous()
         poses = _session_poses(torch.stack([states[0], states[-1]]), self.arms)
         return anchor, clean, _proprio(poses, self.mean, self.std)[None]

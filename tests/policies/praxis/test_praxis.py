@@ -37,6 +37,7 @@ from lerobot.policies.praxis.configuration_praxis import (
     PraxisConfig,
 )
 from lerobot.policies.praxis.modeling_praxis import OBS_SCENE_SEED, PraxisPolicy
+from lerobot.policies.praxis.praxis_core import vae
 from lerobot.policies.praxis.praxis_core.checkpoint import save_checkpoint, verify_checksums
 from lerobot.policies.praxis.processor_praxis import droid7_to_pose8, pose8_to_droid7, pose12_grip_to_droid7
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -791,3 +792,21 @@ def test_to_another_device_selects_its_attention_kernels() -> None:
     assert policy.attention_backend == "triton" and policy.model.action_expert.attention == "sdpa"
     assert all(m.backend == "triton" and m._kernel_options is None for m in attention)
     assert all(t._tf_masks.block_size == block for t in towers)
+
+
+def test_vae_encoder_takes_the_whole_clip_in_one_pass() -> None:
+    """The encoder is causal, so the whole clip in one pass gives the latents of the chunk-by-chunk stream."""
+    torch.manual_seed(0)
+    # A small encoder in float64, so that only the math is compared and not the rounding.
+    encoder = vae.Encoder(dim=8, z_dim=8).double().eval()
+    clip = torch.randn(1, 12, 13, 32, 32, dtype=torch.float64)
+    caches = vae.Caches(vae.count_causal_convs(encoder))
+    chunks = []
+    with torch.no_grad():
+        for i in range(1 + (clip.shape[2] - 1) // 4):
+            caches.index = 0
+            chunks.append(
+                encoder(clip[:, :, :1] if i == 0 else clip[:, :, 1 + 4 * (i - 1) : 1 + 4 * i], caches)
+            )
+        whole = encoder(clip, None)
+    torch.testing.assert_close(whole, torch.cat(chunks, dim=2))

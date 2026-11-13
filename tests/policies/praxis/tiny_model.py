@@ -171,7 +171,7 @@ class FakeAutoencoder:
     ``(1, 192, 1 + (T - 1) // 4, H // 32, W // 32)``: the first frame alone, then
     every 4 frames, pooled in space and repeated over the channels with a fixed
     per-channel scale, so different inputs give different latents. ``encode_eager``,
-    the plain PyTorch path of the real one, is ``encode``. Its ``encoder`` and
+    the plain PyTorch path of the real one, is ``encode``, streamed or not. Its ``encoder`` and
     ``conv1``, the modules the real one encodes with, hold no weights.
     """
 
@@ -194,7 +194,8 @@ class FakeAutoencoder:
         latent = pooled.repeat(1, LATENT_CHANNELS // 3, 1, 1, 1) * self.scale
         return (latent * 2 - 1).to(torch.bfloat16)
 
-    encode_eager = encode
+    def encode_eager(self, frames: torch.Tensor, streamed: bool = True) -> torch.Tensor:
+        return self.encode(frames)
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:

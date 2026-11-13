@@ -112,7 +112,10 @@ def _time_cache(x: Tensor, cache: Tensor | None) -> Tensor:
 
 
 class Caches:
-    """Per-convolution causal contexts for one streamed encode or decode."""
+    """Per-convolution causal contexts for one streamed encode or decode.
+
+    The encoder also takes None instead: it then encodes the whole clip in one pass.
+    """
 
     def __init__(self, n: int) -> None:
         self.items: list[Tensor | str | None] = [None] * n
@@ -124,7 +127,9 @@ class Caches:
         return i
 
 
-def _conv_with_cache(conv: CausalConv3d, x: Tensor, caches: Caches) -> Tensor:
+def _conv_with_cache(conv: CausalConv3d, x: Tensor, caches: Caches | None) -> Tensor:
+    if caches is None:
+        return conv(x)
     i = caches.next_index()
     old = caches.items[i]
     old_t = old if isinstance(old, Tensor) else None
@@ -148,7 +153,7 @@ class ResidualBlock(nn.Module):
         )
         self.shortcut: nn.Module = CausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
 
-    def forward(self, x: Tensor, caches: Caches) -> Tensor:
+    def forward(self, x: Tensor, caches: Caches | None) -> Tensor:
         h = self.shortcut(x)
         for layer in self.residual:
             x = _conv_with_cache(layer, x, caches) if isinstance(layer, CausalConv3d) else layer(x)
@@ -222,14 +227,20 @@ class Resample(nn.Module):
         x = torch.stack((x[:, 0], x[:, 1]), 3)
         return x.reshape(b, c, t * 2, h, w)
 
-    def forward(self, x: Tensor, caches: Caches) -> Tensor:
+    def forward(self, x: Tensor, caches: Caches | None) -> Tensor:
         if self.mode == "upsample3d":
+            assert caches is not None
             x = self._upsample_time(x, caches)
         b, c, t, h, w = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         x = self.resample(x)
         x = x.view(b, t, *x.shape[1:]).permute(0, 2, 1, 3, 4)
         if self.mode == "downsample3d":
+            if caches is None:
+                # Streamed, the first chunk's frame passes as is, and each later chunk convolves the last frame of
+                # the chunk before with its own. Over the whole clip, that is the first frame and then the strided
+                # convolution of all frames.
+                return torch.cat([x[:, :, :1], self.time_conv(x)], 2) if x.shape[2] > 1 else x
             i = caches.next_index()
             old = caches.items[i]
             if old is None:
@@ -300,7 +311,7 @@ class DownBlock(nn.Module):
             layers.append(Resample(out_dim, "downsample3d" if down_t else "downsample2d"))
         self.downsamples = nn.Sequential(*layers)
 
-    def forward(self, x: Tensor, caches: Caches) -> Tensor:
+    def forward(self, x: Tensor, caches: Caches | None) -> Tensor:
         x_copy = x.clone()
         for module in self.downsamples:
             x = module(x, caches)
@@ -359,7 +370,7 @@ class Encoder(nn.Module):
             CausalConv3d(out_dim, z_dim, 3, padding=1),
         )
 
-    def forward(self, x: Tensor, caches: Caches) -> Tensor:
+    def forward(self, x: Tensor, caches: Caches | None) -> Tensor:
         x = _conv_with_cache(self.conv1, x, caches)
         for layer in self.downsamples:
             x = layer(x, caches)
@@ -788,25 +799,33 @@ class Autoencoder(nn.Module):
             return to_policy_latent(z)
 
     @torch.no_grad()
-    def encode_eager(self, frames: Tensor) -> Tensor:
-        """Encode with plain PyTorch ops. Not bitwise equal to ``encode``."""
+    def encode_eager(self, frames: Tensor, streamed: bool = True) -> Tensor:
+        """Encode with plain PyTorch ops. Not bitwise equal to ``encode``.
+
+        ``streamed=False`` encodes the whole clip in one pass instead of chunk by chunk. The encoder is causal, so
+        the math is the same. Only the rounding differs, by about one bfloat16 step of the latent. A compiler then
+        gets one large graph without the copies that carry each chunk's causal context to the next.
+        """
         x = patchify(self._to_unit(frames))
-        caches = Caches(count_causal_convs(self.encoder))
         n = 1 + (x.shape[2] - 1) // 4
         dev_type = x.device.type
-        outs = []
         with (
             torch.autocast(dev_type, dtype=torch.bfloat16),
             torch.autocast(dev_type, dtype=torch.float16),
         ):
             mean, inv_std = self.scale
-            for i in range(n):
-                caches.index = 0
-                sl = x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
-                mu = self.conv1(self.encoder(sl, caches)).chunk(2, dim=1)[0]
-                mu = (mu - mean.view(1, Z_DIM, 1, 1, 1)) * inv_std.view(1, Z_DIM, 1, 1, 1)
-                outs.append(mu)
-            return to_policy_latent(torch.cat(outs, dim=2).to(torch.bfloat16))
+            if streamed:
+                caches = Caches(count_causal_convs(self.encoder))
+                outs = []
+                for i in range(n):
+                    caches.index = 0
+                    sl = x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
+                    outs.append(self.conv1(self.encoder(sl, caches)).chunk(2, dim=1)[0])
+            else:
+                outs = [self.conv1(self.encoder(x[:, :, : 1 + 4 * (n - 1)], None)).chunk(2, dim=1)[0]]
+            mu = torch.cat(outs, dim=2)
+            mu = (mu - mean.view(1, Z_DIM, 1, 1, 1)) * inv_std.view(1, Z_DIM, 1, 1, 1)
+            return to_policy_latent(mu.to(torch.bfloat16))
 
     @torch.no_grad()
     def decode(self, latent: Tensor) -> Tensor:
