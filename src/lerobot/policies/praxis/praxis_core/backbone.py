@@ -611,6 +611,23 @@ class EncoderTower(nn.Module):
         ``chunk_causal_positions``). Returns the conditioning tokens
         ``(1, K * F, h, w, dim)`` of the noised chunks and the taps.
         """
+        return self.forward_chunk_causal_pair([text], anchor, clean, noised, timesteps, rope_shifts)[0]
+
+    def forward_chunk_causal_pair(
+        self,
+        texts: Sequence[Tensor],
+        anchor: Tensor,
+        clean: Tensor | None,
+        noised: Tensor,
+        timesteps: Tensor,
+        rope_shifts: tuple[int, int, int] = (0, 0, 0),
+    ) -> list[tuple[Tensor, TapFeatures]]:
+        """``forward_chunk_causal`` for each text of ``texts``, such as the guided and the unguided pass.
+
+        With more than one text, the core runs the texts block by block (``Transformer.forward_pair``), so
+        each mixture-of-experts block reads its routed experts' weights once for all texts. Every output has
+        the bits of its text run alone.
+        """
         kk = int(timesteps.shape[1])
         frames, height, width = (int(d) for d in noised.shape[2:])
         if frames % kk:
@@ -622,76 +639,88 @@ class EncoderTower(nn.Module):
         tpf = height * width
         # One projection call per input, as in the original implementation.
         anchor_tok = self.input_projections[VIDEO](anchor).flatten(1, -2)
-        text_tok = self.input_projections[TEXT](text)
         noised_tok = self.input_projections[VIDEO](noised)
         noised_shape = noised_tok.shape
         noised_tok = self._chunk_modulate(
             noised_tok.flatten(1, -2), self.t_embedding(timesteps), [chunk * tpf] * kk
         )
-        parts = [self.registers, anchor_tok, text_tok, noised_tok]
+        video_parts = [noised_tok]
         if clean is not None:
             clean_tok = self.input_projections[VIDEO](clean).flatten(1, -2)
             t_clean = self.t_embedding(torch.zeros_like(timesteps))
-            parts.append(self._chunk_modulate(clean_tok, t_clean, [chunk * tpf] * (kk - 1)))
-        x = torch.cat(parts, dim=1)
+            video_parts.append(self._chunk_modulate(clean_tok, t_clean, [chunk * tpf] * (kk - 1)))
 
         n_reg = self.registers.size(1)
         n_anchor = anchor_tok.size(1)
-        n_text = text_tok.size(1)
         n_noised = frames * tpf
         n_clean = n_clean_frames * tpf
-        positions = chunk_causal_positions(
-            n_reg,
-            (int(anchor.shape[3]), int(anchor.shape[4])),
-            n_text,
-            (frames, height, width),
-            n_clean_frames,
-            rope_shifts,
-        )
-        positions = positions.unsqueeze(0).to(x.device)
-        slots = [
-            ("global", 1, n_reg),
-            ("global", 1, n_anchor),
-            ("global", 1, n_text),
-            ("noised", frames, tpf),
-        ]
-        if n_clean:
-            slots.append(("clean", n_clean_frames, tpf))
-        mask = self._tf_masks.get(slots, chunk, True, x.device, _full_blocks(self.core))
-
-        out, taps = self.core(x, positions, None, mask, self.tap_blocks)
-        if self.positive_zero_residual_add:
-            out = out + 0.0
-        # The output projection runs once over the noised and the clean tokens.
-        n_global = n_reg + n_anchor + n_text
-        projected = self.output_projections[VIDEO](
-            torch.cat(
-                list(
-                    out.narrow(1, n_global, n_noised + n_clean).split(
-                        [n_noised, n_clean] if n_clean else [n_noised], dim=1
-                    )
-                ),
-                dim=1,
+        inputs = []
+        for text in texts:
+            text_tok = self.input_projections[TEXT](text)
+            x = torch.cat([self.registers, anchor_tok, text_tok, *video_parts], dim=1)
+            n_text = text_tok.size(1)
+            positions = chunk_causal_positions(
+                n_reg,
+                (int(anchor.shape[3]), int(anchor.shape[4])),
+                n_text,
+                (frames, height, width),
+                n_clean_frames,
+                rope_shifts,
             )
-        )
-        cond = projected.narrow(1, 0, n_noised).view(*noised_shape[:-1], -1)
+            positions = positions.unsqueeze(0).to(x.device)
+            slots = [
+                ("global", 1, n_reg),
+                ("global", 1, n_anchor),
+                ("global", 1, n_text),
+                ("noised", frames, tpf),
+            ]
+            if n_clean:
+                slots.append(("clean", n_clean_frames, tpf))
+            mask = self._tf_masks.get(slots, chunk, True, x.device, _full_blocks(self.core))
+            inputs.append((x, positions, mask, n_text))
 
-        features = TapFeatures(
-            taps=list(taps),
-            embeddings=x,
-            frames_per_chunk=chunk,
-            tokens_per_frame=tpf,
-            rope_ids=positions,
-            global_spans={
-                "register": (0, n_reg),
-                "anchor": (n_reg, n_anchor),
-                "text": (n_reg + n_anchor, n_text),
-            },
-            noised_span=(n_global, n_noised),
-            clean_span=(n_global + n_noised, n_clean) if n_clean else None,
-            n_chunks=kk,
-        )
-        return cond, features
+        if len(inputs) == 1:
+            x, positions, mask, _ = inputs[0]
+            outs = [self.core(x, positions, None, mask, self.tap_blocks)]
+        else:
+            xs, positions_list, masks, _ = zip(*inputs, strict=True)
+            outs = self.core.forward_pair(xs, positions_list, [None] * len(xs), masks, self.tap_blocks)
+
+        results = []
+        for (x, positions, _, n_text), (out, taps) in zip(inputs, outs, strict=True):
+            if self.positive_zero_residual_add:
+                out = out + 0.0
+            # The output projection runs once over the noised and the clean tokens.
+            n_global = n_reg + n_anchor + n_text
+            projected = self.output_projections[VIDEO](
+                torch.cat(
+                    list(
+                        out.narrow(1, n_global, n_noised + n_clean).split(
+                            [n_noised, n_clean] if n_clean else [n_noised], dim=1
+                        )
+                    ),
+                    dim=1,
+                )
+            )
+            cond = projected.narrow(1, 0, n_noised).view(*noised_shape[:-1], -1)
+
+            features = TapFeatures(
+                taps=list(taps),
+                embeddings=x,
+                frames_per_chunk=chunk,
+                tokens_per_frame=tpf,
+                rope_ids=positions,
+                global_spans={
+                    "register": (0, n_reg),
+                    "anchor": (n_reg, n_anchor),
+                    "text": (n_reg + n_anchor, n_text),
+                },
+                noised_span=(n_global, n_noised),
+                clean_span=(n_global + n_noised, n_clean) if n_clean else None,
+                n_chunks=kk,
+            )
+            results.append((cond, features))
+        return results
 
 
 class DecoderTower(nn.Module):

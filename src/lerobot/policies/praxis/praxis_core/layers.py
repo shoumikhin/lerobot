@@ -675,24 +675,36 @@ def _sum_rows_of_tokens(rows: Tensor, rows_of_token: Tensor, scale: Tensor) -> T
     return ((acc[0] + acc[1]) + acc[2]) + acc[3]
 
 
-def _routed_chunk(
+def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
     gate: Tensor,
+    sizes: Sequence[int],
     gate_up_w: Tensor,
     down_w: Tensor,
     scaling: float,
-) -> Tensor:
-    """Float32 scaled routed sum of one token chunk (see ``MoEFeedForward``)."""
-    num_tokens, top_k = top_idx.shape
+) -> list[Tensor]:
+    """Float32 scaled routed sum of each token chunk of ``x`` (see ``MoEFeedForward``). The chunks follow each
+    other in ``x``, with ``sizes`` tokens each.
+
+    The rows of all chunks are sorted by expert together (inside an expert, the rows of the first chunk
+    first), so the two grouped GEMMs read each expert's weights once for all chunks. Each output row of a
+    grouped GEMM depends only on its own input row, and each chunk sums only its own rows, so each sum has the
+    bits of its chunk run alone.
+    """
+    top_k = top_idx.shape[1]
     order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
     rows = x[sorted_tokens].to(gate_up_w.dtype)
     gate_up = torch._grouped_mm(rows, gate_up_w, offsets)
     out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
-    scale = gate.to(torch.float32) * scaling
-    return _sum_rows_of_tokens(out, inverse.view(num_tokens, top_k), scale)
+    sums = []
+    rows_of_tokens = inverse.split([n * top_k for n in sizes])
+    for rows_of_token, chunk_gate in zip(rows_of_tokens, gate.split(list(sizes)), strict=True):
+        scale = chunk_gate.to(torch.float32) * scaling
+        sums.append(_sum_rows_of_tokens(out, rows_of_token.view(chunk_gate.shape), scale))
+    return sums
 
 
 def _routed_chunk_backward(
@@ -809,6 +821,13 @@ class _ChunkedRoutedExperts(torch.autograd.Function):
         )
 
 
+def _rows_of_spans(t: Tensor, spans: Sequence[tuple[int, int]]) -> Tensor:
+    """The rows ``t[a : a + n]`` of each ``(a, n)`` of ``spans``, in order: one slice if they are adjacent."""
+    if all(a + n == b for (a, n), (b, _) in zip(spans, spans[1:], strict=False)):
+        return t.narrow(0, spans[0][0], sum(n for _, n in spans))
+    return torch.cat([t.narrow(0, a, n) for a, n in spans])
+
+
 def _routed_chunks(
     x: Tensor,
     top_idx: Tensor,
@@ -819,21 +838,45 @@ def _routed_chunks(
     step: int,
 ) -> Tensor:
     """The scaled routed sum over token chunks of ``step``, rounded once."""
-    num_tokens, c = x.shape
-    out = x.new_empty(num_tokens, c, dtype=torch.float32)
-    for start in range(0, max(num_tokens, 1), step):
-        end = min(start + step, num_tokens)
-        if end <= start:
+    return _routed_chunks_group(x, top_idx, gate, [x.shape[0]], gate_up_w, down_w, scaling, step)[0]
+
+
+def _routed_chunks_group(
+    x: Tensor,
+    top_idx: Tensor,
+    gate: Tensor,
+    lengths: Sequence[int],
+    gate_up_w: Tensor,
+    down_w: Tensor,
+    scaling: float,
+    step: int,
+) -> list[Tensor]:
+    """``_routed_chunks`` of each input. The inputs follow each other in ``x``, with ``lengths`` tokens each.
+
+    Each input keeps its own token chunks of ``step``, and chunk ``k`` of every input runs in one
+    ``_routed_chunk_group``. When those chunks are adjacent in ``x``, as when every input fits in one chunk,
+    they are one slice: Torch-TensorRT converts the expert sort only when it can trace its keys back to
+    ``torch.topk`` through views, which a concatenation hides.
+    """
+    starts = [sum(lengths[:i]) for i in range(len(lengths))]
+    outs = [x.new_empty(n, x.shape[1], dtype=torch.float32) for n in lengths]
+    for start in range(0, max([*lengths, 1]), step):
+        group = [i for i, n in enumerate(lengths) if n > start]
+        if not group:
             break
-        out[start:end] = _routed_chunk(
-            x[start:end],
-            top_idx[start:end],
-            gate[start:end],
+        spans = [(starts[i] + start, min(step, lengths[i] - start)) for i in group]
+        sums = _routed_chunk_group(
+            _rows_of_spans(x, spans),
+            _rows_of_spans(top_idx, spans),
+            _rows_of_spans(gate, spans),
+            [n for _, n in spans],
             gate_up_w,
             down_w,
             scaling,
         )
-    return out.to(x.dtype)
+        for i, (_, n), chunk_sum in zip(group, spans, sums, strict=True):
+            outs[i][start : start + n] = chunk_sum
+    return [out.to(x.dtype) for out in outs]
 
 
 RoutingHook = Callable[["MoEFeedForward", Tensor, Tensor], None]
@@ -887,16 +930,56 @@ class MoEFeedForward(nn.Module):
         self.expert_bias = bias.to(device=self.expert_bias.device)
         return self
 
-    def forward(self, x: Tensor) -> Tensor:
-        shape = x.shape
-        x_flat = x.reshape(-1, x.size(-1))
-        logits = _router_logits(self.router.weight, x_flat)
+    def _route(self, logits: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """The picked experts of each token and their gates in ``dtype``, from the float32 router logits."""
         scores = torch.sigmoid(logits)
         biased = scores + self.expert_bias.to(scores.dtype)
         _, top_idx = torch.topk(biased, self.top_k, dim=-1)
         picked = scores.gather(dim=-1, index=top_idx)
         gate = picked / picked.sum(dim=-1, keepdim=True)
-        gate = gate.to(x_flat.dtype)
+        return top_idx, gate.to(dtype)
+
+    def forward_pair(self, xs: Sequence[Tensor]) -> list[Tensor]:
+        """``[self(x) for x in xs]`` with one pass of the routed experts for all inputs.
+
+        The router GEMM and the shared expert run per input, as in ``forward``, and the rest of the routing
+        runs row by row. Token chunk ``k`` of every input is dispatched together (``_routed_chunks_group``),
+        so the grouped GEMMs read each expert's weights once for all inputs, and every output has the bits of
+        ``forward``. Without ``dispatch_chunk_size`` or with grad, the inputs run one at a time. An input longer
+        than one token chunk makes each chunk's sort keys a concatenation of top-k slices, which Torch-TensorRT
+        may leave outside the engine; the outputs stay the same, and the released DROID checkpoint's chunk of
+        16384 tokens holds a whole caption (about 3.5k tokens).
+        """
+        if self.dispatch_chunk_size is None or torch.is_grad_enabled():
+            return [self(x) for x in xs]
+        flats = [x.reshape(-1, x.size(-1)) for x in xs]
+        lengths = [x_flat.shape[0] for x_flat in flats]
+        logits = torch.cat([_router_logits(self.router.weight, x_flat) for x_flat in flats])
+        top_idx, gate = self._route(logits, flats[0].dtype)
+        if self.routing_hook is not None:
+            for rows in zip(logits.split(lengths), top_idx.split(lengths), strict=True):
+                self.routing_hook(self, *rows)
+        shared = [self.shared(x_flat) for x_flat in flats]
+        routed = _routed_chunks_group(
+            torch.cat(flats),
+            top_idx,
+            gate,
+            lengths,
+            self.routed.gate_up_weight,
+            self.routed.down_weight,
+            float(self.routed_scaling_factor),
+            int(self.dispatch_chunk_size),
+        )
+        return [
+            (y_routed + y_shared).reshape(x.shape)
+            for y_routed, y_shared, x in zip(routed, shared, xs, strict=True)
+        ]
+
+    def forward(self, x: Tensor) -> Tensor:
+        shape = x.shape
+        x_flat = x.reshape(-1, x.size(-1))
+        logits = _router_logits(self.router.weight, x_flat)
+        top_idx, gate = self._route(logits, x_flat.dtype)
         if self.routing_hook is not None:
             self.routing_hook(self, logits, top_idx)
         y_shared = self.shared(x_flat)
@@ -1018,13 +1101,39 @@ class TransformerBlock(nn.Module):
         block_mask: BlockMask | AttentionBlocks | None = None,
         modulation: Modulation | None = None,
     ) -> Tensor:
+        x = self._attend(x, rope, block_mask, modulation)
+        return x + self.ffn(self.ln_out(x) * self.s)
+
+    def forward_pair(
+        self,
+        xs: Sequence[Tensor],
+        ropes: Sequence[Tensor | None],
+        block_masks: Sequence[BlockMask | AttentionBlocks | None],
+        modulations: Sequence[Modulation | None],
+    ) -> list[Tensor]:
+        """``forward`` of each input, with one pass of a mixture of experts' routed experts for all inputs
+        (``MoEFeedForward.forward_pair``)."""
+        xs = [self._attend(*args) for args in zip(xs, ropes, block_masks, modulations, strict=True)]
+        ffn_in = [self.ln_out(x) * self.s for x in xs]
+        if isinstance(self.ffn, MoEFeedForward):
+            ys = self.ffn.forward_pair(ffn_in)
+        else:
+            ys = [self.ffn(h) for h in ffn_in]
+        return [x + y for x, y in zip(xs, ys, strict=True)]
+
+    def _attend(
+        self,
+        x: Tensor,
+        rope: Tensor | None,
+        block_mask: BlockMask | AttentionBlocks | None,
+        modulation: Modulation | None,
+    ) -> Tensor:
+        """The modulation, if any, and the attention half of the block."""
         if modulation is not None:
             modulator, x_mod, dtype = modulation
             shift, scale = modulator(x_mod).chunk(2, dim=-1)
             x = modulate(x, shift, 1 + scale, dtype=dtype)
-        x = x + self.mha(self.ln_in(x) * self.s, rope, block_mask)
-        x = x + self.ffn(self.ln_out(x) * self.s)
-        return x
+        return x + self.mha(self.ln_in(x) * self.s, rope, block_mask)
 
 
 class Transformer(nn.Module):
@@ -1127,3 +1236,27 @@ class Transformer(nn.Module):
             if i in tap_blocks:
                 taps[i] = x
         return x, [taps[i] for i in tap_blocks]
+
+    def forward_pair(
+        self,
+        xs: Sequence[Tensor],
+        rope_idxs: Sequence[Tensor],
+        x_mods: Sequence[Tensor | None],
+        block_masks: Sequence[BlockMask | AttentionBlocks | None],
+        tap_blocks: Sequence[int] = (),
+    ) -> list[tuple[Tensor, list[Tensor]]]:
+        """``forward`` of each input, block by block, so each mixture-of-experts block reads its routed
+        experts' weights once for all inputs (``TransformerBlock.forward_pair``)."""
+        ropes = [self.rope_table(rope_idx, x.size(-2)) for rope_idx, x in zip(rope_idxs, xs, strict=True)]
+        taps: list[dict[int, Tensor]] = [{} for _ in xs]
+        for i, block in enumerate(self.blocks):
+            if self.modulators is None:
+                modulations: list[Modulation | None] = [None] * len(xs)
+            else:
+                assert all(x_mod is not None for x_mod in x_mods), "a modulated stack needs x_mod"
+                modulations = [(self.modulators[i], x_mod, self.modulation_dtype) for x_mod in x_mods]
+            xs = block.forward_pair(xs, ropes, block_masks, modulations)
+            if i in tap_blocks:
+                for tap, x in zip(taps, xs, strict=True):
+                    tap[i] = x
+        return [(x, [tap[i] for i in tap_blocks]) for x, tap in zip(xs, taps, strict=True)]

@@ -324,6 +324,9 @@ class _Sample(nn.Module):
     is, so the blank caption's pass runs no expert. The last step runs only the passes whose action velocities it
     combines. The texts are fixed with the task, so the program holds them.
 
+    The passes of a step run the encoder tower together (`EncoderTower.forward_chunk_causal_pair`), so each of its
+    mixture-of-experts blocks reads its routed experts' weights once for both captions.
+
     The latents the last step reads move no action after it, but they are the only output the decoder tower
     reaches directly, so the check of the program on its own (`ProgramCheck`) sees that tower through them.
     """
@@ -361,8 +364,9 @@ class _Sample(nn.Module):
             last = i == self.steps - 1
             noised, timesteps = video.to(dtype), time.to(dtype).expand(1, chunks)
             conds, action_velocities = [], []
-            for p, text in enumerate(texts[: self.action_passes] if last else texts):
-                cond, taps = self.encoder.forward_chunk_causal(text, anchor, clean, noised, timesteps)
+            step_texts = texts[: self.action_passes] if last else texts
+            encoded = self.encoder.forward_chunk_causal_pair(step_texts, anchor, clean, noised, timesteps)
+            for p, (cond, taps) in enumerate(encoded):
                 if not last:
                     conds.append(cond)
                 if p >= self.action_passes:

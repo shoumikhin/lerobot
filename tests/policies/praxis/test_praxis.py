@@ -45,6 +45,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.rotation import Rotation
 
 from .tiny_model import (
+    TEXT_DIM,
     FakeAutoencoder,
     FakeTextEncoder,
     fake_observation,
@@ -881,3 +882,87 @@ def test_split_attention_plays_the_actions_of_the_dense_attention() -> None:
     finally:
         praxis_layers.set_flex_attention_mode(saved)
     torch.testing.assert_close(played["split"], played["dense"])
+
+
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+]
+
+
+def _count_grouped_mm(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count the grouped GEMMs from now on: one entry per call."""
+    calls: list[int] = []
+    grouped_mm = torch._grouped_mm
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return grouped_mm(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", counted)
+    return calls
+
+
+def _randn(generator: torch.Generator, *shape: int) -> torch.Tensor:
+    return torch.randn(*shape, generator=generator).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_moe_forward_pair_gives_each_input_the_bits_of_forward(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """Each input keeps its own token chunks of 40. Chunk k of both inputs runs one pair of grouped GEMMs."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn.to(device)
+    generator = torch.Generator().manual_seed(0)
+    xs = [_randn(generator, 1, n, 64).to(device) for n in (90, 30)]
+    calls = _count_grouped_mm(monkeypatch)
+    with torch.no_grad():
+        alone = [ffn(x) for x in xs]
+        assert len(calls) == 2 * (3 + 1)
+        paired = ffn.forward_pair(xs)
+    assert len(calls) == 2 * (3 + 1) + 2 * 3
+    assert all(torch.equal(a, b) for a, b in zip(alone, paired, strict=True))
+
+
+def test_moe_forward_pair_sorts_keys_that_torch_tensorrt_traces_to_topk() -> None:
+    """Torch-TensorRT converts the expert sort only when it can trace its keys to ``torch.topk``. Otherwise
+    the sort runs outside TensorRT and splits the engine, and each part holds its own copy of the experts'
+    weights."""
+    # The pass that counts the sort's keys comes with pytorch/TensorRT#5020.
+    passes = pytest.importorskip("torch_tensorrt.dynamo.lowering.passes.annotate_sort_num_keys")
+    from torch_tensorrt.dynamo import CompilationSettings
+
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    generator = torch.Generator().manual_seed(0)
+    xs = tuple(_randn(generator, 1, n, 64) for n in (30, 10))  # one token chunk of 40 each
+
+    class Pair(torch.nn.Module):
+        def forward(self, *xs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            return tuple(ffn.forward_pair(list(xs)))
+
+    with torch.no_grad():
+        graph = torch.export.export(Pair(), xs).run_decompositions().module()
+    passes.annotate_sort_num_keys(graph, CompilationSettings())
+    sorts = [node for node in graph.graph.nodes if node.target == torch.ops.aten.sort.stable]
+    assert len(sorts) == 1 and sorts[0].meta.get("_num_sort_keys") == ffn.num_experts
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_the_encoder_runs_both_captions_through_one_pass_of_the_routed_experts(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """Each text gets the bits of ``forward_chunk_causal``, with half the grouped GEMMs."""
+    encoder = make_tiny_policy().model.backbone.encoder.to(device)
+    generator = torch.Generator().manual_seed(0)
+    texts = [_randn(generator, 1, 3, TEXT_DIM).to(device), _randn(generator, 1, 1, TEXT_DIM).to(device)]
+    anchor, clean, noised = (_randn(generator, 1, 192, frames, 1, 4).to(device) for frames in (1, 3, 6))
+    timesteps = _randn(generator, 1, 2).to(device)
+    calls = _count_grouped_mm(monkeypatch)
+    with torch.no_grad():
+        alone = [encoder.forward_chunk_causal(text, anchor, clean, noised, timesteps) for text in texts]
+        n_alone = len(calls)
+        paired = encoder.forward_chunk_causal_pair(texts, anchor, clean, noised, timesteps)
+    assert len(calls) - n_alone == n_alone // 2 > 0
+    for (cond, taps), (cond_paired, taps_paired) in zip(alone, paired, strict=True):
+        assert torch.equal(cond, cond_paired)
+        assert all(torch.equal(a, b) for a, b in zip(taps.taps, taps_paired.taps, strict=True))

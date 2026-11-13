@@ -229,11 +229,11 @@ def test_the_last_step_runs_only_the_passes_whose_action_velocities_it_combines(
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, **settings)
     sample = next(part for part in recipe.parts() if part.name == "sample")
     encoder, calls = sample.module.encoder, []
-    forward = encoder.forward_chunk_causal
+    forward = encoder.forward_chunk_causal_pair
     monkeypatch.setattr(
         encoder,
-        "forward_chunk_causal",
-        lambda *args, **kwargs: calls.append(args) or forward(*args, **kwargs),
+        "forward_chunk_causal_pair",
+        lambda texts, *args, **kwargs: calls.extend(texts) or forward(texts, *args, **kwargs),
     )
     with torch.no_grad():
         sample.module(*sample.example_inputs)
