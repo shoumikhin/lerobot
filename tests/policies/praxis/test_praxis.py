@@ -1005,3 +1005,88 @@ def test_the_encoder_context_cache_runs_only_the_noised_tokens_after_the_first_c
         praxis_layers.set_flex_attention_mode(saved)
     noised_tokens = 6 * 1 * 4
     assert rows[1::2] == [rows[0], [noised_tokens] * 2, [noised_tokens] * 2]
+
+
+def test_with_gradients_the_decoder_modulators_keep_the_full_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With gradients on, as in training, the decoder's output and gradients are the bits of the full-row modulation
+    written out below, and each modulator maps one row per latent token: backward never sums a patch's gradients in
+    compact rows."""
+    decoder = make_tiny_policy().model.backbone.decoder
+    generator = torch.Generator().manual_seed(0)
+    (ph, pw), n_reg, dim = decoder.patch_size, decoder.registers.size(1), decoder.registers.size(-1)
+    frames, height, width = 6, 2, 3
+    cond = _randn(generator, 1, frames, height, width, dim)
+    noised = _randn(generator, 1, 192, frames, height, width)
+    timesteps = _randn(generator, 1, 2)
+    leaves: list[torch.Tensor] = []
+
+    def run() -> tuple[torch.Tensor, list[torch.Tensor]]:
+        decoder.zero_grad(set_to_none=True)
+        leaves.append(cond.clone().requires_grad_())
+        out = decoder.forward_chunk_causal(noised, leaves[-1], timesteps)
+        out.square().sum().backward()
+        return out.detach(), [leaves[-1].grad, *(p.grad for p in decoder.parameters() if p.grad is not None)]
+
+    rows: list[int] = []
+    hooks = [
+        modulator.register_forward_hook(lambda module, args, out: rows.append(args[0].size(1)))
+        for modulator in decoder.core.modulators
+    ]
+    out, grads = run()
+    for hook in hooks:
+        hook.remove()
+    core_forward = decoder.core.forward
+
+    def full_rows(x, rope_idx, x_mod, *args, **kwargs):
+        # The modulation before the compact rows: zero rows for the registers, each conditioning row over its patch.
+        up = (
+            leaves[-1][:, :, :, None, :, None, :]
+            .expand(1, frames, height, ph, width, pw, dim)
+            .reshape(1, -1, dim)
+        )
+        full = torch.cat([torch.zeros(1, n_reg, dim, dtype=up.dtype), up], dim=1)
+        return core_forward(x, rope_idx, full, *args, **kwargs)
+
+    monkeypatch.setattr(decoder.core, "forward", full_rows)
+    ref_out, ref_grads = run()
+    assert torch.equal(out, ref_out)
+    assert len(grads) == len(ref_grads) > 1
+    assert all(torch.equal(g, r) for g, r in zip(grads, ref_grads, strict=True))
+    assert rows == [n_reg + frames * height * ph * width * pw] * len(decoder.core.modulators)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_the_decoder_modulators_map_one_row_per_conditioning_token(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    """Each block's modulator maps the registers' rows and one row per conditioning token, not one per latent
+    token of its patch, and the decoder gives the bits of the modulation of the expanded rows."""
+    decoder = make_tiny_policy().model.backbone.decoder.to(device)
+    generator = torch.Generator().manual_seed(0)
+    (ph, pw), n_reg, dim = decoder.patch_size, decoder.registers.size(1), decoder.registers.size(-1)
+    frames, height, width = 6, 2, 3
+    cond = _randn(generator, 1, frames, height, width, dim).to(device)
+    noised = _randn(generator, 1, 192, frames, height, width).to(device)
+    timesteps = _randn(generator, 1, 2).to(device)
+    rows: list[int] = []
+    for modulator in decoder.core.modulators:
+        modulator.register_forward_hook(lambda module, args, out: rows.append(args[0].size(1)))
+    x_mods: list[praxis_layers.PatchRows] = []
+    core_forward = decoder.core.forward
+
+    def core(x, rope_idx, x_mod, *args, expand=False, **kwargs):
+        x_mods.append(x_mod)
+        return core_forward(x, rope_idx, x_mod.expand(x_mod.rows) if expand else x_mod, *args, **kwargs)
+
+    with torch.no_grad():
+        monkeypatch.setattr(decoder.core, "forward", core)
+        compact = decoder.forward_chunk_causal(noised, cond, timesteps)
+        assert rows == [n_reg + frames * height * width] * len(decoder.core.modulators)
+        monkeypatch.setattr(
+            decoder.core, "forward", lambda *args, **kwargs: core(*args, expand=True, **kwargs)
+        )
+        expanded = decoder.forward_chunk_causal(noised, cond, timesteps)
+    assert torch.equal(compact, expanded)
+    up = cond[:, :, :, None, :, None, :].expand(1, frames, height, ph, width, pw, dim).reshape(1, -1, dim)
+    full = torch.cat([torch.zeros(1, n_reg, dim, dtype=cond.dtype, device=device), up], dim=1)
+    assert torch.equal(x_mods[0].expand(x_mods[0].rows), full)

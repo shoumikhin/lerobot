@@ -1143,7 +1143,32 @@ class MoEFeedForward(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-Modulation = tuple[nn.Module, Tensor, ModulationDtype | None]
+@dataclass(frozen=True)
+class PatchRows:
+    """Per-token conditioning that repeats each row over a patch, kept as its distinct rows (LeRobot addition).
+
+    The full rows are ``lead`` rows used once, then each row of an ``(F, H, W)`` grid repeated over the
+    ``(ph, pw)`` patch of an ``(F, H * ph, W * pw)`` grid. ``rows`` (B, lead + F * H * W, C) holds the lead rows
+    and then the grid. A map of each row on its own, like a block's modulator, gives on the full rows what
+    ``expand`` gives of it on ``rows``, with ``ph * pw`` times fewer rows for the grid (the original
+    implementation's MOD_COMPACT).
+    """
+
+    rows: Tensor
+    lead: int
+    grid: tuple[int, int, int]
+    patch: tuple[int, int]
+
+    def expand(self, y: Tensor) -> Tensor:
+        """The full rows of ``y`` (B, lead + F * H * W, D), a row-wise map of ``rows``."""
+        (f, h, w), (ph, pw) = self.grid, self.patch
+        b, _, d = y.shape
+        lead, grid = y.split([self.lead, f * h * w], dim=1)
+        up = grid.view(b, f, h, 1, w, 1, d).expand(b, f, h, ph, w, pw, d).reshape(b, -1, d)
+        return torch.cat([lead, up], dim=1)
+
+
+Modulation = tuple[nn.Module, Tensor | PatchRows, ModulationDtype | None]
 
 
 class TransformerBlock(nn.Module):
@@ -1217,8 +1242,13 @@ class TransformerBlock(nn.Module):
         """The modulation, if any, and the attention half of the block."""
         if modulation is not None:
             modulator, x_mod, dtype = modulation
-            shift, scale = modulator(x_mod).chunk(2, dim=-1)
-            x = modulate(x, shift, 1 + scale, dtype=dtype)
+            if isinstance(x_mod, PatchRows):
+                shift, scale = modulator(x_mod.rows).chunk(2, dim=-1)
+                shift, scale = x_mod.expand(shift), x_mod.expand(1 + scale)
+            else:
+                shift, scale = modulator(x_mod).chunk(2, dim=-1)
+                scale = 1 + scale
+            x = modulate(x, shift, scale, dtype=dtype)
         return x + self.mha(self.ln_in(x) * self.s, rope, block_mask, context)
 
 
@@ -1228,7 +1258,8 @@ class Transformer(nn.Module):
     The first ``num_dense`` blocks have a dense SwiGLU, the others a mixture of
     experts. With ``mod_dim`` set, each block has a modulator: a linear map of
     the per-token conditioning ``x_mod`` to ``(shift, scale)``. The block input
-    is then ``modulate(x, shift, 1 + scale)``.
+    is then ``modulate(x, shift, 1 + scale)``. ``x_mod`` can be ``PatchRows``,
+    whose distinct rows the modulators map before they are expanded.
     """
 
     def __init__(
@@ -1292,7 +1323,7 @@ class Transformer(nn.Module):
         i: int,
         x: Tensor,
         rope: Tensor,
-        x_mod: Tensor | None = None,
+        x_mod: Tensor | PatchRows | None = None,
         block_mask: BlockMask | AttentionBlocks | None = None,
         context: ContextCache | None = None,
     ) -> Tensor:
@@ -1307,7 +1338,7 @@ class Transformer(nn.Module):
         self,
         x: Tensor,
         rope_idx: Tensor,
-        x_mod: Tensor | None = None,
+        x_mod: Tensor | PatchRows | None = None,
         block_mask: BlockMask | AttentionBlocks | None = None,
         tap_blocks: Sequence[int] = (),
         context: ContextCache | None = None,
@@ -1330,7 +1361,7 @@ class Transformer(nn.Module):
         self,
         xs: Sequence[Tensor],
         rope_idxs: Sequence[Tensor],
-        x_mods: Sequence[Tensor | None],
+        x_mods: Sequence[Tensor | PatchRows | None],
         block_masks: Sequence[BlockMask | AttentionBlocks | None],
         tap_blocks: Sequence[int] = (),
         contexts: Sequence[ContextCache | None] | None = None,

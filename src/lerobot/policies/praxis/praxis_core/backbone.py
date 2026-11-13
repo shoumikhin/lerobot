@@ -41,6 +41,7 @@ from lerobot.policies.praxis.praxis_core.layers import (
     Attention,
     AttentionBlocks,
     ContextCache,
+    PatchRows,
     Transformer,
     flex_attention_mode,
     modulate as layer_modulate,
@@ -824,12 +825,19 @@ class DecoderTower(nn.Module):
         flat = modulate(tok.flatten(1, -2), _chunk_rows(shift, rows), _chunk_rows(1 + scale, rows))
         x = torch.cat([self.registers, flat], dim=1)
 
+        # Each conditioning row modulates the ph * pw tokens of its patch, and the registers get zero rows.
         b, cf, h, w, c = cond.shape
-        up = cond[:, :, :, None, :, None, :].expand(b, cf, h, ph, w, pw, c)
-        up = up.reshape(b, cf * h * ph * w * pw, c)
         n_reg = self.registers.size(1)
-        pad = torch.zeros(b, n_reg, c, device=up.device, dtype=up.dtype)
-        modulation = torch.cat([pad, up], dim=1)
+        pad = torch.zeros(b, n_reg, c, device=cond.device, dtype=cond.dtype)
+        modulation: Tensor | PatchRows
+        if torch.is_grad_enabled():
+            # Training keeps the full rows: on the distinct rows, backward would sum each patch's gradients in the
+            # modulator's dtype, which can overflow in float16. The original implementation gates MOD_COMPACT alike.
+            up = cond[:, :, :, None, :, None, :].expand(b, cf, h, ph, w, pw, c)
+            modulation = torch.cat([pad, up.reshape(b, cf * h * ph * w * pw, c)], dim=1)
+        else:
+            cond_rows = torch.cat([pad, cond.reshape(b, cf * h * w, c)], dim=1)
+            modulation = PatchRows(cond_rows, n_reg, (cf, h, w), (ph, pw))
 
         pos = [
             torch.zeros(n_reg, dtype=torch.int64),
