@@ -101,6 +101,27 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
     import triton.language as tl
 
     @triton.jit
+    def e2m1_pairs(even, odd, NATIVE: tl.constexpr):  # noqa: N803
+        # The codes of two values in one byte, the even column in the low nibble.
+        if NATIVE:
+            # sm_100 and later convert in one instruction, to `e2m1`'s code for every float32 but NaN (checked
+            # exhaustively on Jetson Thor and DGX Spark), which `e2m1` turns into a signed zero first.
+            even_zero = (even.to(tl.uint32, bitcast=True) & 0x80000000).to(tl.float32, bitcast=True)
+            odd_zero = (odd.to(tl.uint32, bitcast=True) & 0x80000000).to(tl.float32, bitcast=True)
+            even = tl.where(even != even, even_zero, even)
+            odd = tl.where(odd != odd, odd_zero, odd)
+            return tl.inline_asm_elementwise(
+                "{ .reg .b8 byte; cvt.rn.satfinite.e2m1x2.f32 byte, $2, $1; cvt.u32.u8 $0, byte; }",
+                constraints="=r,f,f",
+                args=(even, odd),
+                dtype=tl.uint32,
+                is_pure=True,
+                pack=1,
+            ).to(tl.uint8)
+        else:
+            return e2m1(even) | (e2m1(odd) << 4)
+
+    @triton.jit
     def e2m1(v):
         # Nearest FP4 e2m1 value, ties to the even code, as `_e2m1_codes`.
         m = tl.abs(v)
@@ -116,9 +137,19 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
         return code | ((v.to(tl.uint32, bitcast=True) >> 28).to(tl.uint8) & 8)
 
     @triton.jit
-    def round_rows(
-        x, source, rows, count, width, row_global, codes, scales, R: tl.constexpr, C: tl.constexpr
-    ):  # noqa: N803
+    def round_rows(  # noqa: N803
+        x,
+        source,
+        rows,
+        count,
+        width,
+        row_global,
+        codes,
+        scales,
+        R: tl.constexpr,
+        C: tl.constexpr,
+        NATIVE: tl.constexpr,
+    ):
         # The int32 words of the codes, written two codes per byte (`Nvfp4Bank`).
         codes = codes.to(tl.pointer_type(tl.uint8))
         live = rows < count
@@ -140,7 +171,7 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
         rows = rows.to(tl.int64)
         tl.store(
             codes + rows[:, None] * (width // 2) + pairs[None, :],
-            e2m1(even) | (e2m1(odd) << 4),
+            e2m1_pairs(even, odd, NATIVE),
             mask=live[:, None] & (pairs[None, :] < width // 2),
         )
         blocks_index = tl.program_id(1) * (C // 16) + tl.arange(0, C // 16)
@@ -151,15 +182,28 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
         )
 
     @triton.jit
-    def take_rows_kernel(x, index, row_global, count, width, codes, scales, R: tl.constexpr, C: tl.constexpr):  # noqa: N803
+    def take_rows_kernel(  # noqa: N803
+        x,
+        index,
+        row_global,
+        count,
+        width,
+        codes,
+        scales,
+        R: tl.constexpr,
+        C: tl.constexpr,
+        NATIVE: tl.constexpr,
+    ):
         rows = tl.program_id(0) * R + tl.arange(0, R)
         source = tl.load(index + rows, mask=rows < count, other=0)
-        round_rows(x, source, rows, count, width, row_global, codes, scales, R, C)
+        round_rows(x, source, rows, count, width, row_global, codes, scales, R, C, NATIVE)
 
     @triton.jit
-    def rows_kernel(x, row_global, count, width, codes, scales, R: tl.constexpr, C: tl.constexpr):  # noqa: N803
+    def rows_kernel(  # noqa: N803
+        x, row_global, count, width, codes, scales, R: tl.constexpr, C: tl.constexpr, NATIVE: tl.constexpr
+    ):
         rows = tl.program_id(0) * R + tl.arange(0, R)
-        round_rows(x, rows.to(tl.int64), rows, count, width, row_global, codes, scales, R, C)
+        round_rows(x, rows.to(tl.int64), rows, count, width, row_global, codes, scales, R, C, NATIVE)
 
     @triton.jit
     def row_globals_kernel(  # noqa: N803
@@ -261,6 +305,7 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
         )
 
     block_m, block_n, block_k = TILES
+    native = torch.cuda.get_device_capability()[0] >= 10
     num_stages = NUM_STAGES[0]
 
     # Run eagerly, as in the export's checks, the operators launch the same kernels, so that a part's PyTorch run
@@ -300,7 +345,16 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
             grid = (triton.cdiv(count, ROWS_TILE[0]), triton.cdiv(width, ROWS_TILE[1]))
             if index is None:
                 rows_kernel[grid](
-                    blocks, row_global, count, width, codes, scales, *ROWS_TILE, num_warps=4, num_stages=1
+                    blocks,
+                    row_global,
+                    count,
+                    width,
+                    codes,
+                    scales,
+                    *ROWS_TILE,
+                    native,
+                    num_warps=4,
+                    num_stages=1,
                 )
             else:
                 take_rows_kernel[grid](
@@ -312,6 +366,7 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
                     codes,
                     scales,
                     *ROWS_TILE,
+                    native,
                     num_warps=4,
                     num_stages=1,
                 )
@@ -375,7 +430,7 @@ def _register() -> praxis_layers.Nvfp4Kernels | None:
         logger.warning("The NVFP4 grouped GEMM plugin does not build for this GPU: %s", failure)
         return None
 
-    common = {"R": ROWS_TILE[0], "C": ROWS_TILE[1]}
+    common = {"R": ROWS_TILE[0], "C": ROWS_TILE[1], "NATIVE": native}
     triton_op(
         "lerobot_praxis::take_nvfp4_rows",
         take_rows_kernel,

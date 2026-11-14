@@ -838,6 +838,31 @@ def test_nvfp4_experts_run_only_in_tensorrt(monkeypatch):
         PraxisExportRecipe.load(cfg)
 
 
+@pytest.mark.parametrize(
+    ("capability", "native"), [((9, 0), False), ((10, 0), True), ((11, 0), True), ((12, 1), True)]
+)
+def test_the_nvfp4_row_plugins_convert_with_one_instruction_from_sm_100(monkeypatch, capability, native):
+    """sm_100 and later round the rows with the FP4 conversion instruction, which gives the same codes; older GPUs
+    compare. Nothing else in the plugins depends on the GPU."""
+    pytest.importorskip("triton")
+    from lerobot.policies.praxis import export_nvfp4
+
+    constexprs = {}
+
+    def triton_op(name, kernel, signature, consts, **kwargs):
+        constexprs[name] = consts
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    monkeypatch.setattr(export_nvfp4, "_triton_op", lambda: triton_op)
+    monkeypatch.setattr(torch.ops, "lerobot_praxis", SimpleNamespace(nvfp4_row_globals=None), raising=False)
+    assert export_nvfp4._register() is not None
+    assert constexprs["lerobot_praxis::take_nvfp4_rows"]["NATIVE"] is native
+    assert constexprs["lerobot_praxis::nvfp4_rows"]["NATIVE"] is native
+    assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_grouped_mm"]
+    assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_row_globals"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugins run on CUDA")
 def test_the_nvfp4_plugins_compute_as_pytorch_does_inside_tensorrt():
     torch_tensorrt = _need_triton_op()
