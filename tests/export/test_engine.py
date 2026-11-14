@@ -31,6 +31,7 @@ import torch
 from safetensors.numpy import load_file, save_file
 from torch import Tensor, nn
 
+from lerobot.bundle import engine as engine_module
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import (
     MANIFEST,
@@ -455,6 +456,38 @@ def test_engine_runs_a_program_several_times_with_constants(tmp_path, monkeypatc
     engine = BundleEngine(_repeat_bundle(tmp_path / "bundle"))
     assert loads == ["model.pt2", "scale.pt2"]
     np.testing.assert_array_equal(engine.get_action({OBS_STATE: np.ones(3, np.float32)}), [1, 1, 1])
+
+
+def test_engine_copies_a_constant_two_runs_read_once(tmp_path, monkeypatch):
+    """The second run gets what was placed for the first, so a weight several runs read is in memory once."""
+    bundle = _repeat_bundle(tmp_path / "bundle", chunk_inputs=("scaled", "factor_0"))
+    save_file({"factor_0": np.array([1.0], np.float32)}, bundle.path / "constants.safetensors")
+    given = []
+    place = TorchProgram.place
+    monkeypatch.setattr(
+        TorchProgram,
+        "place",
+        lambda self, index, value: given.append((index, type(value))) or place(self, index, value),
+    )
+    BundleEngine(Bundle.read(bundle.path))
+    # Index 1 of the scale program is the factor; index 0 of the model program is the state of each chunk.
+    assert [kind for index, kind in given if index == 1] == [np.ndarray, Tensor]
+
+
+def test_engine_reads_each_constant_from_its_file_only_to_place_it(tmp_path, monkeypatch):
+    """A constant no run reads is never read, and one that two runs read is read once."""
+    bundle = _repeat_bundle(tmp_path / "bundle", chunk_inputs=("scaled", "factor_0"))
+    save_file(
+        {"factor_0": np.array([1.0], np.float32), "unread": np.zeros(4, np.float32)},
+        bundle.path / "constants.safetensors",
+    )
+    reads = []
+    get = engine_module._Constants.__getitem__
+    monkeypatch.setattr(
+        engine_module._Constants, "__getitem__", lambda self, name: reads.append(name) or get(self, name)
+    )
+    BundleEngine(Bundle.read(bundle.path))
+    assert reads == ["factor_0"]
 
 
 def test_engine_places_the_constants_at_load_and_a_frame_value_once_per_chunk(tmp_path, monkeypatch):

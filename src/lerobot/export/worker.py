@@ -31,11 +31,13 @@ import shutil
 import sys
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import draccus
 import torch
+from torch import Tensor, nn
 
 from lerobot.bundle.manifest import (
     CONSTANTS,
@@ -152,8 +154,14 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         checks: list[str] = []
         compile_options: dict[str, dict[str, Any]] = {}
         operator_modules: dict[str, list[str]] = {}
+        weights: dict[str, Tensor] = {}
+        weight_inputs: dict[str, list[str]] = {}
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
+            if cfg.weights_as_inputs:
+                part, part_weights = _weights_as_inputs(part, cfg.backend.device)
+                weights.update(part_weights)
+                weight_inputs[part.name] = list(part_weights)
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
             # default, and its Dynamo cannot run some policies' Python, such as ACT's.
             with torch.no_grad(), _quantized(cfg, part):
@@ -161,6 +169,10 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
                 # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
                 # flat_apply that Transformers' vmap attention masks trace to.
                 program = program.run_decompositions({})
+            if weight_inputs.get(part.name):
+                program.example_inputs = _without_weight_values(
+                    program.example_inputs, len(weight_inputs[part.name])
+                )
             torch.export.save(program, traced / f"{part.name}.pt2")
             if part.check is not None:
                 part.check.save(traced / f"{part.name}.check.safetensors")
@@ -178,8 +190,11 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
                 "--max_task_tokens applies only to a policy whose bundle takes any task, such as pi0.5."
             )
         test_case = recipe.test_case()
-        runs = runs if plan.runs is None else plan.runs
-        first_runs = plan.first_runs
+        runs = runs if plan.runs is None else _reading_weights(plan.runs, weight_inputs)
+        first_runs = [_reading_weights(chunk, weight_inputs) for chunk in plan.first_runs]
+        if clashes := sorted(set(weights) & set(plan.constants or {})):
+            raise ValueError(f"The recipe's constants {clashes} have the names of weights the programs take.")
+        constants = {**(plan.constants or {}), **weights}
         # A test case with values carried between chunks, or of the first chunks from a reset, holds the noise of
         # each of its chunks.
         several = plan.carry or plan.first_runs
@@ -202,7 +217,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             programs=programs,
             runs=runs,
             first_runs=first_runs,
-            constants=CONSTANTS if plan.constants else None,
+            constants=CONSTANTS if constants else None,
             task_tokens=None
             if task_tokens is None
             else TaskTokens(
@@ -221,7 +236,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
         )
         write_bundle(
-            Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens, action_tokens
+            Bundle(folder, manifest), test_case, recipe.config, constants, task_tokens, action_tokens
         )
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
@@ -239,6 +254,84 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "backend": {"type": cfg.backend.type, **draccus.encode(cfg.backend)},
         "log_level": cfg.log_level,
     }
+
+
+class _WeightsAsInputs(nn.Module):
+    """`module` taking its parameters as its last inputs, in the order of `names`, so its program holds none."""
+
+    def __init__(self, module: nn.Module, names: list[str]):
+        super().__init__()
+        # In a tuple, which a module does not register, so torch.export does not also lift its parameters.
+        self.wrapped, self.names = (module,), names
+
+    def forward(self, *inputs: Tensor) -> Any:
+        count = len(inputs) - len(self.names)
+        weights = dict(zip(self.names, inputs[count:], strict=True))
+        return torch.func.functional_call(self.wrapped[0], weights, inputs[:count])
+
+
+def _weights_as_inputs(part: Part, device: str) -> tuple[Part, dict[str, Tensor]]:
+    """`part` taking its parameters as inputs, and their values as the bundle stores them, named as those inputs.
+
+    Refuses bfloat16 weights for a backend that runs off CUDA: a bundle stores them as their bits, which only a CUDA
+    runtime uploads as bfloat16.
+    """
+    parameters = {name: weight.detach() for name, weight in part.module.named_parameters()}
+    if not parameters:
+        return part, {}
+    if device != "cuda" and any(weight.dtype == torch.bfloat16 for weight in parameters.values()):
+        raise ValueError(
+            f"The part {part.name} has bfloat16 weights, which only a bundle on CUDA can take as inputs. Export it "
+            "without --weights_as_inputs."
+        )
+    names = [f"{part.name}.{name}" for name in parameters]
+    values = tuple(parameters.values())
+    check = part.check
+    if check is not None:
+        check = ProgramCheck((*check.inputs, *values), check.outputs, check.floor)
+    part = replace(
+        part,
+        module=_WeightsAsInputs(part.module, list(parameters)),
+        example_inputs=(*part.example_inputs, *values),
+        inputs=[*part.inputs, *names],
+        check=check,
+    )
+    return part, {name: _stored(value) for name, value in zip(names, values, strict=True)}
+
+
+def _stored(value: Tensor) -> Tensor:
+    """`value` as a bundle stores it, a bfloat16 value as its bits.
+
+    NumPy, which reads the bundle, has no bfloat16. A bundle's runtime uploads the bits as bfloat16 to an input of
+    that dtype.
+    """
+    return value.view(torch.uint16) if value.dtype == torch.bfloat16 else value
+
+
+def _without_weight_values(
+    example_inputs: tuple[tuple[Any, ...], dict[str, Any]], count: int
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """`example_inputs` with the last `count`, the weights, as zeros that take no memory.
+
+    torch.export.save writes a program's example inputs through host memory all at once, which for a policy's weights
+    is twice their size. The bundle's constants hold their values, and the compiler reads only their shapes and dtypes.
+    """
+    args, kwargs = example_inputs
+    zeros = [
+        torch.zeros((), dtype=weight.dtype, device=weight.device).expand(weight.shape)
+        for weight in args[-count:]
+    ]
+    return (*args[:-count], *zeros), kwargs
+
+
+def _reading_weights(runs: list[ProgramRun], weight_inputs: dict[str, list[str]]) -> list[ProgramRun]:
+    """`runs`, each reading the weights its program takes as inputs after its other inputs."""
+    return [
+        replace(run, inputs=[*run.inputs, *weight_inputs[run.program]])
+        if run.program in weight_inputs
+        else run
+        for run in runs
+    ]
 
 
 def _quantized(cfg: ExportConfig, part: Part) -> contextlib.AbstractContextManager:

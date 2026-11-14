@@ -22,11 +22,13 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from pathlib import Path
 from threading import Event
 from typing import Any, cast
 
 import numpy as np
+from safetensors import safe_open
 from safetensors.numpy import load_file
 
 from lerobot.utils.constants import ACTION
@@ -41,7 +43,6 @@ from .manifest import (
     TASK_LENGTH,
     Bundle,
     BundleManifest,
-    ProgramRun,
 )
 from .runtime import Program, prepare_runtime
 from .target import check_runtime_versions, check_target
@@ -100,7 +101,7 @@ class BundleEngine:
         self._check_task(task)
         self._task = task
         self._stop = stop_event or Event()
-        constants = {} if manifest.constants is None else load_file(bundle.path / manifest.constants)
+        constants = {} if manifest.constants is None else _Constants(bundle.path / manifest.constants)
         self._noise_shape = manifest.noise_shape
         chunks = [*manifest.first_runs, manifest.runs]
         # The engine draws the noise on the host only if no run draws it, as one does on a CUDA device.
@@ -189,8 +190,7 @@ class BundleEngine:
         # Each run gets the constants once, where its program reads them, rather than a copy on every chunk.
         # So do the values of the task, which stays the same until `set_task`: first those of the exported
         # task, which the test case runs.
-        exported = {**constants, **self._encode(self._fixed_task or "")}
-        self._placed = [self._place(runs, exported) for runs in self._chunk_runs]
+        self._placed = self._place(self._encode(self._fixed_task or ""), constants)
         self.chunk_length = self._check(frames, noise, expected, manifest.tolerance)
         if task != (self._fixed_task or ""):
             self._place_task(task_values)
@@ -377,19 +377,26 @@ class BundleEngine:
             )
         return np.stack(played), len(chunk)
 
-    @staticmethod
-    def _place(
-        runs: list[tuple[ProgramRun, Program]], values: Mapping[str, np.ndarray]
-    ) -> list[dict[int, Any]]:
-        """`values` copied, for each of `runs`, where its program reads them."""
-        return [
-            {
-                index: program.place(index, values[name])
-                for index, name in enumerate(run.inputs)
-                if name in values
-            }
-            for run, program in runs
-        ]
+    def _place(self, *sources: Mapping[str, np.ndarray]) -> list[list[dict[int, Any]]]:
+        """The values of `sources` copied, for each run of each chunk, where its program reads them.
+
+        A name in more than one source takes its value from the first. A value is copied for the first run that reads it, and each later run gets that copy, which a program on
+        the same device keeps as it is. So a value many runs read, such as a weight, is in memory once.
+        """
+        placed: dict[str, Any] = {}
+        chunks = []
+        for runs in self._chunk_runs:
+            chunk = []
+            for run, program in runs:
+                inputs = {}
+                for index, name in enumerate(run.inputs):
+                    source = next((values for values in sources if name in values), None)
+                    if source is not None:
+                        value = placed[name] if name in placed else source[name]
+                        inputs[index] = placed[name] = program.place(index, value)
+                chunk.append(inputs)
+            chunks.append(chunk)
+        return chunks
 
     def _encode(self, task: str) -> dict[str, np.ndarray]:
         """The values the programs take for `task`: none for a bundle without task tokens."""
@@ -454,7 +461,7 @@ class BundleEngine:
 
     def _place_task(self, values: Mapping[str, np.ndarray]) -> None:
         # All placed before any is kept, so a failure leaves the task that runs whole.
-        placements = [self._place(runs, values) for runs in self._chunk_runs]
+        placements = self._place(values)
         for placed_runs, task_placed_runs in zip(self._placed, placements, strict=True):
             for placed, task_placed in zip(placed_runs, task_placed_runs, strict=True):
                 placed.update(task_placed)
@@ -521,6 +528,32 @@ def _check_noise_draw(noise: np.ndarray, shape: list[int] | None) -> None:
             f"to {noise.max():.3g}, not standard normal noise shaped {shape}. Export the policy again on this "
             "device."
         )
+
+
+class _Constants(Mapping[str, np.ndarray]):
+    """The bundle's constants file, each value read only when asked for.
+
+    A bundle whose programs take their weights as inputs keeps them here. Read one at a time, just before each is
+    placed, they are never all in host memory at once.
+    """
+
+    def __init__(self, path: Path):
+        self._file = safe_open(path, framework="np")
+        self._names = set(self._file.keys())
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        if name not in self._names:
+            raise KeyError(name)
+        return self._file.get_tensor(name)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._names
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._names)
+
+    def __len__(self) -> int:
+        return len(self._names)
 
 
 def _check_dataflow(manifest: BundleManifest, frame: list[str], constants: list[str], noise: bool) -> None:

@@ -40,7 +40,7 @@ def write_bundle(
     bundle: Bundle,
     test_case: TestCase,
     config: PreTrainedConfig,
-    constants: dict[str, np.ndarray] | None = None,
+    constants: dict[str, np.ndarray | torch.Tensor] | None = None,
     task_tokens: TaskTokenData | None = None,
     action_tokens: ActionTokenData | None = None,
 ) -> None:
@@ -53,7 +53,7 @@ def write_bundle(
             The frame, noise and actions the programs must reproduce.
         config (`PreTrainedConfig`):
             The policy config, naming the frame the programs take.
-        constants (`dict[str, np.ndarray]`, *optional*):
+        constants (`dict[str, np.ndarray | torch.Tensor]`, *optional*):
             Named arrays the programs read, written to the file the manifest names in `constants` one at a time,
             each copied to the host only as it is written.
         task_tokens (`TaskTokenData`, *optional*):

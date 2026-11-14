@@ -85,6 +85,27 @@ def test_a_scalar_input_keeps_its_rank(tmp_path):
     assert double.to_numpy(double(np.array(3.0, np.float32))[0]).tolist() == 6.0
 
 
+def test_a_bfloat16_input_given_as_bits_is_uploaded_as_bfloat16():
+    """NumPy has no bfloat16, so a bundle keeps a bfloat16 constant, such as a weight, as its bits."""
+    calls = []
+    program = executorch.ExecuTorchProgram.__new__(executorch.ExecuTorchProgram)
+    program._from_host = lambda value, index, **dtype: calls.append((value.dtype, index, dtype))
+    program._devices, program._dtypes = ["cuda:1", "cuda:1"], ["bfloat16", "float32"]
+    program.place(0, np.zeros(2, np.uint16))
+    program.place(1, np.zeros(2, np.float32))
+    assert calls == [(np.uint16, 1, {"dtype": "bfloat16"}), (np.float32, 1, {})]
+
+
+def test_bfloat16_bits_need_an_executorch_whose_from_host_takes_a_dtype():
+    def from_host(value, index):
+        raise AssertionError("not reached")
+
+    program = executorch.ExecuTorchProgram.__new__(executorch.ExecuTorchProgram)
+    program._from_host, program._devices, program._dtypes = from_host, ["cuda:0"], ["bfloat16"]
+    with pytest.raises(RuntimeError, match="from_host takes a dtype"):
+        program.place(0, np.zeros(2, np.uint16))
+
+
 def test_an_executorch_older_than_1_6_gets_the_install_hint_and_the_environment_back(tmp_path):
     # A stand-in with `executorch.runtime`, but without the result type that ExecuTorch 1.6 added.
     (tmp_path / "executorch").mkdir()

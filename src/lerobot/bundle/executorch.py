@@ -97,22 +97,25 @@ class ExecuTorchProgram:
             raise RuntimeError(f"ExecuTorch could not load {path.name}: {error}") from error
         meta = self._method.metadata
         self._devices = [meta.input_tensor_meta(i).device() for i in range(meta.num_inputs())]
+        self._dtypes = [meta.input_tensor_meta(i).dtype_name() for i in range(meta.num_inputs())]
 
     def __call__(self, *inputs: Any) -> tuple[Any, ...]:
         """Run the program; its outputs stay where it writes them."""
         return tuple(
-            self._method.execute([self._place(x, d) for x, d in zip(inputs, self._devices, strict=True)])
+            self._method.execute(
+                [self._place(*input) for input in zip(inputs, self._devices, self._dtypes, strict=True)]
+            )
         )
 
     def to_numpy(self, value: Any) -> np.ndarray:
         """An output as a host array."""
         return np.asarray(value if str(value.device) == "cpu" else value.to_host())
 
-    def place(self, index: int, value: np.ndarray) -> Any:
+    def place(self, index: int, value: Any) -> Any:
         """`value` copied where input `index` reads it, once."""
-        return self._place(value, self._devices[index])
+        return self._place(value, self._devices[index], self._dtypes[index])
 
-    def _place(self, value: Any, device: str) -> Any:
+    def _place(self, value: Any, device: str, dtype: str) -> Any:
         if not isinstance(value, np.ndarray):
             if str(value.device) == device:
                 return value
@@ -123,4 +126,15 @@ class ExecuTorchProgram:
         value = np.require(value, requirements="C")
         if device == "cpu":
             return value
-        return self._from_host(value, int(device.removeprefix("cuda:")))
+        index = int(device.removeprefix("cuda:"))
+        if dtype == "bfloat16" and value.dtype == np.uint16:
+            # NumPy has no bfloat16, so a bundle keeps a bfloat16 value, such as a weight, as its bits.
+            try:
+                return self._from_host(value, index, dtype=dtype)
+            except TypeError as error:
+                raise RuntimeError(
+                    "This bundle passes bfloat16 values as their bits, which needs an ExecuTorch whose "
+                    f"ExecuTorchResult.from_host takes a dtype ({error}). Upgrade ExecuTorch, or export the policy "
+                    "again without --weights_as_inputs."
+                ) from error
+        return self._from_host(value, index)

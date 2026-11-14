@@ -374,7 +374,7 @@ def test_engine_runs_the_task_it_is_given(tmp_path, monkeypatch):
     np.testing.assert_allclose(engine.predict_chunk({OBS_STATE: state}), [pick_it, pick_it], rtol=1e-5)
 
     # A task whose values fail to reach a program is refused too, also after a reset.
-    def out_of_memory(runs, values):
+    def out_of_memory(values):
         raise MemoryError("the device is out of memory")
 
     with monkeypatch.context() as patch, pytest.raises(MemoryError):

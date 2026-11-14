@@ -41,7 +41,7 @@ from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
 from lerobot.configs import parser
 from lerobot.export import worker
 from lerobot.export.configs import ExportBackendConfig, ExportConfig
-from lerobot.export.recipe import ExportRecipe
+from lerobot.export.recipe import ExportRecipe, Part, ProgramCheck
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -192,6 +192,66 @@ def test_safetensors_written_one_value_at_a_time_read_back_as_written(tmp_path):
         assert torch.equal(read[name].reshape(-1).view(torch.uint8), bits), name
     with safe_open(tmp_path / "v.safetensors", framework="pt") as file:
         assert file.metadata() == {"floor": "[1]"}
+
+
+def test_export_passes_the_weights_as_inputs_from_the_bundles_constants(checkpoint, tmp_path):
+    run_export(
+        f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'bundle'}", "--weights_as_inputs=true"
+    )
+    bundle = Bundle.read(tmp_path / "bundle")
+    constants = load_file(bundle.path / bundle.manifest.constants)
+    (run,) = bundle.manifest.runs
+    weights = [name for name in run.inputs if name in constants]
+    assert weights and all(name.startswith(f"{run.program}.") for name in weights)
+    policy = ACTPolicy.from_pretrained(checkpoint)
+    assert sum(constants[name].size for name in weights) == sum(p.numel() for p in policy.parameters())
+    program = torch.export.load(bundle.path / bundle.manifest.programs[run.program].file)
+    assert not program.graph_signature.parameters
+    assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
+
+
+def test_a_part_taking_its_weights_as_inputs_is_checked_with_them():
+    linear = torch.nn.Linear(3, 2)
+    x = torch.randn(4, 3)
+    check = ProgramCheck.measure(linear, (x,), with_float32=False)
+    part, weights = worker._weights_as_inputs(Part("model", linear, (x,), ["x"], ["y"], check), "cpu")
+    assert part.inputs == ["x", "model.weight", "model.bias"] and list(weights) == part.inputs[1:]
+    assert torch.equal(part.module(*part.check.inputs), linear(x))
+    assert torch.equal(part.module(*part.example_inputs), linear(x))
+
+
+def test_a_traced_program_is_saved_without_its_weights_values():
+    x, weight = torch.randn(2, 3), torch.randn(4, 3)
+    (kept, zeros), kwargs = worker._without_weight_values(((x, weight), {}), 1)
+    assert kept is x and kwargs == {}
+    assert zeros.shape == weight.shape and zeros.dtype == weight.dtype
+    assert zeros.untyped_storage().nbytes() == weight.element_size() and not zeros.any()
+
+
+def test_bfloat16_weights_are_refused_as_inputs_off_cuda():
+    linear = torch.nn.Linear(3, 2).to(torch.bfloat16)
+    part = Part("model", linear, (torch.randn(4, 3, dtype=torch.bfloat16),), ["x"], ["y"])
+    with pytest.raises(ValueError, match="only a bundle on CUDA can take as inputs"):
+        worker._weights_as_inputs(part, "cpu")
+
+
+def test_export_refuses_weights_as_inputs_with_a_quantization(tmp_path, monkeypatch):
+    monkeypatch.setattr(TorchTestBackend, "quantizations", ("fp8",))
+    with pytest.raises(ValueError, match="--weights_as_inputs cannot be combined with --quantize"):
+        ExportConfig(
+            TorchTestBackend(),
+            output_dir=tmp_path / "b",
+            quantize="fp8",
+            tolerance=1.0,
+            weights_as_inputs=True,
+        )
+
+
+def test_a_bfloat16_weight_is_kept_as_its_bits():
+    weight = torch.tensor([1.0, -2.5, 3e-3], dtype=torch.bfloat16)
+    bits = worker._stored(weight).numpy()
+    assert bits.dtype == np.uint16
+    assert torch.equal(torch.from_numpy(bits).view(torch.bfloat16), weight)
 
 
 def test_a_backend_that_cannot_run_its_programs_says_so():
