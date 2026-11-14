@@ -23,7 +23,8 @@ import inspect
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable, Iterator, Sequence
+import struct
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,7 +33,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 import numpy as np
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.overrides import TorchFunctionMode
@@ -290,18 +291,11 @@ class ProgramCheck:
 
     def save(self, path: Path) -> None:
         """Write the check to `path`, for the step that runs the compiled program."""
-        # Contiguous copies, since safetensors refuses a tensor that is not contiguous or shares memory with
-        # another.
-        tensors = {
-            f"input.{i}": x.clone(memory_format=torch.contiguous_format) for i, x in enumerate(self.inputs)
-        }
-        tensors.update(
-            {
-                f"output.{i}": x.clone(memory_format=torch.contiguous_format)
-                for i, x in enumerate(self.outputs)
-            }
-        )
-        save_file(tensors, path, metadata={"floor": json.dumps(self.floor)})
+        tensors = {f"input.{i}": x for i, x in enumerate(self.inputs)}
+        tensors.update({f"output.{i}": x for i, x in enumerate(self.outputs)})
+        # One value at a time, so that a large part, such as one whose inputs are its weights, needs no second
+        # copy of them in host memory.
+        write_safetensors(path, tensors, {"floor": json.dumps(self.floor)})
 
     @classmethod
     def load(cls, path: Path, device: str) -> ProgramCheck:
@@ -314,6 +308,60 @@ class ProgramCheck:
             tuple(tensors[f"output.{i}"] for i in range(len(floor))),
             cast(list[tuple[float, float]], floor),
         )
+
+
+# The names safetensors gives the dtypes `write_safetensors` writes.
+_SAFETENSORS_DTYPES = {
+    torch.float64: "F64",
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float8_e4m3fn: "F8_E4M3",
+    torch.float8_e5m2: "F8_E5M2",
+    torch.int64: "I64",
+    torch.int32: "I32",
+    torch.int16: "I16",
+    torch.int8: "I8",
+    torch.uint64: "U64",
+    torch.uint32: "U32",
+    torch.uint16: "U16",
+    torch.uint8: "U8",
+    torch.bool: "BOOL",
+}
+
+
+def write_safetensors(
+    path: Path, values: Mapping[str, Tensor | np.ndarray], metadata: dict[str, str] | None = None
+) -> None:
+    """Write `values` to the safetensors file `path`, each copied to the host only as it is written.
+
+    safetensors' own functions hold the bytes of every value at once, which for a policy's weights is their whole
+    size again in host memory. Unlike its `save_file`, the file gets the usual permissions, so another user can
+    read it.
+    """
+    tensors = {
+        name: torch.from_numpy(np.require(value, requirements="C"))
+        if isinstance(value, np.ndarray)
+        else value
+        for name, value in values.items()
+    }
+    header: dict[str, Any] = {} if metadata is None else {"__metadata__": metadata}
+    offset = 0
+    for name, tensor in tensors.items():
+        size = tensor.numel() * tensor.element_size()
+        header[name] = {
+            "dtype": _SAFETENSORS_DTYPES[tensor.dtype],
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    # Padded with spaces to 8 bytes, as safetensors pads it, so that the values start aligned.
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as file:
+        file.write(struct.pack("<Q", len(encoded)) + encoded)
+        for tensor in tensors.values():
+            file.write(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
 
 
 def relative_errors(outputs: Sequence[Tensor], expected: Sequence[Tensor]) -> list[tuple[float, float]]:

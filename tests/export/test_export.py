@@ -169,6 +169,31 @@ def test_a_part_checked_on_its_own_refuses_a_program_that_computes_something_els
         assert list(tmp_path.iterdir()) == []
 
 
+def test_safetensors_written_one_value_at_a_time_read_back_as_written(tmp_path):
+    from safetensors import safe_open
+    from safetensors.torch import load_file as load_tensors
+
+    from lerobot.export.recipe import write_safetensors
+
+    values = {
+        "bf16": torch.tensor([[1.5, -2.0], [3e-3, 7.0]], dtype=torch.bfloat16).T,
+        "flags": torch.tensor([True, False, True]),
+        "scalar": np.array(3, np.int64),
+        "strided": np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2],
+        "empty": torch.zeros(0, 4),
+        "fp8": torch.tensor([0.5, -1.0]).to(torch.float8_e4m3fn),
+    }
+    write_safetensors(tmp_path / "v.safetensors", values, {"floor": "[1]"})
+    read = load_tensors(tmp_path / "v.safetensors")
+    for name, value in values.items():
+        expected = torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+        assert read[name].dtype == expected.dtype, name
+        bits = expected.contiguous().reshape(-1).view(torch.uint8)
+        assert torch.equal(read[name].reshape(-1).view(torch.uint8), bits), name
+    with safe_open(tmp_path / "v.safetensors", framework="pt") as file:
+        assert file.metadata() == {"floor": "[1]"}
+
+
 def test_a_backend_that_cannot_run_its_programs_says_so():
     with pytest.raises(NotImplementedError, match="The torch_test backend cannot run its programs at export"):
         ExportBackendConfig.run(TorchTestBackend(), Path("model.pt2"), None, ())

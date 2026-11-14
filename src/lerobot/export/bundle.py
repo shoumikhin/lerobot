@@ -33,7 +33,7 @@ from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, TASK_EMBEDDINGS, TASK_
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION
 
-from .recipe import ActionTokenData, TaskTokenData, TestCase
+from .recipe import ActionTokenData, TaskTokenData, TestCase, write_safetensors
 
 
 def write_bundle(
@@ -54,7 +54,8 @@ def write_bundle(
         config (`PreTrainedConfig`):
             The policy config, naming the frame the programs take.
         constants (`dict[str, np.ndarray]`, *optional*):
-            Named arrays the programs read, written to the file the manifest names in `constants`.
+            Named arrays the programs read, written to the file the manifest names in `constants` one at a time,
+            each copied to the host only as it is written.
         task_tokens (`TaskTokenData`, *optional*):
             The tokenizer, embedding table and known tasks, written to the files the manifest names in
             `task_tokens`.
@@ -76,9 +77,7 @@ def write_bundle(
         save({name: np.require(value, requirements="C") for name, value in case.items()})
     )
     if manifest.constants is not None:
-        (folder / manifest.constants).write_bytes(
-            save({name: np.require(value, requirements="C") for name, value in (constants or {}).items()})
-        )
+        write_safetensors(folder / manifest.constants, constants or {})
     if manifest.task_tokens is not None and task_tokens is not None:
         shutil.copyfile(task_tokens.tokenizer, folder / manifest.task_tokens.tokenizer)
         # Written from the table without a serialized copy in memory, which for a large vocabulary is a GiB
