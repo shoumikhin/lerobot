@@ -1332,3 +1332,41 @@ def test_float8_experts_run_their_bfloat16_grouped_gemms_with_the_exports_kernel
     finally:
         praxis_layers.set_float8_grouped_mm(None)
     assert len(banks) == 2 and banks[0] is gate_up.data and banks[1] is down.data
+
+
+def test_float8_experts_run_their_gather_gate_up_and_swiglu_with_the_exports_kernel() -> None:
+    """An export gives the gather of the float8 rows, the gate and up products and the SwiGLU to its compiler as one
+    operation (`set_float8_gate_up`): it gets each token's float8 row once, and float32 keeps the PyTorch side."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    ffn.routed.to_float8()
+    gate_up, down = ffn.routed.banks()
+    generator = torch.Generator().manual_seed(0)
+    rows = _randn(generator, 24, 64)
+    index = torch.randperm(24, generator=generator)[:20]
+    offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.data.shape[0] - 4), dtype=torch.int32)
+    calls = []
+
+    def fused(tokens, tokens_scale, index, data, scale, offsets, silu=torch.nn.functional.silu):
+        calls.append((tuple(tokens.shape), data is gate_up.data))
+        out = praxis_layers._float8_grouped_mm_pytorch(
+            tokens[index], tokens_scale[index], data, scale, offsets, torch.bfloat16
+        )
+        gate, up = out.chunk(2, dim=-1)
+        return silu(gate) * up
+
+    expected = {
+        dtype: praxis_layers._float8_experts(rows.to(dtype), index, gate_up, down, offsets)
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    try:
+        praxis_layers.set_float8_gate_up(fused)
+        for dtype in (torch.float32, torch.bfloat16):
+            out = praxis_layers._float8_experts(rows.to(dtype), index, gate_up, down, offsets)
+            assert torch.equal(out, expected[dtype])
+        praxis_layers.set_float8_gate_up(lambda *args: fused(*args, silu=lambda gate: gate))
+        wrong = praxis_layers._float8_experts(rows.to(torch.bfloat16), index, gate_up, down, offsets)
+    finally:
+        praxis_layers.set_float8_gate_up(None)
+    assert not torch.equal(wrong, expected[torch.bfloat16])
+    # Only bfloat16 runs it, with each of the 24 tokens rounded once.
+    assert calls == [((24, 64), True), ((24, 64), True)]

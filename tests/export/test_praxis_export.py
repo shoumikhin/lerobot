@@ -689,6 +689,7 @@ def float8_recipe(path, monkeypatch, grouped_mm) -> PraxisExportRecipe:
     monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
     monkeypatch.setattr(export_praxis, "_float8_rows_plugin", lambda: praxis_layers._float8_rows)
     monkeypatch.setattr(export_praxis, "_float8_grouped_mm_plugin", lambda: grouped_mm)
+    monkeypatch.setattr(export_praxis, "_float8_gate_up_plugin", lambda: None)
     recipe = make_recipe(path, monkeypatch, dtype=torch.bfloat16)
     recipe.cfg.backend = ExecuTorchTensorRTConfig()
     recipe.cfg.quantize = "fp8"
@@ -714,6 +715,44 @@ def test_with_tensorrt_the_float8_experts_trace_their_rounding_and_grouped_gemms
     assert praxis_layers._FLOAT8_GROUPED_MM is None and praxis_layers._FLOAT8_ROWS is None
     # The compile step registers the plugins' operators before it loads the program.
     modules = (export_praxis.FLOAT8_ROWS_MODULE, export_praxis.FLOAT8_GROUPED_MM_MODULE)
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: modules if part.name in export_praxis.MOE_PARTS else () for part in parts
+    }
+
+
+def test_with_tensorrt_the_float8_experts_trace_their_gather_gate_up_and_swiglu_as_one_plugin(
+    tmp_path, monkeypatch
+):
+    """As a gather, a grouped GEMM and a SwiGLU, TensorRT writes the float8 rows and both products to memory."""
+    seen = []
+
+    def gate_up(tokens, tokens_scale, index, data, scale, offsets):
+        seen.append(
+            (tokens.dtype, data.dtype, index.shape[0] % tokens.shape[0], index.shape[0] // tokens.shape[0])
+        )
+        rows, rows_scale = tokens[index], tokens_scale[index]
+        out = praxis_layers._float8_grouped_mm_pytorch(rows, rows_scale, data, scale, offsets, torch.bfloat16)
+        gate, up = out.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    def grouped_mm(rows, rows_scale, data, scale, offsets):
+        return praxis_layers._float8_grouped_mm_pytorch(
+            rows, rows_scale, data, scale, offsets, torch.bfloat16
+        )
+
+    recipe = float8_recipe(tmp_path / "checkpoint", monkeypatch, grouped_mm)
+    monkeypatch.setattr(export_praxis, "_float8_gate_up_plugin", lambda: gate_up)
+    parts = list(recipe.parts())
+    # Each token's float8 row is rounded once and gathered once for each of its experts.
+    assert seen and all(
+        entry[:3] == (torch.float8_e4m3fn, torch.float8_e4m3fn, 0) and entry[3] > 1 for entry in seen
+    )
+    assert praxis_layers._FLOAT8_GATE_UP is None
+    modules = (
+        export_praxis.FLOAT8_ROWS_MODULE,
+        export_praxis.FLOAT8_GROUPED_MM_MODULE,
+        export_praxis.FLOAT8_GATE_UP_MODULE,
+    )
     assert {part.name: part.operator_modules for part in parts} == {
         part.name: modules if part.name in export_praxis.MOE_PARTS else () for part in parts
     }
@@ -808,6 +847,48 @@ def test_the_float8_grouped_gemm_plugin_multiplies_as_pytorch_does_inside_tensor
     )
     # Only the order of the float32 sums differs.
     torch.testing.assert_close(compiled(*inputs), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
+def test_the_float8_gate_up_plugin_computes_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_float8_gate_up import FLOAT8_GATE_UP, _float8_gate_up_eager
+
+    if FLOAT8_GATE_UP is None:
+        pytest.skip(
+            f"Torch-TensorRT {torch_tensorrt.__version__} builds no float8 gate and up plugin on this GPU"
+        )
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # Experts of several row tiles and columns of two tiles, none of them full, an expert without rows, and each token
+    # taken top_k times.
+    tokens, top_k, experts, k, hidden = 200, 2, 6, 272, 208
+    data, scale = praxis_layers._float8_bank(
+        torch.randn(experts, k, 2 * hidden, device="cuda", generator=generator) * 0.02
+    )
+    x = torch.randn(tokens, k, device="cuda", generator=generator).to(torch.bfloat16)
+    rows, rows_scale = praxis_layers._float8_rows(x)
+    chosen = torch.randint(0, experts - 1, (tokens * top_k,), device="cuda", generator=generator)
+    chosen[chosen == 3] = experts - 1
+    _, order = chosen.sort(stable=True)
+    index = torch.arange(tokens, device="cuda").repeat_interleave(top_k)[order]
+    offsets = torch.bincount(chosen, minlength=experts).cumsum(0).to(torch.int32)
+
+    class GateUp(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("data", data)
+            self.register_buffer("scale", scale)
+
+        def forward(self, rows, rows_scale, index, offsets):
+            return FLOAT8_GATE_UP(rows, rows_scale, index, self.data, self.scale, offsets)
+
+    inputs = [rows, rows_scale, index, offsets]
+    program = torch.export.export(GateUp(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
+    _assert_runs_in_tensorrt(compiled)
+    expected = _float8_gate_up_eager(rows, rows_scale, index, data, scale.unflatten(1, (2, hidden)), offsets)
+    # The order of the products' float32 sums can move a bfloat16 rounding, and near zero that has no relative bound.
+    torch.testing.assert_close(compiled(*inputs), expected, atol=1e-2, rtol=2**-6)
 
 
 @pytest.mark.parametrize("tensorrt", [True, False], ids=["tensorrt", "test_backend"])

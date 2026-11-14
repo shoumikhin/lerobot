@@ -849,6 +849,23 @@ def set_float8_grouped_mm(fn: Float8GroupedMM | None) -> None:
     _FLOAT8_GROUPED_MM = fn
 
 
+Float8GateUp = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
+_FLOAT8_GATE_UP: Float8GateUp | None = None
+
+
+def set_float8_gate_up(fn: Float8GateUp | None) -> None:
+    """Gather the float8 rows, multiply them by the gate and up columns of float8 experts and apply SwiGLU with
+    ``fn`` (LeRobot addition).
+
+    ``fn(tokens, tokens_scale, index, bank.data, bank.scale, offsets)`` returns ``silu(gate) * up`` of
+    ``_float8_grouped_mm_pytorch(tokens[index], tokens_scale[index], bank.data, bank.scale, offsets)`` in bfloat16,
+    with ``tokens`` and ``tokens_scale`` the float8 rows of the tokens. An export uses it to give these steps to its
+    compiler as one operation. None restores them. ``_float8_experts`` reads the module attribute at call time.
+    """
+    global _FLOAT8_GATE_UP
+    _FLOAT8_GATE_UP = fn
+
+
 def _float8_rows(x: Tensor, index: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """The rows ``x[index]`` (all of ``x`` without ``index``) in float8 e4m3, with a float32 scale per row: the
     row's largest magnitude over ``FLOAT8_MAX``."""
@@ -898,8 +915,13 @@ def _float8_experts(
     The input of each grouped GEMM is rounded to float8 per row (``_float8_rows``).
     """
     to_float8 = _FLOAT8_ROWS if _FLOAT8_ROWS is not None and x.dtype == torch.bfloat16 else _float8_rows
-    rows, rows_scale = to_float8(x, index)
-    hidden = _expert_swiglu(_float8_grouped_mm(rows, rows_scale, gate_up, offsets, x.dtype))
+    if _FLOAT8_GATE_UP is not None and x.dtype == torch.bfloat16:
+        # A row's scale depends only on its token, so each token is rounded once and the plugin gathers them.
+        tokens, tokens_scale = to_float8(x, None)
+        hidden = _FLOAT8_GATE_UP(tokens, tokens_scale, index, gate_up.data, gate_up.scale, offsets)
+    else:
+        rows, rows_scale = to_float8(x, index)
+        hidden = _expert_swiglu(_float8_grouped_mm(rows, rows_scale, gate_up, offsets, x.dtype))
     hidden, hidden_scale = to_float8(hidden, None)
     return _float8_grouped_mm(hidden, hidden_scale, down, offsets, x.dtype)
 

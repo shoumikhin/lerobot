@@ -124,6 +124,9 @@ AUTOENCODER_KERNELS_MODULE = "lerobot.policies.praxis.export_autoencoder_kernels
 FLOAT8_ROWS_MODULE = "lerobot.policies.praxis.export_float8_rows"
 # The module that registers the TensorRT plugin of the float8 experts' grouped GEMMs (--quantize=fp8).
 FLOAT8_GROUPED_MM_MODULE = "lerobot.policies.praxis.export_float8_grouped_mm"
+# The module that registers the TensorRT plugin of the float8 experts' row gather, gate and up products and SwiGLU in
+# one kernel (--quantize=fp8).
+FLOAT8_GATE_UP_MODULE = "lerobot.policies.praxis.export_float8_gate_up"
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +585,14 @@ def _float8_grouped_mm_plugin() -> praxis_layers.Float8GroupedMM | None:
     return export_float8_grouped_mm.FLOAT8_GROUPED_MM
 
 
+def _float8_gate_up_plugin() -> praxis_layers.Float8GateUp | None:
+    """The float8 experts' row gather, gate and up products and SwiGLU as one TensorRT plugin
+    (`export_float8_gate_up`), if there is one."""
+    from . import export_float8_gate_up
+
+    return export_float8_gate_up.FLOAT8_GATE_UP
+
+
 def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     """The mixture-of-experts row gather as one TensorRT plugin (`export_take_rows`), if there is one."""
     from . import export_take_rows
@@ -856,6 +867,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     (EXPERT_GATE_UP_MODULE, self._expert_gate_up()),
                     (FLOAT8_ROWS_MODULE, self._float8_rows()),
                     (FLOAT8_GROUPED_MM_MODULE, self._float8_grouped_mm()),
+                    (FLOAT8_GATE_UP_MODULE, self._float8_gate_up()),
                 )
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 if self._autoencoder_kernels() and name == "encode":
@@ -906,6 +918,14 @@ class PraxisExportRecipe(ActionChunkRecipe):
             return _float8_grouped_mm_plugin()
         return None
 
+    def _float8_gate_up(self) -> praxis_layers.Float8GateUp | None:
+        """The TensorRT plugin of the float8 experts' row gather, gate and up products and SwiGLU, for TensorRT in
+        bfloat16 with `--quantize=fp8`."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        if tensorrt and self.cfg.quantize == "fp8" and self.policy.model.dtype == torch.bfloat16:
+            return _float8_gate_up_plugin()
+        return None
+
     def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
         """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
         if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
@@ -932,6 +952,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_expert_gate_up(self._expert_gate_up())
         praxis_layers.set_float8_rows(self._float8_rows())
         praxis_layers.set_float8_grouped_mm(self._float8_grouped_mm())
+        praxis_layers.set_float8_gate_up(self._float8_gate_up())
         praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
@@ -942,6 +963,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             praxis_layers.set_expert_gate_up(None)
             praxis_layers.set_float8_rows(None)
             praxis_layers.set_float8_grouped_mm(None)
+            praxis_layers.set_float8_gate_up(None)
             praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)
