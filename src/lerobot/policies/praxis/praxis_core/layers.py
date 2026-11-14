@@ -232,7 +232,8 @@ def set_flex_attention_mode(mode: FlexAttentionMode) -> None:
     no CPU backward; CPU runs (tests, CPU-only hosts) select ``"dense"``. ``"split"`` runs the dense
     form without a mask, a few SDPAs over the runs of the mask (``_split_flex_attention``), for
     compilers that see only PyTorch operations. The towers then pass ``AttentionBlocks`` for their
-    masks. All four compute the same attention. ``Attention.forward`` reads the module attribute at
+    masks, and the action expert runs its cross attention without a dense mask too
+    (``action_expert.trunk_cross_attention_blocks``). All four compute the same attention. ``Attention.forward`` reads the module attribute at
     call time.
     """
     global _compiled_flex_attention, _FLEX_ATTENTION_MODE

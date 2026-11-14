@@ -38,8 +38,17 @@ from lerobot.policies.praxis.configuration_praxis import (
 )
 from lerobot.policies.praxis.modeling_praxis import OBS_SCENE_SEED, PraxisPolicy
 from lerobot.policies.praxis.praxis_core import layers as praxis_layers, vae
+from lerobot.policies.praxis.praxis_core.action_expert import (
+    ActionExpert,
+    build_trunk_rope_masks,
+    trunk_cross_attention_blocks,
+)
 from lerobot.policies.praxis.praxis_core.backbone import teacher_forcing_mask
-from lerobot.policies.praxis.praxis_core.checkpoint import save_checkpoint, verify_checksums
+from lerobot.policies.praxis.praxis_core.checkpoint import (
+    EXPERT_TRUNK_ROPE,
+    save_checkpoint,
+    verify_checksums,
+)
 from lerobot.policies.praxis.processor_praxis import droid7_to_pose8, pose8_to_droid7, pose12_grip_to_droid7
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.rotation import Rotation
@@ -933,6 +942,120 @@ DEVICES = [
     "cpu",
     pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
 ]
+
+
+# (global tokens, clean frames, noised frames, chunk size, window, include noised): the expert's cross layouts.
+EXPERT_CROSS_LAYOUTS = {
+    "serve: 2 noised chunks and 1 clean chunk": (4, 3, 6, 3, 9, True),
+    "serve, clean frames only": (4, 3, 6, 3, 9, False),
+    "2 noised chunks, short window": (4, 3, 6, 3, 1, True),
+    "1 noised chunk, short window": (4, 6, 3, 3, 2, True),
+    "noised = clean + 1, a partial chunk": (4, 2, 3, 2, 5, True),
+    "no clean frames, a partial chunk": (4, 0, 7, 3, 7, True),
+    "no key": (0, 0, 3, 3, 3, False),
+}
+
+
+def _expert_cross_layout(name: str) -> dict[str, int | bool]:
+    n_g, n_c, n_noised, chunk, window, include_noised = EXPERT_CROSS_LAYOUTS[name]
+    return {
+        "num_action_tokens": n_noised,
+        "num_future_per_chunk": 2,
+        "chunk_size": chunk,
+        "num_clean_frames": n_c,
+        "num_noised_frames": n_noised,
+        "tokens_per_frame": 2,
+        "window_size": window,
+        "num_global_tokens": n_g,
+        "include_noised": include_noised,
+    }
+
+
+@pytest.mark.parametrize("name", list(EXPERT_CROSS_LAYOUTS))
+def test_the_expert_cross_attention_blocks_are_the_runs_of_its_mask(name: str) -> None:
+    """Blocks from the layout are the runs of the dense cross mask. A query without a key keeps the mask."""
+    layout = _expert_cross_layout(name)
+    cross, _ = build_trunk_rope_masks(**layout, device=torch.device("cpu"), block=False)
+    runs = praxis_layers.AttentionBlocks.from_mask(cross)
+    blocks = trunk_cross_attention_blocks(**layout)
+    if name == "no key":
+        assert blocks is None and not runs.runs[0][2]
+    else:
+        assert blocks == runs
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("name", [name for name in EXPERT_CROSS_LAYOUTS if name != "no key"])
+def test_the_split_expert_cross_attention_computes_the_masked_attention(
+    name: str, device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In the split mode the expert's cross attention runs one unmasked SDPA per distinct set of attended keys
+    and gives the masked attention's output (float64, so that the two forms differ only in the last bits)."""
+    layout = _expert_cross_layout(name)
+    n_g, n_c, n_noised = layout["num_global_tokens"], layout["num_clean_frames"], layout["num_noised_frames"]
+    head_dim = int(EXPERT_TRUNK_ROPE["dim"])
+    torch.manual_seed(0)
+    expert = (
+        ActionExpert(
+            action_patch_dim=4,
+            proprio_patch_dim=3,
+            trunk_dim=16,
+            dim=2 * head_dim,
+            num_layers=2,
+            num_heads=2,
+            head_dim=head_dim,
+            num_future_per_chunk=layout["num_future_per_chunk"],
+            clean_only_conditioning=not layout["include_noised"],
+            rope=dict(EXPERT_TRUNK_ROPE),
+        )
+        .double()
+        .to(device)
+    )
+    generator = torch.Generator().manual_seed(0)
+    kv_len = n_g + (n_c + n_noised) * layout["tokens_per_frame"]
+    inputs = {
+        "noised_action_latents": torch.randn(1, n_noised, 4, generator=generator, dtype=torch.float64).to(
+            device
+        ),
+        "action_timesteps": torch.rand(1, generator=generator, dtype=torch.float64).to(device),
+        "trunk_features": [
+            torch.randn(1, kv_len - n_g, 16, generator=generator, dtype=torch.float64).to(device)
+        ],
+        "global_tokens": torch.randn(1, n_g, 16, generator=generator, dtype=torch.float64).to(device),
+        "proprio_latents": torch.randn(1, n_noised, 3, generator=generator, dtype=torch.float64).to(device),
+        "kv_rope_ids": (torch.arange(kv_len)[None] * 3).to(device),
+        **{k: layout[k] for k in ("chunk_size", "num_clean_frames", "num_noised_frames", "tokens_per_frame")},
+        "window_size": layout["window_size"],
+    }
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    calls: list[tuple[bool, int, int]] = []
+
+    def recorded(q, k, v, attn_mask=None, **kwargs):
+        calls.append((attn_mask is not None, q.shape[-2], k.shape[-2]))
+        return sdpa(q, k, v, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recorded)
+    out, cross_calls = {}, {}
+    saved = praxis_layers.flex_attention_mode()
+    try:
+        for mode in ("dense", "split"):
+            praxis_layers.set_flex_attention_mode(mode)
+            calls.clear()
+            with torch.no_grad():
+                out[mode] = expert.forward_trunk_rope(**inputs)
+            cross_calls[mode] = calls[:-1]  # the last call is the self-attention layer's
+    finally:
+        praxis_layers.set_flex_attention_mode(saved)
+    torch.testing.assert_close(out["split"], out["dense"])
+    blocks = trunk_cross_attention_blocks(**layout)
+    assert blocks is not None
+    q_len = blocks.runs[-1][1]
+    groups: dict = {}
+    for start, end, ranges in blocks.runs:
+        groups[ranges] = groups.get(ranges, 0) + end - start
+    assert cross_calls["dense"] == [(True, q_len, kv_len)]
+    expected = [(False, rows, sum(end - start for start, end in ranges)) for ranges, rows in groups.items()]
+    assert cross_calls["split"] == expected
 
 
 def _count_grouped_mm(monkeypatch: pytest.MonkeyPatch) -> list[int]:

@@ -44,7 +44,10 @@ Trunk-rope layout (``rope={"kind": "trunk", ...}``, the checkpoint):
 Numerics: the weights and activations are bfloat16. The norms, the AdaLN
 scale and the timestep features run in float32 and cast back. The op order
 follows the original implementation exactly, so the output is bitwise equal for the
-same weights and inputs.
+same weights and inputs. The export's ``"split"`` flex attention mode (see
+``layers.set_flex_attention_mode``) runs the cross attention as unmasked attentions
+over the keys each chunk reads: the same attention in another reduction order, equal
+only up to rounding.
 
 ``run_expert_on_taps_k`` runs the expert on the taps of one chunk-causal
 encoder forward.
@@ -60,9 +63,13 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, FlexKernelOptions
 
 from lerobot.policies.praxis.praxis_core.layers import (
+    AttentionBlocks,
+    KeyRanges,
     RotaryEmbedding,
     _compiled_flex_attention_dynamic,
+    _key_slices,
     apply_rope,
+    flex_attention_mode,
 )
 
 __all__ = [
@@ -76,6 +83,7 @@ __all__ = [
     "noised_frame_offset",
     "run_expert_on_taps_k",
     "tap_blocks_for",
+    "trunk_cross_attention_blocks",
     "trunk_mask_mods",
     "trunk_query_rope_ids",
 ]
@@ -372,6 +380,90 @@ def trunk_mask_mods(
     return cross, self_, q_len, kv_len
 
 
+def trunk_cross_attention_blocks(
+    *,
+    num_action_tokens: int,
+    num_future_per_chunk: int,
+    chunk_size: int,
+    num_clean_frames: int,
+    num_noised_frames: int,
+    tokens_per_frame: int,
+    window_size: int,
+    num_global_tokens: int,
+    include_noised: bool = True,
+) -> AttentionBlocks | None:
+    """The cross mask of ``trunk_mask_mods`` as ``AttentionBlocks``, from the layout alone (LeRobot addition).
+
+    The query tags of ``trunk_mask_mods`` depend only on the query's chunk, so all queries of a chunk read the
+    same keys: the global tokens, the clean frames in the window before the chunk and the chunk's noised
+    frames. The runs follow the query order (the proprio, future and action tokens of each chunk). None when a
+    query reads no key, which keeps the dense mask.
+    """
+    f, cs, n_c, tpf = num_future_per_chunk, chunk_size, num_clean_frames, tokens_per_frame
+    n_g = num_global_tokens
+    k = max(1, num_action_tokens // cs)
+    offset = noised_frame_offset(num_noised_frames, n_c, cs)
+
+    def key_ranges(chunk: int) -> KeyRanges:
+        start = chunk * cs + offset
+        spans = [(0, n_g), (n_g + max(0, start - window_size) * tpf, n_g + min(start, n_c) * tpf)]
+        if include_noised:
+            noised = (chunk * cs, min((chunk + 1) * cs, num_noised_frames))
+            spans.append((n_g + (n_c + noised[0]) * tpf, n_g + (n_c + noised[1]) * tpf))
+        ranges: list[tuple[int, int]] = []
+        for begin, end in spans:
+            if begin >= end:
+                continue
+            if ranges and ranges[-1][1] == begin:
+                ranges[-1] = (ranges[-1][0], end)
+            else:
+                ranges.append((begin, end))
+        return tuple(ranges)
+
+    rows = [(c, c + 1, c) for c in range(k)]
+    rows += [(k + c * f, k + (c + 1) * f, c) for c in range(k) if f]
+    first_action = k * (1 + f)
+    rows += [
+        (first_action + start, first_action + min(start + cs, num_action_tokens), start // cs)
+        for start in range(0, num_action_tokens, cs)
+    ]
+    runs: list[tuple[int, int, KeyRanges]] = []
+    for start, end, chunk in rows:
+        ranges = key_ranges(chunk)
+        if not ranges:
+            return None
+        if runs and runs[-1][2] == ranges:
+            runs[-1] = (runs[-1][0], end, ranges)
+        else:
+            runs.append((start, end, ranges))
+    return AttentionBlocks(tuple(runs))
+
+
+def _attention_by_key_ranges(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, blocks: AttentionBlocks
+) -> torch.Tensor:
+    """The attention of ``blocks`` as one unmasked SDPA per distinct key ranges (LeRobot addition).
+
+    The cross mask's runs alternate between the chunks, so the rows that read the same keys are gathered
+    into one SDPA. Masked keys add nothing to the softmax: this is the masked attention in another
+    reduction order.
+    """
+    groups: dict[KeyRanges, list[tuple[int, int]]] = {}
+    for start, end, ranges in blocks.runs:
+        groups.setdefault(ranges, []).append((start, end))
+    pieces: dict[int, torch.Tensor] = {}
+    for ranges, rows in groups.items():
+        out = F.scaled_dot_product_attention(
+            torch.cat([q[:, :, start:end] for start, end in rows], dim=2),
+            _key_slices(k, ranges),
+            _key_slices(v, ranges),
+        )
+        sizes = [end - start for start, end in rows]
+        for (start, _), piece in zip(rows, out.split(sizes, dim=2), strict=True):
+            pieces[start] = piece
+    return torch.cat([pieces[start] for start in sorted(pieces)], dim=2)
+
+
 def _block_mask_from_mod(
     mod: MaskMod, q_len: int, kv_len: int, device: torch.device, block: int = 128
 ) -> BlockMask:
@@ -520,7 +612,7 @@ class ActionExpertBlock(nn.Module):
         cond: torch.Tensor,
         *,
         kv_source: torch.Tensor | None,
-        mask: torch.Tensor | BlockMask,
+        mask: torch.Tensor | BlockMask | AttentionBlocks,
         q_table: torch.Tensor,
         k_table: torch.Tensor,
         kernel_options: Mapping[str, int] | None = None,
@@ -546,7 +638,7 @@ class ActionExpertBlock(nn.Module):
         cond: torch.Tensor,
         *,
         kv_source: torch.Tensor | None,
-        mask: torch.Tensor | BlockMask,
+        mask: torch.Tensor | BlockMask | AttentionBlocks,
         q_table: torch.Tensor,
         k_table: torch.Tensor,
         kernel_options: Mapping[str, int] | None = None,
@@ -556,7 +648,8 @@ class ActionExpertBlock(nn.Module):
         ``q_table`` and ``k_table`` are trunk rotary tables ``(B, N, D/2, 2)``.
         The rotation runs BEFORE the q/k RMS norm. ``mask`` is a flex
         ``BlockMask`` (compiled dynamic flex attention with
-        ``kernel_options``) or a dense ``(Q, KV)`` bool mask (SDPA).
+        ``kernel_options``), a dense ``(Q, KV)`` bool mask (SDPA) or the mask's ``AttentionBlocks``
+        (unmasked SDPAs over the attended keys, see ``_attention_by_key_ranges``).
         """
         b, q_len, _ = x.shape
         h = self.adaln_attn(x, cond)
@@ -589,6 +682,8 @@ class ActionExpertBlock(nn.Module):
                 ),
             )
             assert isinstance(attn, torch.Tensor)
+        elif isinstance(mask, AttentionBlocks):
+            attn = _attention_by_key_ranges(qh, kh, vh, mask)
         else:
             attn = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask[None, None])
         x = x + self.to_out(attn.transpose(1, 2).reshape(b, q_len, -1))
@@ -822,6 +917,21 @@ class ActionExpert(nn.Module):
             include_noised=not self.clean_only_conditioning,
             block=self.attention == "flex_dynamic",
         )
+        if self.attention == "sdpa" and flex_attention_mode() == "split":
+            # TensorRT runs its fused attention slower with a dense mask than without one.
+            blocks = trunk_cross_attention_blocks(
+                num_action_tokens=t_lat,
+                num_future_per_chunk=self.num_future_per_chunk,
+                chunk_size=chunk_size,
+                num_clean_frames=num_clean_frames,
+                num_noised_frames=num_noised_frames,
+                tokens_per_frame=tokens_per_frame,
+                window_size=window_size,
+                num_global_tokens=num_global,
+                include_noised=not self.clean_only_conditioning,
+            )
+            if blocks is not None:
+                cross_mask = blocks
 
         kv_ids = kv_rope_ids.to(device).long()
         expected_kv = num_global + (num_clean_frames + num_noised_frames) * (tokens_per_frame)
