@@ -31,6 +31,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import draccus
 import numpy as np
 import pytest
 import torch
@@ -210,14 +211,69 @@ def test_export_passes_the_weights_as_inputs_from_the_bundles_constants(checkpoi
     assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
 
 
+def test_a_part_without_parameters_takes_no_weights_as_inputs(checkpoint, tmp_path, monkeypatch):
+    """A part whose module registers no parameters, such as a step that only moves tensors, exports as it is."""
+    load = ExportRecipe.load.__func__
+
+    class Unregistered(torch.nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.wrapped = (module,)
+
+        def forward(self, *inputs):
+            return self.wrapped[0](*inputs)
+
+    def load_without_parameters(cls, cfg):
+        recipe = load(cls, cfg)
+        parts = recipe.parts
+        recipe.parts = lambda: (replace(part, module=Unregistered(part.module)) for part in parts())
+        return recipe
+
+    monkeypatch.setattr(ExportRecipe, "load", classmethod(load_without_parameters))
+    run_export_in_this_process(
+        monkeypatch,
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--weights_as_inputs=true",
+    )
+    (run,) = Bundle.read(tmp_path / "b").manifest.runs
+    assert not any(name.startswith(f"{run.program}.") for name in run.inputs)
+
+
 def test_a_part_taking_its_weights_as_inputs_is_checked_with_them():
     linear = torch.nn.Linear(3, 2)
     x = torch.randn(4, 3)
     check = ProgramCheck.measure(linear, (x,), with_float32=False)
     part, weights = worker._weights_as_inputs(Part("model", linear, (x,), ["x"], ["y"], check), "cpu")
     assert part.inputs == ["x", "model.weight", "model.bias"] and list(weights) == part.inputs[1:]
-    assert torch.equal(part.module(*part.check.inputs), linear(x))
+    assert part.check is check
+    assert torch.equal(part.module(*part.check.inputs, *weights.values()), linear(x))
     assert torch.equal(part.module(*part.example_inputs), linear(x))
+
+
+def test_the_check_step_reads_a_parts_weights_from_the_bundles_constants(tmp_path, monkeypatch):
+    from lerobot.export.recipe import write_safetensors
+
+    x, weight = torch.randn(2, 3), torch.randn(4, 3, dtype=torch.bfloat16)
+    ProgramCheck((x,), (torch.zeros(2, 4),), [(1.0, 1.0)]).save(tmp_path / "model.check.safetensors")
+    write_safetensors(tmp_path / "constants.safetensors", {"model.weight": weight.view(torch.uint16)})
+    given = []
+    monkeypatch.setattr(
+        TorchTestBackend, "run", lambda self, path, data, inputs: given.append(inputs) or (torch.zeros(2, 4),)
+    )
+    worker.check_step(
+        {
+            "plugins": [],
+            "backend": {"type": "torch_test", **draccus.encode(TorchTestBackend())},
+            "path": str(tmp_path / "model.pt2"),
+            "check": str(tmp_path / "model.check.safetensors"),
+            "data": None,
+            "weights": [["model.weight", "bfloat16"]],
+            "constants": str(tmp_path / "constants.safetensors"),
+        }
+    )
+    ((given_x, given_weight),) = given
+    assert torch.equal(given_x, x) and torch.equal(given_weight, weight)
 
 
 def test_a_traced_program_is_saved_without_its_weights_values():

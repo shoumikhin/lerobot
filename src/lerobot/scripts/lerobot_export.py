@@ -121,6 +121,9 @@ def export(args: Sequence[str]) -> Path:
                         "plugins": plugins,
                         "log_level": traced["log_level"],
                     }
+                    if weights := traced["weights"].get(name):
+                        check["weights"] = weights
+                        check["constants"] = str(folder / traced["manifest"]["constants"])
                     with _step(f"[{step}/{steps}] Checking the compiled {name} on its own inputs"):
                         _run_step(work, f"check-{name}", check)
             shutil.rmtree(traced["traced"])

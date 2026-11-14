@@ -37,6 +37,7 @@ from typing import Any, cast
 
 import draccus
 import torch
+from safetensors import safe_open
 from torch import Tensor, nn
 
 from lerobot.bundle.manifest import (
@@ -156,12 +157,18 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         operator_modules: dict[str, list[str]] = {}
         weights: dict[str, Tensor] = {}
         weight_inputs: dict[str, list[str]] = {}
+        weight_dtypes: dict[str, list[list[str]]] = {}
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
             if cfg.weights_as_inputs:
                 part, part_weights = _weights_as_inputs(part, cfg.backend.device)
                 weights.update(part_weights)
                 weight_inputs[part.name] = list(part_weights)
+                first = len(part.example_inputs) - len(part_weights)
+                weight_dtypes[part.name] = [
+                    [name, str(weight.dtype).removeprefix("torch.")]
+                    for name, weight in zip(part_weights, part.example_inputs[first:], strict=True)
+                ]
             # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
             # default, and its Dynamo cannot run some policies' Python, such as ACT's.
             with torch.no_grad(), _quantized(cfg, part):
@@ -248,6 +255,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         "manifest": manifest.to_dict(),
         "traced": str(traced),
         "checks": checks,
+        "weights": weight_dtypes,
         "compile_options": compile_options,
         "operator_modules": operator_modules,
         "quantize": cfg.quantize,
@@ -286,15 +294,13 @@ def _weights_as_inputs(part: Part, device: str) -> tuple[Part, dict[str, Tensor]
         )
     names = [f"{part.name}.{name}" for name in parameters]
     values = tuple(parameters.values())
-    check = part.check
-    if check is not None:
-        check = ProgramCheck((*check.inputs, *values), check.outputs, check.floor)
+    # The check keeps the part's other inputs: its step reads the weights from the bundle's constants, so they are
+    # not on the disk twice.
     part = replace(
         part,
         module=_WeightsAsInputs(part.module, list(parameters)),
         example_inputs=(*part.example_inputs, *values),
         inputs=[*part.inputs, *names],
-        check=check,
     )
     return part, {name: _stored(value) for name, value in zip(names, values, strict=True)}
 
@@ -404,7 +410,13 @@ def check_step(request: dict[str, Any]) -> dict[str, Any]:
     path = Path(request["path"])
     check = ProgramCheck.load(Path(request["check"]), backend.device)
     data = None if request["data"] is None else Path(request["data"])
-    outputs = backend.run(path, data, check.inputs)
+    weights = []
+    if request.get("weights"):
+        # A part that takes its weights as inputs reads them from the bundle's constants, as the bundle stores them.
+        with safe_open(request["constants"], framework="pt", device=backend.device) as file:
+            for name, dtype in request["weights"]:
+                weights.append(file.get_tensor(name).view(getattr(torch, dtype)))
+    outputs = backend.run(path, data, (*check.inputs, *weights))
     if failures := check.failures(path.stem, outputs):
         raise RuntimeError(
             f"The compiled {path.stem} program computes something else than PyTorch on its own inputs, by more "
