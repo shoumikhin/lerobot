@@ -740,6 +740,36 @@ def test_float8_experts_outside_tensorrt_need_a_hopper_gpu(monkeypatch):
         PraxisExportRecipe.load(cfg)
 
 
+def test_the_float8_grouped_gemm_plugin_takes_the_deepest_pipeline_that_fits(monkeypatch):
+    """With tcgen05 (sm_100, sm_110) 3 stages need more shared memory than TensorRT gives a plugin kernel, and the
+    kernel takes the tiles measured fastest there."""
+    pytest.importorskip("triton")
+    from lerobot.policies.praxis import export_float8_grouped_mm
+
+    stages, tiles = [], []
+
+    def triton_op(name, kernel, signature, constexprs, *, num_stages, **kwargs):
+        stages.append(num_stages)
+        tiles.append((constexprs["BLOCK_M"], constexprs["BLOCK_N"], constexprs["BLOCK_K"]))
+        if num_stages > 2:
+            raise ValueError("triton_op needs 49168 bytes of dynamic shared memory")
+
+    def unsupported(*args, **kwargs):
+        raise RuntimeError("Triton kernel requires unsupported launch feature(s): tmem_size=128")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (11, 0))
+    monkeypatch.setattr(export_float8_grouped_mm, "_triton_op", lambda: triton_op)
+    assert export_float8_grouped_mm._register() is not None
+    assert stages == [3, 2] and set(tiles) == {export_float8_grouped_mm.TCGEN05_TILES}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (12, 1))
+    tiles.clear()
+    assert export_float8_grouped_mm._register() is not None
+    assert set(tiles) == {export_float8_grouped_mm.TILES}
+    monkeypatch.setattr(export_float8_grouped_mm, "_triton_op", lambda: unsupported)
+    assert export_float8_grouped_mm._register() is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
 def test_the_float8_grouped_gemm_plugin_multiplies_as_pytorch_does_inside_tensorrt():
     torch_tensorrt = _need_triton_op()

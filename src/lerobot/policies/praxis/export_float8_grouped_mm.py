@@ -18,7 +18,8 @@ With `--quantize=fp8` each routed expert multiplies float8 rows, with a float32 
 weights, with a float32 scale per output column (`praxis_core.layers._float8_grouped_mm`). PyTorch's
 `torch._scaled_grouped_mm` runs only on sm_90 and sm_100, and TensorRT has no layer for it on other GPUs. The
 plugin is one Triton kernel that multiplies each row by its own expert's weights on float8 tensor cores
-(`mma.sync` on sm_89, sm_120 and sm_121, `wgmma` on sm_90) and applies both scales to the float32 sums. Its
+(`mma.sync` on sm_89, sm_120 and sm_121, `wgmma` on sm_90, and `tcgen05` on sm_100 and sm_110 where
+Torch-TensorRT lets a plugin kernel use tensor memory) and applies both scales to the float32 sums. Its
 results differ from the operator's PyTorch side (`_float8_grouped_mm_pytorch`) only in the order of those sums.
 
 Importing this module registers the operator `lerobot_praxis::float8_grouped_mm` if CUDA is available and the
@@ -39,9 +40,14 @@ from .praxis_core import layers as praxis_layers
 
 logger = logging.getLogger(__name__)
 
-# 128 x 128 x 64 tiles with 3 pipeline stages need at most the 48 KiB of shared memory that TensorRT gives a
-# plugin kernel. Float8 tensor cores take 32 values of K per step, so a 64 deep tile keeps them busy.
-BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 128, 128, 64, 3
+# (BLOCK_M, BLOCK_N, BLOCK_K). Float8 tensor cores take 32 values of K per step, so a 64 deep tile keeps them busy.
+# TensorRT gives a plugin kernel 48 KiB of shared memory, and the kernel gets the deepest pipeline that fits it:
+# 3 stages of the mma.sync tiles (32 KiB), 2 of the tcgen05 ones (40 KiB; 3 would need 60 KiB).
+TILES = (128, 128, 64)
+# tcgen05 (sm_100, sm_110): the fastest tile within 48 KiB on Jetson Thor at Praxis-1's shapes, 4% faster than
+# 128 x 128 x 64, which there fits only 2 stages too.
+TCGEN05_TILES = (64, 256, 64)
+NUM_STAGES = (3, 2)
 # The most experts the kernel finds a row tile's expert among, a power of two.
 MAX_EXPERTS = 128
 # The kernel reads 16 float8 values at a time along K and writes rows of N bfloat16 values.
@@ -66,6 +72,9 @@ def _register() -> praxis_layers.Float8GroupedMM | None:
     triton_op = _triton_op()
     if triton_op is None or not torch.cuda.is_available():
         return None
+    block_m, block_n, block_k = (
+        TCGEN05_TILES if (10, 0) <= torch.cuda.get_device_capability() < (12, 0) else TILES
+    )
     import triton
     import triton.language as tl
 
@@ -141,43 +150,18 @@ def _register() -> praxis_layers.Float8GroupedMM | None:
             mask=row_mask[:, None] & col_mask[None, :],
         )
 
-    try:
-        triton_op(
-            "lerobot_praxis::float8_grouped_mm",
-            float8_grouped_mm_kernel,
-            {
-                "rows": "*fp8e4nv",
-                "rows_scale": "*fp32",
-                "bank": "*fp8e4nv",
-                "bank_scale": "*fp32",
-                "offsets": "*i32",
-                "M": "i32",
-                "N": "i32",
-                "K": "i32",
-                "EXPERTS": "i32",
-                "out": "*bf16",
-            },
-            {"MAX_EXPERTS": MAX_EXPERTS, "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K},
-            # Each expert and the rows past the last offset can end in a partial row tile.
-            grid=lambda inputs, outputs: (
-                ((inputs[0].shape_expr[0] + BLOCK_M - 1) // BLOCK_M + inputs[2].shape_expr[0])
-                * ((inputs[2].shape_expr[1] + BLOCK_N - 1) // BLOCK_N),
-            ),
-            meta_fn=_float8_grouped_mm_meta,
-            extra_args_fn=lambda inputs, outputs: [
-                inputs[0].shape_expr[0],
-                inputs[2].shape_expr[1],
-                inputs[2].shape_expr[2],
-                inputs[2].shape_expr[0],
-            ],
-            eager_fn=_float8_grouped_mm_eager,
-            num_warps=4,
-            num_stages=NUM_STAGES,
-        )
-    except RuntimeError as error:
-        # Such as a GPU whose float8 tensor cores a plugin kernel cannot drive (sm_100 and later need tensor memory).
-        logger.warning("The float8 grouped GEMM plugin does not build for this GPU: %s", error)
-        return None
+    signature = {
+        "rows": "*fp8e4nv",
+        "rows_scale": "*fp32",
+        "bank": "*fp8e4nv",
+        "bank_scale": "*fp32",
+        "offsets": "*i32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "EXPERTS": "i32",
+        "out": "*bf16",
+    }
 
     def float8_grouped_mm(
         rows: Tensor, rows_scale: Tensor, bank: Tensor, bank_scale: Tensor, offsets: Tensor
@@ -190,7 +174,41 @@ def _register() -> praxis_layers.Float8GroupedMM | None:
             )
         return torch.ops.lerobot_praxis.float8_grouped_mm(rows, rows_scale, bank, bank_scale, offsets)
 
-    return float8_grouped_mm
+    for num_stages in NUM_STAGES:
+        try:
+            triton_op(
+                "lerobot_praxis::float8_grouped_mm",
+                float8_grouped_mm_kernel,
+                signature,
+                {"MAX_EXPERTS": MAX_EXPERTS, "BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k},
+                # Each expert and the rows past the last offset can end in a partial row tile.
+                grid=lambda inputs, outputs: (
+                    ((inputs[0].shape_expr[0] + block_m - 1) // block_m + inputs[2].shape_expr[0])
+                    * ((inputs[2].shape_expr[1] + block_n - 1) // block_n),
+                ),
+                meta_fn=_float8_grouped_mm_meta,
+                extra_args_fn=lambda inputs, outputs: [
+                    inputs[0].shape_expr[0],
+                    inputs[2].shape_expr[1],
+                    inputs[2].shape_expr[2],
+                    inputs[2].shape_expr[0],
+                ],
+                eager_fn=_float8_grouped_mm_eager,
+                num_warps=4,
+                num_stages=num_stages,
+            )
+        except ValueError as error:
+            # More shared memory than TensorRT launches a plugin kernel with. Torch-TensorRT checks it before it
+            # registers anything, so a shallower pipeline can still register the operator.
+            failure: Exception = error
+        except RuntimeError as error:
+            # Such as a launch feature the TensorRT plugin path cannot reproduce on this GPU.
+            failure = error
+            break
+        else:
+            return float8_grouped_mm
+    logger.warning("The float8 grouped GEMM plugin does not build for this GPU: %s", failure)
+    return None
 
 
 FLOAT8_GROUPED_MM = _register()
