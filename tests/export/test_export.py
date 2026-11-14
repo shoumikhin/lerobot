@@ -39,13 +39,14 @@ from safetensors.numpy import load_file, save_file
 
 from lerobot.bundle.engine import BundleEngine
 from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, Bundle, ProgramRun
-from lerobot.configs import parser
+from lerobot.configs import PreTrainedConfig, parser
 from lerobot.export import worker
 from lerobot.export.configs import ExportBackendConfig, ExportConfig
 from lerobot.export.recipe import ExportRecipe, Part, ProgramCheck
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.factory import get_export_recipe_class
 from lerobot.scripts import lerobot_export
 from lerobot.scripts.lerobot_export import export
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
@@ -416,8 +417,29 @@ def test_export_refuses_a_command_line_before_it_traces(
 
 def test_export_refuses_a_quantization_its_backend_does_not_offer(checkpoint, tmp_path, capfd):
     with pytest.raises(RuntimeError, match="trace step failed"):
-        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--quantize=fp8")
+        run_export(
+            f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--quantize=fp8", "--tolerance=1"
+        )
     assert "The torch_test backend cannot --quantize=fp8. It offers: none." in capfd.readouterr().err
+
+
+def test_export_takes_a_quantization_that_the_recipe_applies_itself(checkpoint, tmp_path, monkeypatch):
+    """A recipe can quantize its own modules in a mode its backend does not offer, on kernels of its own."""
+
+    @parser.wrap()
+    def parse(cfg: ExportConfig) -> ExportConfig:
+        return cfg
+
+    argv = ["lerobot-export", "--backend.type=torch_test", f"--policy.path={checkpoint}"]
+    monkeypatch.setattr(
+        sys, "argv", [*argv, f"--output_dir={tmp_path / 'b'}", "--quantize=int4", "--tolerance=1"]
+    )
+    with pytest.raises(Exception) as refusal:
+        parse()
+    assert "cannot --quantize=int4. It offers: none." in str(refusal.value.__cause__ or refusal.value)
+    recipe = get_export_recipe_class(PreTrainedConfig.from_pretrained(checkpoint))
+    monkeypatch.setattr(recipe, "quantizations", ("int4",))
+    assert parse().quantize == "int4"
 
 
 def test_export_refuses_a_quantization_without_a_tolerance(tmp_path, monkeypatch):

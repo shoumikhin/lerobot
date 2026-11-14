@@ -192,7 +192,8 @@ class ExportConfig:
     max_task_tokens: int | None = None
     # Seeds the random test case.
     seed: int = 1000
-    # Compute in fewer bits, with a mode the backend offers, such as `fp8` with `executorch_tensorrt`.
+    # Compute in fewer bits, with a mode the backend offers, such as `fp8` with `executorch_tensorrt`, or one the
+    # policy's export recipe applies itself, such as Praxis-1's `nvfp4`.
     # The bundle is still checked against the unquantized policy, so `tolerance` must then be given.
     quantize: str | None = None
     # Pass each program its weights as inputs, which the bundle uploads once where its programs read them, rather
@@ -207,11 +208,6 @@ class ExportConfig:
     def __post_init__(self) -> None:
         """Check the PyTorch version, load the policy config from `--policy.path` and pick the bundle folder."""
         self.backend.check_torch()
-        if self.quantize is not None and self.quantize not in self.backend.quantizations:
-            offered = ", ".join(self.backend.quantizations) or "none"
-            raise ValueError(
-                f"The {self.backend.type} backend cannot --quantize={self.quantize}. It offers: {offered}."
-            )
         if self.quantize is not None and self.tolerance is None:
             raise ValueError(
                 "--quantize needs --tolerance: the bundle is checked against the unquantized policy, and "
@@ -229,6 +225,16 @@ class ExportConfig:
             )
         if self.policy is None or self.policy.pretrained_path is None:
             raise ValueError("--policy.path is required: the trained policy to export.")
+        if self.quantize is not None:
+            from lerobot.policies.factory import get_export_recipe_class
+
+            # A policy's export recipe can apply a mode itself, on kernels of its own, that its backend does not.
+            offered = (*self.backend.quantizations, *get_export_recipe_class(self.policy).quantizations)
+            if self.quantize not in offered:
+                raise ValueError(
+                    f"The {self.backend.type} backend cannot --quantize={self.quantize}. It offers: "
+                    f"{', '.join(offered) or 'none'}."
+                )
         if self.max_task_tokens is not None and self.max_task_tokens < 1:
             raise ValueError(f"--max_task_tokens must be at least 1, not {self.max_task_tokens}.")
         if self.tolerance is not None and not (math.isfinite(self.tolerance) and self.tolerance >= 0):
