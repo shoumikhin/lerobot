@@ -153,6 +153,12 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         weights: dict[str, Tensor] = {}
         weight_inputs: dict[str, list[str]] = {}
         weight_dtypes: dict[str, list[list[str]]] = {}
+        if cfg.weights_as_inputs and cfg.quantize is not None and cfg.quantize not in recipe.quantizations:
+            raise ValueError(
+                f"--weights_as_inputs cannot be combined with --quantize={cfg.quantize} for the "
+                f"{cast(PreTrainedConfig, cfg.policy).type} policy: the backend quantizes a part into modules that "
+                "keep their weights to themselves."
+            )
         for part in recipe.parts():
             logger.info("Tracing %s", part.name)
             if cfg.weights_as_inputs:
@@ -275,18 +281,24 @@ class _WeightsAsInputs(nn.Module):
 
 
 def _weights_as_inputs(part: Part, device: str) -> tuple[Part, dict[str, Tensor]]:
-    """`part` taking its parameters as inputs, and their values as the bundle stores them, named as those inputs.
+    """`part` taking its weights as inputs, and their values as the bundle stores them, named as those inputs.
 
-    Refuses bfloat16 weights for a backend that runs off CUDA: a bundle stores them as their bits, which only a CUDA
-    runtime uploads as bfloat16.
+    The weights are the parameters and the persistent buffers, such as the float8 banks and scales a recipe quantizes
+    its parameters into. Refuses weights of a dtype NumPy lacks, such as bfloat16, for a backend that runs off CUDA: a
+    bundle stores them as their bits, which only a CUDA runtime uploads in their dtype.
     """
-    parameters = {name: weight.detach() for name, weight in part.module.named_parameters()}
+    persistent = part.module.state_dict(keep_vars=True).keys()
+    parameters = {
+        name: weight.detach()
+        for name, weight in (*part.module.named_parameters(), *part.module.named_buffers())
+        if name in persistent
+    }
     if not parameters:
         return part, {}
-    if device != "cuda" and any(weight.dtype == torch.bfloat16 for weight in parameters.values()):
+    if device != "cuda" and any(weight.dtype in _BITS for weight in parameters.values()):
         raise ValueError(
-            f"The part {part.name} has bfloat16 weights, which only a bundle on CUDA can take as inputs. Export it "
-            "without --weights_as_inputs."
+            f"The part {part.name} has weights of a dtype NumPy lacks, such as bfloat16, which only a bundle on CUDA "
+            "can take as inputs. Export it without --weights_as_inputs."
         )
     names = [f"{part.name}.{name}" for name in parameters]
     values = tuple(parameters.values())
@@ -301,13 +313,18 @@ def _weights_as_inputs(part: Part, device: str) -> tuple[Part, dict[str, Tensor]
     return part, {name: _stored(value) for name, value in zip(names, values, strict=True)}
 
 
-def _stored(value: Tensor) -> Tensor:
-    """`value` as a bundle stores it, a bfloat16 value as its bits.
+# The dtypes NumPy, which reads the bundle, lacks, and the unsigned integers of their width that a bundle keeps their
+# bits in. A bundle's runtime uploads the bits in the dtype of the input that reads them.
+_BITS = {
+    torch.bfloat16: torch.uint16,
+    torch.float8_e4m3fn: torch.uint8,
+    torch.float8_e5m2: torch.uint8,
+}
 
-    NumPy, which reads the bundle, has no bfloat16. A bundle's runtime uploads the bits as bfloat16 to an input of
-    that dtype.
-    """
-    return value.view(torch.uint16) if value.dtype == torch.bfloat16 else value
+
+def _stored(value: Tensor) -> Tensor:
+    """`value` as a bundle stores it, a value of a dtype NumPy lacks as its bits."""
+    return value.view(_BITS[value.dtype]) if value.dtype in _BITS else value
 
 
 def _without_weight_values(

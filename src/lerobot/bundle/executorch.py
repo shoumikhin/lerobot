@@ -74,6 +74,10 @@ def _runtime_module() -> ModuleType:
     return importlib.import_module("executorch.runtime")
 
 
+# The dtypes NumPy lacks, whose values a bundle keeps as their bits.
+_BIT_DTYPES = ("bfloat16", "float8_e4m3fn", "float8_e5m2")
+
+
 class ExecuTorchProgram:
     """The `forward` method of a `.pte` program.
 
@@ -127,13 +131,13 @@ class ExecuTorchProgram:
         if device == "cpu":
             return value
         index = int(device.removeprefix("cuda:"))
-        if dtype == "bfloat16" and value.dtype == np.uint16:
-            # NumPy has no bfloat16, so a bundle keeps a bfloat16 value, such as a weight, as its bits.
+        if dtype in _BIT_DTYPES and value.dtype.kind == "u":
+            # NumPy has no bfloat16 or float8, so a bundle keeps a value of such a dtype, such as a weight, as its bits.
             try:
                 return self._from_host(value, index, dtype=dtype)
             except TypeError as error:
                 raise RuntimeError(
-                    "This bundle passes bfloat16 values as their bits, which needs an ExecuTorch whose "
+                    f"This bundle passes {dtype} values as their bits, which needs an ExecuTorch whose "
                     f"ExecuTorchResult.from_host takes a dtype ({error}). Upgrade ExecuTorch, or export the policy "
                     "again without --weights_as_inputs."
                 ) from error

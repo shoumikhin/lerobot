@@ -197,7 +197,8 @@ class ExportConfig:
     quantize: str | None = None
     # Pass each program its weights as inputs, which the bundle uploads once where its programs read them, rather
     # than build them into the program. The compiler then builds a program without a copy of its weights, which
-    # lowers the memory the export needs. Not with `quantize`.
+    # lowers the memory the export needs. Not with a `quantize` mode of the backend, which keeps the weights in
+    # modules of its own.
     weights_as_inputs: bool = False
     # INFO logs each step of the export and how long it took; DEBUG adds the logs of torch.export, ExecuTorch and
     # the backend's compiler.
@@ -210,11 +211,6 @@ class ExportConfig:
             offered = ", ".join(self.backend.quantizations) or "none"
             raise ValueError(
                 f"The {self.backend.type} backend cannot --quantize={self.quantize}. It offers: {offered}."
-            )
-        if self.quantize is not None and self.weights_as_inputs:
-            raise ValueError(
-                "--weights_as_inputs cannot be combined with --quantize: a quantized part keeps its weights in "
-                "modules of its own."
             )
         if self.quantize is not None and self.tolerance is None:
             raise ValueError(

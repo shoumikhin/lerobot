@@ -205,7 +205,10 @@ def test_export_passes_the_weights_as_inputs_from_the_bundles_constants(checkpoi
     weights = [name for name in run.inputs if name in constants]
     assert weights and all(name.startswith(f"{run.program}.") for name in weights)
     policy = ACTPolicy.from_pretrained(checkpoint)
-    assert sum(constants[name].size for name in weights) == sum(p.numel() for p in policy.parameters())
+    # The weights are the parameters and the persistent buffers, such as ACT's positional embedding.
+    assert sum(constants[name].size for name in weights) == sum(
+        t.numel() for t in policy.state_dict().values()
+    )
     program = torch.export.load(bundle.path / bundle.manifest.programs[run.program].file)
     assert not program.graph_signature.parameters
     assert_plays_like_pytorch(checkpoint, bundle, IMAGE)
@@ -291,15 +294,44 @@ def test_bfloat16_weights_are_refused_as_inputs_off_cuda():
         worker._weights_as_inputs(part, "cpu")
 
 
-def test_export_refuses_weights_as_inputs_with_a_quantization(tmp_path, monkeypatch):
+def test_a_float8_bank_and_its_scale_are_weights_too():
+    """A recipe that quantizes its parameters keeps them in buffers, such as a float8 bank and its scale."""
+
+    class Bank(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("bank", torch.randn(3, 2).to(torch.float8_e4m3fn))
+            self.register_buffer("scale", torch.rand(2))
+            self.register_buffer("cache", torch.ones(2), persistent=False)
+
+        def forward(self, x):
+            return x @ self.bank.float() * self.scale * self.cache
+
+    bank, x = Bank(), torch.randn(4, 3)
+    part, weights = worker._weights_as_inputs(Part("model", bank, (x,), ["x"], ["y"]), "cuda")
+    assert part.inputs == ["x", "model.bank", "model.scale"]
+    assert weights["model.bank"].dtype == torch.uint8
+    assert torch.equal(weights["model.bank"].view(torch.float8_e4m3fn).float(), bank.bank.float())
+    assert torch.equal(part.module(*part.example_inputs), bank(x))
+
+
+def test_float8_weights_are_refused_as_inputs_off_cuda():
+    linear = torch.nn.Linear(3, 2)
+    linear.register_buffer("bank", torch.zeros(2).to(torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="only a bundle on CUDA"):
+        worker._weights_as_inputs(Part("model", linear, (torch.randn(4, 3),), ["x"], ["y"]), "cpu")
+
+
+def test_export_refuses_weights_as_inputs_with_a_backends_quantization(checkpoint, tmp_path, monkeypatch):
     monkeypatch.setattr(TorchTestBackend, "quantizations", ("fp8",))
-    with pytest.raises(ValueError, match="--weights_as_inputs cannot be combined with --quantize"):
-        ExportConfig(
-            TorchTestBackend(),
-            output_dir=tmp_path / "b",
-            quantize="fp8",
-            tolerance=1.0,
-            weights_as_inputs=True,
+    with pytest.raises(ValueError, match="--weights_as_inputs cannot be combined with --quantize=fp8"):
+        run_export_in_this_process(
+            monkeypatch,
+            f"--policy.path={checkpoint}",
+            f"--output_dir={tmp_path / 'b'}",
+            "--quantize=fp8",
+            "--tolerance=1",
+            "--weights_as_inputs=true",
         )
 
 

@@ -85,15 +85,28 @@ def test_a_scalar_input_keeps_its_rank(tmp_path):
     assert double.to_numpy(double(np.array(3.0, np.float32))[0]).tolist() == 6.0
 
 
-def test_a_bfloat16_input_given_as_bits_is_uploaded_as_bfloat16():
-    """NumPy has no bfloat16, so a bundle keeps a bfloat16 constant, such as a weight, as its bits."""
+def test_an_input_given_as_bits_is_uploaded_in_its_own_dtype():
+    """NumPy has no bfloat16 or float8, so a bundle keeps such a constant, such as a weight, as its bits."""
     calls = []
     program = executorch.ExecuTorchProgram.__new__(executorch.ExecuTorchProgram)
     program._from_host = lambda value, index, **dtype: calls.append((value.dtype, index, dtype))
-    program._devices, program._dtypes = ["cuda:1", "cuda:1"], ["bfloat16", "float32"]
+    program._dtypes = ["bfloat16", "float32", "float8_e4m3fn", "uint8", "bool", "float8_e5m2"]
+    program._devices = ["cuda:1"] * 6
     program.place(0, np.zeros(2, np.uint16))
     program.place(1, np.zeros(2, np.float32))
-    assert calls == [(np.uint16, 1, {"dtype": "bfloat16"}), (np.float32, 1, {})]
+    program.place(2, np.zeros(2, np.uint8))
+    program.place(3, np.zeros(2, np.uint8))
+    # Unsigned, under another name, yet not the bits of a dtype NumPy lacks.
+    program.place(4, np.zeros(2, np.uint8))
+    program.place(5, np.zeros(2, np.uint8))
+    assert calls == [
+        (np.uint16, 1, {"dtype": "bfloat16"}),
+        (np.float32, 1, {}),
+        (np.uint8, 1, {"dtype": "float8_e4m3fn"}),
+        (np.uint8, 1, {}),
+        (np.uint8, 1, {}),
+        (np.uint8, 1, {"dtype": "float8_e5m2"}),
+    ]
 
 
 def test_bfloat16_bits_need_an_executorch_whose_from_host_takes_a_dtype():
