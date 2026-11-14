@@ -116,6 +116,8 @@ GROUPED_MM_KERNEL = "grouped_mm_kernel"
 TOP_K_SUM_MODULE = "lerobot.policies.praxis.export_top_k_sum"
 # The module that registers the TensorRT plugin of their row gather.
 TAKE_ROWS_MODULE = "lerobot.policies.praxis.export_take_rows"
+# The module that registers the TensorRT plugin of their row gather, gate and up products and SwiGLU in one kernel.
+EXPERT_GATE_UP_MODULE = "lerobot.policies.praxis.export_expert_gate_up"
 # The module that registers the TensorRT plugins of the autoencoder's norm steps and patch averages.
 AUTOENCODER_KERNELS_MODULE = "lerobot.policies.praxis.export_autoencoder_kernels"
 
@@ -569,6 +571,14 @@ def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     return export_take_rows.TAKE_ROWS
 
 
+def _expert_gate_up_plugin() -> praxis_layers.ExpertGateUp | None:
+    """The mixture-of-experts row gather, gate and up products and SwiGLU as one TensorRT plugin
+    (`export_expert_gate_up`), if there is one."""
+    from . import export_expert_gate_up
+
+    return export_expert_gate_up.EXPERT_GATE_UP
+
+
 def _autoencoder_kernel_plugins() -> praxis_vae.AutoencoderKernels | None:
     """The autoencoder's norm steps and patch averages as TensorRT plugins (`export_autoencoder_kernels`), if there
     are such."""
@@ -778,7 +788,11 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 # Torch-TensorRT runs the grouped matrix multiplies of mixture-of-experts layers only with this
                 # setting. Without it each such layer stays in PyTorch and splits the program around it.
                 options = {GROUPED_MM_KERNEL: True} if tensorrt and name in MOE_PARTS else {}
-                plugins = (TOP_K_SUM_MODULE, self._top_k_sum()), (TAKE_ROWS_MODULE, self._take_rows())
+                plugins = (
+                    (TOP_K_SUM_MODULE, self._top_k_sum()),
+                    (TAKE_ROWS_MODULE, self._take_rows()),
+                    (EXPERT_GATE_UP_MODULE, self._expert_gate_up()),
+                )
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 if self._autoencoder_kernels() and name == "encode":
                     operators = (*operators, AUTOENCODER_KERNELS_MODULE)
@@ -807,6 +821,11 @@ class PraxisExportRecipe(ActionChunkRecipe):
         tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
         return _take_rows_plugin() if tensorrt and self.policy.model.dtype == torch.bfloat16 else None
 
+    def _expert_gate_up(self) -> praxis_layers.ExpertGateUp | None:
+        """The TensorRT plugin of the row gather, gate and up products and SwiGLU, for TensorRT in bfloat16."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        return _expert_gate_up_plugin() if tensorrt and self.policy.model.dtype == torch.bfloat16 else None
+
     def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
         """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
         if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
@@ -830,6 +849,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_custom_kernels(False)
         praxis_layers.set_top_k_sum(self._top_k_sum())
         praxis_layers.set_take_rows(self._take_rows())
+        praxis_layers.set_expert_gate_up(self._expert_gate_up())
         praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
@@ -837,6 +857,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             praxis_layers.set_custom_kernels(kernels)
             praxis_layers.set_top_k_sum(None)
             praxis_layers.set_take_rows(None)
+            praxis_layers.set_expert_gate_up(None)
             praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)

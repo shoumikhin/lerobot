@@ -758,6 +758,23 @@ def set_take_rows(fn: TakeRows | None) -> None:
     _TAKE_ROWS = fn
 
 
+ExpertGateUp = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
+_EXPERT_GATE_UP: ExpertGateUp | None = None
+
+
+def set_expert_gate_up(fn: ExpertGateUp | None) -> None:
+    """Gather, multiply by the gate and up weights and apply SwiGLU in the chunked expert dispatch with ``fn``
+    (LeRobot addition).
+
+    ``fn(x, index, gate_up_w, offsets)`` returns ``silu(gate) * up`` of ``torch._grouped_mm(x[index], gate_up_w,
+    offsets)``. An export uses it to give the three steps to its compiler as one operation, which then replaces
+    ``set_take_rows``. None restores the three steps. ``_routed_chunk_group`` reads the module attribute at call
+    time.
+    """
+    global _EXPERT_GATE_UP
+    _EXPERT_GATE_UP = fn
+
+
 def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
@@ -777,9 +794,12 @@ def _routed_chunk_group(
     """
     top_k = top_idx.shape[1]
     order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.shape[0])
-    rows = x[sorted_tokens] if _TAKE_ROWS is None else _TAKE_ROWS(x, sorted_tokens)
-    gate_up = torch._grouped_mm(rows.to(gate_up_w.dtype), gate_up_w, offsets)
-    out = torch._grouped_mm(_expert_swiglu(gate_up), down_w, offsets)
+    if _EXPERT_GATE_UP is None:
+        rows = x[sorted_tokens] if _TAKE_ROWS is None else _TAKE_ROWS(x, sorted_tokens)
+        hidden = _expert_swiglu(torch._grouped_mm(rows.to(gate_up_w.dtype), gate_up_w, offsets))
+    else:
+        hidden = _EXPERT_GATE_UP(x, sorted_tokens, gate_up_w, offsets)
+    out = torch._grouped_mm(hidden, down_w, offsets)
     inverse = torch.empty_like(order)
     inverse[order] = torch.arange(order.numel(), device=x.device)
     top_k_sum = _TOP_K_SUM or _sum_rows_of_tokens

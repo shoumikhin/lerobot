@@ -456,6 +456,40 @@ def test_set_top_k_sum_runs_the_top_k_sum_of_each_dispatch_chunk() -> None:
         assert torch.equal(moe(x), expected)
 
 
+def test_set_expert_gate_up_computes_the_swiglu_of_each_dispatch_chunk() -> None:
+    """An export gives the gather, the gate and up products and the SwiGLU to its compiler as one operation."""
+    from lerobot.policies.praxis.praxis_core import layers as praxis_layers
+
+    torch.manual_seed(0)
+    moe = MoEFeedForward(dim=16, hidden=8, num_experts=4, top_k=2, dispatch_chunk_size=5)
+    for parameter in moe.parameters():
+        torch.nn.init.normal_(parameter)
+    x = torch.randn(7, 16)
+    calls = []
+
+    def expert_gate_up(rows, index, bank, offsets):
+        calls.append((tuple(rows.shape), tuple(index.shape), tuple(bank.shape), tuple(offsets.shape)))
+        gate, up = torch._grouped_mm(rows[index], bank, offsets).chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    def no_silu(rows, index, bank, offsets):
+        gate, up = torch._grouped_mm(rows[index], bank, offsets).chunk(2, dim=-1)
+        return gate * up
+
+    with torch.no_grad():
+        expected = moe(x)
+        try:
+            praxis_layers.set_expert_gate_up(expert_gate_up)
+            routed = moe(x)
+            praxis_layers.set_expert_gate_up(no_silu)
+            wrong = moe(x)
+        finally:
+            praxis_layers.set_expert_gate_up(None)
+        assert torch.equal(routed, expected)
+        assert calls == [((5, 16), (10,), (4, 16, 16), (4,)), ((2, 16), (4,), (4, 16, 16), (4,))]
+        assert not torch.equal(wrong, expected)
+
+
 def test_set_take_rows_gathers_the_rows_of_each_dispatch_chunk() -> None:
     """An export gives the gather of the rows in expert order to its compiler as one operation, `x[index]`."""
     from lerobot.policies.praxis.praxis_core import layers as praxis_layers

@@ -455,6 +455,7 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_row_gather_as_one_plugin(
     monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: take_rows)
     monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
     monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
+    monkeypatch.setattr(export_praxis, "_expert_gate_up_plugin", lambda: None)
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
     recipe.cfg.backend = ExecuTorchTensorRTConfig()
     seen = []
@@ -476,6 +477,81 @@ def test_with_tensorrt_in_bfloat16_the_parts_trace_the_row_gather_as_one_plugin(
         part.name: (export_praxis.TAKE_ROWS_MODULE,) if bfloat16 and part.name == "sample" else ()
         for part in parts
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_with_tensorrt_in_bfloat16_the_parts_trace_the_expert_gate_up_and_swiglu_as_one_plugin(
+    tmp_path, monkeypatch, dtype
+):
+    """As a gather, a grouped GEMM and a SwiGLU, TensorRT writes the gathered rows and both products to memory."""
+
+    def expert_gate_up(x, index, bank, offsets):
+        gate, up = torch._grouped_mm(x[index], bank, offsets).chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    def take_rows(x, index):
+        return x[index]
+
+    monkeypatch.setattr(export_praxis, "_expert_gate_up_plugin", lambda: expert_gate_up)
+    monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: take_rows)
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=dtype)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    seen = []
+    routed = praxis_layers._routed_chunk_group
+
+    def routed_chunk(*args):
+        seen.append(praxis_layers._EXPERT_GATE_UP)
+        return routed(*args)
+
+    monkeypatch.setattr(praxis_layers, "_routed_chunk_group", routed_chunk)
+    parts = list(recipe.parts())
+    bfloat16 = dtype == torch.bfloat16
+    assert set(seen) <= {None, expert_gate_up}
+    assert (expert_gate_up in seen) == bfloat16
+    assert praxis_layers._EXPERT_GATE_UP is None
+    modules = (export_praxis.TAKE_ROWS_MODULE, export_praxis.EXPERT_GATE_UP_MODULE)
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: modules if bfloat16 and part.name in export_praxis.MOE_PARTS else () for part in parts
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
+def test_the_expert_gate_up_plugin_computes_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_expert_gate_up import EXPERT_GATE_UP, _expert_gate_up_eager
+
+    if EXPERT_GATE_UP is None:
+        pytest.skip("the plugin needs tcgen05 tensor cores (sm_100 or sm_110)")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # Experts of several row tiles and columns of two tiles, none of them full, an expert without rows, and each token
+    # taken top_k times.
+    tokens, top_k, experts, dim, hidden = 400, 2, 6, 96, 208
+    x = torch.randn(tokens, dim, device="cuda", generator=generator).to(torch.bfloat16)
+    bank = torch.randn(experts, dim, 2 * hidden, device="cuda", generator=generator) / dim**0.5
+    bank = bank.to(torch.bfloat16)
+    chosen = torch.randint(0, experts - 1, (tokens * top_k,), device="cuda", generator=generator)
+    chosen[chosen == 3] = experts - 1
+    _, order = chosen.sort(stable=True)
+    index = torch.arange(tokens, device="cuda").repeat_interleave(top_k)[order]
+    offsets = torch.bincount(chosen, minlength=experts).cumsum(0).to(torch.int32)
+
+    class ExpertGateUp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bank = torch.nn.Parameter(bank, requires_grad=False)
+
+        def forward(self, x, index, offsets):
+            return EXPERT_GATE_UP(x, index, self.bank, offsets)
+
+    inputs = [x, index, offsets]
+    program = torch.export.export(ExpertGateUp(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
+    _assert_runs_in_tensorrt(compiled)
+    expected = _expert_gate_up_eager(x, index, bank.unflatten(2, (2, hidden)), offsets)
+    # The order of the products' float32 sums can move a bfloat16 rounding, and near zero that has no relative bound.
+    torch.testing.assert_close(compiled(*inputs), expected, atol=1e-2, rtol=2**-6)
 
 
 def _need_triton_op():
@@ -552,6 +628,7 @@ def test_with_tensorrt_encode_traces_the_autoencoders_norm_steps_and_averages_as
     kernels = praxis_vae.AutoencoderKernels(lambda x, gamma: x, lambda x, factor_t: x)
     monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: kernels)
     monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_expert_gate_up_plugin", lambda: None)
     recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
     if tensorrt:
         recipe.cfg.backend = ExecuTorchTensorRTConfig()
