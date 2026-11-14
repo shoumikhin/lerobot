@@ -614,6 +614,91 @@ def _float8_bank(w: Tensor) -> tuple[Tensor, Tensor]:
     return (columns / scale[:, :, None]).to(torch.float8_e4m3fn).contiguous(), scale
 
 
+# NVFP4: FP4 e2m1 values with a float8 e4m3 scale per NVFP4_BLOCK values along K and a float32 global scale per group.
+NVFP4_BLOCK = 16
+# A group's global scale is its largest magnitude over 448 * 6, so that its largest block scale fits float8 e4m3 and
+# its largest value fits FP4 e2m1.
+NVFP4_GLOBAL_DIVISOR = 2688.0
+# The values of the FP4 e2m1 codes 0 to 15 (bit 3 is the sign).
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+@dataclass(frozen=True)
+class Nvfp4Bank:
+    """An expert weight bank in NVFP4 (LeRobot addition), as the original implementation's NVFP4 inference packs it.
+
+    ``codes`` (E, N, K / 8) int32 holds output column ``n``'s K values as FP4 e2m1 codes, eight per word, the first
+    in the lowest bits (TensorRT keeps no uint8 tensors inside an engine; the kernels read the words as bytes, two
+    codes per byte); ``scales`` (E, N, K / 16) float8 e4m3 holds a scale per 16 of them; ``global_scale``
+    (E,) float32 holds one scale per expert. ``w[e, k, n]`` is about ``value(codes) * scales * global_scale[e]``.
+    """
+
+    codes: Tensor
+    scales: Tensor
+    global_scale: Tensor
+
+
+def _nvfp4_global(largest: Tensor) -> Tensor:
+    """The float32 global scales of NVFP4 groups whose largest magnitudes are ``largest``.
+
+    As the original implementation's quantization-aware training rounds them: the largest magnitude in bfloat16,
+    at least 1e-12, times the float32 reciprocal of ``NVFP4_GLOBAL_DIVISOR``.
+    """
+    return largest.to(torch.bfloat16).clamp_min(1e-12).float() * (1.0 / NVFP4_GLOBAL_DIVISOR)
+
+
+def _e2m1_codes(v: Tensor) -> Tensor:
+    """The FP4 e2m1 codes of float32 ``v`` within [-6, 6]: the nearest value, ties to the even code, the sign from
+    the sign bit."""
+    m = v.abs()
+    code = torch.zeros(v.shape, dtype=torch.uint8, device=v.device)
+    for above in (m > 0.25, m >= 0.75, m > 1.25, m >= 1.75, m > 2.5, m >= 3.5, m > 5.0):
+        code += above.to(torch.uint8)
+    return code | ((v.view(torch.int32) >> 28) & 8).to(torch.uint8)
+
+
+def _nvfp4_quantize(x: Tensor, global_scale: Tensor) -> tuple[Tensor, Tensor]:
+    """The NVFP4 codes (R, K / 8) and block scales (R, K / 16) of the rows ``x`` (R, K), each row with its float32
+    global scale ``global_scale`` (R,): see ``Nvfp4Bank``.
+
+    The rounding of the original implementation: the block scale is the block's largest magnitude over 6 over the
+    global scale, within [2^-6, 448], in float8 e4m3, and each value is multiplied by the float32 reciprocal of the
+    global scale divided by the block scale.
+    """
+    rows, k = x.shape
+    blocks = x.float().reshape(rows, k // NVFP4_BLOCK, NVFP4_BLOCK)
+    g = global_scale.float()[:, None]
+    scales = (blocks.abs().amax(dim=2) * (1.0 / 6.0) / g).clamp(2.0**-6, 448.0).to(torch.float8_e4m3fn)
+    reciprocal = (1.0 / g) / scales.float()
+    codes = _e2m1_codes((blocks * reciprocal[:, :, None]).clamp(-6.0, 6.0).reshape(rows, k))
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int32), scales
+
+
+def _nvfp4_dequantize(codes: Tensor, scales: Tensor) -> Tensor:
+    """The float32 values of NVFP4 codes (..., K / 8) and block scales (..., K / 16), without the global scale."""
+    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=codes.device)
+    codes = codes.view(torch.uint8)
+    k = codes.shape[-1] * 2
+    v = values[torch.stack((codes & 15, codes >> 4), dim=-1).long()].reshape(
+        *codes.shape[:-1], k // NVFP4_BLOCK, -1
+    )
+    return (v * scales.float()[..., None]).reshape(*codes.shape[:-1], k)
+
+
+def _nvfp4_bank(w: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """The NVFP4 codes, block scales and global scales of a bank ``w`` (E, K, N): see ``Nvfp4Bank``. One global
+    scale per expert, from its largest magnitude."""
+    columns = w.detach().transpose(1, 2)
+    experts, n, k = columns.shape
+    global_scale = _nvfp4_global(columns.abs().amax(dim=(1, 2)))
+    codes = torch.empty(experts, n, k // 8, dtype=torch.int32, device=w.device)
+    scales = torch.empty(experts, n, k // NVFP4_BLOCK, dtype=torch.float8_e4m3fn, device=w.device)
+    # One expert at a time, so that the float32 copy is one expert's.
+    for e in range(experts):
+        codes[e], scales[e] = _nvfp4_quantize(columns[e], global_scale[e].expand(n))
+    return codes, scales, global_scale
+
+
 class RoutedExperts(nn.Module):
     """Expert weight banks, expert-first: gate|up (E, C, 2H), down (E, H, C)."""
 
@@ -635,8 +720,28 @@ class RoutedExperts(nn.Module):
             self.register_buffer(name, data)
             self.register_buffer(name.replace("_weight", "_scale"), scale)
 
-    def banks(self) -> tuple[Tensor, Tensor] | tuple[Float8Bank, Float8Bank]:
-        """The gate|up and down banks, as ``Float8Bank`` after ``to_float8``."""
+    def to_nvfp4(self) -> None:
+        """Keep the banks in NVFP4, as the original implementation's NVFP4 inference packs them (LeRobot addition).
+
+        The banks become buffers of the same names holding the codes (see ``Nvfp4Bank``), with their block scales
+        in ``gate_up_scale`` and ``down_scale`` and their global scales in ``gate_up_global`` and ``down_global``.
+        The experts then round their input rows to NVFP4 too (``_nvfp4_experts``). For an export: it cannot be
+        undone.
+        """
+        for name in ("gate_up_weight", "down_weight"):
+            codes, scales, global_scale = _nvfp4_bank(getattr(self, name))
+            delattr(self, name)
+            self.register_buffer(name, codes)
+            self.register_buffer(name.replace("_weight", "_scale"), scales)
+            self.register_buffer(name.replace("_weight", "_global"), global_scale)
+
+    def banks(self) -> tuple[Tensor, Tensor] | tuple[Float8Bank, Float8Bank] | tuple[Nvfp4Bank, Nvfp4Bank]:
+        """The gate|up and down banks, as ``Float8Bank`` after ``to_float8`` and ``Nvfp4Bank`` after ``to_nvfp4``."""
+        if hasattr(self, "gate_up_global"):
+            return (
+                Nvfp4Bank(self.gate_up_weight, self.gate_up_scale, self.gate_up_global),
+                Nvfp4Bank(self.down_weight, self.down_scale, self.down_global),
+            )
         if self.gate_up_weight.dtype != torch.float8_e4m3fn:
             return self.gate_up_weight, self.down_weight
         return Float8Bank(self.gate_up_weight, self.gate_up_scale), Float8Bank(
@@ -926,13 +1031,132 @@ def _float8_experts(
     return _float8_grouped_mm(hidden, hidden_scale, down, offsets, x.dtype)
 
 
+@dataclass(frozen=True)
+class Nvfp4Kernels:
+    """The steps of NVFP4 experts that an export gives its compiler as single operations (LeRobot addition).
+
+    ``row_globals(row_largest, segment_ends)`` returns ``_nvfp4_row_globals`` of them, ``rows(x, index,
+    row_global)`` returns ``_nvfp4_rows`` of them, and ``grouped_mm(codes, scales, bank.codes, bank.scales,
+    offsets)`` returns ``_nvfp4_grouped_mm_pytorch`` of them in bfloat16.
+    """
+
+    row_globals: Callable[[Tensor, Tensor], Tensor]
+    rows: Callable[[Tensor, Tensor | None, Tensor], tuple[Tensor, Tensor]]
+    grouped_mm: Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
+
+
+_NVFP4_KERNELS: Nvfp4Kernels | None = None
+
+
+def set_nvfp4_kernels(kernels: Nvfp4Kernels | None) -> None:
+    """Run the bfloat16 steps of NVFP4 experts with ``kernels`` (LeRobot addition). None restores their PyTorch
+    sides. ``_nvfp4_experts`` reads the module attribute at call time."""
+    global _NVFP4_KERNELS
+    _NVFP4_KERNELS = kernels
+
+
+def _nvfp4_row_globals(row_largest: Tensor, segment_ends: Tensor) -> Tensor:
+    """The float32 global scale of each row (R,): ``_nvfp4_global`` of the largest of ``row_largest`` (R,), the rows'
+    largest magnitudes, over the row's segment. The segments follow each other and end at ``segment_ends``."""
+    rows = torch.arange(row_largest.shape[0], device=row_largest.device, dtype=segment_ends.dtype)
+    segment = torch.bucketize(rows, segment_ends, right=True).long()
+    largest = torch.zeros(segment_ends.shape[0], dtype=torch.float32, device=row_largest.device)
+    largest.scatter_reduce_(0, segment, row_largest.float(), "amax")
+    return _nvfp4_global(largest)[segment]
+
+
+def _nvfp4_rows(x: Tensor, index: Tensor | None, row_global: Tensor) -> tuple[Tensor, Tensor]:
+    """The NVFP4 codes and block scales of the rows ``x[index]`` (all of ``x`` without ``index``), each with its
+    global scale ``row_global``: see ``_nvfp4_quantize``."""
+    return _nvfp4_quantize(x if index is None else x[index], row_global)
+
+
+def _nvfp4_grouped_mm_pytorch(
+    codes: Tensor,
+    scales: Tensor,
+    bank_codes: Tensor,
+    bank_scales: Tensor,
+    offsets: Tensor,
+    dtype: torch.dtype,
+) -> Tensor:
+    """The grouped GEMM of NVFP4 rows with an NVFP4 bank, without their global scales: the float32 sums of the
+    products of their values, rounded to ``dtype``. One expert at a time, so that the float32 copy of the bank is one
+    expert's."""
+    a = _nvfp4_dequantize(codes, scales)
+    out = torch.zeros(codes.shape[0], bank_codes.shape[1], dtype=torch.float32, device=codes.device)
+    start = 0
+    for e, end in enumerate(offsets.tolist()):
+        if end > start:
+            out[start:end] = a[start:end] @ _nvfp4_dequantize(bank_codes[e], bank_scales[e]).t()
+        start = end
+    return out.to(dtype)
+
+
+def _nvfp4_rescale(raw: Tensor, rows_global: Tensor, bank_global: Tensor) -> Tensor:
+    """``raw`` times its row's and its expert's global scales, their product rounded to bfloat16 first, as the
+    original implementation rescales."""
+    multiplier = (rows_global * bank_global).to(torch.bfloat16).float()
+    return (raw.float() * multiplier[:, None]).to(raw.dtype)
+
+
+def _nvfp4_experts(
+    x: Tensor,
+    index: Tensor,
+    row_experts: Tensor,
+    segment_ends: Tensor,
+    gate_up: Nvfp4Bank,
+    down: Nvfp4Bank,
+    offsets: Tensor,
+) -> Tensor:
+    """``down(swiglu(gate_up(x[index])))`` of each row with its expert's NVFP4 banks (LeRobot addition).
+
+    As the original implementation's NVFP4 inference: the input of each grouped GEMM is rounded to NVFP4 with a
+    global scale per segment of rows, the segments ending at ``segment_ends``; the GEMM's bfloat16 result is
+    multiplied by the row's and the expert's (``row_experts``) global scales.
+    """
+    if _NVFP4_KERNELS is not None and x.dtype == torch.bfloat16:
+        row_globals, rows, grouped_mm = (
+            _NVFP4_KERNELS.row_globals,
+            _NVFP4_KERNELS.rows,
+            _NVFP4_KERNELS.grouped_mm,
+        )
+    else:
+        row_globals, rows = _nvfp4_row_globals, _nvfp4_rows
+
+        def grouped_mm(
+            codes: Tensor, scales: Tensor, bank_codes: Tensor, bank_scales: Tensor, offs: Tensor
+        ) -> Tensor:
+            return _nvfp4_grouped_mm_pytorch(codes, scales, bank_codes, bank_scales, offs, x.dtype)
+
+    x_global = row_globals(x.abs().amax(dim=1)[index], segment_ends)
+    codes, scales = rows(x, index, x_global)
+    gate_up_out = grouped_mm(codes, scales, gate_up.codes, gate_up.scales, offsets)
+    hidden = _expert_swiglu(_nvfp4_rescale(gate_up_out, x_global, gate_up.global_scale[row_experts]))
+    hidden_global = row_globals(hidden.abs().amax(dim=1), segment_ends)
+    codes, scales = rows(hidden, None, hidden_global)
+    out = grouped_mm(codes, scales, down.codes, down.scales, offsets)
+    return _nvfp4_rescale(out, hidden_global, down.global_scale[row_experts])
+
+
+def _segment_ends(top_idx: Tensor, sizes: Sequence[int], num_experts: int) -> Tensor:
+    """The int32 end offsets of the (expert, chunk) segments of the rows ``_dispatch_rows`` sorts: expert by expert,
+    and inside an expert the rows of each chunk of ``sizes`` tokens."""
+    counts = []
+    for chunk in top_idx.split(list(sizes)):
+        experts = chunk.reshape(-1)
+        count = torch.zeros(num_experts, device=top_idx.device, dtype=torch.int64)
+        count.scatter_add_(0, experts.long(), torch.ones_like(experts, dtype=torch.int64))
+        counts.append(count)
+    return torch.stack(counts, dim=1).reshape(-1).cumsum(dim=0).to(torch.int32)
+
+
 def _routed_chunk_group(
     x: Tensor,
     top_idx: Tensor,
     gate: Tensor,
     sizes: Sequence[int],
-    gate_up_w: Tensor | Float8Bank,
-    down_w: Tensor | Float8Bank,
+    gate_up_w: Tensor | Float8Bank | Nvfp4Bank,
+    down_w: Tensor | Float8Bank | Nvfp4Bank,
     scaling: float,
 ) -> list[Tensor]:
     """Float32 scaled routed sum of each token chunk of ``x`` (see ``MoEFeedForward``). The chunks follow each
@@ -944,7 +1168,16 @@ def _routed_chunk_group(
     bits of its chunk run alone.
     """
     top_k = top_idx.shape[1]
-    if isinstance(gate_up_w, Float8Bank):
+    if isinstance(gate_up_w, Nvfp4Bank):
+        assert isinstance(down_w, Nvfp4Bank)
+        experts = gate_up_w.codes.shape[0]
+        order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, experts)
+        # Each chunk's rows of an expert get their own global scale, so that each sum has the bits of its chunk
+        # run alone, as for the other banks.
+        segment_ends = _segment_ends(top_idx, sizes, experts)
+        row_experts = top_idx.reshape(-1)[order]
+        out = _nvfp4_experts(x, sorted_tokens, row_experts, segment_ends, gate_up_w, down_w, offsets)
+    elif isinstance(gate_up_w, Float8Bank):
         assert isinstance(down_w, Float8Bank)
         order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.data.shape[0])
         out = _float8_experts(x, sorted_tokens, gate_up_w, down_w, offsets)
@@ -1093,8 +1326,8 @@ def _routed_chunks(
     x: Tensor,
     top_idx: Tensor,
     gate: Tensor,
-    gate_up_w: Tensor | Float8Bank,
-    down_w: Tensor | Float8Bank,
+    gate_up_w: Tensor | Float8Bank | Nvfp4Bank,
+    down_w: Tensor | Float8Bank | Nvfp4Bank,
     scaling: float,
     step: int,
 ) -> Tensor:
@@ -1107,8 +1340,8 @@ def _routed_chunks_group(
     top_idx: Tensor,
     gate: Tensor,
     lengths: Sequence[int],
-    gate_up_w: Tensor | Float8Bank,
-    down_w: Tensor | Float8Bank,
+    gate_up_w: Tensor | Float8Bank | Nvfp4Bank,
+    down_w: Tensor | Float8Bank | Nvfp4Bank,
     scaling: float,
     step: int,
 ) -> list[Tensor]:
@@ -1268,7 +1501,7 @@ class MoEFeedForward(nn.Module):
         """
         assert self.dispatch_chunk_size is not None
         gate_up_w, down_w = self.routed.banks()
-        if isinstance(gate_up_w, Float8Bank):
+        if isinstance(gate_up_w, (Float8Bank, Nvfp4Bank)):
             return _routed_chunks(
                 x,
                 top_idx,
@@ -1301,8 +1534,8 @@ class MoEFeedForward(nn.Module):
     def _routed_forward(self, x: Tensor, top_idx: Tensor, gate: Tensor) -> Tensor:
         """Sort the (token, expert) rows by expert, run two grouped GEMMs,
         scale each row by its gate, undo the sort and sum over ``top_k``."""
-        if self.routed.gate_up_weight.dtype == torch.float8_e4m3fn:
-            raise ValueError("Float8 expert banks run only with a dispatch_chunk_size.")
+        if not isinstance(self.routed.banks()[0], Tensor):
+            raise ValueError("Float8 and NVFP4 expert banks run only with a dispatch_chunk_size.")
         num_tokens, c = x.shape
         device = x.device
         experts = top_idx.reshape(-1)

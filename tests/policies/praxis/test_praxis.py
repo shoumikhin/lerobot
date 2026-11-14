@@ -1302,6 +1302,139 @@ def test_float8_experts_multiply_rows_and_banks_rounded_to_float8() -> None:
     assert (quantized - unquantized).float().norm() / unquantized.float().norm() < 0.1
 
 
+def test_nvfp4_codes_round_to_the_nearest_value_with_ties_to_even() -> None:
+    """FP4 e2m1 holds 0, 0.5, 1, 1.5, 2, 3, 4 and 6; a value halfway between two goes to the one with the even code,
+    as the original implementation's NVFP4 packing rounds."""
+    v = torch.tensor([0.25, 0.26, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.1, 6.0, -0.75, -0.0, -0.1])
+    codes = praxis_layers._e2m1_codes(v)
+    values = torch.tensor(praxis_layers._E2M1_VALUES)[codes.long()]
+    assert values.tolist() == [0.0, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 6.0, 6.0, -1.0, 0.0, 0.0]
+    assert codes[-2:].tolist() == [8, 8]
+
+
+def test_nvfp4_experts_round_banks_and_rows_as_the_original_nvfp4_inference() -> None:
+    """`RoutedExperts.to_nvfp4` keeps NVFP4 banks: FP4 codes, a float8 scale per 16 values along K and a float32
+    global scale per expert, its largest magnitude over 2688. Each grouped GEMM multiplies rows rounded the same way,
+    with a global scale per segment of rows, and the result is rescaled by both global scales."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    generator = torch.Generator().manual_seed(0)
+    x = _randn(generator, 1, 90, 64)
+    banks = [ffn.routed.gate_up_weight.detach().clone(), ffn.routed.down_weight.detach().clone()]
+    with torch.no_grad():
+        unquantized = ffn(x)
+        ffn.routed.to_nvfp4()
+        quantized = ffn(x)
+    gate_up, down = ffn.routed.banks()
+    for bank, weight in zip((gate_up, down), banks, strict=True):
+        e, k, n = weight.shape
+        assert bank.codes.shape == (e, n, k // 8) and bank.codes.dtype == torch.int32
+        assert bank.scales.shape == (e, n, k // 16) and bank.scales.dtype == torch.float8_e4m3fn
+        largest = weight.abs().amax(dim=(1, 2)).to(torch.bfloat16).float()
+        assert torch.equal(bank.global_scale, largest * (1.0 / 2688.0))
+        dequantized = (
+            praxis_layers._nvfp4_dequantize(bank.codes, bank.scales) * bank.global_scale[:, None, None]
+        )
+        assert (dequantized.transpose(1, 2) - weight.float()).norm() / weight.float().norm() < 0.15
+
+    def rounded(rows: torch.Tensor) -> torch.Tensor:
+        # One global scale for all these rows: the largest magnitude over 2688 in bfloat16, then per block of 16.
+        g = rows.float().abs().amax().to(torch.bfloat16).float() * (1.0 / 2688.0)
+        blocks = rows.float().reshape(rows.shape[0], -1, 16)
+        scale = (blocks.abs().amax(dim=2, keepdim=True) * (1.0 / 6.0) / g).clamp(2.0**-6, 448.0)
+        scale = scale.to(torch.float8_e4m3fn).float()
+        values = torch.tensor(praxis_layers._E2M1_VALUES)
+        codes = praxis_layers._e2m1_codes((blocks * ((1.0 / g) / scale)).clamp(-6.0, 6.0))
+        return (values[codes.long()] * scale).reshape(rows.shape), g
+
+    rows = _randn(generator, 24, 64)
+    index = torch.randperm(24, generator=generator)[:20]
+    offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.codes.shape[0] - 4), dtype=torch.int32)
+    counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).long()
+    row_experts = torch.repeat_interleave(torch.arange(len(offsets)), counts)
+    # One segment per expert.
+    expected = []
+    for e, (start, end) in enumerate(zip([0, *offsets[:-1].tolist()], offsets.tolist(), strict=True)):
+        if end == start:
+            continue
+        a, g = rounded(rows[index[start:end]])
+        w = praxis_layers._nvfp4_dequantize(gate_up.codes[e], gate_up.scales[e])
+        hidden = (a @ w.T).to(torch.bfloat16).float() * (g * gate_up.global_scale[e]).to(
+            torch.bfloat16
+        ).float()
+        gate, up = hidden.to(torch.bfloat16).chunk(2, dim=-1)
+        a, g = rounded(torch.nn.functional.silu(gate) * up)
+        w = praxis_layers._nvfp4_dequantize(down.codes[e], down.scales[e])
+        out = (a @ w.T).to(torch.bfloat16).float() * (g * down.global_scale[e]).to(torch.bfloat16).float()
+        expected.append(out.to(torch.bfloat16))
+    out = praxis_layers._nvfp4_experts(rows, index, row_experts, offsets, gate_up, down, offsets)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=2**-7, atol=1e-6)
+    # The NVFP4 experts ran, and moved the layer by about what 4-bit rounding does.
+    assert not torch.equal(quantized, unquantized)
+    assert (quantized - unquantized).float().norm() / unquantized.float().norm() < 0.3
+
+
+def test_nvfp4_experts_give_each_chunk_its_own_global_scales() -> None:
+    """The chunks that share the grouped GEMMs round their rows with their own global scales, so each chunk's sum has
+    the bits of the chunk run alone, as the original implementation's paired dispatch keeps them."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    ffn.routed.to_nvfp4()
+    generator = torch.Generator().manual_seed(1)
+    # The second chunk's rows are 50 times larger, so a scale shared with them would wipe out the first chunk's.
+    x = torch.cat([_randn(generator, 30, 64), 50 * _randn(generator, 25, 64)])
+    top_idx = torch.randint(0, ffn.num_experts, (55, ffn.top_k), generator=generator)
+    top_idx[:, 1] = (top_idx[:, 0] + 1) % ffn.num_experts
+    gate = torch.rand(55, ffn.top_k, generator=generator).to(torch.bfloat16)
+    banks = ffn.routed.banks()
+    together = praxis_layers._routed_chunk_group(x, top_idx, gate, [30, 25], *banks, 2.5)
+    for chunk, (start, end) in zip(together, ((0, 30), (30, 55)), strict=True):
+        alone = praxis_layers._routed_chunk_group(
+            x[start:end], top_idx[start:end], gate[start:end], [end - start], *banks, 2.5
+        )
+        assert torch.equal(chunk, alone[0])
+
+
+def test_nvfp4_experts_run_their_bfloat16_steps_with_the_exports_kernels() -> None:
+    """An export gives the NVFP4 steps to its compiler as single operations (`set_nvfp4_kernels`): they get the bank
+    as it is stored, and float32 keeps the PyTorch sides."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    ffn.routed.to_nvfp4()
+    gate_up, down = ffn.routed.banks()
+    generator = torch.Generator().manual_seed(0)
+    rows = _randn(generator, 24, 64)
+    index = torch.randperm(24, generator=generator)[:20]
+    offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.codes.shape[0] - 4), dtype=torch.int32)
+    counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).long()
+    row_experts = torch.repeat_interleave(torch.arange(len(offsets)), counts)
+    segment_ends = torch.tensor(
+        [3, 5, 5, 9, 12, 20] + [20] * (2 * gate_up.codes.shape[0] - 6), dtype=torch.int32
+    )
+    calls = []
+
+    def grouped_mm(codes, scales, bank, bank_scales, offs):
+        calls.append(bank)
+        return praxis_layers._nvfp4_grouped_mm_pytorch(codes, scales, bank, bank_scales, offs, torch.bfloat16)
+
+    kernels = praxis_layers.Nvfp4Kernels(
+        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, grouped_mm
+    )
+    expected = {
+        dtype: praxis_layers._nvfp4_experts(
+            rows.to(dtype), index, row_experts, segment_ends, gate_up, down, offsets
+        )
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    praxis_layers.set_nvfp4_kernels(kernels)
+    try:
+        for dtype in (torch.float32, torch.bfloat16):
+            out = praxis_layers._nvfp4_experts(
+                rows.to(dtype), index, row_experts, segment_ends, gate_up, down, offsets
+            )
+            assert torch.equal(out, expected[dtype])
+    finally:
+        praxis_layers.set_nvfp4_kernels(None)
+    assert len(calls) == 2 and calls[0] is gate_up.codes and calls[1] is down.codes
+
+
 def test_float8_experts_run_their_bfloat16_grouped_gemms_with_the_exports_kernel() -> None:
     """An export gives each bfloat16 grouped GEMM of the float8 experts to its compiler as one operation
     (`set_float8_grouped_mm`): it gets the float8 bank as it is stored, and float32 keeps the PyTorch side."""

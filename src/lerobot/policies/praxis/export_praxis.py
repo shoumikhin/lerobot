@@ -127,6 +127,8 @@ FLOAT8_GROUPED_MM_MODULE = "lerobot.policies.praxis.export_float8_grouped_mm"
 # The module that registers the TensorRT plugin of the float8 experts' row gather, gate and up products and SwiGLU in
 # one kernel (--quantize=fp8).
 FLOAT8_GATE_UP_MODULE = "lerobot.policies.praxis.export_float8_gate_up"
+# The module that registers the TensorRT plugins of the NVFP4 experts (--quantize=nvfp4).
+NVFP4_MODULE = "lerobot.policies.praxis.export_nvfp4"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +595,13 @@ def _float8_gate_up_plugin() -> praxis_layers.Float8GateUp | None:
     return export_float8_gate_up.FLOAT8_GATE_UP
 
 
+def _nvfp4_plugins() -> praxis_layers.Nvfp4Kernels | None:
+    """The NVFP4 experts' steps as TensorRT plugins (`export_nvfp4`), if there are such."""
+    from . import export_nvfp4
+
+    return export_nvfp4.NVFP4_KERNELS
+
+
 def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     """The mixture-of-experts row gather as one TensorRT plugin (`export_take_rows`), if there is one."""
     from . import export_take_rows
@@ -637,7 +646,9 @@ class PraxisExportRecipe(ActionChunkRecipe):
     # `--quantize=fp8` keeps the towers' routed experts in float8 (`RoutedExperts.to_float8`), the largest share of
     # the work, and everything else in the checkpoint's dtype. The parts are quantized before they are checked,
     # so `sample` is still checked on its own: its compiled program against its own float8 experts in PyTorch.
-    quantizations = ("fp8",)
+    # `--quantize=nvfp4` keeps them in NVFP4 as the original implementation's NVFP4 inference packs them
+    # (`RoutedExperts.to_nvfp4`), with their input rows rounded to NVFP4 too. It runs only in TensorRT plugins.
+    quantizations = ("fp8", "nvfp4")
     policy: PraxisPolicy
 
     @classmethod
@@ -646,7 +657,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         _check_config(cast("PraxisConfig", cfg.policy))
         dtype = cast("PraxisConfig", cfg.policy).dtype
         if (
-            cfg.quantize in ("fp8",)
+            cfg.quantize in ("fp8", "nvfp4")
             and isinstance(cfg.backend, ExecuTorchTensorRTConfig)
             and dtype not in (None, torch.bfloat16)
         ):
@@ -669,6 +680,8 @@ class PraxisExportRecipe(ActionChunkRecipe):
                 "Praxis-1's --quantize=fp8 runs its float8 experts in TensorRT plugins, or in PyTorch on a Hopper "
                 "GPU (sm_90)."
             )
+        if cfg.quantize == "nvfp4" and not tensorrt:
+            raise ValueError("Praxis-1's --quantize=nvfp4 runs its NVFP4 experts in TensorRT plugins only.")
         return cast(PraxisExportRecipe, super().load(cfg))
 
     def __init__(
@@ -802,7 +815,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         """The parts, after checking that they play the policy's actions as the bundle runs them."""
         tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
         bfloat16 = self.policy.model.dtype == torch.bfloat16
-        if self.cfg.quantize in ("fp8",) and tensorrt and not bfloat16:
+        if self.cfg.quantize in ("fp8", "nvfp4") and tensorrt and not bfloat16:
             # `load` lets a policy that keeps its checkpoint's dtype through, so that dtype is checked here.
             raise ValueError(
                 f"Praxis-1's --quantize={self.cfg.quantize} with TensorRT needs a bfloat16 policy, not "
@@ -812,6 +825,11 @@ class PraxisExportRecipe(ActionChunkRecipe):
             raise ValueError(
                 "Praxis-1's --quantize=fp8 needs the float8 grouped GEMM plugin (export_float8_grouped_mm), which "
                 "this Torch-TensorRT and GPU do not build."
+            )
+        if self.cfg.quantize == "nvfp4" and tensorrt and self._nvfp4_kernels() is None:
+            raise ValueError(
+                "Praxis-1's --quantize=nvfp4 needs the NVFP4 plugins (export_nvfp4), which this Torch-TensorRT and "
+                "GPU do not build."
             )
         ticks = self._random_ticks()
         # The test case's chunks draw with the seeds `seed` to `seed + CHUNKS - 1`.
@@ -823,6 +841,10 @@ class PraxisExportRecipe(ActionChunkRecipe):
             for layer in self.policy.modules():
                 if isinstance(layer, praxis_layers.RoutedExperts):
                     layer.to_float8()
+        elif self.cfg.quantize == "nvfp4":
+            for layer in self.policy.modules():
+                if isinstance(layer, praxis_layers.RoutedExperts):
+                    layer.to_nvfp4()
         stacked = {name: np.stack([tick[name] for tick in ticks]) for name in self._features}
         assert self._case.noise is not None
         with self._plain_pytorch():
@@ -868,6 +890,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     (FLOAT8_ROWS_MODULE, self._float8_rows()),
                     (FLOAT8_GROUPED_MM_MODULE, self._float8_grouped_mm()),
                     (FLOAT8_GATE_UP_MODULE, self._float8_gate_up()),
+                    (NVFP4_MODULE, self._nvfp4_kernels()),
                 )
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 if self._autoencoder_kernels() and name == "encode":
@@ -926,6 +949,13 @@ class PraxisExportRecipe(ActionChunkRecipe):
             return _float8_gate_up_plugin()
         return None
 
+    def _nvfp4_kernels(self) -> praxis_layers.Nvfp4Kernels | None:
+        """The TensorRT plugins of the NVFP4 experts, for TensorRT in bfloat16 with `--quantize=nvfp4`."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        if tensorrt and self.cfg.quantize == "nvfp4" and self.policy.model.dtype == torch.bfloat16:
+            return _nvfp4_plugins()
+        return None
+
     def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
         """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
         if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
@@ -953,6 +983,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_float8_rows(self._float8_rows())
         praxis_layers.set_float8_grouped_mm(self._float8_grouped_mm())
         praxis_layers.set_float8_gate_up(self._float8_gate_up())
+        praxis_layers.set_nvfp4_kernels(self._nvfp4_kernels())
         praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
@@ -964,6 +995,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             praxis_layers.set_float8_rows(None)
             praxis_layers.set_float8_grouped_mm(None)
             praxis_layers.set_float8_gate_up(None)
+            praxis_layers.set_nvfp4_kernels(None)
             praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)

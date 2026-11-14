@@ -495,6 +495,7 @@ ignore = [
 "src/lerobot/policies/praxis/praxis_core/kernels/*.py" = ["N803"]
 # N806: their grouped GEMM kernels also name the matrix sizes M, N and K in upper case
 "src/lerobot/policies/praxis/export_float8_grouped_mm.py" = ["N803", "N806"]
+"src/lerobot/policies/praxis/export_nvfp4.py" = ["N803", "N806"]
 # E402: conditional-import guards (TYPE_CHECKING / is_package_available) must precede the imports they protect
 "src/lerobot/scripts/convert_dataset_v21_to_v30.py" = ["E402"]
 

@@ -644,7 +644,7 @@ def test_float8_experts_off_tensorrt_need_the_backend_on_a_hopper_gpu(monkeypatc
         PraxisExportRecipe.load(cfg)
 
 
-@pytest.mark.parametrize("quantize", ["fp8"])
+@pytest.mark.parametrize("quantize", ["fp8", "nvfp4"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_quantized_experts_in_tensorrt_need_a_bfloat16_policy(monkeypatch, quantize, dtype):
     """The plugins take bfloat16 rows, and the experts' PyTorch fallback does not build in TensorRT."""
@@ -667,7 +667,7 @@ def test_quantized_experts_in_tensorrt_take_the_checkpoint_dtype_when_none_is_se
         PraxisExportRecipe.load(cfg)
 
 
-@pytest.mark.parametrize("quantize", ["fp8"])
+@pytest.mark.parametrize("quantize", ["fp8", "nvfp4"])
 def test_quantized_experts_in_tensorrt_refuse_a_loaded_policy_that_is_not_bfloat16(
     tmp_path, monkeypatch, quantize
 ):
@@ -777,6 +777,118 @@ def test_float8_experts_outside_tensorrt_need_a_hopper_gpu(monkeypatch):
     cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchCUDAConfig(), quantize="fp8")
     with pytest.raises(ValueError, match="Hopper GPU"):
         PraxisExportRecipe.load(cfg)
+
+
+def nvfp4_recipe(path, monkeypatch, kernels) -> PraxisExportRecipe:
+    """The bfloat16 recipe of the tiny checkpoint for TensorRT with `--quantize=nvfp4`, with `kernels` as the
+    plugins of the NVFP4 experts."""
+    # Whatever the host's GPU and Torch-TensorRT build, only the NVFP4 plugins of the test are set.
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_expert_gate_up_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
+    monkeypatch.setattr(export_praxis, "_nvfp4_plugins", lambda: kernels)
+    recipe = make_recipe(path, monkeypatch, dtype=torch.bfloat16)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    recipe.cfg.quantize = "nvfp4"
+    return recipe
+
+
+def test_with_tensorrt_the_nvfp4_experts_trace_their_steps_as_plugins(tmp_path, monkeypatch):
+    """TensorRT has no layer for NVFP4 grouped GEMMs with NVFP4 rows, so the parts give the steps to TensorRT as
+    plugins, with the NVFP4 bank as it is stored."""
+    banks = []
+
+    def grouped_mm(codes, scales, bank, bank_scales, offsets):
+        banks.append(bank)
+        return praxis_layers._nvfp4_grouped_mm_pytorch(
+            codes, scales, bank, bank_scales, offsets, torch.bfloat16
+        )
+
+    kernels = praxis_layers.Nvfp4Kernels(
+        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, grouped_mm
+    )
+    recipe = nvfp4_recipe(tmp_path / "checkpoint", monkeypatch, kernels)
+    parts = list(recipe.parts())
+    assert banks and all(bank.dtype == torch.int32 and bank.is_contiguous() for bank in banks)
+    assert praxis_layers._NVFP4_KERNELS is None
+    assert all(
+        (export_praxis.NVFP4_MODULE in part.operator_modules) == (part.name in export_praxis.MOE_PARTS)
+        for part in parts
+    )
+
+
+def test_with_tensorrt_the_nvfp4_experts_need_their_plugins(tmp_path, monkeypatch):
+    """Without them, each grouped GEMM would stay in PyTorch and split its program."""
+    recipe = nvfp4_recipe(tmp_path / "checkpoint", monkeypatch, None)
+    with pytest.raises(ValueError, match="needs the NVFP4 plugins"):
+        next(recipe.parts())
+
+
+def test_nvfp4_experts_run_only_in_tensorrt(monkeypatch):
+    """Other backends have no NVFP4 grouped GEMM, so the recipe refuses them before any weight loads."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def load_policy(cfg):
+        raise LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchCUDAConfig(), quantize="nvfp4")
+    with pytest.raises(ValueError, match="TensorRT plugins only"):
+        PraxisExportRecipe.load(cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugins run on CUDA")
+def test_the_nvfp4_plugins_compute_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_nvfp4 import NVFP4_KERNELS
+
+    if NVFP4_KERNELS is None:
+        pytest.skip(f"Torch-TensorRT {torch_tensorrt.__version__} builds no NVFP4 plugins on this GPU")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # Experts of several row tiles, output columns ending in a partial tile, an expert without rows, segments of two
+    # chunks, and each token taken top_k times.
+    tokens, top_k, experts, k, n = 300, 2, 6, 512, 400
+    codes, scales, global_scale = praxis_layers._nvfp4_bank(
+        torch.randn(experts, k, n, device="cuda", generator=generator) * 0.02
+    )
+    x = (torch.randn(tokens, k, device="cuda", generator=generator) * 3).to(torch.bfloat16)
+    chosen = torch.randint(0, experts - 1, (tokens, top_k), device="cuda", generator=generator)
+    chosen[chosen == 3] = experts - 1
+    _, order = chosen.reshape(-1).sort(stable=True)
+    index = torch.arange(tokens, device="cuda").repeat_interleave(top_k)[order]
+    offsets = torch.bincount(chosen.reshape(-1), minlength=experts).cumsum(0).to(torch.int32)
+    segment_ends = praxis_layers._segment_ends(chosen, [180, 120], experts)
+
+    class Experts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("codes", codes)
+            self.register_buffer("scales", scales)
+
+        def forward(self, x, index, offsets, segment_ends):
+            row_global = NVFP4_KERNELS.row_globals(x.abs().amax(dim=1)[index], segment_ends)
+            rows, rows_scales = NVFP4_KERNELS.rows(x, index, row_global)
+            out = NVFP4_KERNELS.grouped_mm(rows, rows_scales, self.codes, self.scales, offsets)
+            hidden_rows, _ = NVFP4_KERNELS.rows(out, None, row_global)
+            return row_global, rows, rows_scales, out, hidden_rows
+
+    inputs = [x, index, offsets, segment_ends]
+    program = torch.export.export(Experts(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
+    _assert_runs_in_tensorrt(compiled)
+    row_global, rows, rows_scales, out, hidden_rows = compiled(*inputs)
+    expected_global = praxis_layers._nvfp4_row_globals(x.abs().amax(dim=1)[index], segment_ends)
+    expected_rows, expected_scales = praxis_layers._nvfp4_rows(x, index, expected_global)
+    assert torch.equal(row_global, expected_global)
+    assert torch.equal(rows, expected_rows)
+    assert torch.equal(rows_scales.view(torch.uint8), expected_scales.view(torch.uint8))
+    expected = praxis_layers._nvfp4_grouped_mm_pytorch(
+        rows, rows_scales, codes, scales, offsets, torch.bfloat16
+    )
+    # Only the order of the float32 sums differs: at most one bfloat16 step.
+    torch.testing.assert_close(out, expected, rtol=2**-7, atol=1e-5)
+    assert torch.equal(hidden_rows, praxis_layers._nvfp4_rows(out, None, row_global)[0])
 
 
 def test_the_float8_grouped_gemm_plugin_takes_the_deepest_pipeline_that_fits(monkeypatch):
