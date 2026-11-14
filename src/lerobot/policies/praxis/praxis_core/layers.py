@@ -598,8 +598,9 @@ FLOAT8_MAX = 448.0
 class Float8Bank:
     """An expert weight bank in float8 e4m3 with a float32 scale per expert and output column (LeRobot addition).
 
-    ``data`` (E, K, N) is column-major, as ``torch._scaled_grouped_mm`` takes it: ``data[e, :, n]`` is the
-    column ``w[e, :, n] / scale[e, n]`` rounded to float8, so that ``w`` is about ``data * scale[:, None]``.
+    ``data`` (E, N, K) holds each output column's K values next to each other, as float8 tensor cores read
+    them: ``data[e, n]`` is the column ``w[e, :, n] / scale[e, n]`` rounded to float8, so that ``w`` is about
+    ``data.transpose(1, 2) * scale[:, None]``. ``torch._scaled_grouped_mm`` takes ``data.transpose(1, 2)``.
     """
 
     data: Tensor
@@ -607,10 +608,10 @@ class Float8Bank:
 
 
 def _float8_bank(w: Tensor) -> tuple[Tensor, Tensor]:
-    """The column-major float8 bank and the float32 scales of a bank ``w`` (E, K, N): see ``Float8Bank``."""
+    """The float8 bank (E, N, K) and the float32 scales of a bank ``w`` (E, K, N): see ``Float8Bank``."""
     columns = w.detach().transpose(1, 2).float()
     scale = columns.abs().amax(dim=2).clamp(min=torch.finfo(torch.float32).tiny) / FLOAT8_MAX
-    return (columns / scale[:, :, None]).to(torch.float8_e4m3fn).contiguous().transpose(1, 2), scale
+    return (columns / scale[:, :, None]).to(torch.float8_e4m3fn).contiguous(), scale
 
 
 class RoutedExperts(nn.Module):
@@ -833,6 +834,21 @@ def set_float8_rows(fn: Float8Rows | None) -> None:
     _FLOAT8_ROWS = fn
 
 
+Float8GroupedMM = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
+_FLOAT8_GROUPED_MM: Float8GroupedMM | None = None
+
+
+def set_float8_grouped_mm(fn: Float8GroupedMM | None) -> None:
+    """Run the bfloat16 grouped GEMMs of float8 experts with ``fn`` (LeRobot addition).
+
+    ``fn(rows, rows_scale, bank.data, bank.scale, offsets)`` returns ``_float8_grouped_mm_pytorch`` of them in
+    bfloat16. An export uses it to give each grouped GEMM to its compiler as one operation. None restores
+    ``_float8_grouped_mm_pytorch``. ``_float8_grouped_mm`` reads the module attribute at call time.
+    """
+    global _FLOAT8_GROUPED_MM
+    _FLOAT8_GROUPED_MM = fn
+
+
 def _float8_rows(x: Tensor, index: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """The rows ``x[index]`` (all of ``x`` without ``index``) in float8 e4m3, with a float32 scale per row: the
     row's largest magnitude over ``FLOAT8_MAX``."""
@@ -841,21 +857,37 @@ def _float8_rows(x: Tensor, index: Tensor | None = None) -> tuple[Tensor, Tensor
     return (rows / scale[:, None]).to(torch.float8_e4m3fn), scale
 
 
+# The GPUs whose float8 grouped GEMM torch._scaled_grouped_mm runs, as its own error message lists them.
+_SCALED_GROUPED_MM_GPUS = ((9, 0), (10, 0))
+
+
+def _float8_grouped_mm_pytorch(
+    rows: Tensor, rows_scale: Tensor, data: Tensor, scale: Tensor, offsets: Tensor, dtype: torch.dtype
+) -> Tensor:
+    """The grouped GEMM of float8 rows with a float8 bank (``Float8Bank`` ``data`` and ``scale``), both scales
+    applied to the float32 sums.
+
+    On CUDA in bfloat16 on a GPU that runs it, this is ``torch._scaled_grouped_mm``. Otherwise, as on the CPU, on
+    other GPUs or in the float32 rerun of an export's check, it multiplies the same scaled float8 values in
+    float32 and rounds the result to ``dtype``.
+    """
+    scaled = rows.is_cuda and torch.cuda.get_device_capability(rows.device) in _SCALED_GROUPED_MM_GPUS
+    if scaled and dtype == torch.bfloat16:
+        return torch._scaled_grouped_mm(
+            rows, data.transpose(1, 2), rows_scale, scale, offs=offsets, out_dtype=torch.bfloat16
+        )
+    a = rows.float() * rows_scale[:, None]
+    b = data.float().transpose(1, 2) * scale[:, None, :]
+    return torch._grouped_mm(a, b, offsets).to(dtype)
+
+
 def _float8_grouped_mm(
     rows: Tensor, rows_scale: Tensor, bank: Float8Bank, offsets: Tensor, dtype: torch.dtype
 ) -> Tensor:
-    """The grouped GEMM of float8 rows with a float8 bank, both scales applied to the float32 sums.
-
-    On CUDA in bfloat16 this is ``torch._scaled_grouped_mm``. Otherwise, as on the CPU or in the float32 rerun of
-    an export's check, it multiplies the same scaled float8 values in float32 and rounds the result to ``dtype``.
-    """
-    if rows.is_cuda and dtype == torch.bfloat16:
-        return torch._scaled_grouped_mm(
-            rows, bank.data, rows_scale, bank.scale, offs=offsets, out_dtype=torch.bfloat16
-        )
-    a = rows.float() * rows_scale[:, None]
-    b = bank.data.float() * bank.scale[:, None, :]
-    return torch._grouped_mm(a, b, offsets).to(dtype)
+    """``_float8_grouped_mm_pytorch``, or in bfloat16 the export's ``set_float8_grouped_mm`` if it set one."""
+    if _FLOAT8_GROUPED_MM is not None and dtype == torch.bfloat16:
+        return _FLOAT8_GROUPED_MM(rows, rows_scale, bank.data, bank.scale, offsets)
+    return _float8_grouped_mm_pytorch(rows, rows_scale, bank.data, bank.scale, offsets, dtype)
 
 
 def _float8_experts(

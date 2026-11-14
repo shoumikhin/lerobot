@@ -122,6 +122,8 @@ EXPERT_GATE_UP_MODULE = "lerobot.policies.praxis.export_expert_gate_up"
 AUTOENCODER_KERNELS_MODULE = "lerobot.policies.praxis.export_autoencoder_kernels"
 # The module that registers the TensorRT plugins of the float8 rounding of the experts' rows (--quantize=fp8).
 FLOAT8_ROWS_MODULE = "lerobot.policies.praxis.export_float8_rows"
+# The module that registers the TensorRT plugin of the float8 experts' grouped GEMMs (--quantize=fp8).
+FLOAT8_GROUPED_MM_MODULE = "lerobot.policies.praxis.export_float8_grouped_mm"
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +575,13 @@ def _float8_rows_plugin() -> praxis_layers.Float8Rows | None:
     return export_float8_rows.FLOAT8_ROWS
 
 
+def _float8_grouped_mm_plugin() -> praxis_layers.Float8GroupedMM | None:
+    """The float8 experts' grouped GEMMs as one TensorRT plugin (`export_float8_grouped_mm`), if there is one."""
+    from . import export_float8_grouped_mm
+
+    return export_float8_grouped_mm.FLOAT8_GROUPED_MM
+
+
 def _take_rows_plugin() -> praxis_layers.TakeRows | None:
     """The mixture-of-experts row gather as one TensorRT plugin (`export_take_rows`), if there is one."""
     from . import export_take_rows
@@ -624,11 +633,31 @@ class PraxisExportRecipe(ActionChunkRecipe):
     def load(cls, cfg: ExportConfig) -> PraxisExportRecipe:
         """Refuse a setting this recipe cannot export before any weight loads, then load the policy."""
         _check_config(cast("PraxisConfig", cfg.policy))
+        dtype = cast("PraxisConfig", cfg.policy).dtype
+        if (
+            cfg.quantize in ("fp8",)
+            and isinstance(cfg.backend, ExecuTorchTensorRTConfig)
+            and dtype not in (None, torch.bfloat16)
+        ):
+            # Its plugins take bfloat16 rows. Without them the experts fall back to PyTorch code TensorRT cannot build.
+            # None keeps the checkpoint's dtype, which `parts` checks once the policy is loaded.
+            raise ValueError(
+                f"Praxis-1's --quantize={cfg.quantize} with TensorRT needs a bfloat16 policy, not {dtype}."
+            )
         if isinstance(cfg.backend, ExecuTorchTensorRTConfig):
             _check_torch_tensorrt(cfg.backend)
-        if cfg.quantize == "fp8" and torch.cuda.get_device_capability() != (9, 0):
-            # torch._scaled_grouped_mm, the float8 experts' PyTorch side, runs on Hopper GPUs.
-            raise ValueError("Praxis-1's --quantize=fp8 runs its float8 experts on a Hopper GPU (sm_90).")
+        tensorrt = isinstance(cfg.backend, ExecuTorchTensorRTConfig)
+        hopper = (
+            cfg.backend.device == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (9, 0)
+        )
+        if cfg.quantize == "fp8" and not tensorrt and not hopper:
+            # Other backends trace torch._scaled_grouped_mm, which runs on Hopper GPUs.
+            raise ValueError(
+                "Praxis-1's --quantize=fp8 runs its float8 experts in TensorRT plugins, or in PyTorch on a Hopper "
+                "GPU (sm_90)."
+            )
         return cast(PraxisExportRecipe, super().load(cfg))
 
     def __init__(
@@ -760,6 +789,19 @@ class PraxisExportRecipe(ActionChunkRecipe):
 
     def parts(self) -> Iterator[Part]:
         """The parts, after checking that they play the policy's actions as the bundle runs them."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        bfloat16 = self.policy.model.dtype == torch.bfloat16
+        if self.cfg.quantize in ("fp8",) and tensorrt and not bfloat16:
+            # `load` lets a policy that keeps its checkpoint's dtype through, so that dtype is checked here.
+            raise ValueError(
+                f"Praxis-1's --quantize={self.cfg.quantize} with TensorRT needs a bfloat16 policy, not "
+                f"{self.policy.model.dtype}."
+            )
+        if self.cfg.quantize == "fp8" and tensorrt and self._float8_grouped_mm() is None:
+            raise ValueError(
+                "Praxis-1's --quantize=fp8 needs the float8 grouped GEMM plugin (export_float8_grouped_mm), which "
+                "this Torch-TensorRT and GPU do not build."
+            )
         ticks = self._random_ticks()
         # The test case's chunks draw with the seeds `seed` to `seed + CHUNKS - 1`.
         seed = self.policy.config.seed + CHUNKS
@@ -794,7 +836,6 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     )
             runs = {run.program: run for chunk in self._chunk_runs() for run in chunk}
             checked = self.policy.model.dtype in (torch.bfloat16, torch.float16)
-            tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
             for name, module in modules.items():
                 check = None
                 # The other parts compute in float32 and float64, or under an autocast of their own like the
@@ -814,6 +855,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
                     (TAKE_ROWS_MODULE, self._take_rows()),
                     (EXPERT_GATE_UP_MODULE, self._expert_gate_up()),
                     (FLOAT8_ROWS_MODULE, self._float8_rows()),
+                    (FLOAT8_GROUPED_MM_MODULE, self._float8_grouped_mm()),
                 )
                 operators = tuple(module for module, plugin in plugins if plugin and name in MOE_PARTS)
                 if self._autoencoder_kernels() and name == "encode":
@@ -856,6 +898,14 @@ class PraxisExportRecipe(ActionChunkRecipe):
             return _float8_rows_plugin()
         return None
 
+    def _float8_grouped_mm(self) -> praxis_layers.Float8GroupedMM | None:
+        """The TensorRT plugin of the float8 experts' grouped GEMMs, for TensorRT in bfloat16 with
+        `--quantize=fp8`."""
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        if tensorrt and self.cfg.quantize == "fp8" and self.policy.model.dtype == torch.bfloat16:
+            return _float8_grouped_mm_plugin()
+        return None
+
     def _autoencoder_kernels(self) -> praxis_vae.AutoencoderKernels | None:
         """The TensorRT plugins of the autoencoder's norm steps and patch averages, for TensorRT."""
         if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
@@ -881,6 +931,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
         praxis_layers.set_take_rows(self._take_rows())
         praxis_layers.set_expert_gate_up(self._expert_gate_up())
         praxis_layers.set_float8_rows(self._float8_rows())
+        praxis_layers.set_float8_grouped_mm(self._float8_grouped_mm())
         praxis_vae.set_autoencoder_kernels(self._autoencoder_kernels())
         try:
             yield
@@ -890,6 +941,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             praxis_layers.set_take_rows(None)
             praxis_layers.set_expert_gate_up(None)
             praxis_layers.set_float8_rows(None)
+            praxis_layers.set_float8_grouped_mm(None)
             praxis_vae.set_autoencoder_kernels(None)
             config.attention_backend = backend
             self.policy._apply_attention_backend(self._device)

@@ -625,6 +625,161 @@ def test_the_row_gather_plugin_gathers_as_pytorch_does_inside_tensorrt():
     assert torch.equal(compiled(*inputs), x[index])
 
 
+def _refuse_loading(monkeypatch):
+    """Make the recipe's policy load fail, so a test sees whether a refusal comes before it."""
+
+    def load_policy(cfg):
+        raise LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+
+
+def test_float8_experts_off_tensorrt_need_the_backend_on_a_hopper_gpu(monkeypatch):
+    """A Hopper GPU in the machine does not help a backend that runs on the CPU."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (9, 0))
+    _refuse_loading(monkeypatch)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=SimpleNamespace(device="cpu"), quantize="fp8")
+    with pytest.raises(ValueError, match="Hopper GPU"):
+        PraxisExportRecipe.load(cfg)
+
+
+@pytest.mark.parametrize("quantize", ["fp8"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_quantized_experts_in_tensorrt_need_a_bfloat16_policy(monkeypatch, quantize, dtype):
+    """The plugins take bfloat16 rows, and the experts' PyTorch fallback does not build in TensorRT."""
+    _refuse_loading(monkeypatch)
+    cfg = SimpleNamespace(
+        policy=tiny_lerobot_config(dtype=dtype), backend=ExecuTorchTensorRTConfig(), quantize=quantize
+    )
+    with pytest.raises(ValueError, match="needs a bfloat16 policy"):
+        PraxisExportRecipe.load(cfg)
+
+
+def test_quantized_experts_in_tensorrt_take_the_checkpoint_dtype_when_none_is_set(monkeypatch):
+    """dtype None keeps the checkpoint's own, so the recipe goes on to load it."""
+    _refuse_loading(monkeypatch)
+    monkeypatch.setattr(export_praxis, "_check_torch_tensorrt", lambda backend: None)
+    cfg = SimpleNamespace(
+        policy=tiny_lerobot_config(dtype=None), backend=ExecuTorchTensorRTConfig(), quantize="fp8"
+    )
+    with pytest.raises(LoadedPolicyError):
+        PraxisExportRecipe.load(cfg)
+
+
+@pytest.mark.parametrize("quantize", ["fp8"])
+def test_quantized_experts_in_tensorrt_refuse_a_loaded_policy_that_is_not_bfloat16(
+    tmp_path, monkeypatch, quantize
+):
+    """A policy that keeps its checkpoint's dtype is checked once it is loaded, before the plugins are looked up."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch, dtype=torch.float32)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    recipe.cfg.quantize = quantize
+    with pytest.raises(ValueError, match="needs a bfloat16 policy, not torch.float32"):
+        next(recipe.parts())
+
+
+def float8_recipe(path, monkeypatch, grouped_mm) -> PraxisExportRecipe:
+    """The bfloat16 recipe of the tiny checkpoint for TensorRT with `--quantize=fp8`, with `grouped_mm` as the
+    plugin of the float8 experts' grouped GEMMs and their rows rounded in PyTorch."""
+    # Whatever the host's GPU and Torch-TensorRT build, only the float8 plugins of the test are set.
+    monkeypatch.setattr(export_praxis, "_top_k_sum_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_expert_gate_up_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_take_rows_plugin", lambda: None)
+    monkeypatch.setattr(export_praxis, "_autoencoder_kernel_plugins", lambda: None)
+    monkeypatch.setattr(export_praxis, "_float8_rows_plugin", lambda: praxis_layers._float8_rows)
+    monkeypatch.setattr(export_praxis, "_float8_grouped_mm_plugin", lambda: grouped_mm)
+    recipe = make_recipe(path, monkeypatch, dtype=torch.bfloat16)
+    recipe.cfg.backend = ExecuTorchTensorRTConfig()
+    recipe.cfg.quantize = "fp8"
+    return recipe
+
+
+def test_with_tensorrt_the_float8_experts_trace_their_rounding_and_grouped_gemms_as_plugins(
+    tmp_path, monkeypatch
+):
+    """PyTorch's float8 grouped GEMM runs only on sm_90 and sm_100, and TensorRT has no layer for it elsewhere, so
+    the parts give each one to TensorRT as a plugin, with the float8 bank as it is stored."""
+    banks = []
+
+    def grouped_mm(rows, rows_scale, data, scale, offsets):
+        banks.append(data)
+        return praxis_layers._float8_grouped_mm_pytorch(
+            rows, rows_scale, data, scale, offsets, torch.bfloat16
+        )
+
+    recipe = float8_recipe(tmp_path / "checkpoint", monkeypatch, grouped_mm)
+    parts = list(recipe.parts())
+    assert banks and all(data.dtype == torch.float8_e4m3fn and data.is_contiguous() for data in banks)
+    assert praxis_layers._FLOAT8_GROUPED_MM is None and praxis_layers._FLOAT8_ROWS is None
+    # The compile step registers the plugins' operators before it loads the program.
+    modules = (export_praxis.FLOAT8_ROWS_MODULE, export_praxis.FLOAT8_GROUPED_MM_MODULE)
+    assert {part.name: part.operator_modules for part in parts} == {
+        part.name: modules if part.name in export_praxis.MOE_PARTS else () for part in parts
+    }
+
+
+def test_with_tensorrt_the_float8_experts_need_the_grouped_gemm_plugin(tmp_path, monkeypatch):
+    """Without it, each grouped GEMM would stay in PyTorch and split its program."""
+    recipe = float8_recipe(tmp_path / "checkpoint", monkeypatch, None)
+    with pytest.raises(ValueError, match="needs the float8 grouped GEMM plugin"):
+        next(recipe.parts())
+
+
+def test_float8_experts_outside_tensorrt_need_a_hopper_gpu(monkeypatch):
+    """Other backends trace PyTorch's float8 grouped GEMM, which runs on sm_90, so the recipe refuses them before
+    any weight loads."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def load_policy(cfg):
+        raise LoadedPolicyError
+
+    monkeypatch.setattr(export_recipe, "load_policy", load_policy)
+    cfg = SimpleNamespace(policy=tiny_lerobot_config(), backend=ExecuTorchCUDAConfig(), quantize="fp8")
+    with pytest.raises(ValueError, match="Hopper GPU"):
+        PraxisExportRecipe.load(cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugin runs on CUDA")
+def test_the_float8_grouped_gemm_plugin_multiplies_as_pytorch_does_inside_tensorrt():
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_float8_grouped_mm import FLOAT8_GROUPED_MM
+
+    if FLOAT8_GROUPED_MM is None:
+        pytest.skip(
+            f"Torch-TensorRT {torch_tensorrt.__version__} builds no float8 grouped GEMM plugin on this GPU"
+        )
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    # Sizes that are no multiples of the kernel's tiles.
+    experts, k, n, count = 8, 272, 400, 1000
+    data, scale = praxis_layers._float8_bank(
+        torch.randn(experts, k, n, device="cuda", generator=generator) * 0.02
+    )
+    x = torch.randn(count, k, device="cuda", generator=generator).to(torch.bfloat16)
+    rows, rows_scale = praxis_layers._float8_rows(x)
+    # Uneven experts, an empty one, and every row in an expert, as the experts' dispatch sorts them.
+    offsets = torch.tensor([100, 100, 350, 351, 600, 640, 900, count], dtype=torch.int32, device="cuda")
+
+    class Experts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("data", data)
+            self.register_buffer("scale", scale)
+
+        def forward(self, rows, rows_scale, offsets):
+            return FLOAT8_GROUPED_MM(rows, rows_scale, self.data, self.scale, offsets)
+
+    inputs = [rows, rows_scale, offsets]
+    program = torch.export.export(Experts(), tuple(inputs))
+    compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
+    _assert_runs_in_tensorrt(compiled)
+    expected = praxis_layers._float8_grouped_mm_pytorch(
+        rows, rows_scale, data, scale, offsets, torch.bfloat16
+    )
+    # Only the order of the float32 sums differs.
+    torch.testing.assert_close(compiled(*inputs), expected, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("tensorrt", [True, False], ids=["tensorrt", "test_backend"])
 def test_with_tensorrt_encode_traces_the_autoencoders_norm_steps_and_averages_as_plugins(
     tmp_path, monkeypatch, tensorrt

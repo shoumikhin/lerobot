@@ -1261,8 +1261,9 @@ def test_the_decoder_modulators_map_one_row_per_conditioning_token(
 
 
 def test_float8_experts_multiply_rows_and_banks_rounded_to_float8() -> None:
-    """`RoutedExperts.to_float8` keeps column-major float8 banks with a scale per expert and output column, whose
-    largest magnitude is 448, and each grouped GEMM then multiplies rows rounded the same way, per row."""
+    """`RoutedExperts.to_float8` keeps float8 banks with each output column's values next to each other and a scale
+    per expert and output column, whose largest magnitude is 448, and each grouped GEMM then multiplies rows rounded
+    the same way, per row."""
     ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
     generator = torch.Generator().manual_seed(0)
     x = _randn(generator, 1, 90, 64)
@@ -1273,11 +1274,12 @@ def test_float8_experts_multiply_rows_and_banks_rounded_to_float8() -> None:
         quantized = ffn(x)
     gate_up, down = ffn.routed.banks()
     for bank, weight in zip((gate_up, down), banks, strict=True):
-        assert bank.data.dtype == torch.float8_e4m3fn and bank.data.transpose(1, 2).is_contiguous()
+        assert bank.data.dtype == torch.float8_e4m3fn and bank.data.is_contiguous()
+        assert bank.data.shape == weight.transpose(1, 2).shape
         assert torch.equal(
-            bank.data.float().abs().amax(dim=1), torch.full_like(bank.scale, praxis_layers.FLOAT8_MAX)
+            bank.data.float().abs().amax(dim=2), torch.full_like(bank.scale, praxis_layers.FLOAT8_MAX)
         )
-        dequantized = bank.data.float() * bank.scale[:, None]
+        dequantized = bank.data.float().transpose(1, 2) * bank.scale[:, None]
         assert (dequantized - weight.float()).norm() / weight.float().norm() < 0.05
 
     def rounded(rows: torch.Tensor) -> torch.Tensor:
@@ -1289,12 +1291,44 @@ def test_float8_experts_multiply_rows_and_banks_rounded_to_float8() -> None:
     offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.data.shape[0] - 4), dtype=torch.int32)
     expected = []
     for e, (start, end) in enumerate(zip([0, *offsets[:-1].tolist()], offsets.tolist(), strict=True)):
-        hidden = rounded(rows[index[start:end]]) @ (gate_up.data[e].float() * gate_up.scale[e])
+        hidden = rounded(rows[index[start:end]]) @ (gate_up.data[e].float().T * gate_up.scale[e])
         gate, up = hidden.to(torch.bfloat16).chunk(2, dim=-1)
         hidden = (torch.nn.functional.silu(gate) * up).float()
-        expected.append(rounded(hidden) @ (down.data[e].float() * down.scale[e]))
+        expected.append(rounded(hidden) @ (down.data[e].float().T * down.scale[e]))
     out = praxis_layers._float8_experts(rows, index, gate_up, down, offsets)
     torch.testing.assert_close(out, torch.cat(expected).to(torch.bfloat16), rtol=2**-7, atol=1e-6)
     # The float8 experts ran, and moved the layer by about what float8 rounding does.
     assert not torch.equal(quantized, unquantized)
     assert (quantized - unquantized).float().norm() / unquantized.float().norm() < 0.1
+
+
+def test_float8_experts_run_their_bfloat16_grouped_gemms_with_the_exports_kernel() -> None:
+    """An export gives each bfloat16 grouped GEMM of the float8 experts to its compiler as one operation
+    (`set_float8_grouped_mm`): it gets the float8 bank as it is stored, and float32 keeps the PyTorch side."""
+    ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
+    ffn.routed.to_float8()
+    gate_up, down = ffn.routed.banks()
+    generator = torch.Generator().manual_seed(0)
+    rows = _randn(generator, 24, 64)
+    index = torch.randperm(24, generator=generator)[:20]
+    offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.data.shape[0] - 4), dtype=torch.int32)
+    banks = []
+
+    def grouped_mm(rows, rows_scale, data, scale, offsets):
+        banks.append(data)
+        return praxis_layers._float8_grouped_mm_pytorch(
+            rows, rows_scale, data, scale, offsets, torch.bfloat16
+        )
+
+    expected = {
+        dtype: praxis_layers._float8_experts(rows.to(dtype), index, gate_up, down, offsets)
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    praxis_layers.set_float8_grouped_mm(grouped_mm)
+    try:
+        for dtype in (torch.float32, torch.bfloat16):
+            out = praxis_layers._float8_experts(rows.to(dtype), index, gate_up, down, offsets)
+            assert torch.equal(out, expected[dtype])
+    finally:
+        praxis_layers.set_float8_grouped_mm(None)
+    assert len(banks) == 2 and banks[0] is gate_up.data and banks[1] is down.data
