@@ -800,14 +800,39 @@ class DecoderTower(nn.Module):
         self.positive_zero_residual_add = positive_zero_residual_add
         self._tf_masks = _TeacherForcingMaskCache(mask_block_size)
 
+    def _positions(self, frames: int, height: int, width: int, rope_shift: int) -> Tensor:
+        """Return the rotary positions of ``[registers | noised]``, frames of ``height x width`` tokens."""
+        registers = torch.zeros(self.registers.size(1), dtype=torch.int64)
+        return torch.cat([registers, video_positions(frames, height, width, rope_shift)])
+
+    def rope_table(
+        self, frames: int, latent_hw: tuple[int, int], first_frame: int, device: torch.device
+    ) -> Tensor:
+        """Return the rotary table of a call on ``frames`` noised frames of
+        ``(h, w)`` latents that start at frame ``first_frame`` of the window.
+
+        Noised chunk k attends only the registers and itself, so a call on
+        chunk k alone, with this table for ``first_frame = k * F``, returns
+        the velocity of chunk k in the whole window.
+        """
+        ph, pw = self.patch_size
+        positions = self._positions(frames, latent_hw[0] * ph, latent_hw[1] * pw, first_frame * FRAME_STRIDE)
+        return self.core.rope_table(positions.unsqueeze(0).to(device), positions.numel())
+
     def forward_chunk_causal(
-        self, noised: Tensor, cond: Tensor, timesteps: Tensor, rope_shift: int = 0
+        self,
+        noised: Tensor,
+        cond: Tensor,
+        timesteps: Tensor,
+        rope_shift: int = 0,
+        rope: Tensor | None = None,
     ) -> Tensor:
         """Return the velocity of the K noised chunks of a chunk-causal window.
 
         The sequence is ``[registers | noised]`` at full latent resolution,
         with the rotary positions of the noised frames from ``rope_shift``
-        (0 at inference). ``cond`` is the encoder output
+        (0 at inference). ``rope``, from ``rope_table``, replaces the table of
+        those positions. ``cond`` is the encoder output
         ``(1, K * F, h, w, dim)``. ``timesteps`` is ``(1, K)``. Noised chunk k
         attends the registers and itself.
         """
@@ -839,15 +864,11 @@ class DecoderTower(nn.Module):
             cond_rows = torch.cat([pad, cond.reshape(b, cf * h * w, c)], dim=1)
             modulation = PatchRows(cond_rows, n_reg, (cf, h, w), (ph, pw))
 
-        pos = [
-            torch.zeros(n_reg, dtype=torch.int64),
-            video_positions(frames, height, width, rope_shift),
-        ]
-        positions = torch.cat(pos).unsqueeze(0).to(x.device)
+        positions = self._positions(frames, height, width, rope_shift).unsqueeze(0).to(x.device)
         slots = [("global", 1, n_reg), ("noised", frames, tpf)]
         mask = self._tf_masks.get(slots, chunk, False, x.device, _full_blocks(self.core))
 
-        out, _ = self.core(x, positions, modulation, mask)
+        out, _ = self.core(x, positions, modulation, mask, rope=rope)
         if self.positive_zero_residual_add:
             out = out + 0.0
         v = self.output_projections[VIDEO](out.narrow(1, n_reg, flat.size(1)))

@@ -1343,14 +1343,18 @@ class Transformer(nn.Module):
         block_mask: BlockMask | AttentionBlocks | None = None,
         tap_blocks: Sequence[int] = (),
         context: ContextCache | None = None,
+        rope: Tensor | None = None,
     ) -> tuple[Tensor, list[Tensor]]:
         """Map ``x`` (B, N, C) to (B, N, C) and return the taps.
 
-        ``rope_idx`` is (B, N) int64. The taps are the outputs of the blocks in
-        ``tap_blocks``, in the order of ``tap_blocks``. ``context`` goes to every
-        attention layer (``Attention.forward``).
+        ``rope_idx`` is (B, N) int64. ``rope`` is its rotary table
+        (``rope_table``), if the caller has it already. The taps are the
+        outputs of the blocks in ``tap_blocks``, in the order of
+        ``tap_blocks``. ``context`` goes to every attention layer
+        (``Attention.forward``).
         """
-        rope = self.rope_table(rope_idx, x.size(-2))
+        if rope is None:
+            rope = self.rope_table(rope_idx, x.size(-2))
         taps: dict[int, Tensor] = {}
         for i in range(len(self.blocks)):
             x = self.block_forward(i, x, rope, x_mod, block_mask, context)

@@ -40,6 +40,12 @@ the first chunk of the two-chunk window, which reads neither the clean latents n
 chunk runs the same programs. After a reset the bundle fills the kept frames with the first one, so `encode`
 reads the current frame as the anchor frame, as the policy does. Only `actions_first` differs: it plays the
 first chunk's 21 actions, where `actions` plays the second chunk's 24 (`first_runs`).
+
+The policy returns one chunk of the window, and nothing that reaches its actions reads the video of the other
+noised chunk: a noised chunk attends only the global tokens, the clean chunks before it and itself, in both
+towers and in the action expert. So `sample` decodes and steps only the video of the chunk the robot plays, at
+its rotary positions in the window, and the other chunk keeps its noise. The first chunk's run plays the first
+chunk of the window and every later run the second, with the constants of that chunk.
 """
 
 from __future__ import annotations
@@ -99,6 +105,8 @@ CHUNKS = 3
 
 ANCHOR, CLEAN, PROPRIO = "anchor", "clean", "proprio"
 VIDEO, ACTIONS = "video_sample", "action_sample"
+# The chunk of the window the robot plays: the first after a reset, the second after that.
+FIRST_CHUNK, LATER_CHUNK = 0, WINDOW_CHUNKS - 1
 
 # The parts that hold the towers' mixture-of-experts layers.
 MOE_PARTS = ("sample",)
@@ -314,14 +322,27 @@ class _Start(nn.Module):
         return video.view(self.video_shape), actions.view(self.action_shape)
 
 
+def _pick(window: Tensor, played: Tensor, dim: int) -> Tensor:
+    """The chunk of `window` along `dim` that `played` picks: one at that chunk's index, zero at the others.
+
+    One times a value is that value, and zero times one is zero, so the pick is exact.
+    """
+    chunks = window.chunk(played.numel(), dim=dim)
+    picked = played[0].to(window.dtype) * chunks[0]
+    for weight, chunk in zip(played[1:], chunks[1:], strict=True):
+        picked = picked + weight.to(window.dtype) * chunk
+    return picked
+
+
 def _guided(velocities: list[Tensor], scale: float) -> Tensor:
     """The guided velocity of the guided pass and, if any, the unguided one, as the sampler combines them."""
     return velocities[0] if len(velocities) == 1 else guidance_combine(velocities[0], velocities[1], scale)
 
 
 class _Sample(nn.Module):
-    """The window's latents, actions and proprio and the time grid in; the latents and the actions before the
-    last Euler step, and the action velocity of each pass the last step combines, out.
+    """The window's latents, actions and proprio, the chunk the robot plays and its decoder rotary table, and the
+    time grid in; the latents and the actions before the last Euler step, and the action velocity of each pass the
+    last step combines, out. With one step, which runs no decoder, there is no played chunk or table.
 
     It runs `PraxisModel.sample_window_joint` up to its last update: on each step the encoder tower for the task's
     text and, with guidance, for the blank caption, and the action expert on the taps of each pass whose actions
@@ -335,6 +356,10 @@ class _Sample(nn.Module):
 
     The latents the last step reads move no action after it, but they are the only output the decoder tower
     reaches directly, so the check of the program on its own (`ProgramCheck`) sees that tower through them.
+
+    The decoder tower runs on the played chunk alone: a noised chunk attends only the registers and itself there,
+    so with the rotary table of its positions in the window (`DecoderTower.rope_table`) it gets its velocity of
+    the whole window. Only that chunk's latents move; the other chunk keeps its noise.
     """
 
     def __init__(
@@ -359,8 +384,9 @@ class _Sample(nn.Module):
         self.register_buffer("text_uncond", texts[1] if len(texts) > 1 else None)
 
     def forward(
-        self, anchor: Tensor, clean: Tensor, video: Tensor, actions: Tensor, proprio: Tensor, *grid: Tensor
+        self, anchor: Tensor, clean: Tensor, video: Tensor, actions: Tensor, proprio: Tensor, *inputs: Tensor
     ) -> tuple[Tensor, ...]:
+        played, rope, *grid = inputs if self.steps > 1 else (None, None, *inputs)
         times, step_sizes = grid[: self.steps], grid[self.steps :]
         dtype = self.encoder.registers.dtype
         chunks = proprio.shape[1]
@@ -398,11 +424,16 @@ class _Sample(nn.Module):
                 action_velocities.append(velocity.float()[0])
             if last:
                 break
+            assert played is not None
+            chunk = _pick(noised, played, dim=2)
             video_velocities = [
-                self.decoder.forward_chunk_causal(noised, cond, timesteps).float()
+                self.decoder.forward_chunk_causal(
+                    chunk, _pick(cond, played, dim=1), time.to(dtype).expand(1, 1), rope=rope
+                ).float()
                 for cond in conds[: self.video_passes]
             ]
-            video = video + step_sizes[i] * _guided(video_velocities, self.video_scale)
+            moved = step_sizes[i] * _guided(video_velocities, self.video_scale)
+            video = video + torch.cat([weight * moved for weight in played.unbind()], dim=2)
             actions = actions + step_sizes[i] * _guided(action_velocities, self.action_scale)
         return video, actions, *action_velocities
 
@@ -428,7 +459,7 @@ class _Actions(nn.Module):
         super().__init__()
         config = policy.config
         self.action_scale = policy.sampler_settings.cfg_scale
-        self.chunk = 0 if first else WINDOW_CHUNKS - 1
+        self.chunk = FIRST_CHUNK if first else LATER_CHUNK
         self.tokens = int(config.model_config["chunking"]["latents_per_chunk"])
         self.first = first
         self.arms = config.n_arms
@@ -462,6 +493,16 @@ class _Actions(nn.Module):
             rpy = _matrix_to_euler_xyz(rotation.double())
             arms += [xyz.double(), rpy, relative[:, grip, None].clamp(0, 1).double()]
         return torch.cat(arms, dim=-1).float()
+
+
+def _played(chunk: int) -> str:
+    """The constant that picks the window's chunk `chunk` (`_pick`)."""
+    return f"played_{chunk}"
+
+
+def _decoder_rope(chunk: int) -> str:
+    """The constant of the decoder's rotary table of the window's chunk `chunk`."""
+    return f"decoder_rope_{chunk}"
 
 
 def _rig(config: PraxisConfig) -> ModuleType:
@@ -837,22 +878,37 @@ class PraxisExportRecipe(ActionChunkRecipe):
         return {name: module.to(self._device) for name, module in modules.items()}
 
     def _constants(self) -> dict[str, np.ndarray]:
-        """The time of each step and its Euler step, on the sampler's float64 grid, as float32."""
+        """The time of each step and its Euler step, on the sampler's float64 grid, as float32, and for each chunk
+        the robot plays, what picks it and the decoder's rotary table of its positions."""
         settings = self.policy.sampler_settings
         times = window_time_grid(settings.num_steps, settings.t_shift)
         constants = {}
         for i in range(settings.num_steps):
             constants[f"time_{i}"] = np.array([times[i]], dtype=np.float32)
             constants[f"step_{i}"] = np.array([times[i + 1] - times[i]], dtype=np.float32)
+        if settings.num_steps > 1:
+            decoder = self.policy.model.backbone.decoder
+            latent_hw = self._video_shape[3], self._video_shape[4]
+            for chunk in (FIRST_CHUNK, LATER_CHUNK):
+                constants[_played(chunk)] = np.eye(WINDOW_CHUNKS, dtype=np.float32)[chunk]
+                # On the export's device, where the policy computes the table of the whole window.
+                table = decoder.rope_table(self._latents, latent_hw, chunk * self._latents, self._device)
+                constants[_decoder_rope(chunk)] = table.cpu().numpy()
         return constants
 
     def _chunk_runs(self) -> tuple[list[ProgramRun], list[ProgramRun]]:
         """The runs of the first chunk after a reset and of every later one."""
+        return self._runs(FIRST_CHUNK, "actions_first"), self._runs(LATER_CHUNK, "actions")
+
+    def _runs(self, played: int, actions: str) -> list[ProgramRun]:
+        """The runs of a chunk whose window's chunk `played` the robot plays with the program `actions`."""
         settings = self.policy.sampler_settings
         _, action_passes = self._passes()
         action_velocities = ["action_velocity", "action_velocity_uncond"][:action_passes]
         last = settings.num_steps - 1
         grid = [f"time_{i}" for i in range(settings.num_steps)] + [f"step_{i}" for i in range(last)]
+        if last:
+            grid = [_played(played), _decoder_rope(played), *grid]
         runs = [
             ProgramRun("encode", "encode", [*self._cameras, self._state], [ANCHOR, CLEAN, PROPRIO]),
             ProgramRun("start", "start", [NOISE], [VIDEO, ACTIONS]),
@@ -864,10 +920,7 @@ class PraxisExportRecipe(ActionChunkRecipe):
             ),
         ]
         finish = [ACTIONS, *action_velocities, f"step_{last}", self._state]
-        return (
-            [*runs, ProgramRun("actions", "actions_first", finish, [ACTION])],
-            [*runs, ProgramRun("actions", "actions", finish, [ACTION])],
-        )
+        return [*runs, ProgramRun("actions", actions, finish, [ACTION])]
 
     def _play(
         self,

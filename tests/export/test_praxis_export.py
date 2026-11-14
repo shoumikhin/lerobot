@@ -268,7 +268,11 @@ def test_sample_returns_what_its_decoder_tower_moves(tmp_path, monkeypatch):
         outputs = sample.module(*sample.example_inputs)
         decoder = sample.module.decoder
         forward = decoder.forward_chunk_causal
-        monkeypatch.setattr(decoder, "forward_chunk_causal", lambda *args: torch.zeros_like(forward(*args)))
+        monkeypatch.setattr(
+            decoder,
+            "forward_chunk_causal",
+            lambda *args, **kwargs: torch.zeros_like(forward(*args, **kwargs)),
+        )
         broken = sample.module(*sample.example_inputs)
     assert sample.outputs[0] == export_praxis.VIDEO
     assert not torch.equal(broken[0], outputs[0])
@@ -616,3 +620,53 @@ def test_the_autoencoder_plugins_compute_as_pytorch_does_inside_tensorrt():
     for result, factor_t in ((average, 1), (average_2, 2)):
         expected = praxis_vae.AvgDown3D(40, 40 * factor_t, factor_t, 2)(x[:, :, 1:])
         torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-3)
+
+
+def test_the_sample_decoder_decodes_a_chunk_alone_as_in_the_whole_window(tmp_path, monkeypatch):
+    """`sample` decodes one chunk alone, with the rotary table of its positions in the window: it gets the whole
+    window's velocity of that chunk, and the other chunk's positions give another velocity."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    parts = {part.name: part for part in recipe.parts()}
+    sample = parts["sample"].module
+    anchor, clean, video, _, proprio, _, _, time, *_ = parts["sample"].example_inputs
+    chunks = export_praxis.WINDOW_CHUNKS
+    constants = recipe.plan().constants
+    ropes = [torch.from_numpy(constants[f"decoder_rope_{chunk}"]) for chunk in range(chunks)]
+    dtype = sample.encoder.registers.dtype
+    noised, timesteps = video.to(dtype), time.to(dtype).expand(1, chunks)
+    with torch.no_grad(), recipe._plain_pytorch():
+        ((cond, _),) = sample.encoder.forward_chunk_causal_pair(
+            [sample.text], anchor.to(dtype), clean.to(dtype), noised, timesteps
+        )
+        window = sample.decoder.forward_chunk_causal(noised, cond, timesteps)
+        for chunk, expected in enumerate(window.chunk(chunks, dim=2)):
+            for positions, rope in enumerate(ropes):
+                alone = sample.decoder.forward_chunk_causal(
+                    noised.chunk(chunks, dim=2)[chunk],
+                    cond.chunk(chunks, dim=1)[chunk],
+                    timesteps[:, :1],
+                    rope=rope,
+                )
+                if positions == chunk:
+                    torch.testing.assert_close(alone, expected, rtol=0, atol=1e-5)
+                else:
+                    assert (alone - expected).abs().max() > 1e-2
+
+
+def test_each_chunk_decodes_and_steps_only_the_chunk_it_plays(tmp_path, monkeypatch):
+    """The first chunk after a reset picks the first chunk of the window, every later one the second, and
+    `sample` moves only the picked chunk's latents."""
+    recipe = make_recipe(tmp_path / "checkpoint", monkeypatch)
+    plan = recipe.plan()
+    for runs, played in ((plan.first_runs[0], 0), (plan.runs, 1)):
+        (run,) = (run for run in runs if run.program == "sample")
+        assert run.inputs[5:7] == [f"played_{played}", f"decoder_rope_{played}"]
+    part = next(part for part in recipe.parts() if part.name == "sample")
+    video, played = part.example_inputs[2], part.example_inputs[5]
+    with torch.no_grad(), recipe._plain_pytorch():
+        moved = part.module(*part.example_inputs)[0]
+    chunks = export_praxis.WINDOW_CHUNKS
+    for chunk, (before, after) in enumerate(
+        zip(video.chunk(chunks, dim=2), moved.chunk(chunks, dim=2), strict=True)
+    ):
+        assert torch.equal(before, after) != bool(played[chunk])
