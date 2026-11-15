@@ -25,6 +25,7 @@ of the expert outputs (``_PermuteRows``) and the chunked expert dispatch
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -1036,13 +1037,15 @@ class Nvfp4Kernels:
     """The steps of NVFP4 experts that an export gives its compiler as single operations (LeRobot addition).
 
     ``row_globals(row_largest, segment_ends)`` returns ``_nvfp4_row_globals`` of them, ``rows(x, index,
-    row_global)`` returns ``_nvfp4_rows`` of them, and ``grouped_mm(codes, scales, bank.codes, bank.scales,
-    offsets)`` returns ``_nvfp4_grouped_mm_pytorch`` of them in bfloat16.
+    row_global)`` returns ``_nvfp4_rows`` of them, ``gate_up(codes, scales, bank, offsets, row_global)`` returns the
+    hidden rows of ``_nvfp4_gate_up`` and the largest magnitudes of any groups of their columns, and ``down(codes,
+    scales, bank, offsets, row_global)`` returns ``_nvfp4_down`` of them, in bfloat16.
     """
 
     row_globals: Callable[[Tensor, Tensor], Tensor]
     rows: Callable[[Tensor, Tensor | None, Tensor], tuple[Tensor, Tensor]]
-    grouped_mm: Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
+    gate_up: Callable[[Tensor, Tensor, Nvfp4Bank, Tensor, Tensor], tuple[Tensor, Tensor]]
+    down: Callable[[Tensor, Tensor, Nvfp4Bank, Tensor, Tensor], Tensor]
 
 
 _NVFP4_KERNELS: Nvfp4Kernels | None = None
@@ -1056,12 +1059,13 @@ def set_nvfp4_kernels(kernels: Nvfp4Kernels | None) -> None:
 
 
 def _nvfp4_row_globals(row_largest: Tensor, segment_ends: Tensor) -> Tensor:
-    """The float32 global scale of each row (R,): ``_nvfp4_global`` of the largest of ``row_largest`` (R,), the rows'
-    largest magnitudes, over the row's segment. The segments follow each other and end at ``segment_ends``."""
+    """The float32 global scale of each row (R,): ``_nvfp4_global`` of the largest of ``row_largest`` (R, G), largest
+    magnitudes of groups of each row's values, over the row's segment. The segments follow each other and end at
+    ``segment_ends``."""
     rows = torch.arange(row_largest.shape[0], device=row_largest.device, dtype=segment_ends.dtype)
     segment = torch.bucketize(rows, segment_ends, right=True).long()
     largest = torch.zeros(segment_ends.shape[0], dtype=torch.float32, device=row_largest.device)
-    largest.scatter_reduce_(0, segment, row_largest.float(), "amax")
+    largest.scatter_reduce_(0, segment, row_largest.float().amax(dim=1), "amax")
     return _nvfp4_global(largest)[segment]
 
 
@@ -1099,43 +1103,55 @@ def _nvfp4_rescale(raw: Tensor, rows_global: Tensor, bank_global: Tensor) -> Ten
     return (raw.float() * multiplier[:, None]).to(raw.dtype)
 
 
+def _nvfp4_row_experts(offsets: Tensor, rows: int) -> Tensor:
+    """The expert of each of ``rows`` rows that end at ``offsets`` expert by expert (rows past them: the last)."""
+    index = torch.arange(rows, device=offsets.device, dtype=offsets.dtype)
+    return torch.bucketize(index, offsets, right=True).clamp_max(offsets.shape[0] - 1)
+
+
+def _nvfp4_gate_up(
+    codes: Tensor, scales: Tensor, bank: Nvfp4Bank, offsets: Tensor, row_global: Tensor, dtype: torch.dtype
+) -> tuple[Tensor, Tensor]:
+    """SwiGLU of the rescaled gate|up grouped GEMM of NVFP4 rows (``codes``, ``scales``, global scales
+    ``row_global``), and the largest magnitude of each of its rows (R, 1)."""
+    raw = _nvfp4_grouped_mm_pytorch(codes, scales, bank.codes, bank.scales, offsets, dtype)
+    experts = _nvfp4_row_experts(offsets, codes.shape[0])
+    hidden = _expert_swiglu(_nvfp4_rescale(raw, row_global, bank.global_scale[experts]))
+    return hidden, hidden.abs().amax(dim=1, keepdim=True)
+
+
+def _nvfp4_down(
+    codes: Tensor, scales: Tensor, bank: Nvfp4Bank, offsets: Tensor, row_global: Tensor, dtype: torch.dtype
+) -> Tensor:
+    """The rescaled down grouped GEMM of NVFP4 rows (``codes``, ``scales``, global scales ``row_global``)."""
+    raw = _nvfp4_grouped_mm_pytorch(codes, scales, bank.codes, bank.scales, offsets, dtype)
+    return _nvfp4_rescale(raw, row_global, bank.global_scale[_nvfp4_row_experts(offsets, codes.shape[0])])
+
+
 def _nvfp4_experts(
-    x: Tensor,
-    index: Tensor,
-    row_experts: Tensor,
-    segment_ends: Tensor,
-    gate_up: Nvfp4Bank,
-    down: Nvfp4Bank,
-    offsets: Tensor,
+    x: Tensor, index: Tensor, segment_ends: Tensor, gate_up: Nvfp4Bank, down: Nvfp4Bank, offsets: Tensor
 ) -> Tensor:
     """``down(swiglu(gate_up(x[index])))`` of each row with its expert's NVFP4 banks (LeRobot addition).
 
     As the original implementation's NVFP4 inference: the input of each grouped GEMM is rounded to NVFP4 with a
     global scale per segment of rows, the segments ending at ``segment_ends``; the GEMM's bfloat16 result is
-    multiplied by the row's and the expert's (``row_experts``) global scales.
+    multiplied by the row's and the expert's global scales.
     """
     if _NVFP4_KERNELS is not None and x.dtype == torch.bfloat16:
-        row_globals, rows, grouped_mm = (
-            _NVFP4_KERNELS.row_globals,
-            _NVFP4_KERNELS.rows,
-            _NVFP4_KERNELS.grouped_mm,
-        )
+        kernels = _NVFP4_KERNELS
     else:
-        row_globals, rows = _nvfp4_row_globals, _nvfp4_rows
-
-        def grouped_mm(
-            codes: Tensor, scales: Tensor, bank_codes: Tensor, bank_scales: Tensor, offs: Tensor
-        ) -> Tensor:
-            return _nvfp4_grouped_mm_pytorch(codes, scales, bank_codes, bank_scales, offs, x.dtype)
-
-    x_global = row_globals(x.abs().amax(dim=1)[index], segment_ends)
-    codes, scales = rows(x, index, x_global)
-    gate_up_out = grouped_mm(codes, scales, gate_up.codes, gate_up.scales, offsets)
-    hidden = _expert_swiglu(_nvfp4_rescale(gate_up_out, x_global, gate_up.global_scale[row_experts]))
-    hidden_global = row_globals(hidden.abs().amax(dim=1), segment_ends)
-    codes, scales = rows(hidden, None, hidden_global)
-    out = grouped_mm(codes, scales, down.codes, down.scales, offsets)
-    return _nvfp4_rescale(out, hidden_global, down.global_scale[row_experts])
+        kernels = Nvfp4Kernels(
+            _nvfp4_row_globals,
+            _nvfp4_rows,
+            functools.partial(_nvfp4_gate_up, dtype=x.dtype),
+            functools.partial(_nvfp4_down, dtype=x.dtype),
+        )
+    x_global = kernels.row_globals(x.abs().amax(dim=1, keepdim=True)[index], segment_ends)
+    codes, scales = kernels.rows(x, index, x_global)
+    hidden, hidden_largest = kernels.gate_up(codes, scales, gate_up, offsets, x_global)
+    hidden_global = kernels.row_globals(hidden_largest, segment_ends)
+    codes, scales = kernels.rows(hidden, None, hidden_global)
+    return kernels.down(codes, scales, down, offsets, hidden_global)
 
 
 def _segment_ends(top_idx: Tensor, sizes: Sequence[int], num_experts: int) -> Tensor:
@@ -1175,8 +1191,7 @@ def _routed_chunk_group(
         # Each chunk's rows of an expert get their own global scale, so that each sum has the bits of its chunk
         # run alone, as for the other banks.
         segment_ends = _segment_ends(top_idx, sizes, experts)
-        row_experts = top_idx.reshape(-1)[order]
-        out = _nvfp4_experts(x, sorted_tokens, row_experts, segment_ends, gate_up_w, down_w, offsets)
+        out = _nvfp4_experts(x, sorted_tokens, segment_ends, gate_up_w, down_w, offsets)
     elif isinstance(gate_up_w, Float8Bank):
         assert isinstance(down_w, Float8Bank)
         order, sorted_tokens, _, offsets = _dispatch_rows(top_idx, gate, gate_up_w.data.shape[0])

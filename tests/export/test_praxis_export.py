@@ -799,14 +799,16 @@ def test_with_tensorrt_the_nvfp4_experts_trace_their_steps_as_plugins(tmp_path, 
     plugins, with the NVFP4 bank as it is stored."""
     banks = []
 
-    def grouped_mm(codes, scales, bank, bank_scales, offsets):
-        banks.append(bank)
-        return praxis_layers._nvfp4_grouped_mm_pytorch(
-            codes, scales, bank, bank_scales, offsets, torch.bfloat16
-        )
+    def gate_up(codes, scales, bank, offsets, row_global):
+        banks.append(bank.codes)
+        return praxis_layers._nvfp4_gate_up(codes, scales, bank, offsets, row_global, torch.bfloat16)
+
+    def down(codes, scales, bank, offsets, row_global):
+        banks.append(bank.codes)
+        return praxis_layers._nvfp4_down(codes, scales, bank, offsets, row_global, torch.bfloat16)
 
     kernels = praxis_layers.Nvfp4Kernels(
-        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, grouped_mm
+        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, gate_up, down
     )
     recipe = nvfp4_recipe(tmp_path / "checkpoint", monkeypatch, kernels)
     parts = list(recipe.parts())
@@ -859,23 +861,27 @@ def test_the_nvfp4_row_plugins_convert_with_one_instruction_from_sm_100(monkeypa
     assert export_nvfp4._register() is not None
     assert constexprs["lerobot_praxis::take_nvfp4_rows"]["NATIVE"] is native
     assert constexprs["lerobot_praxis::nvfp4_rows"]["NATIVE"] is native
-    assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_grouped_mm"]
+    assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_gate_up"]
+    assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_down"]
     assert "NATIVE" not in constexprs["lerobot_praxis::nvfp4_row_globals"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugins run on CUDA")
-def test_the_nvfp4_plugins_compute_as_pytorch_does_inside_tensorrt():
+def test_the_nvfp4_plugins_compute_as_pytorch_does_inside_tensorrt(monkeypatch):
     torch_tensorrt = _need_triton_op()
     from lerobot.policies.praxis.export_nvfp4 import NVFP4_KERNELS
 
     if NVFP4_KERNELS is None:
         pytest.skip(f"Torch-TensorRT {torch_tensorrt.__version__} builds no NVFP4 plugins on this GPU")
     generator = torch.Generator(device="cuda").manual_seed(0)
-    # Experts of several row tiles, output columns ending in a partial tile, an expert without rows, segments of two
+    # Experts of several row tiles, down columns ending in a partial tile, an expert without rows, segments of two
     # chunks, and each token taken top_k times.
-    tokens, top_k, experts, k, n = 300, 2, 6, 512, 400
-    codes, scales, global_scale = praxis_layers._nvfp4_bank(
-        torch.randn(experts, k, n, device="cuda", generator=generator) * 0.02
+    tokens, top_k, experts, k, h, n = 300, 2, 6, 512, 256, 400
+    gate_up = praxis_layers.Nvfp4Bank(
+        *praxis_layers._nvfp4_bank(torch.randn(experts, k, 2 * h, device="cuda", generator=generator) * 0.02)
+    )
+    down = praxis_layers.Nvfp4Bank(
+        *praxis_layers._nvfp4_bank(torch.randn(experts, h, n, device="cuda", generator=generator) * 0.02)
     )
     x = (torch.randn(tokens, k, device="cuda", generator=generator) * 3).to(torch.bfloat16)
     chosen = torch.randint(0, experts - 1, (tokens, top_k), device="cuda", generator=generator)
@@ -888,32 +894,118 @@ def test_the_nvfp4_plugins_compute_as_pytorch_does_inside_tensorrt():
     class Experts(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.register_buffer("codes", codes)
-            self.register_buffer("scales", scales)
+            for name, bank in (("gate_up", gate_up), ("down", down)):
+                self.register_buffer(f"{name}_codes", bank.codes)
+                self.register_buffer(f"{name}_scales", bank.scales)
+                self.register_buffer(f"{name}_global", bank.global_scale)
+
+        def bank(self, name):
+            return praxis_layers.Nvfp4Bank(
+                getattr(self, f"{name}_codes"),
+                getattr(self, f"{name}_scales"),
+                getattr(self, f"{name}_global"),
+            )
 
         def forward(self, x, index, offsets, segment_ends):
-            row_global = NVFP4_KERNELS.row_globals(x.abs().amax(dim=1)[index], segment_ends)
+            row_global = NVFP4_KERNELS.row_globals(x.abs().amax(dim=1, keepdim=True)[index], segment_ends)
             rows, rows_scales = NVFP4_KERNELS.rows(x, index, row_global)
-            out = NVFP4_KERNELS.grouped_mm(rows, rows_scales, self.codes, self.scales, offsets)
-            hidden_rows, _ = NVFP4_KERNELS.rows(out, None, row_global)
-            return row_global, rows, rows_scales, out, hidden_rows
+            hidden, largest = NVFP4_KERNELS.gate_up(
+                rows, rows_scales, self.bank("gate_up"), offsets, row_global
+            )
+            hidden_global = NVFP4_KERNELS.row_globals(largest, segment_ends)
+            hidden_rows, hidden_scales = NVFP4_KERNELS.rows(hidden, None, hidden_global)
+            out = NVFP4_KERNELS.down(hidden_rows, hidden_scales, self.bank("down"), offsets, hidden_global)
+            return (
+                row_global,
+                rows,
+                rows_scales,
+                hidden,
+                largest,
+                hidden_global,
+                hidden_rows,
+                hidden_scales,
+                out,
+            )
 
     inputs = [x, index, offsets, segment_ends]
     program = torch.export.export(Experts(), tuple(inputs))
     compiled = torch_tensorrt.dynamo.compile(program, inputs=inputs, min_block_size=1)
     _assert_runs_in_tensorrt(compiled)
-    row_global, rows, rows_scales, out, hidden_rows = compiled(*inputs)
-    expected_global = praxis_layers._nvfp4_row_globals(x.abs().amax(dim=1)[index], segment_ends)
+    row_global, rows, rows_scales, hidden, largest, hidden_global, hidden_rows, hidden_scales, out = compiled(
+        *inputs
+    )
+    expected_global = praxis_layers._nvfp4_row_globals(x.abs().amax(dim=1, keepdim=True)[index], segment_ends)
     expected_rows, expected_scales = praxis_layers._nvfp4_rows(x, index, expected_global)
     assert torch.equal(row_global, expected_global)
     assert torch.equal(rows, expected_rows)
     assert torch.equal(rows_scales.view(torch.uint8), expected_scales.view(torch.uint8))
-    expected = praxis_layers._nvfp4_grouped_mm_pytorch(
-        rows, rows_scales, codes, scales, offsets, torch.bfloat16
+    # The PyTorch sides as the export runs them, with F.silu instead of the custom SwiGLU kernel.
+    monkeypatch.setattr(praxis_layers, "_CUSTOM_KERNELS", False)
+    expected_hidden, _ = praxis_layers._nvfp4_gate_up(
+        rows, rows_scales, gate_up, offsets, row_global, torch.bfloat16
     )
-    # Only the order of the float32 sums differs: at most one bfloat16 step.
+    # Only the order of the float32 sums differs: at most one bfloat16 step before the SwiGLU.
+    torch.testing.assert_close(hidden, expected_hidden, rtol=2**-6, atol=1e-5)
+    # Each program returns the largest magnitude of its columns, so the hidden rows' global scales are exact.
+    assert torch.equal(largest.amax(dim=1), hidden.abs().amax(dim=1))
+    assert torch.equal(
+        hidden_global, praxis_layers._nvfp4_row_globals(hidden.abs().amax(dim=1, keepdim=True), segment_ends)
+    )
+    expected_hidden_rows, expected_hidden_scales = praxis_layers._nvfp4_rows(hidden, None, hidden_global)
+    assert torch.equal(hidden_rows, expected_hidden_rows)
+    assert torch.equal(hidden_scales.view(torch.uint8), expected_hidden_scales.view(torch.uint8))
+    expected = praxis_layers._nvfp4_down(
+        hidden_rows, hidden_scales, down, offsets, hidden_global, torch.bfloat16
+    )
     torch.testing.assert_close(out, expected, rtol=2**-7, atol=1e-5)
-    assert torch.equal(hidden_rows, praxis_layers._nvfp4_rows(out, None, row_global)[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the plugins run on CUDA")
+def test_the_nvfp4_grouped_gemm_plugins_round_as_pytorch_does(monkeypatch):
+    """With block scales of 1 the float32 sums of FP4 products are exact in any order at these sizes, so the plugins'
+    roundings of the sums, the global scales and the SwiGLU, and their row maxima, must give the bits of the PyTorch
+    sides."""
+    torch_tensorrt = _need_triton_op()
+    from lerobot.policies.praxis.export_nvfp4 import NVFP4_KERNELS
+
+    if NVFP4_KERNELS is None:
+        pytest.skip(f"Torch-TensorRT {torch_tensorrt.__version__} builds no NVFP4 plugins on this GPU")
+    monkeypatch.setattr(praxis_layers, "_CUSTOM_KERNELS", False)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    rows, k, h, n = 300, 512, 256, 400
+    # An expert without rows, partial row tiles, and 15 rows past the last offset.
+    offsets = torch.tensor([70, 0, 90, 40, 60, 25], device="cuda").cumsum(0).to(torch.int32)
+    experts = offsets.shape[0]
+
+    def exact(codes, scales):
+        words = torch.randint(
+            0, 256, (*codes.shape[:-1], codes.shape[-1] * 4), dtype=torch.uint8, device="cuda"
+        )
+        return words.view(torch.int32), torch.ones(scales.shape, device="cuda").to(scales.dtype)
+
+    def global_scales(count, low, high):
+        # Not powers of two, so that each bfloat16 rounding of a product changes some values.
+        return torch.exp2(torch.empty(count, device="cuda").uniform_(low, high, generator=generator))
+
+    def bank(k, n):
+        codes, scales, _ = praxis_layers._nvfp4_bank(torch.randn(experts, k, n, device="cuda"))
+        return praxis_layers.Nvfp4Bank(*exact(codes, scales), global_scales(experts, -9, -5))
+
+    gate_up, down = bank(k, 2 * h), bank(h, n)
+    row_global = global_scales(rows, -3, 3)
+    codes, scales = exact(*praxis_layers._nvfp4_rows(torch.randn(rows, k, device="cuda"), None, row_global))
+    hidden, largest = NVFP4_KERNELS.gate_up(codes, scales, gate_up, offsets, row_global)
+    expected, expected_largest = praxis_layers._nvfp4_gate_up(
+        codes, scales, gate_up, offsets, row_global, torch.bfloat16
+    )
+    assert torch.equal(hidden, expected)
+    assert torch.equal(largest.amax(dim=1, keepdim=True), expected_largest)
+    hidden_codes, hidden_scales = exact(*praxis_layers._nvfp4_rows(hidden, None, row_global))
+    out = NVFP4_KERNELS.down(hidden_codes, hidden_scales, down, offsets, row_global)
+    expected_out = praxis_layers._nvfp4_down(
+        hidden_codes, hidden_scales, down, offsets, row_global, torch.bfloat16
+    )
+    assert torch.equal(out, expected_out)
 
 
 def test_the_float8_grouped_gemm_plugin_takes_the_deepest_pipeline_that_fits(monkeypatch):

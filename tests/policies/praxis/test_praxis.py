@@ -1349,8 +1349,6 @@ def test_nvfp4_experts_round_banks_and_rows_as_the_original_nvfp4_inference() ->
     rows = _randn(generator, 24, 64)
     index = torch.randperm(24, generator=generator)[:20]
     offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.codes.shape[0] - 4), dtype=torch.int32)
-    counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).long()
-    row_experts = torch.repeat_interleave(torch.arange(len(offsets)), counts)
     # One segment per expert.
     expected = []
     for e, (start, end) in enumerate(zip([0, *offsets[:-1].tolist()], offsets.tolist(), strict=True)):
@@ -1366,7 +1364,7 @@ def test_nvfp4_experts_round_banks_and_rows_as_the_original_nvfp4_inference() ->
         w = praxis_layers._nvfp4_dequantize(down.codes[e], down.scales[e])
         out = (a @ w.T).to(torch.bfloat16).float() * (g * down.global_scale[e]).to(torch.bfloat16).float()
         expected.append(out.to(torch.bfloat16))
-    out = praxis_layers._nvfp4_experts(rows, index, row_experts, offsets, gate_up, down, offsets)
+    out = praxis_layers._nvfp4_experts(rows, index, offsets, gate_up, down, offsets)
     torch.testing.assert_close(out, torch.cat(expected), rtol=2**-7, atol=1e-6)
     # The NVFP4 experts ran, and moved the layer by about what 4-bit rounding does.
     assert not torch.equal(quantized, unquantized)
@@ -1395,7 +1393,8 @@ def test_nvfp4_experts_give_each_chunk_its_own_global_scales() -> None:
 
 def test_nvfp4_experts_run_their_bfloat16_steps_with_the_exports_kernels() -> None:
     """An export gives the NVFP4 steps to its compiler as single operations (`set_nvfp4_kernels`): they get the bank
-    as it is stored, and float32 keeps the PyTorch sides."""
+    as it is stored, the hidden rows' global scales come from the largest magnitudes the gate|up step returns (any
+    groups of each row's columns), and float32 keeps the PyTorch sides."""
     ffn = make_tiny_policy().model.backbone.encoder.core.blocks[1].ffn
     ffn.routed.to_nvfp4()
     gate_up, down = ffn.routed.banks()
@@ -1403,36 +1402,36 @@ def test_nvfp4_experts_run_their_bfloat16_steps_with_the_exports_kernels() -> No
     rows = _randn(generator, 24, 64)
     index = torch.randperm(24, generator=generator)[:20]
     offsets = torch.tensor([5, 5, 12, 20] + [20] * (gate_up.codes.shape[0] - 4), dtype=torch.int32)
-    counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).long()
-    row_experts = torch.repeat_interleave(torch.arange(len(offsets)), counts)
     segment_ends = torch.tensor(
         [3, 5, 5, 9, 12, 20] + [20] * (2 * gate_up.codes.shape[0] - 6), dtype=torch.int32
     )
     calls = []
 
-    def grouped_mm(codes, scales, bank, bank_scales, offs):
+    def gate_up_step(codes, scales, bank, offs, row_global):
         calls.append(bank)
-        return praxis_layers._nvfp4_grouped_mm_pytorch(codes, scales, bank, bank_scales, offs, torch.bfloat16)
+        hidden, _ = praxis_layers._nvfp4_gate_up(codes, scales, bank, offs, row_global, torch.bfloat16)
+        # The largest magnitudes of two groups of columns per row, as a kernel's programs return them.
+        return hidden, hidden.abs().unflatten(1, (2, -1)).amax(dim=2)
+
+    def down_step(codes, scales, bank, offs, row_global):
+        calls.append(bank)
+        return praxis_layers._nvfp4_down(codes, scales, bank, offs, row_global, torch.bfloat16)
 
     kernels = praxis_layers.Nvfp4Kernels(
-        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, grouped_mm
+        praxis_layers._nvfp4_row_globals, praxis_layers._nvfp4_rows, gate_up_step, down_step
     )
     expected = {
-        dtype: praxis_layers._nvfp4_experts(
-            rows.to(dtype), index, row_experts, segment_ends, gate_up, down, offsets
-        )
+        dtype: praxis_layers._nvfp4_experts(rows.to(dtype), index, segment_ends, gate_up, down, offsets)
         for dtype in (torch.bfloat16, torch.float32)
     }
     praxis_layers.set_nvfp4_kernels(kernels)
     try:
         for dtype in (torch.float32, torch.bfloat16):
-            out = praxis_layers._nvfp4_experts(
-                rows.to(dtype), index, row_experts, segment_ends, gate_up, down, offsets
-            )
+            out = praxis_layers._nvfp4_experts(rows.to(dtype), index, segment_ends, gate_up, down, offsets)
             assert torch.equal(out, expected[dtype])
     finally:
         praxis_layers.set_nvfp4_kernels(None)
-    assert len(calls) == 2 and calls[0] is gate_up.codes and calls[1] is down.codes
+    assert len(calls) == 2 and calls[0] is gate_up and calls[1] is down
 
 
 def test_float8_experts_run_their_bfloat16_grouped_gemms_with_the_exports_kernel() -> None:
