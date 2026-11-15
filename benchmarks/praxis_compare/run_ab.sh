@@ -16,7 +16,8 @@
 # usage: run_ab.sh <gpu index> <bundle dir> <seq.npz> <out dir> [passes=3]
 #
 # Alternating passes on one GPU. Each pass is a fresh process per side that loads, runs WARMUP + COUNT chunks of
-# the recorded sequence, and exits. Then summarize.py prints each pass's median and the median of the medians.
+# the recorded sequence, and exits. Then summarize.py prints each pass's median, whether the pass is valid, and the
+# median of the valid passes' medians.
 #
 # Environment:
 #   BUNDLE_PY       python of the LeRobot environment (bundle and lerobot sides)    default: python
@@ -24,28 +25,33 @@
 #   RUNWAY_REPO     a checkout of github.com/runwayml/praxis-1-oss                   needed for the runway sides
 #   RUNWAY_WEIGHTS  folder with Runway's checkpoints/ and weights/                   default: RUNWAY_REPO
 #   RUNWAY_CKPT     checkpoint folder, relative to RUNWAY_WEIGHTS                    default: checkpoints/praxis-1-droid
+#   RUNWAY_CKPT_NV  checkpoint folder of the runway_nv side                          default: RUNWAY_CKPT
+#   RUNWAY_PAIR_GEMM_STAGES  pipeline stages of Runway's paired expert GEMM          default: 0 (Runway's own)
 #   LEROBOT_SRC     LeRobot sources to use                                           default: this repository's src
-#   SIDES           any of: bundle runway runway_cr lerobot                          default: bundle runway runway_cr
+#   SIDES           any of: bundle runway runway_cr runway_nv lerobot                default: bundle runway runway_cr
 #   WARMUP, COUNT   warm-up and timed chunks per pass                                default: 3 and 30
 #
-# runway_cr is Runway with the client-side resize (see runway_side.py); lerobot is LeRobot's eager policy.
+# runway_cr is Runway with the client-side resize (see runway_side.py); runway_nv is Runway with its NVFP4 experts
+# (model.routed_precision=nvfp4; given a bfloat16 checkpoint, Runway packs it to NVFP4 when it loads); lerobot is
+# LeRobot's eager policy.
 # Before each pass the script waits until no other process runs kernels on the GPU (up to 10 minutes). A pass
 # during which another process ran on the GPU is thrown away and run again (up to 2 more times). The script exits
-# non-zero when a pass has no clean run, or when summarize.py finds a side short of passes or the sides' sampler
-# settings differ. The output directory must be new or empty, so that only this run's logs are summarized.
+# non-zero when a pass has no clean run, or when summarize.py finds a side short of passes or with no valid pass, or
+# the sides' sampler settings differ. The output directory must be new or empty, so that only this run's logs are
+# summarized.
 set -u
 G=$1; B=$2; SEQ=$3; D=$4; N=${5:-3}
 if [ -n "$(ls -A "$D" 2>/dev/null)" ]; then echo "$D is not empty: give each run a new output directory"; exit 2; fi
 read -r -d '' -a sides <<< "${SIDES:-bundle runway runway_cr}" || true
 [ ${#sides[@]} -gt 0 ] || { echo "SIDES names no side"; exit 2; }
 for side in "${sides[@]}"; do
-  case $side in bundle|runway|runway_cr|lerobot) ;; *) echo "unknown side '$side' in SIDES"; exit 2 ;; esac
+  case $side in bundle|runway|runway_cr|runway_nv|lerobot) ;; *) echo "unknown side '$side' in SIDES"; exit 2 ;; esac
 done
 H=$(cd "$(dirname "$0")" && pwd)
 SRC=${LEROBOT_SRC:-$H/../../src}
 BUNDLE_PY=${BUNDLE_PY:-python}; RUNWAY_PY=${RUNWAY_PY:-python}
 RUNWAY_REPO=${RUNWAY_REPO:-}; RUNWAY_WEIGHTS=${RUNWAY_WEIGHTS:-$RUNWAY_REPO}
-RUNWAY_CKPT=${RUNWAY_CKPT:-checkpoints/praxis-1-droid}
+RUNWAY_CKPT=${RUNWAY_CKPT:-checkpoints/praxis-1-droid}; RUNWAY_CKPT_NV=${RUNWAY_CKPT_NV:-$RUNWAY_CKPT}
 W=${WARMUP:-3}; K=${COUNT:-30}; CH=$((W + K))
 mkdir -p "$D"
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 CUDA_VISIBLE_DEVICES=$G
@@ -65,7 +71,8 @@ watch_others() {  # log every busy process outside the pass's own process group,
 }
 
 common=(--warmup "$W" --count "$K" --chunks "$CH")
-runway=(--weights-dir "$RUNWAY_WEIGHTS" --checkpoint "$RUNWAY_CKPT" --rotation "$SRC/lerobot/utils/rotation.py")
+runway=(--weights-dir "$RUNWAY_WEIGHTS" --rotation "$SRC/lerobot/utils/rotation.py"
+  --pair-gemm-stages "${RUNWAY_PAIR_GEMM_STAGES:-0}")
 failed=0
 for i in $(seq 1 "$N"); do for side in "${sides[@]}"; do clean=0; for attempt in 1 2 3; do
   for _ in $(seq 1 40); do [ -z "$(busy_pids)" ] && break; sleep 15; done
@@ -73,8 +80,12 @@ for i in $(seq 1 "$N"); do for side in "${sides[@]}"; do clean=0; for attempt in
   case $side in
     bundle) cmd=(env PYTHONPATH="$SRC" "$BUNDLE_PY" "$H/bundle_side.py" "$B" "$SEQ" "$O.npz") ;;
     lerobot) cmd=(env PYTHONPATH="$SRC" "$BUNDLE_PY" "$H/lerobot_eager.py" "$SEQ" "$O.npz") ;;
-    runway) cmd=("$RUNWAY_PY" "$H/runway_side.py" "$RUNWAY_REPO" "$SEQ" "$O.npz" "${runway[@]}") ;;
-    runway_cr) cmd=("$RUNWAY_PY" "$H/runway_side.py" "$RUNWAY_REPO" "$SEQ" "$O.npz" "${runway[@]}" --client-resize) ;;
+    runway) cmd=("$RUNWAY_PY" "$H/runway_side.py" "$RUNWAY_REPO" "$SEQ" "$O.npz" "${runway[@]}"
+      --checkpoint "$RUNWAY_CKPT") ;;
+    runway_cr) cmd=("$RUNWAY_PY" "$H/runway_side.py" "$RUNWAY_REPO" "$SEQ" "$O.npz" "${runway[@]}"
+      --checkpoint "$RUNWAY_CKPT" --client-resize) ;;
+    runway_nv) cmd=("$RUNWAY_PY" "$H/runway_side.py" "$RUNWAY_REPO" "$SEQ" "$O.npz" "${runway[@]}"
+      --checkpoint "$RUNWAY_CKPT_NV" --set model.routed_precision=nvfp4) ;;
   esac
   setsid "${cmd[@]}" "${common[@]}" > "$O.log" 2>&1 &
   P=$!; watch_others $P "$O.others"; WP=$!; wait $P; rc=$?; wait $WP

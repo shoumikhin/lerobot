@@ -17,7 +17,8 @@ settings of `configs/serve_droid.yaml` and one `Session.step` per chunk, the cal
 `scripts/benchmark_inference.py` make. Run it in Runway's environment; it does not import LeRobot.
 
 usage: python runway_side.py <praxis-1-oss dir> <seq.npz> <out.npz> [--weights-dir DIR] [--checkpoint DIR]
-       [--warmup 3] [--count 30] [--chunks N] [--client-resize] [--rotation PATH]
+       [--warmup 3] [--count 30] [--chunks N] [--client-resize] [--rotation PATH] [--set KEY=VALUE ...]
+       [--pair-gemm-stages N]
 
 The script keeps what a robot client keeps: the frames and states of the last 25 ticks, as LeRobot's policy holds
 them (1 on the cold call, 22 on the second, 25 after), and sends that stack on each chunk tick. TIMER (chunk ticks
@@ -29,6 +30,11 @@ observation in, DROID action chunk out.
 client does before it sends a view. This is a lower bound for Runway: the bundle's timer still includes the resize.
 --rotation: LeRobot's `lerobot/utils/rotation.py` (NumPy only), loaded by path so the DROID conversions are
 LeRobot's own. Default: the one in this repository.
+--set: overrides an entry of the serve config, as Runway's own scripts take them, for example
+`--set model.routed_precision=nvfp4` for its NVFP4 experts. May be given more than once.
+--pair-gemm-stages: the pipeline stages of Runway's paired expert GEMM (`praxis.layers.PAIR_GEMM_CONFIG`). Runway's
+default tile needs more shared memory than a DGX Spark (GB10) has; 3 stages fit. 0 keeps Runway's default.
+The summary records both, beside the sampler settings.
 """
 
 import argparse
@@ -83,6 +89,8 @@ def main() -> None:
     p.add_argument("--chunks", type=int, default=0)
     p.add_argument("--client-resize", action="store_true")
     p.add_argument("--rotation", default=str(HERE.parents[1] / "src/lerobot/utils/rotation.py"))
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument("--pair-gemm-stages", type=int, default=0)
     a = p.parse_args()
     repo = str(Path(a.repo).resolve())
     out = Path(a.out).resolve()  # before the chdir below
@@ -91,13 +99,16 @@ def main() -> None:
     sys.path.insert(0, repo)
     os.chdir(a.weights_dir or repo)
     import praxis
+    import praxis.layers
     import torch
     from praxis.layers import Attention
     from scripts.run_inference import build_pipeline, load_config
 
     assert praxis.__file__.startswith(repo), praxis.__file__
+    if a.pair_gemm_stages:
+        praxis.layers.PAIR_GEMM_CONFIG = {**praxis.layers.PAIR_GEMM_CONFIG, "num_stages": a.pair_gemm_stages}
     print("praxis from", praxis.__file__, "torch", torch.__version__, flush=True)
-    cfg = load_config(f"{repo}/configs/serve_droid.yaml", [f"model.checkpoint={a.checkpoint}"])
+    cfg = load_config(f"{repo}/configs/serve_droid.yaml", [f"model.checkpoint={a.checkpoint}", *a.set])
     chunk_ticks = [int(t) for t in seq["chunk_ticks"]]
     if a.chunks:
         chunk_ticks = chunk_ticks[: a.chunks]
@@ -182,6 +193,8 @@ def main() -> None:
             key: float(getattr(sess.sampler, key))
             for key in ("num_steps", "t_shift", "cfg_scale", "cfg_video_scale")
         },
+        "config_overrides": a.set,
+        "pair_gemm_config": dict(praxis.layers.PAIR_GEMM_CONFIG),
         "step_only_median_ms": round(float(np.median(step_times[a.warmup : a.warmup + a.count])), 2)
         if timed
         else None,
