@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, TypeVar, Unpack
 from huggingface_hub import hf_hub_download, save_torch_state_dict
 from huggingface_hub.constants import SAFETENSORS_INDEX_FILE, SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import EntryNotFoundError
-from safetensors.torch import load_file, load_model as load_model_as_safetensor
+from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from lerobot.configs import FeatureType, PreTrainedConfig
@@ -333,27 +333,22 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         checkpoint through its keys, shapes and tensors without creating a temporary file.
         """
         device = resolve_safetensors_device(map_location)
-        if len(checkpoint.files) == 1:
-            missing_keys, unexpected_keys = load_model_as_safetensor(
-                model, str(checkpoint.files[0]), strict=strict, device=device
+        expected = set(model.state_dict())
+        missing = set(expected)
+        unexpected: set[str] = set()
+        for file in checkpoint.files:
+            state = load_file(str(file), device=device)
+            result = model.load_state_dict(state, strict=False)
+            missing.intersection_update(result.missing_keys)
+            unexpected.update(result.unexpected_keys)
+            del state
+        missing_keys = _missing_keys(model, expected - missing)
+        unexpected_keys = sorted(unexpected)
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {type(model).__name__}: "
+                f"missing keys {missing_keys}, unexpected keys {unexpected_keys}"
             )
-        else:
-            expected = set(model.state_dict())
-            missing = set(expected)
-            unexpected: set[str] = set()
-            for file in checkpoint.files:
-                state = load_file(str(file), device=device)
-                result = model.load_state_dict(state, strict=False)
-                missing.intersection_update(result.missing_keys)
-                unexpected.update(result.unexpected_keys)
-                del state
-            missing_keys = _missing_keys(model, expected - missing)
-            unexpected_keys = sorted(unexpected)
-            if strict and (missing_keys or unexpected_keys):
-                raise RuntimeError(
-                    f"Error(s) in loading state_dict for {type(model).__name__}: "
-                    f"missing keys {missing_keys}, unexpected keys {unexpected_keys}"
-                )
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model
 

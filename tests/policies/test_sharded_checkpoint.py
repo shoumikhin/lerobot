@@ -56,6 +56,15 @@ def test_strict_load_accepts_tied_weights(tmp_path, alias):
     assert model.a is model.b
 
 
+def test_strict_single_file_load_accepts_both_names_of_a_tied_weight(tmp_path):
+    model = nn.Module()
+    model.register_parameter("a", nn.Parameter(torch.zeros(3)))
+    model.register_parameter("b", model.a)
+    files = write_shards(tmp_path, {"a": torch.ones(3), "b": torch.ones(3)})
+    PreTrainedPolicy._load_weight_files(model, files, "cpu", True)
+    assert torch.equal(model.a, torch.ones(3))
+
+
 def test_strict_load_uses_renamed_keys_and_keeps_warnings(tmp_path, caplog):
     model = nn.Module()
     model.vision_tower = nn.Linear(2, 2)

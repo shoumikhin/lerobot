@@ -19,7 +19,7 @@ import json
 import pytest
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_file, save_model
 from torch import nn
 
 pytest.importorskip("transformers", reason="fastwam requires the `fastwam` extra (transformers)")
@@ -526,11 +526,11 @@ def test_checkpoint_load_stages_weights_on_cpu(monkeypatch, tmp_path, model_devi
     target = FakeFastWAMCore().to(device=model_device, dtype=torch.bfloat16)
     original_parameters = dict(target.named_parameters())
 
-    def load_on_cpu(model, filename, *, strict, device):
+    def load_on_cpu(filename, device):
         assert device == "cpu"
-        return load_model(model, filename, strict=strict, device=device)
+        return load_file(filename, device=device)
 
-    monkeypatch.setattr("lerobot.policies.pretrained.load_model_as_safetensor", load_on_cpu)
+    monkeypatch.setattr("lerobot.policies.pretrained.load_file", load_on_cpu)
     loaded = FastWAMPolicy._load_as_safetensor(target, str(checkpoint), map_location, strict=True)
 
     assert loaded is target
