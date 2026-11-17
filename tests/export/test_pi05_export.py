@@ -29,6 +29,7 @@ from lerobot.bundle.engine import BundleEngine  # noqa: E402
 from lerobot.bundle.manifest import KNOWN_TASKS, TASK_EMBEDDINGS, TASK_LENGTH, TOKENIZER, Bundle  # noqa: E402
 from lerobot.configs import PreTrainedConfig  # noqa: E402
 from lerobot.export import recipe as recipe_module  # noqa: E402
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig  # noqa: E402
 from lerobot.policies.pi05 import PI05Policy, export_pi05  # noqa: E402
 from lerobot.processor import TokenizerProcessorStep  # noqa: E402
 from lerobot.scripts.lerobot_export import export  # noqa: E402
@@ -199,6 +200,23 @@ def test_the_step_takes_a_rounded_timestep_as_its_own(recipe_config):
     with torch.no_grad():
         x_next = step.module(*inputs, rounded)
         torch.testing.assert_close(x_next, step.module(*inputs, timestep), rtol=0, atol=0)
+
+
+class CPUTensorRT(ExecuTorchTensorRTConfig):
+    """The TensorRT backend's settings, with the parts built on the CPU."""
+
+    device = "cpu"
+
+
+@pytest.mark.parametrize(
+    ("backend", "folded"),
+    [(CPUTensorRT(), True), (SimpleNamespace(device="cpu"), False)],
+    ids=["tensorrt", "other_backend"],
+)
+def test_tensorrt_folds_the_steps_shared_key_value_head(recipe_config, backend, folded):
+    recipe_config.backend = backend
+    step = next(part for part in export_pi05.PI05ExportRecipe(recipe_config).parts() if part.name == "step")
+    assert step.compile_options == ({"fold_shared_kv_attention": True} if folded else {})
 
 
 def test_recipe_refuses_a_checkpoint_whose_chunk_spec_fails(recipe_config):

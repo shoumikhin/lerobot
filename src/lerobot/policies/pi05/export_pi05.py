@@ -46,6 +46,7 @@ from torch import Tensor, nn
 
 from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, ProgramRun
 from lerobot.bundle.task_tokens import clean, tokenize
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 from lerobot.export.recipe import (
     BFLOAT16_STEPS_TOLERANCE,
     BFLOAT16_TOLERANCE,
@@ -524,7 +525,10 @@ class PaliGemmaChainRecipe(ChainRecipe):
                 x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
         step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
         step_names = [*cache_names, "x", "timestep"]
-        yield Part("step", step, step_inputs, step_names, ["x"])
+        # The expert's query heads then read its one key and value head without copies, which TensorRT runs faster.
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        options = {"fold_shared_kv_attention": True} if tensorrt else {}
+        yield Part("step", step, step_inputs, step_names, ["x"], compile_options=options)
         step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
         step_runs, self._constants = repeated_runs(
             "step", step_names, ["x"], step_constants, start={"x": NOISE}
