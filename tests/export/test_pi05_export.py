@@ -19,6 +19,7 @@ import json
 import weakref
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -127,6 +128,7 @@ def recipe_config(checkpoint, monkeypatch):
         dataset=None,
         tolerance=None,
         max_task_tokens=None,
+        one_program=None,
         seed=0,
     )
 
@@ -237,6 +239,43 @@ def test_tensorrt_folds_the_steps_shared_key_value_head_on_the_gpus_where_that_i
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     step = next(part for part in export_pi05.PI05ExportRecipe(recipe_config).parts() if part.name == "step")
     assert step.compile_options == ({"fold_shared_kv_attention": True} if folded else {})
+
+
+def test_one_program_builds_the_fewest_programs_with_the_same_actions(recipe_config):
+    default = export_pi05.PI05ExportRecipe(recipe_config)
+    list(default.parts())
+    recipe_config.one_program = True
+    recipe = export_pi05.PI05ExportRecipe(recipe_config)
+    programs = ["embed", "language_model_0", "step", "actions"]
+    assert [part.name for part in recipe.parts()] == programs
+    assert [run.program for run in recipe.plan().runs] == programs
+    torch.testing.assert_close(recipe.test_case().actions, default.test_case().actions, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("one_program", [None, False, True])
+def test_the_step_runs_read_the_schedules_timesteps_in_order(recipe_config, one_program):
+    recipe_config.one_program = one_program
+    recipe = export_pi05.PI05ExportRecipe(recipe_config)
+    list(recipe.parts())
+    schedule = np.array([1.0 - step / 10 for step in range(10)], np.float32)
+    runs = [schedule] if one_program else np.split(schedule, 10)
+    expected = {f"timestep_{i}": timesteps for i, timesteps in enumerate(runs)}
+    plan = recipe.plan()
+    torch.testing.assert_close(plan.constants, expected, rtol=0, atol=0)
+    step_runs = [run for run in plan.runs if run.program == "step"]
+    assert [[name for name in run.inputs if name in expected] for run in step_runs] == [
+        [name] for name in expected
+    ]
+
+
+def test_scheduled_steps_run_the_step_on_each_timestep_in_order():
+    class Step(torch.nn.Module):
+        def forward(self, cache, x, timestep):
+            return 2 * x + timestep + cache
+
+    x = export_pi05.ScheduledSteps(Step())(torch.zeros(1), torch.zeros(1), torch.tensor([1.0, 2.0, 3.0]))
+    # ((0 * 2 + 1) * 2 + 2) * 2 + 3
+    assert x.item() == 11
 
 
 def test_recipe_refuses_a_checkpoint_whose_chunk_spec_fails(recipe_config):

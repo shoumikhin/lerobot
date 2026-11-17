@@ -138,6 +138,25 @@ pi0_programs_hold_only_their_weights = programs_hold_only_their_weights(
 pi05_programs_hold_only_their_weights = programs_hold_only_their_weights(
     PALIGEMMA_PARTS | {"step": (EXPERT, *ACTION_PROJECTIONS)}, transformed=("norm.dense",)
 )
+FEWEST_PALIGEMMA_PARTS = {
+    "embed": PALIGEMMA_PARTS["embed"],
+    "language_model_0": (*PALIGEMMA_PARTS["language_model_0"], *PALIGEMMA_PARTS["language_model_1"]),
+}
+pi0_fewest_programs_hold_only_their_weights = programs_hold_only_their_weights(
+    FEWEST_PALIGEMMA_PARTS
+    | {
+        "step": (
+            EXPERT,
+            "model.state_proj",
+            *ACTION_PROJECTIONS,
+            "model.action_time_mlp_in",
+            "model.action_time_mlp_out",
+        )
+    }
+)
+pi05_fewest_programs_hold_only_their_weights = programs_hold_only_their_weights(
+    FEWEST_PALIGEMMA_PARTS | {"step": (EXPERT, *ACTION_PROJECTIONS)}, transformed=("norm.dense",)
+)
 VLM = "model.vlm_with_expert.vlm.model"
 smolvla_programs_hold_only_their_weights = programs_hold_only_their_weights(
     {
@@ -189,9 +208,23 @@ GROOT = Chain(
 CHAINS = {
     "pi05_absolute": PI05,
     "pi05_relative": replace(PI05, save=save_paligemma(tiny_pi05, relative_actions=True), lora=None),
+    "pi05_one_program": replace(
+        PI05,
+        programs=["actions", "embed", "language_model_0", "step"],
+        args=("--one_program=true",),
+        lora=None,
+        check=pi05_fewest_programs_hold_only_their_weights,
+    ),
     "groot_torchvision": GROOT,
     "pi0_absolute": PI0,
     "pi0_relative": replace(PI0, save=save_paligemma(tiny_pi0, relative_actions=True), lora=None),
+    "pi0_one_program": replace(
+        PI0,
+        programs=["actions", "embed", "language_model_0", "step"],
+        args=("--one_program=true",),
+        lora=None,
+        check=pi0_fewest_programs_hold_only_their_weights,
+    ),
     "smolvla": Chain(
         save_smolvla,
         tasks=(TASK,),
@@ -287,11 +320,12 @@ def test_the_export_refuses_a_peft_adapter(name, tmp_path, monkeypatch, capfd):
     assert "is a PEFT adapter" in capfd.readouterr().err
 
 
+@GROOT_EXTRAS
 def test_one_program_is_refused_for_a_recipe_that_compiles_only_a_chain(tmp_path, monkeypatch, capfd):
-    chain = replace(PI0, args=("--one_program=true",))
+    chain = replace(GROOT, args=(*GROOT.args, "--one_program=true"))
     with pytest.raises(RuntimeError, match="trace step failed"):
         run_export(chain, chain.save(tmp_path, monkeypatch), tmp_path / "bundle", monkeypatch)
-    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as one"
+    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as fewer"
     assert message in capfd.readouterr().err
 
 

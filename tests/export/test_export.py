@@ -256,7 +256,7 @@ def test_export_refuses_a_quantization_without_a_tolerance(tmp_path, monkeypatch
 def test_export_refuses_one_program_for_a_policy_that_already_compiles_one(checkpoint, tmp_path, capfd):
     with pytest.raises(RuntimeError, match="trace step failed"):
         run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--one_program=true")
-    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as one"
+    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as fewer"
     assert message in capfd.readouterr().err
 
 

@@ -50,6 +50,7 @@ def recipe_config(checkpoint, monkeypatch):
         dataset=None,
         tolerance=None,
         max_task_tokens=None,
+        one_program=None,
         seed=0,
     )
 

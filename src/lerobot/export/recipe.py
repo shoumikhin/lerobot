@@ -611,8 +611,8 @@ class ExportRecipe(abc.ABC):
           recipe whose choices TF32's rounding can flip, such as TD-MPC's planner or pi0-FAST's token decoder, sets
           it to False, and its programs stay float32.
         - **offers_one_program** (`bool`) -- Whether `--one_program` applies: the recipe cuts a chunk into a chain
-          only so that it builds on a small board, and compiles one program instead when asked, or by default with
-          TensorRT and the memory for it.
+          only so that it builds on a small board, and compiles the fewest programs instead when asked. SmolVLA's
+          recipe also does so by default with TensorRT and the memory for it.
     """
 
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE

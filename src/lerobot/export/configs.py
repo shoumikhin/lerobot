@@ -204,8 +204,10 @@ class ExportConfig:
     # prompt has room.
     max_task_tokens: int | None = None
     # For a policy whose recipe cuts a chunk into a chain of programs only so that it builds on an 8 GB board, such
-    # as SmolVLA: `true` compiles one program instead, which runs faster and needs more memory to build, and `false`
-    # the chain. Defaults to the recipe's choice for the memory of the machine that exports.
+    # as SmolVLA, pi0 and pi0.5: `true` compiles the fewest programs instead, which run fewer times per chunk and
+    # need more memory to build, and `false` the chain. The fewest is one program for SmolVLA, and for pi0 and pi0.5 one per part
+    # (embed, the language model, the steps, the actions). Defaults to the recipe's choice: for SmolVLA, by the
+    # memory of the machine that exports; for pi0 and pi0.5, the chain.
     one_program: bool | None = None
     # Seeds the random test case.
     seed: int = 1000

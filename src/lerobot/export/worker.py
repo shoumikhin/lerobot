@@ -149,8 +149,8 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
         recipe_class = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy))
         if cfg.one_program is not None and not recipe_class.offers_one_program:
             raise ValueError(
-                "--one_program applies only to a policy whose recipe can compile its chain of programs as one "
-                "program, such as SmolVLA."
+                "--one_program applies only to a policy whose recipe can compile its chain of programs as fewer "
+                "programs, such as SmolVLA, pi0 and pi0.5."
             )
         recipe = recipe_class.load(recipe_cfg)
         if cfg.backend.tf32 and not recipe.tf32:

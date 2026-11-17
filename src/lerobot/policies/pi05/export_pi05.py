@@ -14,7 +14,7 @@
 
 """Export pi0.5 as a chain of small programs, so that it builds and runs on a board with 8 GB of memory.
 
-One action chunk runs as these programs, which pass their values to each other by name:
+By default, one action chunk runs as these programs, which pass their values to each other by name:
 
 ::
 
@@ -22,6 +22,9 @@ One action chunk runs as these programs, which pass their values to each other b
     language_model_0..k  3 layers of the language model each -> the next hidden states and their KV cache
     step x10             the KV cache, the noisy actions and a timestep -> the next noisy actions
     actions              the denoised actions -> the actions in robot units
+
+With `--one_program=true`, all the language model layers are one program and all the steps another, so a chunk
+runs fewer programs, and the export needs more memory to build them.
 
 Each part is built with only its own weights in memory. pi0.5 reads the task and the state, as bin numbers,
 in its prompt. The bundle turns the task into the embedding rows of its tokens with the policy's own tokenizer
@@ -392,6 +395,24 @@ class PI05Step(nn.Module):
         return x_t + self.dt * velocity[0].float()
 
 
+class ScheduledSteps(nn.Module):
+    """Several denoising steps in one program: the step, run once per timestep it is given, in order.
+
+    One program for several steps saves the launch and the handoff between programs of each step. Its inputs are
+    the step's, with the timesteps of its runs in place of one timestep.
+    """
+
+    def __init__(self, step: nn.Module):
+        super().__init__()
+        self.step = step
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        *cache, x_t, timesteps = inputs
+        for i in range(timesteps.shape[0]):
+            x_t = self.step(*cache, x_t, timesteps[i : i + 1])
+        return x_t
+
+
 class PI05Actions(nn.Module):
     """The denoised actions in, the actions to play out, in robot units.
 
@@ -437,6 +458,7 @@ class PaliGemmaChainRecipe(ChainRecipe):
     task: str
     # The outputs of `embed`, after the prefix's embeddings and padding mask, that the step also reads.
     step_inputs: tuple[str, ...] = ()
+    offers_one_program = True
 
     @classmethod
     def load(cls, cfg: ExportConfig) -> PaliGemmaChainRecipe:
@@ -529,8 +551,10 @@ class PaliGemmaChainRecipe(ChainRecipe):
         hidden_name = "prefix_embs"
         cache: dict[str, Tensor] = {}
         depth = self._depth()
-        for group, first in enumerate(range(0, depth, LANGUAGE_LAYERS_PER_PART)):
-            layers = range(first, min(first + LANGUAGE_LAYERS_PER_PART, depth))
+        # `--one_program` builds the fewest programs: all the layers in one, and below all the steps in one.
+        per_part = depth if self.cfg.one_program else LANGUAGE_LAYERS_PER_PART
+        for group, first in enumerate(range(0, depth, per_part)):
+            layers = range(first, min(first + per_part, depth))
             module = PI05LanguageModelLayers(
                 self._load(*(f"{LANGUAGE_MODEL}.layers.{i}" for i in layers)).model, layers
             )
@@ -553,20 +577,24 @@ class PaliGemmaChainRecipe(ChainRecipe):
             hidden_name = output_names[0]
 
         step = self._step(self._load(*self.step_modules).model)
+        if self.cfg.one_program:
+            step, groups = ScheduledSteps(step), [self._timesteps]
+        else:
+            groups = [[timestep] for timestep in self._timesteps]
         cache_inputs = (prefix_pad_masks, *step_extra, *cache.values())
         cache_names = ["prefix_pad_masks", *self.step_inputs, *cache]
         noise = self._noise.to(self._device)
         x_t = noise
         with torch.no_grad():
-            for timestep in self._timesteps:
-                x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
-        step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
+            for timesteps in groups:
+                x_t = step(*cache_inputs, x_t, torch.tensor(timesteps, device=self._device))
+        step_inputs = (*cache_inputs, noise, torch.tensor(groups[0], device=self._device))
         step_names = [*cache_names, "x", "timestep"]
         tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
         fold = tensorrt and torch.cuda.get_device_capability(self._device) in SHARED_KV_GPUS
         options = {"fold_shared_kv_attention": True} if fold else {}
         yield Part("step", step, step_inputs, step_names, ["x"], compile_options=options)
-        step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
+        step_constants = [{"timestep": np.array(timesteps, np.float32)} for timesteps in groups]
         step_runs, self._constants = repeated_runs(
             "step", step_names, ["x"], step_constants, start={"x": NOISE}
         )
@@ -606,7 +634,7 @@ class PaliGemmaChainRecipe(ChainRecipe):
         return case
 
     def plan(self) -> RunPlan:
-        """The parts in order with the step run once per timestep, and the timesteps."""
+        """The parts in order with the step run once per group of timesteps, and the timesteps."""
         return RunPlan(runs=self._runs, constants=self._constants)
 
     @abc.abstractmethod
@@ -726,7 +754,7 @@ class PI05ExportRecipe(PaliGemmaChainRecipe):
                 del self._known_tasks[task]
 
     def plan(self) -> RunPlan:
-        """The parts in order with the step run once per timestep, the timesteps, and the task's tokens."""
+        """The parts in order with the step run once per group of timesteps, the timesteps, and the task's tokens."""
         # The bundle writes the table from the CPU, so it is read there, without a copy on the device.
         config = copy(self._policy_config)
         config.device = "cpu"

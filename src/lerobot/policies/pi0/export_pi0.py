@@ -15,8 +15,8 @@
 """Export pi0 as a chain of small programs, so that it builds and runs on a board with 8 GB of memory.
 
 As one program, pi0 needs all its weights in memory at once, and a compiler builds its ten denoising steps as one
-graph that reads the action expert's weights ten times. One action chunk runs as these programs instead, which pass
-their values to each other by name, as pi0.5's do (see `export_pi05`):
+graph that reads the action expert's weights ten times. By default, one action chunk runs as these programs instead,
+which pass their values to each other by name, as pi0.5's do (see `export_pi05`, also for `--one_program`):
 
 ::
 
