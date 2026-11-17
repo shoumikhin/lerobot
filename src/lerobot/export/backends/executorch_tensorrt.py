@@ -80,6 +80,16 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     """Keep one host copy of each weight, and of its transpose, instead of one per layer that reads it
     (pytorch/TensorRT#4965). `False` gives each layer its own copy, for a policy whose engines come out wrong
     with shared weights."""
+    tf32: bool = True
+    """Let TensorRT round the inputs of float32 matrix products and convolutions to TF32, as PyTorch does on a GPU
+    with `--tf32=true`, so that a float32 policy runs faster (an ACT 1.9 times on a Jetson Orin Nano, 3.7 times on
+    a Jetson Thor). Its actions move, so the bundle's check allows for it, and a recipe whose choices TF32's
+    rounding can flip keeps float32: see `ExportRecipe.tf32`. `False` keeps float32 math in float32, held to the
+    float32 tolerance."""
+
+    def without_tf32(self) -> ExecuTorchTensorRTConfig:
+        """These settings with `tf32` off."""
+        return dataclasses.replace(self, tf32=False)
 
     def quantized(
         self, module: nn.Module, example_inputs: tuple[Tensor, ...], mode: str
@@ -140,9 +150,7 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # The part's PyTorch weights wait in host memory while TensorRT builds; on an 8 GB Jetson this
             # leaves about 600 MiB more free at the peak of the largest build.
             "offload_module_to_cpu": True,
-            # Float32 math stays float32, as in PyTorch. TensorRT's default TF32 moved ACT's actions by up to
-            # 5e-3 of their spread, a thousand times the float32 rounding.
-            "disable_tf32": True,
+            "disable_tf32": not self.tf32,
             "deduplicate_weights": self.deduplicate_weights,
             # Frees each weight once the last engine that reads it is built (pytorch/TensorRT#4853), so the
             # build does not hold the weights and the engines at once. A weight that a part left to the CUDA

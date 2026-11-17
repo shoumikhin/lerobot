@@ -158,7 +158,7 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
         "fallback_pytorch_plugin_ops": True,
         "truncate_double": True,
         "offload_module_to_cpu": True,
-        "disable_tf32": True,
+        "disable_tf32": False,
         "deduplicate_weights": True,
         "release_weights_after_build": True,
         **changed,
@@ -174,6 +174,15 @@ def test_torch_tensorrt_gets_the_settings_an_executorch_program_needs(monkeypatc
             "backend_config": "GPU memory",
         },
     )
+
+
+def test_tf32_off_keeps_float32_math_in_float32(monkeypatch, tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    seen = {}
+    use_fake_tensorrt(monkeypatch, lambda program, arg_inputs, **options: seen.update(options))
+    ExecuTorchTensorRTConfig().without_tf32().compile(linear_program(), tmp_path / "model.pte")
+    assert seen["disable_tf32"] is True
 
 
 def test_a_parts_compile_options_go_to_torch_tensorrt_with_the_backends_own(monkeypatch, tmp_path):

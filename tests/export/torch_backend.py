@@ -21,7 +21,7 @@ import logging
 import os
 import zipfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -166,6 +166,11 @@ class TorchTestBackend(ExportBackendConfig):
     # Writes a data file beside each program, as a backend that keeps the weights apart does, and runs a program
     # only with it.
     data_file: bool = False
+    # As executorch_tensorrt's setting, for a test of the tolerance the bundle then gets; the programs stay float32.
+    tf32: bool = False
+
+    def without_tf32(self) -> "TorchTestBackend":
+        return replace(self, tf32=False)
 
     def compile(self, program: torch.export.ExportedProgram, path: Path) -> Path | None:
         # As a real compiler logs its own work.

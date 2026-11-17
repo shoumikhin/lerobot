@@ -59,7 +59,7 @@ from lerobot.utils.robot_utils import MOTOR_CHANNEL_SUFFIXES
 from . import backends  # noqa: F401
 from .bundle import write_bundle
 from .configs import ExportBackendConfig, ExportConfig
-from .recipe import PROGRAM_FLOOR_FACTOR, Part, ProgramCheck
+from .recipe import PROGRAM_FLOOR_FACTOR, TF32_TOLERANCE_DIVISOR, Part, ProgramCheck
 
 # By name: run with `python -m`, this module is `__main__`, which is not a LeRobot logger.
 logger = logging.getLogger("lerobot.export.worker")
@@ -147,6 +147,10 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             recipe_cfg = copy.copy(cfg)
             recipe_cfg.tolerance = None
         recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
+        if cfg.backend.tf32 and not recipe.tf32:
+            logger.info("The %s recipe keeps its programs in float32, without TF32.", recipe.config.type)
+            # The compile steps take the backend's settings from this step.
+            cfg.backend = cfg.backend.without_tf32()
         programs: dict[str, ProgramFiles] = {}
         runs: list[ProgramRun] = []
         checks: list[str] = []
@@ -191,6 +195,10 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             runs = [draw_run, *runs]
             first_runs = [[draw_run, *chunk] for chunk in first_runs]
         task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
+        tolerance = recipe.tolerance if cfg.quantize is None else cast(float, cfg.tolerance)
+        if cfg.backend.tf32 and cfg.tolerance is None:
+            # The recipe's own checks compare PyTorch with PyTorch in float32; only the programs round to TF32.
+            tolerance = max(tolerance, recipe.bfloat16_tolerance / TF32_TOLERANCE_DIVISOR)
         manifest = BundleManifest(
             backend=cfg.backend.type,
             runtime=cfg.backend.runtime,
@@ -212,7 +220,7 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             task=recipe.task,
             action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
             action_scale=test_case.action_scale.tolist(),
-            tolerance=recipe.tolerance if cfg.quantize is None else cast(float, cfg.tolerance),
+            tolerance=tolerance,
             target=cfg.backend.target(),
             runtime_versions=runtime_versions(cfg.backend.runtime_modules),
             exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
@@ -323,9 +331,9 @@ def main() -> None:
     # The trace step learns the level from the command line it parses.
     set_log_level(request.get("log_level", "INFO"))
     register_third_party_plugins(kinds=("policy", "backend"))
-    # The test case is the policy's float32 arithmetic, and the compiled programs must match it. TF32, which
-    # PyTorch uses for cuDNN convolutions by default, moves a float32 policy's actions by about 1e-3 of their
-    # spread, in the test case and in kernels a compiler builds from PyTorch's.
+    # The test case is the policy's float32 arithmetic, which a bundle is checked against with TF32 programs or
+    # without. TF32, which PyTorch uses for cuDNN convolutions by default, moves a float32 policy's actions by about
+    # 1e-3 of their spread, in the test case and in kernels a compiler builds from PyTorch's.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     result = STEPS[request["step"]](request)

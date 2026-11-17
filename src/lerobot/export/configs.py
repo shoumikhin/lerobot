@@ -101,6 +101,19 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         return Target("cuda", gpu, compute_capability)
 
     @property
+    def tf32(self) -> bool:
+        """Whether the programs may round the inputs of float32 matrix products and convolutions to TF32.
+
+        That moves a float32 policy's actions away from its float32 arithmetic, so the bundle's default tolerance
+        then allows for it. A backend that offers it makes it a setting.
+        """
+        return False
+
+    def without_tf32(self) -> ExportBackendConfig:
+        """These settings with `tf32` off, for a recipe whose programs stay float32 (`ExportRecipe.tf32`)."""
+        return self
+
+    @property
     def type(self) -> str:
         """The `--backend.type` name of this backend."""
         return self.get_choice_name(self.__class__)
