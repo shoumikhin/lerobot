@@ -47,6 +47,7 @@ from torch import Tensor, nn
 from lerobot.bundle.manifest import NOISE, TASK_EMBEDDINGS, TASK_LENGTH, ProgramRun
 from lerobot.bundle.task_tokens import clean, tokenize
 from lerobot.configs import FeatureType
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 from lerobot.export.recipe import (
     BFLOAT16_STEPS_TOLERANCE,
     BFLOAT16_TOLERANCE,
@@ -120,6 +121,11 @@ STEP_MODULES = (
 )
 # The most language model layers whose build fits an 8 GB Jetson Orin Nano beside the rest of the export.
 LANGUAGE_LAYERS_PER_PART = 3
+# The GPUs (compute capabilities) on which TensorRT runs the step faster when the expert's query heads read its one
+# key and value head without copies (Torch-TensorRT's `fold_shared_kv_attention`): an A100, where pi0's chunk took
+# 49.9 ms instead of 59.1 ms, and a Jetson Thor, where pi0.5's took 76.5 ms instead of 84.5 ms. A Jetson Orin Nano
+# (8.7) ran it no faster.
+SHARED_KV_GPUS = ((8, 0), (11, 0))
 # How `Pi05PrepareStateTokenizerProcessorStep` makes the prompt text before the state; `_check_prompt_ops`
 # holds it to that.
 TASK_PROMPT_OPS = [
@@ -556,7 +562,10 @@ class PaliGemmaChainRecipe(ChainRecipe):
                 x_t = step(*cache_inputs, x_t, torch.tensor([timestep], device=self._device))
         step_inputs = (*cache_inputs, noise, torch.tensor(self._timesteps[:1], device=self._device))
         step_names = [*cache_names, "x", "timestep"]
-        yield Part("step", step, step_inputs, step_names, ["x"])
+        tensorrt = isinstance(self.cfg.backend, ExecuTorchTensorRTConfig)
+        fold = tensorrt and torch.cuda.get_device_capability(self._device) in SHARED_KV_GPUS
+        options = {"fold_shared_kv_attention": True} if fold else {}
+        yield Part("step", step, step_inputs, step_names, ["x"], compile_options=options)
         step_constants = [{"timestep": np.array([t], np.float32)} for t in self._timesteps]
         step_runs, self._constants = repeated_runs(
             "step", step_names, ["x"], step_constants, start={"x": NOISE}
