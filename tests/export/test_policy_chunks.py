@@ -200,6 +200,14 @@ CHAINS = {
         tiny=tiny_smolvla.use_tiny_smolvla,
         check=smolvla_programs_hold_only_their_weights,
     ),
+    "smolvla_one_program": Chain(
+        save_smolvla,
+        tasks=(TASK,),
+        programs=["model"],
+        args=("--one_program=true",),
+        plugins=("tiny_smolvla",),
+        tiny=tiny_smolvla.use_tiny_smolvla,
+    ),
 }
 
 
@@ -279,6 +287,43 @@ def test_the_export_refuses_a_peft_adapter(name, tmp_path, monkeypatch, capfd):
     assert "is a PEFT adapter" in capfd.readouterr().err
 
 
+def test_one_program_is_refused_for_a_recipe_that_compiles_only_a_chain(tmp_path, monkeypatch, capfd):
+    chain = replace(PI0, args=("--one_program=true",))
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(chain, chain.save(tmp_path, monkeypatch), tmp_path / "bundle", monkeypatch)
+    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as one"
+    assert message in capfd.readouterr().err
+
+
+# GiB of memory: a Jetson Orin Nano 8 GB, a Jetson Thor, a desktop with 32 GB, a machine with no os.sysconf.
+@pytest.mark.parametrize(
+    ("tensorrt", "memory", "one_program", "one"),
+    [
+        (True, 7.4, None, False),
+        (True, 122, None, True),
+        (True, 32, None, True),
+        (True, None, None, False),
+        (False, 512, None, False),
+        (True, 7.4, True, True),
+        (True, 122, False, False),
+    ],
+    ids=["orin_nano", "thor", "desktop", "windows", "other_backend", "asked_one", "asked_chain"],
+)
+def test_smolvla_compiles_one_program_with_tensorrt_and_the_memory_unless_told(
+    monkeypatch, tensorrt, memory, one_program, one
+):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+    from lerobot.policies.smolvla import export_smolvla
+
+    recipe = object.__new__(export_smolvla.SmolVLAExportRecipe)
+    backend = ExecuTorchTensorRTConfig() if tensorrt else SimpleNamespace(device="cuda")
+    recipe.cfg = SimpleNamespace(backend=backend, one_program=one_program)
+    monkeypatch.setattr(
+        export_smolvla, "memory_limit", lambda: None if memory is None else int(memory * 2**30)
+    )
+    assert recipe._one_program is one
+
+
 def test_the_smolvla_recipe_refuses_a_chain_that_computes_something_else(tmp_path, monkeypatch):
     from lerobot.policies.smolvla.export_smolvla import SmolVLAExportRecipe, SmolVLAStep
 
@@ -290,7 +335,12 @@ def test_the_smolvla_recipe_refuses_a_chain_that_computes_something_else(tmp_pat
         preprocessor,
         postprocessor,
         SimpleNamespace(
-            backend=SimpleNamespace(device="cpu"), seed=0, dataset=None, task=TASK, tolerance=None
+            backend=SimpleNamespace(device="cpu"),
+            seed=0,
+            dataset=None,
+            task=TASK,
+            tolerance=None,
+            one_program=False,
         ),
     )
     step = SmolVLAStep.forward

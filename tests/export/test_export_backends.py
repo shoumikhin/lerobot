@@ -109,7 +109,10 @@ POLICIES = {
     "diffusion": Policy(_diffusion, marks=(DIFFUSERS,)),
     "pi0": Policy(_tiny(tiny_pi0), plugins=("tiny_pi0",), marks=(TRANSFORMERS,)),
     "pi05": Policy(_tiny(tiny_pi05), plugins=("tiny_pi05",), marks=(TRANSFORMERS,)),
-    "smolvla": Policy(_tiny(tiny_smolvla), plugins=("tiny_smolvla",), marks=(TRANSFORMERS,)),
+    # The chain an 8 GB board builds, which TensorRT on a bigger machine would replace by one program.
+    "smolvla": Policy(
+        _tiny(tiny_smolvla), plugins=("tiny_smolvla",), args=("--one_program=false",), marks=(TRANSFORMERS,)
+    ),
     # The tolerance of this random tiny GR00T's chain in tests/export/test_policy_chunks.py.
     "groot": Policy(
         lambda folder, patch: tiny_groot.save_checkpoint(folder, "torchvision"),

@@ -610,10 +610,14 @@ class ExportRecipe(abc.ABC):
           `TF32_TOLERANCE_DIVISOR`; the recipe's own checks, which compare PyTorch with PyTorch, keep `tolerance`. A
           recipe whose choices TF32's rounding can flip, such as TD-MPC's planner or pi0-FAST's token decoder, sets
           it to False, and its programs stay float32.
+        - **offers_one_program** (`bool`) -- Whether `--one_program` applies: the recipe cuts a chunk into a chain
+          only so that it builds on a small board, and compiles one program instead when asked, or by default with
+          TensorRT and the memory for it.
     """
 
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE
     tf32: bool = True
+    offers_one_program: bool = False
 
     @classmethod
     def load(cls, cfg: ExportConfig) -> ExportRecipe:
@@ -1379,28 +1383,48 @@ def _available_memory() -> int | None:
     return None
 
 
-def _cgroup_room() -> int | None:
-    """Bytes left under the tightest cgroup v2 memory limit of this process and its parents, or None.
-
-    Inactive page cache, which the cgroup counts as used and the kernel drops first, counts as room.
-    """
+def _cgroup_limits() -> Iterator[tuple[Path, int]]:
+    """The cgroup v2 memory limits of this process and its parents, with each one's cgroup directory."""
     try:
         group = next(line[3:] for line in _CGROUP.read_text().splitlines() if line.startswith("0::"))
     except (OSError, StopIteration):
-        return None
-    rooms = []
+        return
     path = _CGROUPS / group.lstrip("/")
     while path.is_relative_to(_CGROUPS):
         try:
             limit = (path / "memory.max").read_text().strip()
             if limit != "max":
-                stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
-                used = int((path / "memory.current").read_text()) - int(stats.get("inactive_file", 0))
-                rooms.append(max(int(limit) - used, 0))
+                yield path, int(limit)
         except (OSError, ValueError):
             pass
         path = path.parent
+
+
+def _cgroup_room() -> int | None:
+    """Bytes left under the tightest cgroup v2 memory limit of this process and its parents, or None.
+
+    Inactive page cache, which the cgroup counts as used and the kernel drops first, counts as room.
+    """
+    rooms = []
+    for path, limit in _cgroup_limits():
+        try:
+            stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
+            used = int((path / "memory.current").read_text()) - int(stats.get("inactive_file", 0))
+            rooms.append(max(limit - used, 0))
+        except (OSError, ValueError):
+            pass
     return min(rooms, default=None)
+
+
+def memory_limit() -> int | None:
+    """Bytes of memory this process can use at most: the machine's, or a cgroup v2 limit if that is less.
+
+    None on Windows, which has no os.sysconf. Unlike the memory available, it is the same on every run.
+    """
+    if not hasattr(os, "sysconf"):
+        return None
+    installed = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    return min([installed, *(limit for _, limit in _cgroup_limits())])
 
 
 def whole_policy_fits(model_file: Path, device: torch.device, policy_name: str, peak: float) -> bool:

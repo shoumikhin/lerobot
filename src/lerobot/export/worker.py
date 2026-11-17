@@ -146,7 +146,13 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
             # bundle's check of its test case takes the --tolerance.
             recipe_cfg = copy.copy(cfg)
             recipe_cfg.tolerance = None
-        recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
+        recipe_class = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy))
+        if cfg.one_program is not None and not recipe_class.offers_one_program:
+            raise ValueError(
+                "--one_program applies only to a policy whose recipe can compile its chain of programs as one "
+                "program, such as SmolVLA."
+            )
+        recipe = recipe_class.load(recipe_cfg)
         if cfg.backend.tf32 and not recipe.tf32:
             logger.info("The %s recipe keeps its programs in float32, without TF32.", recipe.config.type)
             # The compile steps take the backend's settings from this step.

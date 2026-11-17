@@ -15,6 +15,7 @@
 """The default export recipe, on a tiny ACT built in memory."""
 
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -727,6 +728,26 @@ def test_a_policy_too_big_for_its_container_is_skipped(
     with caplog.at_level(logging.WARNING, logger=recipe_module.__name__):
         assert not recipe_module.whole_policy_fits(model_file, torch.device("cpu"), "pi0.5", 3)
     assert f"it needs about 3.0 GB, {available} available" in caplog.text
+
+
+@pytest.mark.parametrize(("job_limit", "limit"), [("max", 3_000_000_000), ("2000000000", 2_000_000_000)])
+def test_the_memory_limit_is_the_tightest_container_limit_below_the_machines(
+    tmp_path, monkeypatch, job_limit, limit
+):
+    """A 64 GiB machine, a 3 GB parent cgroup and a job inside it; the memory already used does not count."""
+    (tmp_path / "cgroup").write_text("0::/user.slice/job.scope\n")
+    job = tmp_path / "cgroups" / "user.slice" / "job.scope"
+    job.mkdir(parents=True)
+    (job.parent / "memory.max").write_text("3000000000\n")
+    (job / "memory.max").write_text(f"{job_limit}\n")
+    (job / "memory.current").write_text("1500000000\n")
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "cgroup")
+    monkeypatch.setattr(recipe_module, "_CGROUPS", tmp_path / "cgroups")
+    pages = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 64 * 2**30 // 4096}
+    monkeypatch.setattr(os, "sysconf", pages.__getitem__)
+    assert recipe_module.memory_limit() == limit
+    monkeypatch.setattr(recipe_module, "_CGROUP", tmp_path / "no_cgroup")
+    assert recipe_module.memory_limit() == 64 * 2**30
 
 
 def test_a_policy_too_big_for_host_memory_is_skipped_on_a_gpu(tmp_path, monkeypatch, caplog):

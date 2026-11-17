@@ -253,6 +253,13 @@ def test_export_refuses_a_quantization_without_a_tolerance(tmp_path, monkeypatch
         ExportConfig(TorchTestBackend(), output_dir=tmp_path / "b", quantize="fp8")
 
 
+def test_export_refuses_one_program_for_a_policy_that_already_compiles_one(checkpoint, tmp_path, capfd):
+    with pytest.raises(RuntimeError, match="trace step failed"):
+        run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}", "--one_program=true")
+    message = "--one_program applies only to a policy whose recipe can compile its chain of programs as one"
+    assert message in capfd.readouterr().err
+
+
 # Robot units of the test checkpoint's actions, whose spread is 30: a fifth of the TF32 tolerance, and twice it.
 @pytest.mark.parametrize(("offset", "passes"), [(0.03, True), (0.3, False)])
 def test_a_float32_policy_with_tf32_programs_gets_the_tf32_tolerance(checkpoint, tmp_path, offset, passes):

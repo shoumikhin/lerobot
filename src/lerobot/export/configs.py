@@ -203,6 +203,10 @@ class ExportConfig:
     # Defaults to the recipe's: a little more than the longest task known at export, as far as the policy's
     # prompt has room.
     max_task_tokens: int | None = None
+    # For a policy whose recipe cuts a chunk into a chain of programs only so that it builds on an 8 GB board, such
+    # as SmolVLA: `true` compiles one program instead, which runs faster and needs more memory to build, and `false`
+    # the chain. Defaults to the recipe's choice for the memory of the machine that exports.
+    one_program: bool | None = None
     # Seeds the random test case.
     seed: int = 1000
     # Compute in fewer bits, with a mode the backend offers, such as `fp8` with `executorch_tensorrt`.

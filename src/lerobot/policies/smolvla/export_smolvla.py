@@ -27,11 +27,17 @@ Compiled as one program, the denoising loop is unrolled ten times, and building 
 8 GB board's memory. Here the step is compiled once and run once per timestep, and each program is small enough to
 build with room to spare. As with the default recipe, the task is tokenized at export and the bundle runs only
 that task.
+
+With the TensorRT backend and `ONE_PROGRAM_MEMORY` of memory for the export, or with `--one_program=true`, the
+default recipe compiles the chunk as one program instead, which ran 11% faster on an A100 and 12% on a Jetson Thor.
+`--one_program=false` keeps the chain.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
+from functools import cached_property
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -39,10 +45,12 @@ import torch
 from torch import Tensor
 
 from lerobot.bundle.manifest import NOISE, ProgramRun
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 from lerobot.export.recipe import (
     ActionChunkRecipe,
     Part,
     RunPlan,
+    memory_limit,
     random_frame,
     repeated_runs,
     to_policy_input,
@@ -59,6 +67,12 @@ if TYPE_CHECKING or _transformers_available:
     from transformers import DynamicCache
 
 
+logger = logging.getLogger(__name__)
+
+# The least memory, in bytes, with which SmolVLA compiles as one program by default. Building it peaked
+# at 11.0 GB of host memory beside an A100 (the chain 6.6 GB; the GPU held 1.6 GB either way) and 9.7 GB on a
+# Jetson Thor, whose GPU shares the host's memory. A Jetson Orin Nano 8 GB built it only with 3.3 GB of swap.
+ONE_PROGRAM_MEMORY = 16 * 2**30
 EMBED_OUTPUTS = ("prefix_embs", "prefix_pad_masks", "prefix_att_masks")
 # What the steps read besides the noisy actions and the timestep.
 CACHE = ("prefix_pad_masks", "past_keys", "past_values")
@@ -184,8 +198,16 @@ class SmolVLAExportRecipe(ActionChunkRecipe):
     exported, the chain must compute exactly what the policy does, in PyTorch, for two different frames.
     """
 
+    offers_one_program = True
+
     def parts(self) -> Iterator[Part]:
-        """The embedding, the language model, the step and the actions, in the order they run."""
+        """The embedding, the language model, the step and the actions, in the order they run.
+
+        With TensorRT and the memory for it, or with `--one_program=true`, the default recipe's one program.
+        """
+        if self._one_program:
+            yield from super().parts()
+            return
         policy = cast(SmolVLAPolicy, self.policy)
         frame_names = list(self._features)
         embed = SmolVLAEmbed(policy, self.preprocessor, frame_names, self._visual, self.task or "")
@@ -231,7 +253,27 @@ class SmolVLAExportRecipe(ActionChunkRecipe):
 
     def plan(self) -> RunPlan:
         """The parts in order with the step once per timestep, and the timesteps as constants."""
+        if self._one_program:
+            return super().plan()
         return RunPlan(runs=self._runs, constants=self._constants)
+
+    @cached_property
+    def _one_program(self) -> bool:
+        """`--one_program`, or else whether TensorRT compiles with `ONE_PROGRAM_MEMORY` of memory for the export."""
+        if self.cfg.one_program is not None:
+            return self.cfg.one_program
+        # One program's speed and memory were measured with TensorRT only.
+        if not isinstance(self.cfg.backend, ExecuTorchTensorRTConfig) or (memory := memory_limit()) is None:
+            return False
+        one = memory >= ONE_PROGRAM_MEMORY
+        logger.info(
+            "SmolVLA compiles as %s: the export can use %.1f GiB of memory, and the default is one program from "
+            "%.0f GiB (--one_program chooses).",
+            "one program" if one else "a chain of programs",
+            memory / 2**30,
+            ONE_PROGRAM_MEMORY / 2**30,
+        )
+        return one
 
     def _run(
         self,
