@@ -98,6 +98,19 @@ class ExportBackendConfig(draccus.ChoiceRegistry, abc.ABC):
         return Target(gpu, compute_capability)
 
     @property
+    def tf32(self) -> bool:
+        """Whether the programs may round the inputs of float32 matrix products and convolutions to TF32.
+
+        That moves a float32 policy's actions away from its float32 arithmetic, so the bundle's default tolerance
+        then allows for it. A backend that offers it makes it a setting.
+        """
+        return False
+
+    def without_tf32(self) -> ExportBackendConfig:
+        """These settings with `tf32` off, for a recipe whose programs stay float32 (`ExportRecipe.tf32`)."""
+        return self
+
+    @property
     def type(self) -> str:
         """The `--backend.type` name of this backend."""
         return self.get_choice_name(self.__class__)
@@ -178,8 +191,9 @@ class ExportConfig:
     dataset: DatasetConfig | None = None
     # The largest difference allowed between the compiled actions and PyTorch's on the test case, in the
     # policy's normalized action units (robot units divided by the spread of each action in the training
-    # data). Defaults to the recipe's. PyTorch computes the test case with TF32 off and with exact bfloat16
-    # reductions, so that it does not depend on the GPU it is exported on.
+    # data). Defaults to the recipe's, raised for a float32 policy whose programs round to TF32
+    # (`--backend.tf32`) to what that rounding needs (0.0047 for most policies). PyTorch computes the test case
+    # with TF32 off and with exact bfloat16 reductions, so that it does not depend on the GPU it is exported on.
     tolerance: float | None = None
     # For a policy whose bundle takes any task, such as pi0.5, the most tokens a task may take in the bundle.
     # Defaults to the recipe's: a little more than the longest task known at export, as far as the policy's

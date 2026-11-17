@@ -93,7 +93,7 @@ INFO ... Traced the policy in 19 s
 INFO ... [1/2] Compiling model with executorch_tensorrt
 INFO ... [1/2] Compiling model with executorch_tensorrt: done in 37 s
 INFO ... [2/2] Checking the bundle
-INFO ... Bundle test case: largest difference 5.56e-07 (tolerance 2e-05)
+INFO ... Bundle test case: largest difference 9.18e-04 (tolerance 0.0046875)
 INFO ... [2/2] Checking the bundle: done in 3 s
 INFO ... Wrote outputs/export/act_executorch_tensorrt in 59 s
 ```
@@ -139,7 +139,7 @@ Before the robot connects, `lerobot-rollout` loads the programs, replays the tes
 
 ```
 INFO ... Loading the bundle from 'outputs/export/act_executorch_tensorrt'...
-INFO ... Bundle test case: largest difference 5.40e-06 (tolerance 2e-05)
+INFO ... Bundle test case: largest difference 9.18e-04 (tolerance 0.0046875)
 INFO ... Bundle loaded from outputs/export/act_executorch_tensorrt (backend executorch_tensorrt)
 ```
 
@@ -149,27 +149,28 @@ Then the robot moves, as with any policy. Every 5 seconds it logs the loop rate,
 
 ### Options
 
-| Flag                               | What it does                                                                                                                                                                  |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                                                                      |
-| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                                                               |
-| `--backend.type`                   | The compiler, from the table above.                                                                                                                                           |
-| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                                                          |
-| `--task`                           | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                                                         |
-| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                                                         |
-| `--dataset.root`                   | A local folder that holds the dataset, or with `--dataset.streaming=true` a bucket, `hf://buckets/OWNER/BUCKET`. Defaults to LeRobot's cache, as for training.                |
-| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                                                              |
-| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                                 |
-| `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                                                                     |
-| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                              |
-| `--quantize`                       | Computes in fewer bits, with a mode the backend offers: `fp8` with `executorch_tensorrt`. Needs `--tolerance`. See [FP8](#fp8-with---quantizefp8).                            |
-| `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                                      |
-| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                                           |
-| `--backend.compute_precision`      | Core ML and Vulkan: `float32` (the default) or `float16`, which needs a larger `--tolerance`. Core ML's Neural Engine runs only `float16`.                                    |
-| `--backend.soc`                    | QNN only, required: the Snapdragon chip the programs run on, one whose Hexagon NPU is v69 or newer, such as `QCS9100` or `SM8650`.                                            |
-| `--backend.bfloat16`               | VGF only: `true` also lowers a policy's bfloat16 parts, with TOSA's bf16 extension, which is optional, so a GPU may not run it; `false` (the default) leaves them on the CPU. |
-| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                                                                       |
-| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.                                                         |
+| Flag                               | What it does                                                                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--policy.path`                    | The checkpoint: a local folder or a Hub repository. `--policy.pretrained_revision` picks a Hub revision.                                                                                                |
+| `--policy.<setting>`               | Changes a setting of the checkpoint's config for the export, such as `--policy.dtype=bfloat16`.                                                                                                         |
+| `--backend.type`                   | The compiler, from the table above.                                                                                                                                                                     |
+| `--output_dir`                     | Where to write the bundle. Defaults to `outputs/export/<policy type>_<backend type>`. The folder must not exist yet.                                                                                    |
+| `--task`                           | The task, for a policy that reads one, such as SmolVLA or pi0.5. See [Tasks](#tasks).                                                                                                                   |
+| `--dataset.repo_id`                | The dataset the policy was trained on. The export takes the robot's frame and the tasks from it. See [Tasks](#tasks).                                                                                   |
+| `--dataset.root`                   | A local folder that holds the dataset, or with `--dataset.streaming=true` a bucket, `hf://buckets/OWNER/BUCKET`. Defaults to LeRobot's cache, as for training.                                          |
+| `--dataset.revision`               | The Hub revision of the dataset.                                                                                                                                                                        |
+| `--tolerance`                      | The largest difference allowed between compiled and PyTorch actions. See [Built-in checks](#built-in-checks).                                                                                           |
+| `--max_task_tokens`                | For a bundle that runs any task: the longest task prompt, in tokens. See [Tasks](#tasks).                                                                                                               |
+| `--seed`                           | Seeds the random test frame. Defaults to `1000`.                                                                                                                                                        |
+| `--quantize`                       | Computes in fewer bits, with a mode the backend offers: `fp8` with `executorch_tensorrt`. Needs `--tolerance`. See [FP8](#fp8-with---quantizefp8).                                                      |
+| `--log_level`                      | `INFO` (the default) logs each step and how long it took; `DEBUG` adds the logs of PyTorch, ExecuTorch and the compiler.                                                                                |
+| `--backend.tf32`                   | TensorRT only: `true` (the default) rounds float32 matrix products and convolutions to TF32, 1.9 to 3.7 times faster for ACT on Jetson; `false` keeps float32. See [Built-in checks](#built-in-checks). |
+| `--backend.compute_units`          | Core ML only: the hardware Core ML may use, `all` (the default), `cpu_only`, `cpu_and_gpu` or `cpu_and_ne` (CPU and Neural Engine).                                                                     |
+| `--backend.compute_precision`      | Core ML and Vulkan: `float32` (the default) or `float16`, which needs a larger `--tolerance`. Core ML's Neural Engine runs only `float16`.                                                              |
+| `--backend.soc`                    | QNN only, required: the Snapdragon chip the programs run on, one whose Hexagon NPU is v69 or newer, such as `QCS9100` or `SM8650`.                                                                      |
+| `--backend.bfloat16`               | VGF only: `true` also lowers a policy's bfloat16 parts, with TOSA's bf16 extension, which is optional, so a GPU may not run it; `false` (the default) leaves them on the CPU.                           |
+| `--backend.discover_packages_path` | A package to import that adds a backend, such as your own. See [A backend](#a-backend).                                                                                                                 |
+| `--config_path`                    | A YAML or JSON file that holds these options, such as `policy: {path: ...}`. Options on the command line override it.                                                                                   |
 
 `lerobot-export --backend.type=<backend> --help` lists the options of a backend. Of the other `--dataset.*` options it lists, the export reads `--dataset.repo_type` and `--dataset.streaming` as training does, and does not use the rest.
 
@@ -236,7 +237,7 @@ The bundle holds everything `lerobot-rollout` needs, and nothing else. The robot
     }
   ],
   "action_scale": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
-  "tolerance": 2e-5,
+  "tolerance": 0.0046875,
   "target": {
     "gpu": "NVIDIA H100",
     "compute_capability": "9.0"
@@ -269,7 +270,9 @@ The export makes a random test frame and records the actions PyTorch computes fo
 - **Part by part**, for a recipe that asks for it, each compiled program runs at export on the inputs its part got in PyTorch, and its outputs may differ from the part's by at most 3 times what rounding alone moves them: other attention kernels and matmul settings, the part in float32, and one rounding step of the largest value. A floating point output that none of these moves, such as a copy, may differ by one rounding step; integers must match exactly. A long chain of bfloat16 programs can amplify rounding until correct and broken programs play equally different actions, but one program on its own cannot. The check is for bfloat16 and float16 programs; a float32 program has no wider rerun to measure its rounding against. LingBot-VA's recipe does this in bfloat16 and float16, and Praxis-1's does it for its `velocity` and `decoder` programs in bfloat16 and float16, without the float32 run, which does not fit beside the policy. A part whose outputs move, when it simply runs again, by more than 3 rounding steps of the least precise float type it reads, holds or returns, and by more than 1e-4 of their largest value, such as one that draws random numbers or keeps dropout on, is refused.
 - **At load**, `lerobot-rollout` replays the test frame again, before the robot connects. It also checks the robot's cameras and state (after `--rename_map`), the number of joints, and the joint names when the policy recorded a robot's (names ending in `.pos` or `.vel`). Before any program loads, a bundle is refused if this machine does not have its GPU or its runtime modules (another version of a module gets a warning, unless it is in `exact_runtime_modules`), if its programs read a value that nothing gives, or if its manifest names a file outside the bundle folder. While the robot runs, every chunk must have the right shape and be finite before it is used.
 
-The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 or float16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. GR00T keeps its linear layers in bfloat16 unless `--policy.use_bf16=false`, so it uses 0.075 by default even with float32 weights. In bfloat16, a recipe whose policy runs ten denoising steps, such as pi0.5's, uses 0.2: the steps amplify rounding, as measured on pi0.5's test frame. That catches only large errors: a recipe that swapped two cameras would move pi0.5's actions by about 0.03 there, so check a change to a recipe in float32, where the tolerance is 2e-05. Change the tolerance with `--tolerance`.
+The difference is measured in **normalized units**: each action's difference is divided by its `action_scale`. So the same tolerance means the same thing on every robot. The default tolerance is 2e-05 for a policy with float32 (32-bit) weights: the compiled program computes in full float32, as PyTorch does. For one with bfloat16 or float16 (16-bit) weights it is 0.075, because a compiler may sum 16-bit numbers in another order. GR00T keeps its linear layers in bfloat16 unless `--policy.use_bf16=false`, so it uses 0.075 by default even with float32 weights. In bfloat16, a recipe whose policy runs ten denoising steps, such as pi0.5's, uses 0.2: the steps amplify rounding, as measured on pi0.5's test frame. That catches only large errors: a recipe that swapped two cameras would move pi0.5's actions by about 0.03 there, so check a change to a recipe in float32 (with `--backend.tf32=false` on TensorRT), where the tolerance is 2e-05. Change the tolerance with `--tolerance`.
+
+`executorch_tensorrt` by default rounds the inputs of float32 matrix products and convolutions to TF32 (10 bits of precision instead of 23), as PyTorch does on a GPU with `--tf32=true`, which ran ACT 1.9 times faster on a Jetson Orin Nano and 3.7 times on a Jetson Thor. So the bundle of a float32 policy may then differ by the recipe's bfloat16 tolerance divided by 16: 0.0047 for most policies, and 0.0125 for those that use 0.2 or more in bfloat16, such as pi0 and pi0.5. On an ACT, TF32 moved the actions by up to 1.5e-03 and a planted error that zeroed one attention head by 8.2e-03, so 0.0047 still catches it. The recipe's own checks still compare PyTorch with PyTorch in float32, at their float32 tolerances. The TD-MPC and pi0-FAST recipes keep their programs in float32, because TF32's rounding can change which plan TD-MPC's planner keeps and which token pi0-FAST's decoder picks. `--backend.tf32=false` keeps float32 math in float32 for every policy.
 
 <Tip>
 
@@ -527,7 +530,7 @@ Two tables list what has been tested. In both:
 - Cosmos3's results used `lerobot/Cosmos3-Edge-Policy-LIBERO` in bfloat16. Its recipe exports the sampling without classifier-free guidance, and the one embodiment domain its config names (`domain_id`).
 - Long-WAM's `executorch_cuda` and `executorch_tensorrt` results used `Efficient-Large-Model/Long-WAM-LIBERO-IDM-LeRobot` in bfloat16. Each export took 43 to 52 minutes on an H100, 59 to 107 on an A100, and up to about 60 GB of host memory. Its H100 bundles passed the export's own checks; its A100 bundles also ran in `lerobot-rollout`, with no operation on the CPU. Its recipe needs a checkpoint whose `inference_seed` is set, as in the released ones, or `--policy.inference_seed=1`.
 - Praxis-1's TensorRT result used `runwayml/praxis-1-droid-lerobot` in bfloat16 and the Torch-TensorRT that `compile_and_save` needs (see [Install](#install)). Its recipe turns on Torch-TensorRT's `grouped_mm_kernel` setting from [pytorch/TensorRT#5021](https://github.com/pytorch/TensorRT/pull/5021) for its `velocity` and `decoder` programs, so the grouped matmuls of their mixture-of-experts layers run inside TensorRT. Each of its TensorRT programs then builds as one engine, and only `noise`, which draws the starting noise, runs in ExecuTorch's CUDA backend. Without the setting, Torch-TensorRT leaves those matmuls to ExecuTorch's CUDA backend, and `velocity` ran as 37 TensorRT engines with 36 CUDA backend parts between them. Torch-TensorRT ignores a setting it does not have, so the export refuses a Torch-TensorRT without this one. The export took about 25 minutes on an H100 and up to about 58 GB of host memory, and the bundle is 59 GB. Praxis-1 was also exported and run on the Jetson AGX Thor and the DGX Spark, with the same programs. It does not fit the Jetson Orin Nano's 8 GB. In bfloat16 its 3 test chunks amplify rounding so much that the bundle's test case cannot tell a correct program from a wrong one, so its `velocity` and `decoder` programs are also checked on their own (see [Built-in checks](#built-in-checks)), and the test case only has to stay within 1.0.
-- Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FastWAM, FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy.
+- Diffusion Policy, EO-1, Gaussian actor, Multi-Task DiT and VQ-BeT ran with random weights, and so did FastWAM, FineART VLA, VLA-JEPA and WALL-X on the Thor. That checks the compiler and the runtime, not a trained policy. With random weights, Multi-Task DiT's float32 bundle with TF32 differed by up to 6.3e-03 on an A100, more than its 0.0047 default tolerance; two trained Multi-Task DiT checkpoints differed by at most 4.0e-04.
 
 ### Other backends
 

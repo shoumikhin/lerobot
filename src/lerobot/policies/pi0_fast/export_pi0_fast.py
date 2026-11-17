@@ -193,6 +193,9 @@ class PI0FastExportRecipe(ActionChunkRecipe):
     """
 
     exact = False
+    # Greedy decoding picks the likeliest token at each step, and rounding the steps' products to TF32 could pick
+    # another, as bfloat16 does (see `__init__`).
+    tf32 = False
 
     def __init__(
         self,

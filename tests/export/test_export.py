@@ -40,7 +40,13 @@ from lerobot.bundle.manifest import NOISE, POLICY_CONFIG, TEST_CASE, Bundle, Pro
 from lerobot.configs import parser
 from lerobot.export import worker
 from lerobot.export.configs import ExportBackendConfig, ExportConfig
-from lerobot.export.recipe import ExportRecipe
+from lerobot.export.recipe import (
+    BFLOAT16_STEPS_TOLERANCE,
+    BFLOAT16_TOLERANCE,
+    FLOAT32_TOLERANCE,
+    TF32_TOLERANCE_DIVISOR,
+    ExportRecipe,
+)
 from lerobot.inference.sync import SyncInferenceEngine
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -250,6 +256,74 @@ def test_export_refuses_a_quantization_without_a_tolerance(tmp_path, monkeypatch
     monkeypatch.setattr(TorchTestBackend, "quantizations", {"fp8": None})
     with pytest.raises(ValueError, match="--quantize needs --tolerance"):
         ExportConfig(TorchTestBackend(), output_dir=tmp_path / "b", quantize="fp8")
+
+
+# Robot units of the test checkpoint's actions, whose spread is 30: a fifth of the TF32 tolerance, and twice it.
+@pytest.mark.parametrize(("offset", "passes"), [(0.03, True), (0.3, False)])
+def test_a_float32_policy_with_tf32_programs_gets_the_tf32_tolerance(checkpoint, tmp_path, offset, passes):
+    args = (
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'bundle'}",
+        f"--backend.offset={offset}",
+        "--backend.tf32=true",
+    )
+    if passes:
+        run_export(*args)
+        tolerance = Bundle.read(tmp_path / "bundle").manifest.tolerance
+        assert tolerance == BFLOAT16_TOLERANCE / TF32_TOLERANCE_DIVISOR
+    else:
+        with pytest.raises(RuntimeError, match="failed its check"):
+            run_export(*args)
+
+
+@pytest.mark.usefixtures("restore_torch_backend_flags")
+def test_the_tf32_tolerance_of_a_recipe_with_a_looser_bfloat16_tolerance_is_capped(
+    checkpoint, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ExportRecipe, "bfloat16_tolerance", 1.0)
+    args = [
+        "--backend.type=torch_test",
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--backend.tf32=true",
+    ]
+    request = tmp_path / "trace.json"
+    folders, result = str(tmp_path / "folders.json"), str(tmp_path / "result.json")
+    request.write_text(json.dumps({"step": "trace", "args": args, "folders": folders, "result": result}))
+    monkeypatch.setattr(sys, "argv", ["worker", str(request)])
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    worker.main()
+    tolerance = json.loads(Path(result).read_text())["manifest"]["tolerance"]
+    assert tolerance == BFLOAT16_STEPS_TOLERANCE / TF32_TOLERANCE_DIVISOR
+
+
+@pytest.mark.usefixtures("restore_torch_backend_flags")
+def test_a_recipe_that_keeps_float32_turns_tf32_off_for_its_programs(checkpoint, tmp_path, monkeypatch):
+    monkeypatch.setattr(ExportRecipe, "tf32", False)
+    args = [
+        "--backend.type=torch_test",
+        f"--policy.path={checkpoint}",
+        f"--output_dir={tmp_path / 'b'}",
+        "--backend.tf32=true",
+    ]
+    request = tmp_path / "trace.json"
+    folders, result = str(tmp_path / "folders.json"), str(tmp_path / "result.json")
+    request.write_text(json.dumps({"step": "trace", "args": args, "folders": folders, "result": result}))
+    monkeypatch.setattr(sys, "argv", ["worker", str(request)])
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    worker.main()
+    traced = json.loads(Path(result).read_text())
+    # The compile steps take the backend's settings from the trace step.
+    assert traced["backend"]["tf32"] is False
+    assert traced["manifest"]["tolerance"] == FLOAT32_TOLERANCE
+
+
+def test_the_recipes_whose_choices_tf32_can_flip_keep_float32():
+    from lerobot.policies.pi0_fast.export_pi0_fast import PI0FastExportRecipe
+    from lerobot.policies.tdmpc.export_tdmpc import TDMPCExportRecipe
+
+    assert TDMPCExportRecipe.tf32 is False
+    assert PI0FastExportRecipe.tf32 is False
 
 
 def test_a_part_checked_on_its_own_is_refused_quantization():

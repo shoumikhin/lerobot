@@ -74,6 +74,12 @@ BFLOAT16_TOLERANCE = 0.075
 # TensorRT bundle differed from its test case by 0.079 on an H100, where another kernel moved it by 0.076. Another
 # attention kernel moves Wall-OSS 0.5's actions by up to 0.16.
 BFLOAT16_STEPS_TOLERANCE = 0.2
+# TF32 rounds the inputs of float32 matrix products and convolutions to 10 bits of mantissa, 3 more than bfloat16
+# keeps. With it, float32 TensorRT bundles of pi0 and pi0.5 differed from their test case 12 to 30 times less than
+# their bfloat16 bundles, so the TF32 tolerance is a recipe's bfloat16 tolerance divided by this: 4.7e-3 by default.
+# ACT's TF32 bundles differed by up to 1.5e-3, where a zeroed attention head moved its actions by 8.2e-3 and a layer
+# scaled by 1% by 7.0e-3.
+TF32_TOLERANCE_DIVISOR = 16
 # A part checked on its own (`ProgramCheck`) may differ from PyTorch by this many times what rounding alone moves
 # it. Correct LingBot-VA programs from TensorRT and ExecuTorch's CUDA backend measured up to 1.85 times; a wrong
 # attention head size, swapped keys and values, a skipped layer or a zeroed output measured 9 to 830 times.
@@ -683,9 +689,15 @@ class ExportRecipe(abc.ABC):
         - **bfloat16_tolerance** (`float`) -- The default tolerance of a bfloat16 or float16 checkpoint. A
           recipe whose policy amplifies rounding raises it, such as to `BFLOAT16_STEPS_TOLERANCE` for ten
           bfloat16 denoising steps.
+        - **tf32** (`bool`) -- Whether the programs may round float32 products to TF32 when the backend does
+          (`ExportBackendConfig.tf32`). The bundle's check then allows `bfloat16_tolerance`, at most
+          `BFLOAT16_STEPS_TOLERANCE`, divided by `TF32_TOLERANCE_DIVISOR`; the recipe's own checks, which compare
+          PyTorch with PyTorch, keep `tolerance`. A recipe whose choices TF32's rounding can flip, such as TD-MPC's
+          planner or pi0-FAST's token decoder, sets it to False, and its programs stay float32.
     """
 
     bfloat16_tolerance: float = BFLOAT16_TOLERANCE
+    tf32: bool = True
 
     @classmethod
     def load(cls, cfg: ExportConfig) -> ExportRecipe:

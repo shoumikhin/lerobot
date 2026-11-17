@@ -67,6 +67,9 @@ class TDMPCExportRecipe(ActionChunkRecipe):
 
     # On a GPU the program and the policy may sum in other orders, so they are held to the export's tolerance.
     exact = False
+    # The planner keeps the best of its sampled trajectories, and TF32's rounding changed which: it moved the
+    # actions by 9.3e-3 and 3.0e-2 on two test frames of a TD-MPC with random weights.
+    tf32 = False
 
     def _execution_steps(self) -> int:
         config = self.policy.config
