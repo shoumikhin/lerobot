@@ -123,9 +123,9 @@ STEP_MODULES = (
 LANGUAGE_LAYERS_PER_PART = 3
 # The GPUs (compute capabilities) on which TensorRT runs the step faster when the expert's query heads read its one
 # key and value head without copies (Torch-TensorRT's `fold_shared_kv_attention`): an A100, where pi0's chunk took
-# 49.9 ms instead of 59.1 ms, and a Jetson Thor, where pi0.5's took 76.5 ms instead of 84.5 ms. A Jetson Orin Nano
-# (8.7) ran it no faster.
-SHARED_KV_GPUS = ((8, 0), (11, 0))
+# 49.9 ms instead of 59.1 ms, a Jetson Thor, where pi0.5's took 76.5 ms instead of 84.5 ms, and an H100 (9.0) and a
+# DGX Spark (12.1), where pi0.5's took 19% and 8% less time. A Jetson Orin Nano (8.7) ran it no faster.
+SHARED_KV_GPUS = ((8, 0), (9, 0), (11, 0), (12, 1))
 # How `Pi05PrepareStateTokenizerProcessorStep` makes the prompt text before the state; `_check_prompt_ops`
 # holds it to that.
 TASK_PROMPT_OPS = [

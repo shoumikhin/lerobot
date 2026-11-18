@@ -218,9 +218,17 @@ class CPUTensorRT(ExecuTorchTensorRTConfig):
 
 @pytest.mark.parametrize(
     ("backend", "capability", "folded"),
-    [(CPUTensorRT(), (11, 0), True), (CPUTensorRT(), (8, 0), True), (CPUTensorRT(), (8, 7), False)]
+    [(CPUTensorRT(), (11, 0), True), (CPUTensorRT(), (8, 0), True), (CPUTensorRT(), (9, 0), True)]
+    + [(CPUTensorRT(), (12, 1), True), (CPUTensorRT(), (8, 7), False)]
     + [(SimpleNamespace(device="cpu"), (11, 0), False)],
-    ids=["tensorrt_thor", "tensorrt_a100", "tensorrt_orin", "other_backend"],
+    ids=[
+        "tensorrt_thor",
+        "tensorrt_a100",
+        "tensorrt_h100",
+        "tensorrt_spark",
+        "tensorrt_orin",
+        "other_backend",
+    ],
 )
 def test_tensorrt_folds_the_steps_shared_key_value_head_on_the_gpus_where_that_is_faster(
     recipe_config, monkeypatch, backend, capability, folded
