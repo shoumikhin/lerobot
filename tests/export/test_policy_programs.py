@@ -39,9 +39,9 @@ class Recipe:
 
     `state` is the state of the frame the program is compared on, for a policy that writes the state into its
     prompt: its numbers take other widths there than in the frames the recipe checked. `cuda` also runs the
-    recipe on a GPU, where its pixels must still be the processor's bit for bit. `seeded` is for a policy that
-    seeds its own noise, which the program holds, and `reads_task` for one whose bundle holds the task, as the
-    recipe's own probe finds.
+    recipe on a GPU, where its pixels must still be the processor's bit for bit. `seeded` is for a policy whose
+    program takes no noise: one that seeds its own noise, which the program holds, or one that draws none.
+    `reads_task` is for one whose bundle holds the task, as the recipe's own probe finds.
     `options` are more arguments of `make_recipe`.
     """
 
@@ -100,6 +100,7 @@ RECIPES = {
     "fastwam": Recipe(
         "tests.policies.fastwam.test_export_fastwam", ("monkeypatch",), seeded=True, reads_task=True
     ),
+    "nat_vla": Recipe("tests.policies.nat_vla.export_stand_in", ("tmp_path",), seeded=True, reads_task=True),
 }
 
 
@@ -158,6 +159,7 @@ def test_the_exported_program_computes_what_the_policy_does(request, name, devic
             "molmoact2", {"crop_mode": "overlap-and-resize"}, "uses 'overlap-and-resize'", id="molmoact2-crop"
         ),
         pytest.param("molmoact2", {"width": 42}, "28x42 becomes 28x28", id="molmoact2-camera"),
+        pytest.param("nat_vla", {"rtc_steps": 8}, "--policy.rtc_steps=0", id="nat_vla-rtc"),
     ],
 )
 def test_the_recipe_refuses_what_its_program_cannot_compute(request, name, change, error):
