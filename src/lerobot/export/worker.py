@@ -27,7 +27,6 @@ import copy
 import importlib
 import json
 import logging
-import shutil
 import sys
 import uuid
 from collections.abc import Callable
@@ -140,102 +139,97 @@ def _trace(cfg: ExportConfig, request: dict[str, Any]) -> dict[str, Any]:
     folders = {"made": [str(folder), str(traced)], "parents": [str(path) for path in parents]}
     # Named before any is made, so that lerobot-export removes them however this step ends.
     Path(request["folders"]).write_text(json.dumps(folders))
-    try:
-        output_dir.parent.mkdir(parents=True, exist_ok=True)
-        # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
-        folder.mkdir()
-        traced.mkdir(mode=0o700)
-        recipe_cfg = cfg
-        if cfg.quantize is not None:
-            # The recipe compares its parts with the policy as it does without --quantize, so only the
-            # bundle's check of its test case takes the --tolerance.
-            recipe_cfg = copy.copy(cfg)
-            recipe_cfg.tolerance = None
-        recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
-        if cfg.backend.tf32 and not recipe.tf32:
-            logger.info("The %s recipe keeps its programs in float32, without TF32.", recipe.config.type)
-            # The compile steps take the backend's settings from this step.
-            cfg.backend = cfg.backend.without_tf32()
-        programs: dict[str, ProgramFiles] = {}
-        runs: list[ProgramRun] = []
-        checks: list[str] = []
-        compile_options: dict[str, dict[str, Any]] = {}
-        for part in recipe.parts():
-            logger.info("Tracing %s", part.name)
-            # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
-            # default, and its Dynamo cannot run some policies' Python, such as ACT's.
-            with torch.no_grad(), _quantized(cfg, part):
-                program = torch.export.export(part.module, part.example_inputs, strict=False)
-                # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
-                # flat_apply that Transformers' vmap attention masks trace to.
-                program = program.run_decompositions({})
-            torch.export.save(program, traced / f"{part.name}.pt2")
-            if part.check is not None:
-                part.check.save(traced / f"{part.name}.check.safetensors")
-                checks.append(part.name)
-            if part.compile_options:
-                compile_options[part.name] = part.compile_options
-            programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
-            runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
-            del part, program
-        plan = recipe.plan()
-        if cfg.max_task_tokens is not None and plan.task_tokens is None:
-            raise ValueError(
-                "--max_task_tokens applies only to a policy whose bundle takes any task, such as pi0.5."
-            )
-        test_case = recipe.test_case()
-        runs = runs if plan.runs is None else plan.runs
-        first_runs = plan.first_runs
-        # A test case with values carried between chunks, or of the first chunks from a reset, holds the noise of
-        # each of its chunks.
-        several = plan.carry or plan.first_runs
-        chunk_noise = test_case.noise if test_case.noise is None or not several else test_case.noise[0]
-        if chunk_noise is not None and cfg.backend.device == "cuda":
-            # Drawn where the programs read it, so a chunk uploads only the robot's frame.
-            noise = torch.from_numpy(chunk_noise)
-            draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
-            torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
-            programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
-            draw_run = ProgramRun(NOISE, NOISE, [], [NOISE])
-            runs = [draw_run, *runs]
-            first_runs = [[draw_run, *chunk] for chunk in first_runs]
-        task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
-        tolerance = recipe.tolerance if cfg.quantize is None else cast(float, cfg.tolerance)
-        if cfg.backend.tf32 and cfg.tolerance is None:
-            # The recipe's own checks compare PyTorch with PyTorch in float32; only the programs round to TF32.
-            # A recipe that loosens its bfloat16 tolerance further allows for bfloat16's rounding, which TF32 lacks.
-            base = min(recipe.bfloat16_tolerance, BFLOAT16_STEPS_TOLERANCE)
-            tolerance = max(tolerance, base / TF32_TOLERANCE_DIVISOR)
-        manifest = BundleManifest(
-            backend=cfg.backend.type,
-            runtime=cfg.backend.runtime,
-            runtime_imports=list(cfg.backend.runtime_imports),
-            runtime_options=cfg.backend.runtime_options,
-            programs=programs,
-            runs=runs,
-            first_runs=first_runs,
-            task_tokens=None
-            if task_tokens is None
-            else TaskTokens(task_tokens.prompt_ops, task_tokens.max_tokens),
-            action_tokens=None if action_tokens is None else action_tokens.spec,
-            noise_shape=None if chunk_noise is None else list(chunk_noise.shape),
-            history=plan.history,
-            carry={name: None if shape is None else list(shape) for name, shape in plan.carry.items()},
-            task=recipe.task,
-            action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
-            action_scale=test_case.action_scale.tolist(),
-            tolerance=tolerance,
-            target=cfg.backend.target(),
-            runtime_versions=runtime_versions(cfg.backend.runtime_modules),
-            exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    # Made the way the output folder it becomes would be, so the bundle gets the usual permissions.
+    folder.mkdir()
+    traced.mkdir(mode=0o700)
+    recipe_cfg = cfg
+    if cfg.quantize is not None:
+        # The recipe compares its parts with the policy as it does without --quantize, so only the
+        # bundle's check of its test case takes the --tolerance.
+        recipe_cfg = copy.copy(cfg)
+        recipe_cfg.tolerance = None
+    recipe = get_export_recipe_class(cast(PreTrainedConfig, cfg.policy)).load(recipe_cfg)
+    if cfg.backend.tf32 and not recipe.tf32:
+        logger.info("The %s recipe keeps its programs in float32, without TF32.", recipe.config.type)
+        # The compile steps take the backend's settings from this step.
+        cfg.backend = cfg.backend.without_tf32()
+    programs: dict[str, ProgramFiles] = {}
+    runs: list[ProgramRun] = []
+    checks: list[str] = []
+    compile_options: dict[str, dict[str, Any]] = {}
+    for part in recipe.parts():
+        logger.info("Tracing %s", part.name)
+        # Non-strict, the default of PyTorch 2.15, on every PyTorch: PyTorch 2.7 traces strictly by
+        # default, and its Dynamo cannot run some policies' Python, such as ACT's.
+        with torch.no_grad(), _quantized(cfg, part):
+            program = torch.export.export(part.module, part.example_inputs, strict=False)
+            # No op is decomposed: this inlines the higher-order ops a save cannot write, such as the
+            # flat_apply that Transformers' vmap attention masks trace to.
+            program = program.run_decompositions({})
+        torch.export.save(program, traced / f"{part.name}.pt2")
+        if part.check is not None:
+            part.check.save(traced / f"{part.name}.check.safetensors")
+            checks.append(part.name)
+        if part.compile_options:
+            compile_options[part.name] = part.compile_options
+        programs[part.name] = ProgramFiles(f"{part.name}{cfg.backend.file_suffix}")
+        runs.append(ProgramRun(part.name, part.name, part.inputs, part.outputs))
+        del part, program
+    plan = recipe.plan()
+    if cfg.max_task_tokens is not None and plan.task_tokens is None:
+        raise ValueError(
+            "--max_task_tokens applies only to a policy whose bundle takes any task, such as pi0.5."
         )
-        write_bundle(
-            Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens, action_tokens
-        )
-    except BaseException:
-        shutil.rmtree(folder, ignore_errors=True)
-        shutil.rmtree(traced, ignore_errors=True)
-        raise
+    test_case = recipe.test_case()
+    runs = runs if plan.runs is None else plan.runs
+    first_runs = plan.first_runs
+    # A test case with values carried between chunks, or of the first chunks from a reset, holds the noise of
+    # each of its chunks.
+    several = plan.carry or plan.first_runs
+    chunk_noise = test_case.noise if test_case.noise is None or not several else test_case.noise[0]
+    if chunk_noise is not None and cfg.backend.device == "cuda":
+        # Drawn where the programs read it, so a chunk uploads only the robot's frame.
+        noise = torch.from_numpy(chunk_noise)
+        draw = _DrawNoise(tuple(noise.shape), noise.dtype, cfg.backend.device)
+        torch.export.save(torch.export.export(draw, ()), traced / f"{NOISE}.pt2")
+        programs[NOISE] = ProgramFiles(f"{NOISE}{cfg.backend.file_suffix}")
+        draw_run = ProgramRun(NOISE, NOISE, [], [NOISE])
+        runs = [draw_run, *runs]
+        first_runs = [[draw_run, *chunk] for chunk in first_runs]
+    task_tokens, action_tokens = plan.task_tokens, plan.action_tokens
+    tolerance = recipe.tolerance if cfg.quantize is None else cast(float, cfg.tolerance)
+    if cfg.backend.tf32 and cfg.tolerance is None:
+        # The recipe's own checks compare PyTorch with PyTorch in float32; only the programs round to TF32.
+        # A recipe that loosens its bfloat16 tolerance further allows for bfloat16's rounding, which TF32 lacks.
+        base = min(recipe.bfloat16_tolerance, BFLOAT16_STEPS_TOLERANCE)
+        tolerance = max(tolerance, base / TF32_TOLERANCE_DIVISOR)
+    manifest = BundleManifest(
+        backend=cfg.backend.type,
+        runtime=cfg.backend.runtime,
+        runtime_imports=list(cfg.backend.runtime_imports),
+        runtime_options=cfg.backend.runtime_options,
+        programs=programs,
+        runs=runs,
+        first_runs=first_runs,
+        task_tokens=None
+        if task_tokens is None
+        else TaskTokens(task_tokens.prompt_ops, task_tokens.max_tokens),
+        action_tokens=None if action_tokens is None else action_tokens.spec,
+        noise_shape=None if chunk_noise is None else list(chunk_noise.shape),
+        history=plan.history,
+        carry={name: None if shape is None else list(shape) for name, shape in plan.carry.items()},
+        task=recipe.task,
+        action_names=_robot_action_names(getattr(recipe.config, "action_feature_names", None)),
+        action_scale=test_case.action_scale.tolist(),
+        tolerance=tolerance,
+        target=cfg.backend.target(),
+        runtime_versions=runtime_versions(cfg.backend.runtime_modules),
+        exact_runtime_modules=list(cfg.backend.exact_runtime_modules),
+    )
+    write_bundle(
+        Bundle(folder, manifest), test_case, recipe.config, plan.constants, task_tokens, action_tokens
+    )
     return {
         "folder": str(folder),
         "output_dir": str(output_dir),

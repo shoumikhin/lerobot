@@ -137,8 +137,8 @@ def export(args: Sequence[str]) -> Path:
                 )
             folder.rename(output_dir)
         except BaseException:
-            # A killed trace step could not remove its folders itself. It names them before it makes any, so
-            # one killed while it wrote their names made none.
+            # The trace step names its folders before it makes any, so one killed while it wrote their names
+            # made none.
             with suppress(FileNotFoundError, ValueError):
                 _remove_made(json.loads(folders.read_text()))
             raise
