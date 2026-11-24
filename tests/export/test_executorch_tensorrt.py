@@ -189,13 +189,29 @@ def test_a_parts_compile_options_go_to_torch_tensorrt_with_the_backends_own(monk
     assert seen["grouped_mm_kernel"] is True and seen["fallback_pytorch_plugin_ops"] is True
 
 
-# The user's flags, the backend's own settings and the arguments of its call are not a recipe's to change.
-@pytest.mark.parametrize("name", ["disable_tf32", "deduplicate_weights", "min_block_size", "output_format"])
+def test_a_part_may_turn_off_weight_deduplication(monkeypatch, tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    seen = {}
+    use_fake_tensorrt(
+        monkeypatch,
+        lambda program, arg_inputs, **options: seen.update(options),
+        settings=["deduplicate_weights"],
+    )
+    ExecuTorchTensorRTConfig().compile(
+        linear_program(), tmp_path / "model.pte", compile_options={"deduplicate_weights": False}
+    )
+    assert seen["deduplicate_weights"] is False
+
+
+# The user's flags, the backend's own settings except `deduplicate_weights` and the arguments of its call
+# are not a recipe's to change.
+@pytest.mark.parametrize("name", ["disable_tf32", "min_block_size", "output_format"])
 def test_compile_options_that_the_backend_already_sets_are_refused(monkeypatch, tmp_path, name):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 
     built = []
-    settings = ["disable_tf32", "deduplicate_weights", "min_block_size"]
+    settings = ["disable_tf32", "min_block_size"]
     use_fake_tensorrt(
         monkeypatch, lambda program, arg_inputs, **options: built.append(options), settings=settings
     )

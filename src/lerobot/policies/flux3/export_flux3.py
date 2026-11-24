@@ -23,13 +23,16 @@ every chunk from that same noise too.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from lerobot.export.recipe import ActionChunkRecipe
+from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+from lerobot.export.recipe import ActionChunkRecipe, Part
 from lerobot.policies import PreTrainedPolicy
 from lerobot.processor import policy_output_to_transition, transition_to_policy_action
 
@@ -49,6 +52,15 @@ class Flux3ExportRecipe(ActionChunkRecipe):
             kwargs = {"video_noise": video.reshape(video_shape), "noise": action.reshape(action_shape)}
         output = policy.predict_action_chunk(batch, **kwargs)
         return transition_to_policy_action(policy_output_to_transition(output))
+
+    def parts(self) -> Iterator[Part]:
+        """The default part, with weight sharing turned off for TensorRT."""
+        for part in super().parts():
+            if isinstance(self.cfg.backend, ExecuTorchTensorRTConfig):
+                # TensorRT's builder crashes on FLUX3's network when Torch-TensorRT shares one transposed weight
+                # between layers (`deduplicate_weights`): NVIDIA/TensorRT#4963.
+                part = replace(part, compile_options={"deduplicate_weights": False})
+            yield part
 
     def _seeded_noise(self) -> Tensor:
         # The two noises FLUX3 draws when it is given none, in its order.

@@ -114,8 +114,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
         It empties in place the weights that only its TensorRT engines read, so neither `program` nor a module
         that shares its weights can run afterwards. `compile_options` are Torch-TensorRT settings, added to the
         backend's own. One that the installed Torch-TensorRT does not have, or that the backend already sets,
-        from its own settings or the `--backend` flags, is refused. Returns the weights file of the CUDA backend's
-        part, if it has one.
+        from its own settings or the `--backend` flags, is refused, except `deduplicate_weights`, which a part
+        may turn off. Returns the weights file of the CUDA backend's part, if it has one.
         """
         import torch_tensorrt
         from torch_tensorrt import compile_and_save
@@ -134,9 +134,6 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # Float32 math stays float32, as in PyTorch. TensorRT's default TF32 moved ACT's actions by up to
             # 5e-3 of their spread, a thousand times the float32 rounding.
             "disable_tf32": True,
-            # One host copy of each weight, and of its transpose, instead of one per layer that reads it
-            # (pytorch/TensorRT#4965).
-            "deduplicate_weights": True,
             # Frees each weight once the last engine that reads it is built (pytorch/TensorRT#4853), so the
             # build does not hold the weights and the engines at once. A weight that a part left to the CUDA
             # backend reads stays, since Torch-TensorRT frees only what no graph outside TensorRT reads.
@@ -155,6 +152,9 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
                     f"options of {path.stem} set, and it would ignore it without a word."
                 )
         options.update(compile_options or {})
+        # One host copy of each weight, and of its transpose, instead of one per layer that reads it
+        # (pytorch/TensorRT#4965). Unlike the settings above, a part may turn it off.
+        options.setdefault("deduplicate_weights", True)
         args, _ = program.example_inputs
         # compile_and_save writes each engine to a file in the temporary directory as soon as it is built, and
         # streams the files into the program, so no engine is held in memory while it is saved.
