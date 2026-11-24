@@ -182,6 +182,25 @@ def test_tf32_off_keeps_float32_math_in_float32(monkeypatch, tmp_path):
     assert seen["disable_tf32"] is True
 
 
+def test_the_optimization_level_goes_to_torch_tensorrt_only_when_set(monkeypatch, tmp_path):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    built = []
+    use_fake_tensorrt(monkeypatch, lambda program, arg_inputs, **options: built.append(options))
+    ExecuTorchTensorRTConfig().compile(linear_program(), tmp_path / "default.pte")
+    ExecuTorchTensorRTConfig(optimization_level=0).compile(linear_program(), tmp_path / "level0.pte")
+    assert "optimization_level" not in built[0]
+    assert built[1]["optimization_level"] == 0
+
+
+@pytest.mark.parametrize("level", [-1, 6])
+def test_an_optimization_level_tensorrt_does_not_have_is_refused(level):
+    from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
+
+    with pytest.raises(ValueError, match=f"optimization_level must be 0 to 5, not {level}"):
+        ExecuTorchTensorRTConfig(optimization_level=level)
+
+
 def test_a_parts_compile_options_go_to_torch_tensorrt_with_the_backends_own(monkeypatch, tmp_path):
     from lerobot.export.backends.executorch_tensorrt import ExecuTorchTensorRTConfig
 

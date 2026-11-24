@@ -79,6 +79,16 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
     rounding can flip keeps float32: see `ExportRecipe.tf32`. `False` keeps float32 math in float32, held to the
     float32 tolerance."""
 
+    optimization_level: int | None = None
+    """How hard TensorRT searches for fast kernels when it builds an engine, from 0 to 5. `None` (the default)
+    keeps TensorRT's own, 3. A lower level builds faster and with less memory, and its engines may run slower:
+    on a Jetson Orin Nano, evo1's largest engine ran out of memory at the default level and built at 0."""
+
+    def __post_init__(self) -> None:
+        """Refuse an optimization level TensorRT does not have before anything is traced."""
+        if self.optimization_level is not None and not 0 <= self.optimization_level <= 5:
+            raise ValueError(f"--backend.optimization_level must be 0 to 5, not {self.optimization_level}.")
+
     def without_tf32(self) -> ExecuTorchTensorRTConfig:
         """These settings with `tf32` off."""
         return dataclasses.replace(self, tf32=False)
@@ -148,6 +158,8 @@ class ExecuTorchTensorRTConfig(ExecuTorchConfig):
             # backend reads stays, since Torch-TensorRT frees only what no graph outside TensorRT reads.
             "release_weights_after_build": True,
         }
+        if self.optimization_level is not None:
+            options["optimization_level"] = self.optimization_level
         for name in compile_options or {}:
             # A recipe's setting must not silently replace the user's flags or what an ExecuTorch program needs.
             if name in options or name in ("output_format", "arg_inputs", "save_options"):
