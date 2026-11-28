@@ -239,6 +239,21 @@ def test_a_part_refuses_inputs_without_one_name_each():
         Part("p", torch.nn.Identity(), (torch.zeros(2), torch.ones(2)), ["a"], ["y"])
 
 
+def test_a_part_refuses_compile_options_that_json_cannot_hold():
+    """The trace step hands them to the compile step as JSON, after every part is traced."""
+    from lerobot.export.recipe import Part
+
+    with pytest.raises(ValueError, match="compile options of the part p must be values JSON can hold"):
+        Part(
+            "p",
+            torch.nn.Identity(),
+            (torch.zeros(2),),
+            ["a"],
+            ["y"],
+            compile_options={"precisions": {torch.half}},
+        )
+
+
 def test_a_part_or_a_run_cannot_take_the_name_of_the_noise_draw():
     from lerobot.bundle.manifest import ProgramRun
     from lerobot.export.recipe import Part, RunPlan

@@ -26,6 +26,7 @@ import signal
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -717,6 +718,34 @@ def test_the_compile_step_says_which_quantization_needs_a_module_that_does_not_i
         ImportError, match="--quantize=fp8 holds operators that missing_module_for_quantized_ops"
     ):
         compile_part(tmp_path, "fp8")
+
+
+def test_each_parts_compile_options_reach_the_backend_that_compiles_it(checkpoint, tmp_path, monkeypatch):
+    """From the recipe's part, through the trace step and the compile step's request, to a backend that takes
+    them."""
+    load, compile = ExportRecipe.load.__func__, TorchTestBackend.compile
+    seen = {}
+
+    def load_with_options(cls, cfg):
+        recipe = load(cls, cfg)
+        parts = recipe.parts
+        recipe.parts = lambda: (replace(part, compile_options={"setting": part.name}) for part in parts())
+        return recipe
+
+    def compile_and_record(self, program, path, compile_options=None):
+        seen[path.stem] = compile_options
+        return compile(self, program, path)
+
+    def run_step_in_this_process(work, name, request):
+        # Through JSON, as between processes.
+        return json.loads(json.dumps(worker.STEPS[request["step"]](json.loads(json.dumps(request)))))
+
+    monkeypatch.setattr(ExportRecipe, "load", classmethod(load_with_options))
+    monkeypatch.setattr(TorchTestBackend, "compile", compile_and_record)
+    monkeypatch.setattr(lerobot_export, "_run_step", run_step_in_this_process)
+    monkeypatch.setattr(worker, "set_log_level", lambda level: None)
+    run_export(f"--policy.path={checkpoint}", f"--output_dir={tmp_path / 'b'}")
+    assert seen == {"model": {"setting": "model"}}
 
 
 def test_the_compile_step_names_what_its_backend_needs_installed(tmp_path, monkeypatch):
